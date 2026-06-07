@@ -6,7 +6,7 @@ import {
   LayoutDashboard, Eye, Database, Zap, ShieldCheck, Layers,
   HelpCircle, RefreshCw, Clock, ScanSearch,
 } from 'lucide-react'
-import { screenshotApi } from '@/lib/api'
+import { screenshotApi, canvasApi } from '@/lib/api'
 import { UploadDropzone } from '@/components/screenshot/UploadDropzone'
 import { HintDialog } from '@/components/screenshot/HintDialog'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
@@ -193,6 +193,8 @@ export default function ScreenshotPage() {
   const [chartStates, setChartStates] = useState<Record<string, unknown>[]>([])
   const [screenshotJob, setScreenshotJob] = useState<Record<string, unknown> | null>(null)
   const [hint, setHint] = useState<HintRequest | null>(null)
+  const [dashboardName, setDashboardName] = useState('')
+  const [renamingSaving, setRenamingSaving] = useState(false)
   const [phase, setPhase] = useState<'idle' | 'uploading' | 'processing' | 'done' | 'error'>('idle')
   const [log, setLog] = useState<LogEntry[]>([])
   const [steps, setSteps] = useState<Record<StepKey, StepStatus>>({
@@ -568,6 +570,38 @@ export default function ScreenshotPage() {
                   </p>
                 </div>
               </div>
+              {/* Canvas rename input */}
+              {resultDashboardId && (
+                <div className="flex items-center gap-2 mt-2">
+                  <label className="text-xs text-gray-400 font-semibold shrink-0">Canvas name:</label>
+                  <input
+                    value={dashboardName}
+                    onChange={e => setDashboardName(e.target.value)}
+                    placeholder="e.g. Q2 Insurance Report"
+                    className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-blue-400"
+                    onKeyDown={async e => {
+                      if (e.key === 'Enter' && dashboardName.trim() && resultDashboardId) {
+                        setRenamingSaving(true)
+                        try { await canvasApi.rename(resultDashboardId, dashboardName.trim()) } catch {}
+                        setRenamingSaving(false)
+                      }
+                    }}
+                  />
+                  <button
+                    disabled={!dashboardName.trim() || renamingSaving}
+                    onClick={async () => {
+                      if (!dashboardName.trim() || !resultDashboardId) return
+                      setRenamingSaving(true)
+                      try { await canvasApi.rename(resultDashboardId, dashboardName.trim()) } catch {}
+                      setRenamingSaving(false)
+                    }}
+                    className="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1 disabled:opacity-40"
+                  >
+                    {renamingSaving ? <Loader2 size={11} className="animate-spin" /> : null}
+                    Save
+                  </button>
+                </div>
+              )}
               <div className="flex justify-end gap-3 flex-wrap">
                 <button
                   onClick={() => { setPhase('idle'); setFiles([]); setChartStates([]); setJobId(null); setLog([]); setSteps({ upload: 'idle', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' }) }}

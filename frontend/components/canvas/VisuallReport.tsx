@@ -63,7 +63,7 @@ const THEMES: Theme[] = [
     cardRadius: 16, buttonMinH: 32, animations: true, glassMorphism: true,
   },
   {
-    id: 'senior', label: 'Senior (80+)',
+    id: 'senior', label: 'Classic',
     bg: '#FFFFFF', surface: '#F8F9FA', border: 'rgba(0,0,0,0.15)', text: '#000000', muted: '#555555',
     accent: '#000080', accentBg: '#E8E8FF',
     rail: '#000080', railText: 'rgba(255,255,255,0.85)', railActive: 'rgba(0,0,128,0.2)',
@@ -72,7 +72,7 @@ const THEMES: Theme[] = [
     cardRadius: 8, buttonMinH: 48, animations: false, glassMorphism: false,
   },
   {
-    id: 'maturepro', label: 'Mature Pro (55+)',
+    id: 'maturepro', label: 'Warm Earth',
     bg: '#F5F0E8', surface: '#FFFEF8', border: 'rgba(0,0,0,0.1)', text: '#2C1810', muted: '#7A6A5A',
     accent: '#8B4513', accentBg: '#FFF3E0',
     rail: '#3E2723', railText: 'rgba(255,255,255,0.7)', railActive: 'rgba(139,69,19,0.2)',
@@ -81,7 +81,7 @@ const THEMES: Theme[] = [
     cardRadius: 12, buttonMinH: 40, animations: false, glassMorphism: false,
   },
   {
-    id: 'digitalnative', label: 'Digital (25+)',
+    id: 'digitalnative', label: 'Neon',
     bg: '#09090B', surface: 'rgba(255,255,255,0.04)', border: 'rgba(0,255,200,0.12)', text: '#E2E8F0', muted: 'rgba(255,255,255,0.35)',
     accent: '#00FFC8', accentBg: 'rgba(0,255,200,0.06)',
     rail: '#050507', railText: 'rgba(255,255,255,0.3)', railActive: 'rgba(0,255,200,0.1)',
@@ -90,7 +90,7 @@ const THEMES: Theme[] = [
     cardRadius: 10, buttonMinH: 30, animations: true, glassMorphism: true,
   },
   {
-    id: 'genz', label: 'Gen Z',
+    id: 'genz', label: 'Vivid',
     bg: '#FDF4FF', surface: '#FFFFFF', border: 'rgba(168,85,247,0.12)', text: '#1A1A2E', muted: '#9CA3AF',
     accent: '#A855F7', accentBg: '#FAF5FF',
     rail: '#1A1A2E', railText: 'rgba(255,255,255,0.5)', railActive: 'rgba(168,85,247,0.15)',
@@ -108,6 +108,70 @@ const THEMES: Theme[] = [
     cardRadius: 6, buttonMinH: 44, animations: false, glassMorphism: false,
   },
 ]
+
+// ─── Markdown renderer (no external deps) ─────────────────────────────────────
+
+function MarkdownText({ text, color, fontSize = 13 }: { text: string; color: string; fontSize?: number }) {
+  const lines = text.split('\n')
+  const elements: React.ReactNode[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (!line.trim()) { i++; continue }
+    // Headings
+    const h3 = line.match(/^###\s+(.+)/)
+    const h2 = line.match(/^##\s+(.+)/)
+    const h1 = line.match(/^#\s+(.+)/)
+    if (h1 || h2 || h3) {
+      const txt = (h1?.[1] ?? h2?.[1] ?? h3?.[1] ?? '').trim()
+      elements.push(<p key={i} style={{ fontSize: h1 ? fontSize + 3 : h2 ? fontSize + 1 : fontSize, fontWeight: 800, color, margin: '10px 0 4px', lineHeight: 1.3 }}>{inlineRender(txt)}</p>)
+      i++; continue
+    }
+    // Bullet lines: • - * at start
+    if (/^[•\-\*]\s/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^[•\-\*]\s/.test(lines[i])) {
+        items.push(lines[i].replace(/^[•\-\*]\s+/, '').trim())
+        i++
+      }
+      elements.push(
+        <ul key={`ul-${i}`} style={{ margin: '4px 0', paddingLeft: 18, color }}>
+          {items.map((it, j) => <li key={j} style={{ fontSize, lineHeight: 1.65, marginBottom: 2 }}>{inlineRender(it)}</li>)}
+        </ul>
+      )
+      continue
+    }
+    // Numbered list
+    if (/^\d+\.\s/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+\.\s+/, '').trim())
+        i++
+      }
+      elements.push(
+        <ol key={`ol-${i}`} style={{ margin: '4px 0', paddingLeft: 20, color }}>
+          {items.map((it, j) => <li key={j} style={{ fontSize, lineHeight: 1.65, marginBottom: 2 }}>{inlineRender(it)}</li>)}
+        </ol>
+      )
+      continue
+    }
+    // Regular paragraph
+    elements.push(<p key={i} style={{ fontSize, lineHeight: 1.7, color, margin: '3px 0' }}>{inlineRender(line)}</p>)
+    i++
+  }
+  return <div>{elements}</div>
+}
+
+function inlineRender(text: string): React.ReactNode[] {
+  // Split on **bold**, *italic*, `code`
+  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/)
+  return parts.map((p, i) => {
+    if (p.startsWith('**') && p.endsWith('**')) return <strong key={i}>{p.slice(2,-2)}</strong>
+    if (p.startsWith('*') && p.endsWith('*')) return <em key={i}>{p.slice(1,-1)}</em>
+    if (p.startsWith('`') && p.endsWith('`')) return <code key={i} style={{ fontFamily: 'monospace', fontSize: '0.88em', background: 'rgba(0,0,0,0.07)', padding: '1px 4px', borderRadius: 3 }}>{p.slice(1,-1)}</code>
+    return p
+  })
+}
 
 // ─── Micro-components ──────────────────────────────────────────────────────────
 
@@ -235,6 +299,7 @@ interface Props {
   projectId: string
   onClose: () => void
   onWidgetAdded: () => void
+  onCanvasRename?: (newName: string) => void
 }
 
 function getRecommendedQuestions(widgets: CanvasWidgetData[]): string[] {
@@ -375,7 +440,7 @@ function detectAnomalyIndices(values: (number|null)[]): number[] {
 
 // ─── Main Component ────────────────────────────────────────────────────────────
 
-export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdded }: Props) {
+export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdded, onCanvasRename }: Props) {
   const [themeIdx, setThemeIdx] = useState(() => {
     try { return parseInt(localStorage.getItem(`visually-theme-${canvas.id}`) ?? '0', 10) || 0 } catch { return 0 }
   })
@@ -427,6 +492,9 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   // Table accordion state — tables are collapsed by default
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
   const [heroCollapsed, setHeroCollapsed] = useState(false)
+  const [canvasName, setCanvasName] = useState(canvas.name)
+  const [renamingCanvas, setRenamingCanvas] = useState(false)
+  const [renameValue, setRenameValue] = useState(canvas.name)
   // Table chart type overrides (for visualizing table data as charts)
   const [tableChartTypes, setTableChartTypes] = useState<Record<string,string>>({})
   // AI-generated table names
@@ -640,9 +708,23 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     try {
       const h2c = (await import('html2canvas')).default
       const c = await h2c(el, { backgroundColor: theme.id === 'midnight' ? '#070D1A' : '#ffffff', scale: 2 })
-      c.toBlob(b => { if (b) navigator.clipboard.write([new ClipboardItem({ 'image/png': b })]) })
-      showToast('Chart copied to clipboard!')
-    } catch { showToast('Could not copy — try a different browser') }
+      await new Promise<void>((resolve, reject) => {
+        c.toBlob(async b => {
+          if (!b) { reject(new Error('no blob')); return }
+          try {
+            await navigator.clipboard.write([new ClipboardItem({ 'image/png': b })])
+            resolve()
+          } catch {
+            // Fallback: download as PNG instead
+            const url = URL.createObjectURL(b)
+            const a = document.createElement('a'); a.href = url; a.download = `chart.png`; a.click()
+            URL.revokeObjectURL(url)
+            resolve()
+          }
+        })
+      })
+      showToast('Chart copied / downloaded!')
+    } catch { showToast('Could not export chart') }
   }, [theme.id, showToast])
 
   // ── Open info panel for a widget ─────────────────────────────────────────
@@ -708,6 +790,18 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     } catch { showToast('AI rename failed') }
     finally { setTableAiNaming(prev => ({ ...prev, [w.id]: false })) }
   }, [tableAiNaming, projectId, connectionId, canvas.id, showToast])
+
+  const commitRename = useCallback(async () => {
+    const trimmed = renameValue.trim()
+    if (!trimmed || trimmed === canvasName) { setRenamingCanvas(false); return }
+    setCanvasName(trimmed)
+    setRenamingCanvas(false)
+    try {
+      await canvasApi.rename(canvas.id, trimmed)
+      onCanvasRename?.(trimmed)
+      showToast(`✓ Renamed to "${trimmed}"`)
+    } catch { showToast('Rename failed'); setCanvasName(canvasName) }
+  }, [renameValue, canvasName, canvas.id, onCanvasRename, showToast])
 
   const handlePrint = useCallback(() => window.print(), [])
 
@@ -1431,7 +1525,17 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                     </span>
                     <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)' }}>{widgets.length} charts · Real-time data</span>
                   </div>
-                  <h1 style={{ fontSize: 20, fontWeight: 800, color: 'white', margin: 0, letterSpacing: '-0.4px' }}>{canvas.name}</h1>
+                  {renamingCanvas ? (
+                    <input autoFocus value={renameValue} onChange={e => setRenameValue(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') { setRenamingCanvas(false); setRenameValue(canvasName) } }}
+                      onBlur={commitRename}
+                      style={{ fontSize: 20, fontWeight: 800, color: 'white', background: 'rgba(255,255,255,0.12)', border: '2px solid rgba(255,255,255,0.5)', borderRadius: 8, padding: '2px 10px', outline: 'none', width: 360, letterSpacing: '-0.4px' }} />
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => { setRenamingCanvas(true); setRenameValue(canvasName) }}>
+                      <h1 style={{ fontSize: 20, fontWeight: 800, color: 'white', margin: 0, letterSpacing: '-0.4px' }}>{canvasName}</h1>
+                      <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', userSelect: 'none' }} title="Click to rename">✏️</span>
+                    </div>
+                  )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <div style={{ display: 'flex', background: 'rgba(255,255,255,0.12)', borderRadius: 8, padding: 2, gap: 2 }}>
@@ -1456,7 +1560,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 16px', position: 'relative' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ADE80', animation: 'visually-pulse 2s ease infinite', display: 'inline-block' }} />
-                <span style={{ fontSize: 12, fontWeight: 700, color: 'white', letterSpacing: '-0.2px' }}>{canvas.name}</span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: 'white', letterSpacing: '-0.2px', cursor: 'pointer' }} onClick={() => { setHeroCollapsed(false); setTimeout(() => { setRenamingCanvas(true); setRenameValue(canvasName) }, 150) }}>{canvasName}</span>
                 <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)' }}>{widgets.length} widgets</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -1498,7 +1602,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               <div style={{ padding: '0 20px 12px' }}>
                 {summaryLoading
                   ? <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}><Loader2 size={12} style={{ color: theme.accent }} /><span style={{ fontSize: 12, color: theme.muted }}>Generating…</span></div>
-                  : <div style={{ fontSize: 13, color: theme.text, lineHeight: 1.7, whiteSpace: 'pre-line' }}>{execSummary}</div>
+                  : <MarkdownText text={execSummary} color={theme.text} fontSize={13} />
                 }
               </div>
             )}
@@ -1650,7 +1754,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                       <span style={{ fontSize: 12, color: theme.muted }}>Generating insight…</span>
                     </div>
                   ) : desc ? (
-                    <p style={{ fontSize: 13, color: theme.text, lineHeight: 1.7, margin: 0 }}>{desc}</p>
+                    <MarkdownText text={desc} color={theme.text} fontSize={13} />
                   ) : (
                     <p style={{ fontSize: 13, color: theme.muted, lineHeight: 1.7, margin: 0 }}>Insight will appear here once loaded.</p>
                   )}
@@ -1747,7 +1851,12 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               return (
                 <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 8 }}>
                   <div style={{ maxWidth: '90%', padding: '9px 13px', borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '4px 16px 16px 16px', background: bubbleBg, color: msg.role === 'user' ? 'white' : theme.text, fontSize: 13, lineHeight: 1.55 }}>
-                    {isLatestAI ? <TypewriterText text={msg.content} active speed={10} /> : msg.content}
+                    {isLatestAI
+                      ? <TypewriterText text={msg.content} active speed={10} />
+                      : msg.role === 'assistant'
+                        ? <MarkdownText text={msg.content} color={theme.text} fontSize={13} />
+                        : msg.content
+                    }
                   </div>
 
                   {msg.inlineChart && (

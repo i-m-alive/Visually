@@ -134,6 +134,8 @@ export const canvasApi = {
   list: (projectId: string) => api.get(`/dashboards?project_id=${projectId}`),
   get: (canvasId: string) => api.get(`/dashboards/${canvasId}`),
   delete: (canvasId: string) => api.delete(`/dashboards/${canvasId}`),
+  rename: (canvasId: string, name: string) =>
+    api.patch(`/dashboards/${canvasId}`, { name }),
   updateTheme: (canvasId: string, theme: string) =>
     api.patch(`/dashboards/${canvasId}`, { theme }),
   updateLayout: (canvasId: string, items: LayoutItem[]) =>

@@ -59,8 +59,23 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   const ganttTasks   = (chart_data as Record<string, unknown>).gantt_tasks   as Array<{ task: string; start: string; end: string; category: string }> | undefined
   const orgNodes     = (chart_data as Record<string, unknown>).org_nodes     as Array<{ id: string; name: string; parent: string }> | undefined
 
-  const xKey = columns[0] || x_axis_label || 'x'
-  const yKey = columns[1] || y_axis_label || 'value'
+  // Smart column detection: when rows contain typed data, prefer string→X, number→Y
+  let xKey = columns[0] || x_axis_label || 'x'
+  let yKey = columns[1] || y_axis_label || 'value'
+  if (rows.length > 0 && columns.length >= 2) {
+    const sample = rows[0]
+    const strCols = columns.filter(c => typeof sample[c] === 'string')
+    const numCols = columns.filter(c => typeof sample[c] === 'number')
+    if (strCols.length > 0 && numCols.length > 0) {
+      xKey = strCols[0]
+      yKey = numCols[0]
+    } else if (numCols.length >= 2 && typeof sample[xKey] === 'number' && typeof sample[yKey] === 'number') {
+      // Both numeric: keep default order (x=first, y=second)
+    } else if (strCols.length >= 2) {
+      // Both strings: use first as category, count rows as value (fallback)
+      xKey = strCols[0]
+    }
+  }
 
   // recharts data array from rows (or from labels/values if rows is empty)
   const rechartData = rows.length > 0
@@ -175,23 +190,33 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
 
   // ── Pie / Donut ────────────────────────────────────────────────────────────────
   if (ct === 'pie' || ct === 'donut') {
-    const pieData = labels.length > 0
+    const MAX_SLICES = 12
+    let rawPie = labels.length > 0
       ? labels.map((l, i) => ({ name: l, value: values[i] ?? 0 }))
       : rechartData.map(r => ({ name: String(r[xKey] ?? ''), value: Number(r[yKey] ?? 0) }))
+    // Sort descending by value so "Other" bucket is the tail
+    rawPie = [...rawPie].sort((a, b) => b.value - a.value)
+    let pieData = rawPie
+    if (rawPie.length > MAX_SLICES) {
+      const top = rawPie.slice(0, MAX_SLICES - 1)
+      const otherSum = rawPie.slice(MAX_SLICES - 1).reduce((s, d) => s + d.value, 0)
+      pieData = [...top, { name: `Other (${rawPie.length - MAX_SLICES + 1})`, value: otherSum }]
+    }
+    const manySlices = pieData.length > 7
     const showLegend = height > 200
     return (
       <ResponsiveContainer width="100%" height={height}>
         <PieChart>
           <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
-            innerRadius={ct === 'donut' ? '50%' : 0}
-            outerRadius={showLegend ? '65%' : '75%'}
-            label={showLegend ? ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)` : undefined}
-            labelLine={showLegend}
+            innerRadius={ct === 'donut' ? '45%' : 0}
+            outerRadius={showLegend && !manySlices ? '60%' : '72%'}
+            label={!manySlices && showLegend ? ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)` : undefined}
+            labelLine={!manySlices && showLegend}
           >
             {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
           </Pie>
-          <Tooltip />
-          {showLegend && <Legend />}
+          <Tooltip formatter={(v: number) => v.toLocaleString()} />
+          {showLegend && <Legend wrapperStyle={{ fontSize: 11, maxHeight: 80, overflowY: 'auto' }} />}
         </PieChart>
       </ResponsiveContainer>
     )
@@ -392,20 +417,31 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       )
     }
 
-    // Give each bar at least 34px of vertical space to avoid crowding
-    const barH = Math.max(height, rechartData.length * 34)
+    // Cap display at top 50 rows to avoid unusable charts; show a note if truncated
+    const MAX_BARS = 50
+    const truncated = rechartData.length > MAX_BARS
+    const displayData = truncated ? rechartData.slice(0, MAX_BARS) : rechartData
+    // Each bar needs at least 30px height; cap total at 700px with internal scroll
+    const barH = Math.min(700, Math.max(height, displayData.length * 30))
     return (
-      <ResponsiveContainer width="100%" height={barH}>
-        <BarChart data={rechartData} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
-          <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-          <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-          <YAxis dataKey={xKey} type="category" width={yAxisWidth} tick={<HorizontalYTick />} axisLine={false} tickLine={false} />
-          <Tooltip formatter={(v: number) => v.toLocaleString()} />
-          <Bar dataKey={yKey} radius={[0, 3, 3, 0]} maxBarSize={26}>
-            {rechartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-          </Bar>
-        </BarChart>
-      </ResponsiveContainer>
+      <div>
+        {truncated && (
+          <p style={{ fontSize: 10, color: '#9CA3AF', marginBottom: 4 }}>
+            Showing top {MAX_BARS} of {rechartData.length} rows (sorted by value)
+          </p>
+        )}
+        <ResponsiveContainer width="100%" height={barH}>
+          <BarChart data={displayData} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+            <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+            <YAxis dataKey={xKey} type="category" width={yAxisWidth} tick={<HorizontalYTick />} axisLine={false} tickLine={false} />
+            <Tooltip formatter={(v: number) => v.toLocaleString()} />
+            <Bar dataKey={yKey} radius={[0, 3, 3, 0]} maxBarSize={22}>
+              {displayData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
     )
   }
 
@@ -1527,11 +1563,35 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
 
   // ── Bar (vertical, default — also handles bar_vertical) ──────────────────────
   const anomalySet = new Set(anomalyIndices)
+  // If many categories and labels are long, auto-switch to horizontal bar
+  const shouldAutoHBar = rechartData.length > 15 && rechartData.some(r => String(r[xKey] ?? '').length > 6)
+  if (shouldAutoHBar) {
+    const longestL = rechartData.reduce((m, r) => Math.max(m, String(r[xKey] ?? '').length), 0)
+    const yAxisW = Math.min(200, Math.max(100, longestL * 6.5))
+    const barH = Math.min(700, Math.max(height, Math.min(rechartData.length, 50) * 30))
+    const capped = rechartData.length > 50 ? rechartData.slice(0, 50) : rechartData
+    return (
+      <div>
+        {rechartData.length > 50 && <p style={{ fontSize: 10, color: '#9CA3AF', marginBottom: 4 }}>Showing top 50 of {rechartData.length}</p>}
+        <ResponsiveContainer width="100%" height={barH}>
+          <BarChart data={capped} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+            <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+            <YAxis dataKey={xKey} type="category" width={yAxisW} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+            <Tooltip formatter={(v: number) => v.toLocaleString()} />
+            <Bar dataKey={yKey} radius={[0, 3, 3, 0]} maxBarSize={22}>
+              {capped.map((_, i) => <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    )
+  }
   return (
     <ResponsiveContainer width="100%" height={height}>
       <BarChart data={rechartData}>
         <CartesianGrid strokeDasharray="3 3" />
-        <XAxis dataKey={xKey} tick={{ fontSize: 11 }} />
+        <XAxis dataKey={xKey} tick={{ fontSize: 11 }} interval="preserveStartEnd" />
         <YAxis tick={{ fontSize: 11 }} />
         <Tooltip />
         <Bar dataKey={yKey} radius={[3, 3, 0, 0]}>
