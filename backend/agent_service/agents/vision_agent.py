@@ -92,17 +92,24 @@ Do not include non-chart elements like navigation bars, logos, or plain text par
 
 ANALYSIS_SYSTEM_PROMPT = """You are a data visualization expert analyzing a single chart or graph image.
 Extract all structural and semantic information from this chart.
-Return ONLY valid JSON. Be precise about numbers you can read and honest about estimates."""
+Return ONLY valid JSON. Be precise about numbers you can read and honest about estimates.
+
+CRITICAL: KPI card recognition rules — use chart_type "kpi" (NOT "kpi_card") when:
+- The visual shows a single large number prominently displayed (e.g. "$1.2M", "4,521", "87%")
+- There is a metric label above or below the number (e.g. "Total Revenue", "Active Users")
+- There may be a trend indicator (up/down arrow, percentage change) but NO x/y axes
+- The card occupies a small tile region — it is NOT a bar/line chart with one bar or point
+Do NOT use "kpi" for single-bar charts or single-point line charts — those have axes."""
 
 ANALYSIS_USER_PROMPT = """Analyze this chart image and extract all information you can see.
 
 Return JSON in this exact format:
 {
-  "chart_type": "bar_vertical|bar_horizontal|line|area|pie|donut|scatter|kpi_card|table|heatmap|gauge|funnel|treemap",
+  "chart_type": "bar_vertical|bar_horizontal|line|area|pie|donut|scatter|kpi|table|heatmap|gauge|funnel|treemap",
   "title": "exact chart title text or null",
   "subtitle": "subtitle text or null",
-  "x_axis_label": "x-axis label text or null",
-  "y_axis_label": "y-axis label text or null",
+  "x_axis_label": "x-axis label text or null (null for KPI cards)",
+  "y_axis_label": "y-axis label text or null (null for KPI cards)",
   "x_tick_labels": ["Jan", "Feb"],
   "y_scale": {"min": 0, "max": 1000, "unit": null},
   "legend_labels": [],
@@ -111,6 +118,8 @@ Return JSON in this exact format:
   "series_count": 1,
   "has_trend_line": false,
   "color_scheme": "sequential|diverging|categorical|monochrome",
+  "kpi_metric_name": "metric label text if this is a KPI card, else null",
+  "kpi_value_text": "raw display value if KPI card (e.g. '$1.2M', '4,521'), else null",
   "reasoning": "brief explanation of your analysis"
 }
 
@@ -118,10 +127,41 @@ For estimated_values:
 - Bar chart: {"Category1": 1200, "Category2": 800}
 - Line chart: {"2024-01": 1200, "2024-02": 1350} (use tick labels as keys)
 - Pie/Donut: {"Segment1": 35.0, "Segment2": 25.0} (as percentages)
-- KPI card: {"value": 1234567, "change_pct": 12.3}
+- KPI card: {"value": 1234567, "change_pct": 12.3, "metric_name": "Total Revenue"}
 - Table: {"row_count": 10, "col_count": 5, "columns": ["col1", "col2"]}
 
 Mark unclear values with "~" prefix: "~1200"."""
+
+
+FILTER_DETECTION_SYSTEM_PROMPT = """You are a UI analysis system that identifies interactive filter controls in business intelligence dashboards.
+Return ONLY valid JSON. No prose before or after the JSON block."""
+
+FILTER_DETECTION_USER_PROMPT = """Examine this screenshot for any filter panels, slicer controls, dropdown filters, date range pickers, search boxes, or any UI element that lets users filter the data shown.
+
+Common Power BI locations: right-side filter pane, slicer visuals anywhere in the report, top-bar dropdowns.
+
+For each filter control found, return:
+- display_name: the label text visible next to or above the control (e.g. "Job Status", "Region")
+- column_hint: likely database column name in snake_case (e.g. "job_status", "region")
+- filter_type: one of [multi_select, single_select, date_range, search_box]
+- visible_values: list of values/options visible in the filter UI (max 20)
+- selected_values: values that appear currently selected/checked (empty list if none)
+
+Return JSON:
+{
+  "filters_detected": [
+    {
+      "display_name": "Status",
+      "column_hint": "status",
+      "filter_type": "multi_select",
+      "visible_values": ["Active", "Closed", "New"],
+      "selected_values": ["Active"]
+    }
+  ],
+  "total_found": 0
+}
+
+If no filter controls are visible, return {"filters_detected": [], "total_found": 0}."""
 
 
 class VisionAgent:
@@ -337,6 +377,28 @@ class VisionAgent:
         except Exception as exc:
             print(f"[vision] ⚠ compare_charts failed (non-fatal): {exc}", flush=True)
             return {"match": True, "score": 0.5, "mismatches": [], "suggestion": ""}
+
+    async def detect_filters(self, image_bytes: bytes, source_filename: str) -> list[dict]:
+        """Detect filter panels and slicer controls in a BI screenshot."""
+        print(f"[vision] detect_filters START  file={source_filename}", flush=True)
+        try:
+            normalized_bytes, _, _ = normalize_image(image_bytes, target_width=1000)
+            response_text = await bedrock_invoke_with_image(
+                model_id=self.model_id,
+                system_prompt=FILTER_DETECTION_SYSTEM_PROMPT,
+                user_text=FILTER_DETECTION_USER_PROMPT,
+                image_bytes=normalized_bytes,
+                image_media_type="image/png",
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            result = _parse_json_response(response_text)
+            filters = result.get("filters_detected", [])
+            print(f"[vision] detect_filters → {len(filters)} filters found in {source_filename}", flush=True)
+            return [f for f in filters if f.get("column_hint")]
+        except Exception as exc:
+            print(f"[vision] ⚠ detect_filters failed (non-fatal): {exc}", flush=True)
+            return []
 
     async def process_images(self, images: list[dict], job_id: str, redis=None) -> dict:
         """

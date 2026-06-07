@@ -7,7 +7,7 @@ import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
-  Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles
+  Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil
 } from 'lucide-react'
 import { canvasApi, widgetApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -129,11 +129,21 @@ interface WidgetWithPosition extends CanvasWidgetData {
   height: number
 }
 
+interface FilterConfig {
+  id: string
+  column: string
+  display_name: string
+  filter_type: string
+  available_values: string[]
+  table: string
+}
+
 interface CanvasDetail {
   id: string
   name: string
   theme: string
   project_id: string
+  filter_config?: FilterConfig[]
   widgets: WidgetWithPosition[]
 }
 
@@ -152,6 +162,8 @@ export default function CanvasEditorPage() {
   const [showReport, setShowReport] = useState(false)
   const [zoomTarget, setZoomTarget] = useState<{ widget: CanvasWidgetData; colors: string[] } | null>(null)
   const [isDirty, setIsDirty]       = useState(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleValue, setTitleValue]     = useState('')
 
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -251,6 +263,16 @@ export default function CanvasEditorPage() {
     persistLayout(layout)
   }
 
+  const handleTitleSave = async () => {
+    setEditingTitle(false)
+    const trimmed = titleValue.trim()
+    if (!trimmed || trimmed === canvas?.name) return
+    try {
+      await canvasApi.rename(canvas!.id, trimmed)
+      setCanvas(prev => prev ? { ...prev, name: trimmed } : prev)
+    } catch { /* ignore */ }
+  }
+
   const handleAutoArrange = useCallback(() => {
     const arranged = autoArrange(widgets)
     setLayout(arranged)
@@ -289,7 +311,28 @@ export default function CanvasEditorPage() {
 
         <div className="flex items-center gap-2 flex-1 min-w-0">
           <Layers size={16} className="text-brand flex-shrink-0" />
-          <h1 className="text-sm font-semibold text-gray-900 truncate">{canvas?.name}</h1>
+          {editingTitle ? (
+            <input
+              autoFocus
+              value={titleValue}
+              onChange={e => setTitleValue(e.target.value)}
+              onBlur={handleTitleSave}
+              onKeyDown={e => {
+                if (e.key === 'Enter') handleTitleSave()
+                if (e.key === 'Escape') { setTitleValue(canvas?.name ?? ''); setEditingTitle(false) }
+              }}
+              className="text-sm font-semibold text-gray-900 bg-transparent border-b-2 border-brand outline-none min-w-0 w-48"
+            />
+          ) : (
+            <button
+              onClick={() => { setTitleValue(canvas?.name ?? ''); setEditingTitle(true) }}
+              className="group/title flex items-center gap-1.5 text-sm font-semibold text-gray-900 hover:text-brand transition-colors min-w-0"
+              title="Click to rename"
+            >
+              <span className="truncate">{canvas?.name}</span>
+              <Pencil size={12} className="text-gray-300 group-hover/title:text-brand shrink-0 transition-colors" />
+            </button>
+          )}
         </div>
 
         {/* Save state */}
@@ -425,7 +468,7 @@ export default function CanvasEditorPage() {
       {/* Visually report overlay */}
       {showReport && canvas && (
         <VisuallReport
-          canvas={{ id: canvas.id, name: canvas.name, project_id: canvas.project_id }}
+          canvas={{ id: canvas.id, name: canvas.name, project_id: canvas.project_id, filter_config: canvas.filter_config }}
           widgets={widgets}
           projectId={projectId}
           onClose={() => setShowReport(false)}

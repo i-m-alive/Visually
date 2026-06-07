@@ -8,12 +8,18 @@ import { Database, MessageSquare, Settings, LogOut, BarChart2, LayoutDashboard, 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const pathname = usePathname()
-  const { user, clearAuth } = useAuthStore()
+  const { user, clearAuth, _hasHydrated } = useAuthStore()
 
   useEffect(() => {
+    // Wait until localStorage has been read before making routing decisions.
+    // Without this guard, the layout redirects to /login on every refresh because
+    // Zustand's persist middleware restores state asynchronously after first render.
+    if (!_hasHydrated) return
     if (!user) router.push('/login')
-  }, [user, router])
+  }, [user, router, _hasHydrated])
 
+  // Show nothing while rehydrating — localStorage read is fast so this is imperceptible
+  if (!_hasHydrated) return null
   if (!user) return null
 
   // Extract projectId from pathname if present

@@ -16,6 +16,7 @@ class Dashboard(Base):
     theme: Mapped[str] = mapped_column(String(50), default="frost", nullable=False)
     layout_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    filter_config: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

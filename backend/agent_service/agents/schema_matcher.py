@@ -2,16 +2,23 @@
 Schema Matcher Agent — ranks schema tables/column combinations for a given chart spec.
 Accepts an EnrichedSchema (from schema_cache) so it gets disambiguation context and
 pre-built compact table list for free — no re-processing per call.
+
+Speed: uses Haiku (5× faster, 10× cheaper than Sonnet) — table ranking is a
+classification task that doesn't require deep reasoning.
+
+Accuracy: TF-IDF pre-filter reduces the table set sent to the LLM, shrinking the
+prompt and focusing the model on the most relevant tables.
 """
 import json
 import re
 from typing import TYPE_CHECKING
-from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
+from shared.bedrock_client import bedrock_invoke, BEDROCK_HAIKU_MODEL
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
 
-MATCHER_MODEL = BEDROCK_SONNET_MODEL
+# Haiku is sufficient for table ranking (classification, not generation)
+MATCHER_MODEL = BEDROCK_HAIKU_MODEL
 
 SYSTEM_PROMPT = """You are a database schema analyst specializing in data visualization.
 Given a chart specification detected from a screenshot and an enriched database schema,
@@ -28,6 +35,20 @@ ANALYSIS APPROACH:
 5. chart type inference: KPI→single aggregate, line→time series, bar→category+metric
 6. data_point_count hints at expected row granularity
 7. Consider joins when a single table can't supply both dimension and metric
+
+SEMANTIC GRAIN CHECK (critical — wrong grain = wrong table):
+- Chart title says "jobs by role" or "open positions" → look for a table whose grain is JOB/POSTING (one row per job), not employee or profile table
+- Chart title says "revenue by month" → look for a transaction or order table, not a product or customer table
+- Chart title says "employees by department" → look for an employee or headcount table, not a jobs table
+- PENALIZE tables that are at the wrong entity level — even if they share a column name
+- When TABLE SEMANTICS section is present, read the "purpose" and "grain" fields before assigning confidence
+
+CONFIDENCE CALIBRATION:
+- Start from 1.0 and subtract based on mismatches
+- Mismatch in grain: -0.4
+- Mismatch in key_metric_cols: -0.2
+- Mismatch in chart title keywords vs table description: -0.1 per keyword miss
+- If a better-matching table exists in the schema, assign the wrong one confidence ≤ 0.3
 
 Return ONLY valid JSON."""
 
@@ -65,7 +86,67 @@ Rules:
 - Only use table names that exist in the schema above
 - confidence 0.8+ = strong match, 0.5-0.8 = plausible, <0.5 = speculative
 - When a column name is ambiguous, pick the occurrence from the most relevant table (see DISAMBIGUATION)
+- When x_tick_labels show job titles / roles (e.g. "Software Engineer", "Manager"), the dimension col must be a role/title column in a JOBS or POSITIONS table — not an employee profile or account table
+- When x_tick_labels show company names or clients, prefer tables with a company/client grain
 - Return at least 1 candidate"""
+
+
+def _tfidf_prefilter(chart_spec: dict, compact_tables: list, top_n: int = 15) -> list:
+    """
+    Word-overlap pre-filter: scores each table by how many chart-spec words appear
+    in its name + description + column names.  Keeps top_n tables before calling
+    the LLM.  Recall-focused (not Jaccard) — we prefer not to miss the right table.
+
+    When the schema has ≤ top_n tables the function returns the original list unchanged.
+    """
+    if not compact_tables or len(compact_tables) <= top_n:
+        return compact_tables
+
+    # Collect query terms from the chart spec
+    query_terms: set[str] = set()
+
+    def _add(text: str) -> None:
+        if text:
+            for w in re.sub(r"[^a-z0-9_]", " ", text.lower()).split():
+                if len(w) > 2:
+                    query_terms.add(w)
+
+    _add(chart_spec.get("title", ""))
+    _add(chart_spec.get("x_axis_label", ""))
+    _add(chart_spec.get("y_axis_label", ""))
+    for lbl in (chart_spec.get("x_tick_labels") or [])[:6]:
+        _add(str(lbl))
+    for lbl in (chart_spec.get("legend_labels") or [])[:4]:
+        _add(str(lbl))
+
+    if not query_terms:
+        return compact_tables[:top_n]
+
+    def _score(table: dict) -> float:
+        tterms: set[str] = set()
+
+        def _add_t(text: str) -> None:
+            if text:
+                for w in re.sub(r"[^a-z0-9_]", " ", text.lower()).split():
+                    if len(w) > 2:
+                        tterms.add(w)
+
+        _add_t(table.get("name", ""))
+        _add_t(table.get("description", ""))
+        for col in (table.get("columns") or [])[:20]:
+            _add_t(col.get("name", ""))
+            _add_t(col.get("description", ""))
+        if not tterms:
+            return 0.0
+        return len(query_terms & tterms) / len(query_terms)
+
+    scored = sorted(compact_tables, key=_score, reverse=True)
+    result = scored[:top_n]
+    print(
+        f"[schema_matcher] TF-IDF pre-filter: {len(compact_tables)} → {len(result)} tables",
+        flush=True,
+    )
+    return result
 
 
 class SchemaMatcher:
@@ -82,6 +163,9 @@ class SchemaMatcher:
         if not tables:
             return []
 
+        # TF-IDF pre-filter: send at most 15 tables to the LLM
+        filtered_tables = _tfidf_prefilter(chart_spec, enriched.compact_tables, top_n=15)
+
         chart_summary = {
             "type": chart_spec.get("type"),
             "title": chart_spec.get("title"),
@@ -94,14 +178,16 @@ class SchemaMatcher:
         }
 
         disambiguation_block = enriched.get_disambiguation_text()
-        semantics_block = enriched.get_table_semantics_text()
+        # Only show semantics for the filtered tables to keep prompt short
+        filtered_names = [t.get("name") for t in filtered_tables]
+        semantics_block = enriched.get_table_semantics_text(table_names=filtered_names)
 
         user_msg = USER_TEMPLATE.format(
             chart_json=json.dumps(chart_summary, indent=2),
             disambiguation_block=disambiguation_block if disambiguation_block else "",
             semantics_block=semantics_block if semantics_block else "",
-            schema_json=json.dumps(enriched.compact_tables, indent=2),
-            table_count=len(tables),
+            schema_json=json.dumps(filtered_tables, indent=2),
+            table_count=len(filtered_tables),
             db_type=enriched.db_type,
         )
 
@@ -113,9 +199,16 @@ class SchemaMatcher:
                 temperature=0.1,
             )
             raw = raw.strip()
+            # Strip code fences
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
                 raw = re.sub(r"\n?```\s*$", "", raw)
+                raw = raw.strip()
+            # Extract just the JSON array — Haiku often appends prose/notes after the
+            # closing ']', which causes json.loads to fail with "Extra data".
+            m = re.search(r"\[.*\]", raw, re.DOTALL)
+            if m:
+                raw = m.group(0)
             candidates = json.loads(raw)
             if isinstance(candidates, list):
                 # validate_names must use compact_tables names (schema-qualified when the DB
@@ -129,6 +222,15 @@ class SchemaMatcher:
                     if fixed:
                         c["tables"] = fixed
                         valid.append(c)
+
+                # Deduplicate: keep only the highest-confidence entry per unique table set
+                seen_keys: dict[tuple, dict] = {}
+                for c in valid:
+                    key = tuple(sorted(c.get("tables", [])))
+                    if key not in seen_keys or c.get("confidence", 0) > seen_keys[key].get("confidence", 0):
+                        seen_keys[key] = c
+                valid = list(seen_keys.values())
+
                 ranked = sorted(valid, key=lambda x: x.get("confidence", 0), reverse=True)[:5]
 
                 # Validate join paths against the FK relationship graph

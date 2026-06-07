@@ -26,6 +26,8 @@ class Widget(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     chart_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    base_sql: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filterable_columns: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

@@ -1,7 +1,7 @@
 'use client'
 import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { Plus, Layers, ArrowRight, Loader2, AlertCircle, BarChart2, Trash2 } from 'lucide-react'
+import { Plus, Layers, ArrowRight, Loader2, AlertCircle, BarChart2, Trash2, Pencil, Check, X } from 'lucide-react'
 import { canvasApi } from '@/lib/api'
 
 interface Canvas {
@@ -24,6 +24,9 @@ export default function CanvasListPage() {
   const [creating, setCreating] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [confirmId, setConfirmId] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const [renamingId, setRenamingId] = useState<string | null>(null)
 
   useEffect(() => {
     const load = async () => {
@@ -50,6 +53,22 @@ export default function CanvasListPage() {
     } catch {
       setError('Failed to create canvas')
       setCreating(false)
+    }
+  }
+
+  const handleRename = async (id: string) => {
+    const trimmed = editingName.trim()
+    if (!trimmed) { setEditingId(null); return }
+    setRenamingId(id)
+    try {
+      await canvasApi.rename(id, trimmed)
+      setCanvases(prev => prev.map(c => c.id === id ? { ...c, name: trimmed } : c))
+    } catch {
+      setError('Failed to rename canvas')
+    } finally {
+      setRenamingId(null)
+      setEditingId(null)
+      setEditingName('')
     }
   }
 
@@ -150,56 +169,105 @@ export default function CanvasListPage() {
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {canvases.map((canvas) => (
               <div key={canvas.id} className="relative group">
-                <button
-                  onClick={() => router.push(`/projects/${projectId}/canvas/${canvas.id}`)}
-                  className="w-full bg-white border border-gray-200 rounded-xl p-5 text-left hover:border-brand/40 hover:shadow-md transition-all"
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="w-10 h-10 rounded-lg bg-brand/10 flex items-center justify-center">
-                      <BarChart2 size={18} className="text-brand" />
+                {editingId === canvas.id ? (
+                  /* ── Inline rename mode ─────────────────────────── */
+                  <div className="bg-white border border-brand/40 rounded-xl p-5 shadow-sm">
+                    <div className="flex items-center gap-2 mb-3">
+                      <div className="w-10 h-10 rounded-lg bg-brand/10 flex items-center justify-center shrink-0">
+                        <BarChart2 size={18} className="text-brand" />
+                      </div>
                     </div>
-                    <ArrowRight size={16} className="text-gray-300 group-hover:text-brand transition-colors" />
+                    <input
+                      autoFocus
+                      value={editingName}
+                      onChange={e => setEditingName(e.target.value)}
+                      onKeyDown={async e => {
+                        if (e.key === 'Enter') await handleRename(canvas.id)
+                        if (e.key === 'Escape') { setEditingId(null); setEditingName('') }
+                      }}
+                      className="w-full text-sm font-semibold text-gray-900 border-b-2 border-brand outline-none bg-transparent pb-0.5 mb-3"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleRename(canvas.id)}
+                        disabled={!editingName.trim() || renamingId === canvas.id}
+                        className="flex items-center gap-1 text-xs px-2.5 py-1 bg-brand text-white rounded-lg disabled:opacity-50"
+                      >
+                        {renamingId === canvas.id ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} />}
+                        Save
+                      </button>
+                      <button
+                        onClick={() => { setEditingId(null); setEditingName('') }}
+                        className="flex items-center gap-1 text-xs px-2.5 py-1 text-gray-500 hover:text-gray-700 rounded-lg hover:bg-gray-100"
+                      >
+                        <X size={10} /> Cancel
+                      </button>
+                    </div>
                   </div>
-                  <p className="font-semibold text-gray-900 mb-1 truncate">{canvas.name}</p>
-                  {canvas.description && (
-                    <p className="text-xs text-gray-500 mb-2 truncate">{canvas.description}</p>
-                  )}
-                  <p className="text-xs text-gray-400">
-                    {new Date(canvas.created_at).toLocaleDateString('en-US', {
-                      month: 'short', day: 'numeric', year: 'numeric'
-                    })}
-                  </p>
-                </button>
-
-                {/* Delete button overlay */}
-                <div className="absolute top-3 right-3">
-                  {confirmId === canvas.id ? (
-                    <div className="flex items-center gap-1.5 bg-white border border-red-200 rounded-lg px-2 py-1 shadow-sm z-10">
-                      <span className="text-xs text-red-600 font-medium">Delete?</span>
-                      <button
-                        onClick={(e) => handleDelete(canvas.id, e)}
-                        disabled={deletingId === canvas.id}
-                        className="text-xs font-semibold text-white bg-red-500 hover:bg-red-600 px-2 py-0.5 rounded transition-colors"
-                      >
-                        {deletingId === canvas.id ? <Loader2 size={10} className="animate-spin" /> : 'Yes'}
-                      </button>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setConfirmId(null) }}
-                        className="text-xs text-gray-500 hover:text-gray-700"
-                      >
-                        No
-                      </button>
+                ) : (
+                  /* ── Normal card ───────────────────────────────── */
+                  <button
+                    onClick={() => router.push(`/projects/${projectId}/canvas/${canvas.id}`)}
+                    className="w-full bg-white border border-gray-200 rounded-xl p-5 text-left hover:border-brand/40 hover:shadow-md transition-all"
+                  >
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="w-10 h-10 rounded-lg bg-brand/10 flex items-center justify-center">
+                        <BarChart2 size={18} className="text-brand" />
+                      </div>
+                      <ArrowRight size={16} className="text-gray-300 group-hover:text-brand transition-colors" />
                     </div>
-                  ) : (
-                    <button
-                      onClick={(e) => handleDelete(canvas.id, e)}
-                      className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all bg-white shadow-sm border border-gray-100"
-                      title="Delete canvas"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  )}
-                </div>
+                    <p className="font-semibold text-gray-900 mb-1 truncate">{canvas.name}</p>
+                    {canvas.description && (
+                      <p className="text-xs text-gray-500 mb-2 truncate">{canvas.description}</p>
+                    )}
+                    <p className="text-xs text-gray-400">
+                      {new Date(canvas.created_at).toLocaleDateString('en-US', {
+                        month: 'short', day: 'numeric', year: 'numeric'
+                      })}
+                    </p>
+                  </button>
+                )}
+
+                {/* Action buttons overlay (top-right) */}
+                {editingId !== canvas.id && (
+                  <div className="absolute top-3 right-3 flex items-center gap-1">
+                    {confirmId === canvas.id ? (
+                      <div className="flex items-center gap-1.5 bg-white border border-red-200 rounded-lg px-2 py-1 shadow-sm z-10">
+                        <span className="text-xs text-red-600 font-medium">Delete?</span>
+                        <button
+                          onClick={(e) => handleDelete(canvas.id, e)}
+                          disabled={deletingId === canvas.id}
+                          className="text-xs font-semibold text-white bg-red-500 hover:bg-red-600 px-2 py-0.5 rounded transition-colors"
+                        >
+                          {deletingId === canvas.id ? <Loader2 size={10} className="animate-spin" /> : 'Yes'}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setConfirmId(null) }}
+                          className="text-xs text-gray-500 hover:text-gray-700"
+                        >
+                          No
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setEditingId(canvas.id); setEditingName(canvas.name) }}
+                          className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-400 hover:text-brand hover:bg-blue-50 rounded-lg transition-all bg-white shadow-sm border border-gray-100"
+                          title="Rename canvas"
+                        >
+                          <Pencil size={13} />
+                        </button>
+                        <button
+                          onClick={(e) => handleDelete(canvas.id, e)}
+                          className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all bg-white shadow-sm border border-gray-100"
+                          title="Delete canvas"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>

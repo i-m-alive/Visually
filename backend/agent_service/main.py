@@ -554,8 +554,10 @@ from shared.models.phase3 import ScreenshotJob, ChartReplicationState
 from pydantic import BaseModel as _BM
 
 
-class DashboardThemePatch(_BM):
-    theme: str
+class DashboardPatch(_BM):
+    theme: str | None = None
+    name: str | None = None
+    description: str | None = None
 
 
 @app.get("/dashboards")
@@ -610,12 +612,15 @@ async def get_dashboard(
         "theme": dashboard.theme,
         "project_id": str(dashboard.project_id),
         "created_at": dashboard.created_at.isoformat(),
+        "filter_config": dashboard.filter_config or [],
         "widgets": [
             {
                 "id": str(w.id),
                 "title": w.title,
                 "chart_type": w.chart_type,
                 "sql_query": w.sql_query,
+                "base_sql": w.base_sql,
+                "filterable_columns": w.filterable_columns or [],
                 "width": w.width,
                 "height": w.height,
                 "position_x": w.position_x,
@@ -633,7 +638,7 @@ async def get_dashboard(
 @app.patch("/dashboards/{dashboard_id}")
 async def update_dashboard(
     dashboard_id: str,
-    patch: DashboardThemePatch,
+    patch: DashboardPatch,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -643,10 +648,15 @@ async def update_dashboard(
     dashboard = result.scalar_one_or_none()
     if not dashboard:
         raise HTTPException(status_code=404, detail="Dashboard not found")
-    dashboard.theme = patch.theme
+    if patch.theme is not None:
+        dashboard.theme = patch.theme
+    if patch.name is not None:
+        dashboard.name = patch.name
+    if patch.description is not None:
+        dashboard.description = patch.description
     dashboard.updated_at = datetime.utcnow()
     await db.commit()
-    return {"id": str(dashboard.id), "theme": dashboard.theme}
+    return {"id": str(dashboard.id), "name": dashboard.name, "theme": dashboard.theme}
 
 
 @app.delete("/dashboards/{dashboard_id}")
@@ -701,6 +711,80 @@ async def delete_dashboard(
     await db.delete(dashboard)
     await db.commit()
     return {"deleted": dashboard_id}
+
+
+import re as _re
+
+
+def _inject_filters_into_sql(base_sql: str, filters: dict) -> str:
+    """Append WHERE/AND clauses for active filters to a base SQL query."""
+    active = {col: vals for col, vals in filters.items() if vals}
+    if not active:
+        return base_sql
+    clauses = []
+    for col, vals in active.items():
+        safe_col = _re.sub(r"[^\w.]", "", col)
+        safe_vals = [str(v).replace("'", "''") for v in vals]
+        if len(safe_vals) == 1:
+            clauses.append(f"{safe_col} = '{safe_vals[0]}'")
+        else:
+            vals_sql = ", ".join(f"'{v}'" for v in safe_vals)
+            clauses.append(f"{safe_col} IN ({vals_sql})")
+    has_where = bool(_re.search(r"\bWHERE\b", base_sql, _re.IGNORECASE))
+    connector = " AND " if has_where else " WHERE "
+    return base_sql.rstrip(";") + connector + " AND ".join(clauses)
+
+
+class RequeryRequest(_BM):
+    filters: dict = {}
+
+
+@app.post("/dashboards/{dashboard_id}/requery")
+async def requery_dashboard(
+    dashboard_id: str,
+    body: RequeryRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-execute all widget queries with the supplied filter WHERE clauses."""
+    from agent_service.utils.http_clients import call_query_executor
+
+    dash_result = await db.execute(
+        select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
+    )
+    dashboard = dash_result.scalar_one_or_none()
+    if not dashboard:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
+    widgets_result = await db.execute(
+        select(WidgetModel).where(WidgetModel.dashboard_id == uuid.UUID(dashboard_id))
+    )
+    widgets = widgets_result.scalars().all()
+
+    async def _exec_widget(w: WidgetModel) -> dict:
+        sql = w.base_sql or w.sql_query
+        if not sql:
+            return {"widget_id": str(w.id), "chart_data": w.chart_data}
+        filtered_sql = _inject_filters_into_sql(sql, body.filters)
+        conn_id = str(w.connection_id) if w.connection_id else None
+        if not conn_id:
+            return {"widget_id": str(w.id), "chart_data": w.chart_data}
+        try:
+            result = await call_query_executor(conn_id, filtered_sql, row_limit=500)
+            if result and not result.get("error"):
+                rows = result.get("rows", [])
+                columns = result.get("columns", [])
+                return {
+                    "widget_id": str(w.id),
+                    "chart_data": {"rows": rows, "columns": columns},
+                }
+        except Exception as exc:
+            print(f"[requery] widget {w.id} failed: {exc}", flush=True)
+        return {"widget_id": str(w.id), "chart_data": w.chart_data}
+
+    results = await asyncio.gather(*[_exec_widget(w) for w in widgets], return_exceptions=True)
+    widget_data = [r for r in results if isinstance(r, dict)]
+    return {"dashboard_id": dashboard_id, "widgets": widget_data}
 
 
 class DashboardCreate(_BM):

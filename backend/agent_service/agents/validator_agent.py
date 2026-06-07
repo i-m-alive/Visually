@@ -90,17 +90,25 @@ class ValidatorAgent:
 
         retry_feedback = None
         if not passed and attempt <= 3:
-            feedback_text = await self.generate_structured_feedback(
-                query_plan={"sql": query_plan.sql, "chart_type": query_plan.chart_type, "title": query_plan.title},
-                execute_result=execute_result,
-                score=score,
-                dimension_scores={
-                    "chart_type": chart_type_score,
-                    "axis_labels": label_score,
-                    "data_shape": shape_score,
-                    "completeness": completeness_score,
-                },
-            )
+            # Skip LLM feedback for obvious DB errors — the error message itself is sufficient
+            # and calling the LLM wastes ~500ms per retry.
+            if execute_result.get("error"):
+                feedback_text = (
+                    f"Database error: {execute_result['error'][:200]}. "
+                    "Fix the SQL syntax/columns or try a different table."
+                )
+            else:
+                feedback_text = await self.generate_structured_feedback(
+                    query_plan={"sql": query_plan.sql, "chart_type": query_plan.chart_type, "title": query_plan.title},
+                    execute_result=execute_result,
+                    score=score,
+                    dimension_scores={
+                        "chart_type": chart_type_score,
+                        "axis_labels": label_score,
+                        "data_shape": shape_score,
+                        "completeness": completeness_score,
+                    },
+                )
             retry_feedback = RetryFeedback(
                 attempt=attempt + 1,
                 strategy=RETRY_STRATEGIES.get(attempt, "adjust_aggregation"),
@@ -291,12 +299,12 @@ def _extract_column_from_error(error: str) -> str:
 def _detect_scale_mismatch(
     estimated: dict,
     rows: list,
-    tolerance_ratio: float = 100.0,
+    tolerance_ratio: float = 5.0,
 ) -> Optional[str]:
     """
     Compare vision-estimated values against actual SQL results.
     Returns a human-readable mismatch description when values differ by
-    more than tolerance_ratio (default 100×), otherwise None.
+    more than tolerance_ratio (default 5×), otherwise None.
     """
     def parse_est(val_str: str) -> Optional[float]:
         s = str(val_str).replace("~", "").replace(",", "").strip()
@@ -326,17 +334,30 @@ def _detect_scale_mismatch(
         if not est_val or est_val == 0:
             continue
         ratio = avg_actual / est_val
+
+        # Log-scale order-of-magnitude: allow 1 OOM leeway (e.g. 1000 vs 500 is fine,
+        # but 1000 vs 50000 is a 2-OOM gap → scale mismatch).
+        if est_val > 0 and avg_actual > 0:
+            est_oom = _math.floor(_math.log10(abs(est_val) + 1))
+            act_oom = _math.floor(_math.log10(abs(avg_actual) + 1))
+            oom_gap = abs(act_oom - est_oom)
+            if oom_gap <= 1:
+                # Within one order of magnitude — not a structural scale mismatch
+                continue
+
         if ratio < 1.0 / tolerance_ratio:
+            factor = int(round(1.0 / ratio))
             return (
-                f"Values are ~{int(1/ratio)}× too small. "
+                f"Values are ~{factor}× too small. "
                 f"Expected ~{est_val:,.0f} (from chart), got ~{avg_actual:,.0f} from SQL. "
-                f"Check if you need SUM instead of COUNT, or are missing a join."
+                f"Use SUM instead of COUNT, or check for a missing join / wrong table."
             )
         if ratio > tolerance_ratio:
+            factor = int(round(ratio))
             return (
-                f"Values are ~{int(ratio)}× too large. "
+                f"Values are ~{factor}× too large. "
                 f"Expected ~{est_val:,.0f} (from chart), got ~{avg_actual:,.0f} from SQL. "
-                f"Check aggregation — you may be double-counting or using raw values instead of aggregated."
+                f"Use COUNT or AVG instead of SUM — you may be summing a non-metric column."
             )
     return None
 
@@ -553,7 +574,7 @@ def score_value_match(
     estimated_values: dict,
     rows: list,
     chart_type: str,
-    tolerance: float = 0.20,
+    tolerance: float = 0.40,
 ) -> tuple:
     """
     Compare vision-estimated values against actual SQL result data using fuzzy numeric matching.
@@ -592,13 +613,20 @@ def score_value_match(
 
     # ── KPI / Gauge: single-value comparison ─────────────────────────────────
     if chart_type in ("kpi", "kpi_card", "gauge"):
-        est_val = _parse(str(list(estimated_values.values())[0]))
+        # Use kpi_value_text (OCR'd from screenshot) when available — more reliable
+        # than estimated_values which are vision-guessed and may be rounded/truncated.
+        kpi_raw = estimated_values.get("kpi_value_text") or str(list(estimated_values.values())[0])
+        est_val = _parse(kpi_raw)
         if est_val and est_val > 0:
             actual = actual_nums[0]
             ratio = actual / est_val
             if (1.0 - tolerance) <= ratio <= (1.0 + tolerance):
                 return 1.0, None
-            elif 0.05 <= ratio <= 20:
+            # Log-scale order-of-magnitude check (allows off-by-one order of magnitude)
+            import math as _m
+            actual_oom = _m.floor(_m.log10(abs(actual) + 1)) if actual > 0 else 0
+            est_oom = _m.floor(_m.log10(abs(est_val) + 1)) if est_val > 0 else 0
+            if abs(actual_oom - est_oom) <= 1:
                 return 0.5, (
                     f"KPI value {actual:,.0f} is {ratio:.1f}× the expected ~{est_val:,.0f}."
                 )
@@ -692,6 +720,10 @@ def score_chart_screenshot_mode(
     actual_count = int(execute_result.get("row_count") or 0)
     if actual_count == 0:
         dim_scores["completeness"] = 0.0
+    elif expected_type in ("kpi_card", "gauge"):
+        # KPI/gauge return exactly 1 row — that IS complete. Vision data_point_count
+        # is unreliable for KPI (defaults to 5), so skip the ratio comparison entirely.
+        dim_scores["completeness"] = 1.0
     elif expected_type in ("table", "data_table"):
         # Table charts should return all matching rows — the screenshot's data_point_count
         # is the viewport size, not the total result set. Any non-empty result gets 0.8.

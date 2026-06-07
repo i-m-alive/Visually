@@ -1,17 +1,27 @@
 """
-Schema Cache — built once per connection, held in process memory.
+Schema Cache — built once per connection, persisted to Redis, exportable as JSON.
 
 Four enrichments on top of the raw schema:
-  1. column_map        — {col_name: [{table, type, description}]} for every column across all tables
-  2. disambiguation    — for columns that appear in 2+ tables, LLM-inferred meaning per occurrence
-  3. table_semantics   — LLM-inferred purpose, grain, key metric/dimension/date cols per table
-  4. relationship_graph — FK adjacency graph built from table.relationships; validates join paths
+  1. column_map        — {col_name: [{table, type, description}]} for every column
+  2. disambiguation    — LLM-inferred meaning per occurrence for ambiguous column names
+  3. table_semantics   — LLM-inferred purpose, grain, key metric/dimension/date cols
+  4. relationship_graph — FK adjacency graph from table.relationships
 
-LLM jobs 2+3 run in parallel on first build. Graph (4) is pure Python — instant.
-Cache is keyed by connection_id so different projects/connections stay isolated.
+Cache hierarchy:
+  L1 — in-process dict (_store): zero-latency, lives for the process lifetime
+  L2 — Redis: keyed by connection_id + schema_hash, TTL = SCHEMA_CACHE_TTL seconds
+  L3 — cold build: LLM disambiguation + table semantics in parallel (~10-20s)
+
+Schema hash invalidation: if the schema changes (new migration), the hash changes
+and Redis cache is bypassed. The old key expires automatically after TTL.
+
+Export/import: the full enriched schema serialises to a single JSON string that can
+be downloaded, committed, and re-uploaded to skip the cold build entirely.
 """
 import asyncio
+import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -19,25 +29,44 @@ from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
 
 _CACHE_MODEL = BEDROCK_SONNET_MODEL
 
-# ── in-process cache ──────────────────────────────────────────────────────────
+SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", "86400"))   # 24 h default
+_REDIS_KEY_PREFIX = "schema_cache"
+
+# ── in-process L1 cache ───────────────────────────────────────────────────────
 _store: dict[str, "EnrichedSchema"] = {}
 
+
+# ── Schema hash ───────────────────────────────────────────────────────────────
+
+def compute_schema_hash(schema_doc: dict) -> str:
+    """
+    Lightweight fingerprint for change detection.
+    Hashes sorted(table_name:column_count) — invalidated by new tables/columns
+    (a migration) but stable across description-only edits.
+    """
+    tables = schema_doc.get("tables", [])
+    sig = "|".join(
+        f"{t.get('name', '')}:{len(t.get('columns', []))}"
+        for t in sorted(tables, key=lambda x: x.get("name", ""))
+    )
+    return hashlib.md5(sig.encode()).hexdigest()[:12]
+
+
+# ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class RelationshipGraph:
     """
     Bidirectional FK adjacency graph built from schema table.relationships.
     edges: {table_a: {table_b: "table_a.fk_col = table_b.pk_col"}}
-    Both directions are stored so path_exists(a, b) == path_exists(b, a).
     """
     edges: dict = field(default_factory=dict)
 
     def add_edge(self, from_table: str, to_table: str, condition: str) -> None:
         self.edges.setdefault(from_table, {})[to_table] = condition
-        self.edges.setdefault(to_table, {})[from_table] = condition  # bidirectional
+        self.edges.setdefault(to_table, {})[from_table] = condition
 
     def path_exists(self, table_a: str, table_b: str, max_hops: int = 2) -> bool:
-        """BFS up to max_hops to find any path between table_a and table_b."""
         if table_a == table_b:
             return True
         visited = {table_a}
@@ -55,11 +84,10 @@ class RelationshipGraph:
         return False
 
     def get_join_condition(self, table_a: str, table_b: str) -> Optional[str]:
-        """Return the direct FK join condition string, or None if no direct edge."""
         return self.edges.get(table_a, {}).get(table_b)
 
     def __len__(self) -> int:
-        return sum(len(v) for v in self.edges.values()) // 2  # each edge stored twice
+        return sum(len(v) for v in self.edges.values()) // 2
 
 
 @dataclass
@@ -67,75 +95,208 @@ class EnrichedSchema:
     schema_doc: dict
     db_type: str
 
-    # {col_name_lower: [{table, type, description}]}
     column_map: dict = field(default_factory=dict)
-
-    # column names that appear in 2+ tables
     ambiguous_columns: list = field(default_factory=list)
-
-    # {col_name: [{table, meaning, use_when}]}
     disambiguation: dict = field(default_factory=dict)
-
-    # {table_name: {purpose, grain, key_metric_cols, key_dimension_cols, key_date_cols}}
     table_semantics: dict = field(default_factory=dict)
-
-    # pre-built compact table list for LLM prompts — avoids rebuilding per agent call
     compact_tables: list = field(default_factory=list)
-
-    # FK adjacency graph — validates join paths proposed by schema_matcher
     relationship_graph: RelationshipGraph = field(default_factory=RelationshipGraph)
 
     def get_disambiguation_text(self) -> str:
-        """Render the disambiguation map as a readable block for LLM prompts."""
         if not self.disambiguation:
             return ""
         lines = ["COLUMN DISAMBIGUATION (same column name, different meanings per table):"]
         for col_name, occurrences in self.disambiguation.items():
             lines.append(f"  • {col_name}:")
             for occ in occurrences:
-                lines.append(f"      [{occ['table']}] {occ.get('meaning', '')} — use when: {occ.get('use_when', '')}")
+                lines.append(
+                    f"      [{occ['table']}] {occ.get('meaning', '')} "
+                    f"— use when: {occ.get('use_when', '')}"
+                )
         return "\n".join(lines)
 
     def get_table_semantics_text(self, table_names: Optional[list] = None) -> str:
-        """Render table semantics as a readable block for a subset of tables."""
         lines = ["TABLE SEMANTICS:"]
         for tname, sem in self.table_semantics.items():
             if table_names and tname not in table_names:
                 continue
-            lines.append(f"  [{tname}] {sem.get('purpose', '')} | grain: {sem.get('grain', '')} | "
-                         f"metrics: {sem.get('key_metric_cols', [])} | "
-                         f"dims: {sem.get('key_dimension_cols', [])} | "
-                         f"dates: {sem.get('key_date_cols', [])}")
+            lines.append(
+                f"  [{tname}] {sem.get('purpose', '')} | grain: {sem.get('grain', '')} | "
+                f"metrics: {sem.get('key_metric_cols', [])} | "
+                f"dims: {sem.get('key_dimension_cols', [])} | "
+                f"dates: {sem.get('key_date_cols', [])}"
+            )
         return "\n".join(lines)
 
 
+# ── Serialisation ─────────────────────────────────────────────────────────────
+
+def _serialize_enriched(enriched: EnrichedSchema) -> str:
+    """Serialize an EnrichedSchema to a compact JSON string (for Redis or export)."""
+    data = {
+        "schema_doc": enriched.schema_doc,
+        "db_type": enriched.db_type,
+        "column_map": enriched.column_map,
+        "ambiguous_columns": enriched.ambiguous_columns,
+        "disambiguation": enriched.disambiguation,
+        "table_semantics": enriched.table_semantics,
+        "compact_tables": enriched.compact_tables,
+        "relationship_graph_edges": enriched.relationship_graph.edges,
+    }
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _deserialize_enriched(json_str: str) -> EnrichedSchema:
+    """Reconstruct an EnrichedSchema from a serialized JSON string."""
+    data = json.loads(json_str)
+    graph = RelationshipGraph()
+    graph.edges = data.get("relationship_graph_edges", {})
+    return EnrichedSchema(
+        schema_doc=data["schema_doc"],
+        db_type=data["db_type"],
+        column_map=data["column_map"],
+        ambiguous_columns=data["ambiguous_columns"],
+        disambiguation=data["disambiguation"],
+        table_semantics=data["table_semantics"],
+        compact_tables=data["compact_tables"],
+        relationship_graph=graph,
+    )
+
+
+# ── Public cache API ──────────────────────────────────────────────────────────
+
 async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> EnrichedSchema:
-    """Return cached EnrichedSchema for this connection, or build and cache it."""
+    """
+    Return the enriched schema for this connection (L1 → L2 → L3).
+    """
+    # L1: in-process
     if connection_id in _store:
-        print(f"[schema_cache] ✓ cache hit  connection={connection_id}", flush=True)
+        print(f"[schema_cache] ✓ in-process hit  connection={connection_id}", flush=True)
         return _store[connection_id]
 
-    print(f"[schema_cache] building enriched schema  connection={connection_id}  tables={len(schema_doc.get('tables', []))}", flush=True)
+    # L2: Redis
+    schema_hash = compute_schema_hash(schema_doc)
+    redis_key = f"{_REDIS_KEY_PREFIX}:{connection_id}:{schema_hash}"
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            cached_json = await redis.get(redis_key)
+            if cached_json:
+                enriched = _deserialize_enriched(cached_json)
+                _store[connection_id] = enriched
+                print(
+                    f"[schema_cache] ✓ Redis hit  connection={connection_id}  hash={schema_hash}",
+                    flush=True,
+                )
+                return enriched
+    except Exception as _re:
+        print(f"[schema_cache] ⚠ Redis read failed (non-fatal): {_re}", flush=True)
+
+    # L3: cold build
+    print(
+        f"[schema_cache] building enriched schema  connection={connection_id}"
+        f"  tables={len(schema_doc.get('tables', []))}",
+        flush=True,
+    )
     enriched = await _build(schema_doc, db_type)
     _store[connection_id] = enriched
-    print(f"[schema_cache] ✓ built  ambiguous_cols={len(enriched.ambiguous_columns)}  tables_analysed={len(enriched.table_semantics)}", flush=True)
+
+    # Persist to Redis
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            serialized = _serialize_enriched(enriched)
+            await redis.setex(redis_key, SCHEMA_CACHE_TTL, serialized)
+            print(
+                f"[schema_cache] ✓ stored in Redis  connection={connection_id}"
+                f"  hash={schema_hash}  ttl={SCHEMA_CACHE_TTL}s  size={len(serialized)//1024}KB",
+                flush=True,
+            )
+    except Exception as _re:
+        print(f"[schema_cache] ⚠ Redis write failed (non-fatal): {_re}", flush=True)
+
+    print(
+        f"[schema_cache] ✓ built  ambiguous_cols={len(enriched.ambiguous_columns)}"
+        f"  tables_analysed={len(enriched.table_semantics)}",
+        flush=True,
+    )
     return enriched
 
 
 def invalidate(connection_id: str) -> None:
-    """Evict cache for this connection (call after schema re-crawl)."""
+    """
+    Evict all cached data for this connection from in-process cache and Redis.
+    Call after a schema re-crawl or when a migration is detected.
+    """
     _store.pop(connection_id, None)
+    import asyncio as _asyncio
+
+    async def _clear_redis():
+        try:
+            from shared.redis_client import get_redis
+            redis = await get_redis()
+            if redis is not None:
+                async for key in redis.scan_iter(f"{_REDIS_KEY_PREFIX}:{connection_id}:*"):
+                    await redis.delete(key)
+                print(
+                    f"[schema_cache] invalidated Redis keys for connection={connection_id}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+    try:
+        loop = _asyncio.get_event_loop()
+        if loop.is_running():
+            _asyncio.ensure_future(_clear_redis())
+    except Exception:
+        pass
+
+
+# ── Export / Import ───────────────────────────────────────────────────────────
+
+def export_cache_json(connection_id: str) -> Optional[str]:
+    """
+    Export the cached enriched schema for this connection as a JSON string.
+    Returns None if the connection is not in cache (call get_or_build first).
+
+    The exported string can be:
+      • Saved as  schema_cache_{connection_id}.json  and committed to the repo
+      • Uploaded on a fresh environment to skip the cold build entirely
+      • Downloaded via GET /schema-cache/{connection_id}/export
+    """
+    enriched = _store.get(connection_id)
+    if not enriched:
+        return None
+    return _serialize_enriched(enriched)
+
+
+def import_cache_json(connection_id: str, json_str: str) -> EnrichedSchema:
+    """
+    Import a previously exported schema cache JSON into the in-process cache.
+    Returns the reconstructed EnrichedSchema.
+    """
+    enriched = _deserialize_enriched(json_str)
+    _store[connection_id] = enriched
+    print(
+        f"[schema_cache] ✓ imported from JSON  connection={connection_id}"
+        f"  tables={len(enriched.compact_tables)}  ambiguous_cols={len(enriched.ambiguous_columns)}",
+        flush=True,
+    )
+    return enriched
+
+
+# ── Internal builder ──────────────────────────────────────────────────────────
+
+def _qualified(table: dict) -> str:
+    schema = (table.get("schema") or "").strip()
+    name = (table.get("name") or "").strip()
+    return f"{schema}.{name}" if schema else name
 
 
 def _build_relationship_graph(tables: list, qualified_name_map: dict) -> RelationshipGraph:
-    """
-    Extract FK relationships from the schema doc and build a bidirectional adjacency graph.
-    Reads each table's 'relationships' list, which has the structure:
-      [{"column": "candidate_id", "references": "candidates.id"}]
-    Uses schema-qualified names (e.g. "navikenz.candidates") as graph node keys
-    so that path_exists() and get_join_condition() work when callers use qualified names.
-    Pure Python — no LLM call, runs instantly.
-    """
     graph = RelationshipGraph()
     bare_names = set(qualified_name_map.keys())
 
@@ -143,7 +304,7 @@ def _build_relationship_graph(tables: list, qualified_name_map: dict) -> Relatio
         bare_tname = table.get("name", "")
         qualified_tname = qualified_name_map.get(bare_tname, bare_tname)
         for rel in table.get("relationships", []):
-            ref = rel.get("references", "")   # e.g. "candidates.id"
+            ref = rel.get("references", "")
             fk_col = rel.get("column", "")
             if "." not in ref:
                 continue
@@ -157,20 +318,9 @@ def _build_relationship_graph(tables: list, qualified_name_map: dict) -> Relatio
     return graph
 
 
-# ── builder ───────────────────────────────────────────────────────────────────
-
-def _qualified(table: dict) -> str:
-    """Return schema-qualified table name: 'schema.table' or just 'table' if no schema."""
-    schema = (table.get("schema") or "").strip()
-    name = (table.get("name") or "").strip()
-    return f"{schema}.{name}" if schema else name
-
-
 async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
     tables = schema_doc.get("tables", [])
 
-    # Pre-build bare→qualified lookup so all structures use consistent names.
-    # Qualified name: "schema.table_name" when schema is present, else just "table_name".
     qualified_name_map: dict[str, str] = {
         t.get("name", ""): _qualified(t)
         for t in tables
@@ -181,7 +331,7 @@ async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
         schemas = {q.split(".")[0] for q in qualified_name_map.values() if "." in q}
         print(f"[schema_cache] schema-qualifying table names  schemas={schemas}", flush=True)
 
-    # Step 1: column_map — pure Python, instant; uses qualified table names
+    # column_map
     column_map: dict[str, list] = {}
     for table in tables:
         qualified_tname = qualified_name_map.get(table.get("name", ""), table.get("name", ""))
@@ -197,8 +347,7 @@ async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
 
     ambiguous_columns = [k for k, v in column_map.items() if len(v) > 1]
 
-    # Step 2: pre-build compact table list once; uses qualified names so
-    # the schema_matcher and SQL generation agents produce fully-qualified SQL.
+    # compact_tables — built once here, reused everywhere
     compact_tables = []
     for t in tables:
         qualified_tname = qualified_name_map.get(t.get("name", ""), t.get("name", ""))
@@ -217,10 +366,10 @@ async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
             "relationships": t.get("relationships", [])[:6],
         })
 
-    # Step 3: Relationship graph — pure Python, instant (no LLM needed)
+    # relationship_graph — pure Python
     relationship_graph = _build_relationship_graph(tables, qualified_name_map)
 
-    # Step 4: LLM jobs in parallel (disambiguation + table semantics)
+    # LLM jobs in parallel
     disambiguation, table_semantics = await asyncio.gather(
         _disambiguate_columns(ambiguous_columns, column_map, tables),
         _analyze_table_semantics(compact_tables, db_type),
@@ -239,24 +388,12 @@ async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
 
 
 def _parse_disambiguation_response(raw: str) -> dict:
-    """
-    Parse the LLM disambiguation response with graceful recovery for truncated output.
-
-    Strategy:
-      1. Strip markdown fences.
-      2. Fast path: valid JSON → return immediately.
-      3. Partial-close recovery: walk backwards to the last complete array entry
-         (`]` that closes a column list), append `}` and try again.
-      4. Regex extraction: pull out each complete `"col": [{...}]` entry
-         individually — works even when the outer object is never closed.
-    """
     clean = raw.strip()
     if clean.startswith("```"):
         clean = re.sub(r"^```(?:json)?\s*\n?", "", clean)
         clean = re.sub(r"\n?```\s*$", "", clean)
     clean = clean.strip()
 
-    # 1. Fast path
     try:
         result = json.loads(clean)
         if isinstance(result, dict):
@@ -264,8 +401,6 @@ def _parse_disambiguation_response(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # 2. Partial-close: find the last ']' that closes a top-level array value,
-    #    then try closing the outer object.
     last_bracket = clean.rfind("]")
     if last_bracket != -1:
         candidate = clean[: last_bracket + 1].rstrip().rstrip(",") + "\n}"
@@ -273,16 +408,13 @@ def _parse_disambiguation_response(raw: str) -> dict:
             result = json.loads(candidate)
             if isinstance(result, dict):
                 print(
-                    f"[schema_cache] ⚠ disambiguation: recovered partial JSON "
-                    f"({len(result)} columns)",
+                    f"[schema_cache] ⚠ disambiguation: recovered partial JSON ({len(result)} columns)",
                     flush=True,
                 )
                 return result
         except json.JSONDecodeError:
             pass
 
-    # 3. Regex extraction: match each complete "col_name": [{flat objects}] entry.
-    #    Inner objects are always flat {key: val, ...} — no nested braces.
     result: dict = {}
     for m in re.finditer(
         r'"(\w+)"\s*:\s*(\[(?:\s*\{[^{}]+\}\s*,?\s*)+\])',
@@ -310,36 +442,35 @@ async def _disambiguate_columns(
     column_map: dict,
     tables: list,
 ) -> dict:
-    """
-    For each column that appears in 2+ tables, ask the LLM to describe the
-    different semantic meanings based on table context.
-    """
     if not ambiguous_columns:
         return {}
 
-    # Cap at top 30 most ambiguous (most tables) to keep prompt size reasonable
-    ranked = sorted(ambiguous_columns, key=lambda c: len(column_map[c]), reverse=True)[:30]
+    # Process top 60 most-ambiguous columns, batched at 15 per LLM call to avoid
+    # truncation. The single-call approach with 30 columns at max_tokens=10000 was
+    # being cut off at ~22 columns — batching + parallel calls is both faster and
+    # more complete.
+    ranked = sorted(ambiguous_columns, key=lambda c: len(column_map[c]), reverse=True)[:60]
 
-    # Build a table-name → column-list index for context
     table_cols: dict[str, list] = {}
     for t in tables:
         table_cols[t.get("name", "")] = [c.get("name") for c in t.get("columns", [])[:20]]
 
-    entries = []
-    for col_name in ranked:
-        occurrences = column_map[col_name]
-        occ_text = []
-        for occ in occurrences:
-            tname = occ["table"]
-            sibling_cols = table_cols.get(tname, [])[:15]
-            occ_text.append(
-                f"  table={tname}  type={occ['type']}  "
-                f"other_cols=[{', '.join(sibling_cols)}]  "
-                f"col_desc={occ['description'][:60]}"
-            )
-        entries.append(f"column: {col_name}\n" + "\n".join(occ_text))
+    def _build_batch_prompt(batch: list[str]) -> str:
+        entries = []
+        for col_name in batch:
+            occurrences = column_map[col_name]
+            occ_text = []
+            for occ in occurrences:
+                tname = occ["table"]
+                sibling_cols = table_cols.get(tname, [])[:15]
+                occ_text.append(
+                    f"  table={tname}  type={occ['type']}  "
+                    f"other_cols=[{', '.join(sibling_cols)}]  "
+                    f"col_desc={occ['description'][:60]}"
+                )
+            entries.append(f"column: {col_name}\n" + "\n".join(occ_text))
 
-    prompt = f"""The following column names appear in multiple database tables.
+        return f"""The following column names appear in multiple database tables.
 For each column, infer the DIFFERENT semantic meaning in each table context based on the table name and sibling columns.
 
 {chr(10).join(entries)}
@@ -354,32 +485,47 @@ Return ONLY valid JSON:
 
 Be specific and concise. Focus on how to tell them apart when generating SQL for a chart."""
 
-    try:
-        raw = await bedrock_invoke(
-            model_id=_CACHE_MODEL,
-            system_prompt="You are a database semantic analyst. Return only valid JSON.",
-            user_message=prompt,
-            temperature=0.0,
-            max_tokens=30000,
+    async def _call_one_batch(batch: list[str]) -> dict:
+        prompt = _build_batch_prompt(batch)
+        try:
+            raw = await bedrock_invoke(
+                model_id=_CACHE_MODEL,
+                system_prompt="You are a database semantic analyst. Return only valid JSON.",
+                user_message=prompt,
+                temperature=0.0,
+                max_tokens=8000,
+            )
+            result = _parse_disambiguation_response(raw.strip())
+            return result or {}
+        except Exception as e:
+            print(f"[schema_cache] ⚠ disambiguation batch failed: {e}", flush=True)
+            return {}
+
+    # Split into batches of 15 and run all batches in parallel
+    _BATCH_SIZE = 15
+    batches = [ranked[i: i + _BATCH_SIZE] for i in range(0, len(ranked), _BATCH_SIZE)]
+    batch_results = await asyncio.gather(*[_call_one_batch(b) for b in batches])
+
+    # Merge results — first batch wins on key collision (most-ambiguous columns first)
+    merged: dict = {}
+    for batch_result in batch_results:
+        for k, v in batch_result.items():
+            if k not in merged:
+                merged[k] = v
+
+    if merged:
+        print(
+            f"[schema_cache] disambiguation: resolved {len(merged)}/{len(ranked)} columns "
+            f"across {len(batches)} batch(es)",
+            flush=True,
         )
-        raw = raw.strip()
-        result = _parse_disambiguation_response(raw)
-        if result:
-            return result
-    except Exception as e:
-        print(f"[schema_cache] ⚠ disambiguation failed: {e}", flush=True)
-    return {}
+    return merged
 
 
 async def _analyze_table_semantics(compact_tables: list, db_type: str) -> dict:
-    """
-    For every table, infer: purpose, data grain, and which columns are
-    metrics, dimensions, and dates.  Returned as {table_name: {...}}.
-    """
     if not compact_tables:
         return {}
 
-    # Batch in groups of 15 to avoid huge prompts
     results: dict = {}
     for batch_start in range(0, len(compact_tables), 15):
         batch = compact_tables[batch_start: batch_start + 15]
@@ -412,13 +558,12 @@ Return ONLY valid JSON:
                 system_prompt="You are a database schema analyst. Return only valid JSON.",
                 user_message=prompt,
                 temperature=0.0,
-                max_tokens=30000,
+                max_tokens=10000,
             )
             raw = raw.strip()
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
                 raw = re.sub(r"\n?```\s*$", "", raw)
-            # Partial-close recovery: if truncated, try closing the outer object
             try:
                 batch_result = json.loads(raw)
             except json.JSONDecodeError:

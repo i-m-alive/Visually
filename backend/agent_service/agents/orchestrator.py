@@ -749,7 +749,9 @@ No explanation. No markdown. Just the JSON array."""
     ) -> dict:
         """Full screenshot replication pipeline: vision → schema match → per-chart SQL loop → assemble."""
         from agent_service.agents.vision_agent import VisionAgent
+        from shared.bedrock_client import start_token_tracking, get_token_summary
         vision_agent = VisionAgent()
+        start_token_tracking()
 
         async def emit(event: dict):
             await publish_pipeline_event(redis, job_id, event)
@@ -778,16 +780,50 @@ No explanation. No markdown. Just the JSON array."""
 
         await self._create_replication_states(screenshot_job_id, charts, db)
 
-        # Step 2: Schema fetch + build enriched cache (disambiguates columns, analyses table semantics)
-        print(f"[pipeline:{job_id}] ── STEP 2: Schema fetch + cache build  project={project_id}", flush=True)
-        await self._update_screenshot_job_status(screenshot_job_id, "schema_matching", db)
-        schema_doc, db_type = await asyncio.gather(
-            self._get_schema(project_id, db),
-            self._get_connection_db_type(connection_id, db),
+        # Steps 1b + 2 run IN PARALLEL — filter detection (vision) and schema fetch (DB) are
+        # independent.  Running them concurrently saves ~1-3 s on every pipeline invocation.
+        print(
+            f"[pipeline:{job_id}] ── STEPS 1b+2 (parallel): filter detection + schema fetch",
+            flush=True,
         )
-        print(f"[pipeline:{job_id}] schema fetched → tables={len(schema_doc.get('tables', []))}  db_type={db_type}", flush=True)
+        await self._update_screenshot_job_status(screenshot_job_id, "schema_matching", db)
 
-        enriched = await _schema_cache.get_or_build(connection_id, schema_doc, db_type)
+        async def _detect_filters_task() -> list:
+            try:
+                filter_tasks = [
+                    vision_agent.detect_filters(img["bytes"], img.get("filename", ""))
+                    for img in uploaded_images
+                ]
+                filter_results = await asyncio.gather(*filter_tasks, return_exceptions=True)
+                out: list[dict] = []
+                seen_cols: set[str] = set()
+                for res in filter_results:
+                    if isinstance(res, list):
+                        for f in res:
+                            col = f.get("column_hint", "")
+                            if col and col not in seen_cols:
+                                seen_cols.add(col)
+                                out.append(f)
+                print(f"[pipeline:{job_id}] Filter detection → {len(out)} unique filters", flush=True)
+                return out
+            except Exception as fe:
+                print(f"[pipeline:{job_id}] ⚠ Filter detection failed (non-fatal): {fe}", flush=True)
+                return []
+
+        async def _schema_fetch_task() -> tuple:
+            schema_doc = await self._get_schema(project_id, db)
+            db_type = await self._get_connection_db_type(connection_id, db)
+            print(
+                f"[pipeline:{job_id}] schema fetched → tables={len(schema_doc.get('tables', []))}  db_type={db_type}",
+                flush=True,
+            )
+            enriched = await _schema_cache.get_or_build(connection_id, schema_doc, db_type)
+            return schema_doc, db_type, enriched
+
+        (detected_filters, (schema_doc, db_type, enriched)) = await asyncio.gather(
+            _detect_filters_task(),
+            _schema_fetch_task(),
+        )
 
         await emit({"type": "schema.fetched", "job_id": job_id,
                     "table_count": len(schema_doc.get("tables", [])),
@@ -819,6 +855,64 @@ No explanation. No markdown. Just the JSON array."""
             all_candidates=chart_candidates,
             enriched=enriched,
         )
+
+        # Step 3b: Sample available values for each detected filter column
+        # Uses candidate tables from schema matching to discover the full value set
+        filter_configs: list[dict] = []
+        if detected_filters:
+            print(f"[pipeline:{job_id}] ── STEP 3b: Filter value sampling  filters={len(detected_filters)}", flush=True)
+            from agent_service.agents.value_sampler import sample_distinct_for_filter as _sdf
+            candidate_tables: list[str] = []
+            for cands in chart_candidates.values():
+                if cands:
+                    for t in cands[0].get("tables", []):
+                        if t not in candidate_tables:
+                            candidate_tables.append(t)
+
+            for flt in detected_filters:
+                col_hint = flt.get("column_hint", "")
+                if not col_hint:
+                    continue
+                for table in candidate_tables[:5]:
+                    try:
+                        available_vals = await _sdf(connection_id, table, col_hint)
+                        if available_vals:
+                            filter_configs.append({
+                                "id": str(uuid.uuid4()),
+                                "column": col_hint,
+                                "display_name": flt.get("display_name", col_hint.replace("_", " ").title()),
+                                "filter_type": flt.get("filter_type", "multi_select"),
+                                "available_values": available_vals,
+                                "table": table,
+                            })
+                            break
+                    except Exception:
+                        continue
+            print(f"[pipeline:{job_id}] Filter configs → {len(filter_configs)} with available values", flush=True)
+
+        # Step 3.7: Pre-sample top 3 candidates for every chart IN PARALLEL.
+        # Results are cached per-chart so that when the candidate switches on retry we
+        # already have the sample context without an extra DB round-trip.
+        print(f"[pipeline:{job_id}] ── STEP 3.7: Pre-sampling top candidates  charts={len(charts)}", flush=True)
+        from agent_service.agents.value_sampler import sample_top_candidates as _stc
+        presample_tasks = [
+            _stc(
+                connection_id=connection_id,
+                candidates=chart_candidates.get(c["id"], []),
+                chart_spec=c,
+                max_candidates=3,
+            )
+            for c in charts
+        ]
+        presample_results = await asyncio.gather(*presample_tasks, return_exceptions=True)
+        # chart_presample_cache: {chart_id: {0: ctx, 1: ctx, 2: ctx}}
+        chart_presample_cache: dict[str, dict] = {}
+        for c, res in zip(charts, presample_results):
+            if isinstance(res, Exception):
+                print(f"[pipeline:{job_id}] ⚠ presample failed for chart {c['id']} (non-fatal): {res}", flush=True)
+                chart_presample_cache[c["id"]] = {}
+            else:
+                chart_presample_cache[c["id"]] = res or {}
 
         # Step 4: N PARALLEL AGENTS — one dedicated agent per chart, all running simultaneously
         # Extract global date context from all chart specs (year/month from x_tick_labels)
@@ -858,19 +952,24 @@ No explanation. No markdown. Just the JSON array."""
             except Exception as _ce:
                 print(f"[chart:{cid}] ⚠ could not crop image for visual comparison (non-fatal): {_ce}", flush=True)
 
-            # Each chart gets its own independent async agent — no shared semaphore
-            return await self._run_chart_replication_loop(
-                chart_spec=chart_spec,
-                enriched=enriched,
-                connection_id=connection_id,
-                screenshot_job_id=screenshot_job_id,
-                job_id=job_id,
-                redis=redis,
-                db=db,
-                candidates=candidates_for_loop,
-                cropped_image_bytes=cropped_image,
-                dashboard_date_context=dashboard_date_context,
-            )
+            # Each chart gets its own DB session — sharing one AsyncSession across
+            # concurrent asyncio.gather tasks causes "concurrent operations are not
+            # permitted" errors because AsyncSession is not concurrency-safe.
+            from shared.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as chart_db:
+                return await self._run_chart_replication_loop(
+                    chart_spec=chart_spec,
+                    enriched=enriched,
+                    connection_id=connection_id,
+                    screenshot_job_id=screenshot_job_id,
+                    job_id=job_id,
+                    redis=redis,
+                    db=chart_db,
+                    candidates=candidates_for_loop,
+                    cropped_image_bytes=cropped_image,
+                    dashboard_date_context=dashboard_date_context,
+                    presample_contexts=chart_presample_cache.get(cid, {}),
+                )
 
         chart_results = await asyncio.gather(
             *[process_chart(spec) for spec in charts],
@@ -996,19 +1095,21 @@ No explanation. No markdown. Just the JSON array."""
                 raw_candidates = chart_candidates.get(cid, [])
 
                 async def _retry_one(spec=chart_spec, feedback=vfeedback, candidates=raw_candidates):
-                    return await self._run_chart_replication_loop(
-                        chart_spec=spec,
-                        candidates=candidates,
-                        enriched=enriched,
-                        connection_id=connection_id,
-                        job_id=job_id,
-                        screenshot_job_id=screenshot_job_id,
-                        redis=redis,
-                        db=db,
-                        verify_feedback=feedback,
-                        max_attempts=5,
-                        dashboard_date_context=dashboard_date_context,
-                    )
+                    from shared.database import AsyncSessionLocal
+                    async with AsyncSessionLocal() as retry_db:
+                        return await self._run_chart_replication_loop(
+                            chart_spec=spec,
+                            candidates=candidates,
+                            enriched=enriched,
+                            connection_id=connection_id,
+                            job_id=job_id,
+                            screenshot_job_id=screenshot_job_id,
+                            redis=redis,
+                            db=retry_db,
+                            verify_feedback=feedback,
+                            max_attempts=5,
+                            dashboard_date_context=dashboard_date_context,
+                        )
 
                 retry_tasks.append(_retry_one())
 
@@ -1094,19 +1195,53 @@ No explanation. No markdown. Just the JSON array."""
             user_id=user_id,
             confirmed_charts=all_charts,
             original_manifest=manifest,
+            filter_configs=filter_configs,
             db=db,
         )
 
         dashboard_id = str(dashboard.id) if dashboard else None
-        await self._update_screenshot_job_status(
-            screenshot_job_id, "completed", db, dashboard_id=dashboard_id
-        )
+        if dashboard_id:
+            # Assembly succeeded — use the current session (already committed cleanly)
+            await self._update_screenshot_job_status(
+                screenshot_job_id, "completed", db, dashboard_id=dashboard_id
+            )
+        else:
+            # Assembly failed — open a fresh session to avoid broken-transaction hang
+            print(f"[pipeline:{job_id}] ⚠ Assembly returned None — updating status via fresh session", flush=True)
+            from shared.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as fresh_db:
+                await self._update_screenshot_job_status(
+                    screenshot_job_id, "failed", fresh_db,
+                    error="Dashboard assembly failed — check DB migration status (005_filter_config)"
+                )
+        # Step 7b: Cross-chart consistency check — lightweight post-processing.
+        # Finds charts that share the same table/dimension but show different date ranges
+        # or divergent totals, and logs them for debugging (non-blocking, non-fatal).
+        try:
+            _consistency_issues = _cross_chart_consistency_check(all_charts)
+            if _consistency_issues:
+                print(
+                    f"[pipeline:{job_id}] ⚠ Cross-chart consistency: {len(_consistency_issues)} issue(s):",
+                    flush=True,
+                )
+                for _issue in _consistency_issues[:5]:
+                    print(f"  {_issue}", flush=True)
+                await emit({
+                    "type": "dashboard.consistency_issues",
+                    "job_id": job_id,
+                    "issues": _consistency_issues[:10],
+                })
+        except Exception as _cc_err:
+            print(f"[pipeline:{job_id}] ⚠ cross-chart check failed (non-fatal): {_cc_err}", flush=True)
+
+        token_summary = get_token_summary()
         await emit({
             "type": "dashboard.assembled",
             "job_id": job_id,
             "dashboard_id": dashboard_id,
             "widget_count": len(all_charts),
             "total_charts": len(charts),
+            "token_usage": token_summary,
         })
 
         return {"dashboard_id": dashboard_id, "confirmed": len(confirmed), "total": len(charts)}
@@ -1230,6 +1365,7 @@ No explanation. No markdown. Just the JSON array."""
         verify_feedback: Optional[str] = None,
         max_attempts: int = 5,
         dashboard_date_context: Optional[dict] = None,
+        presample_contexts: Optional[dict] = None,
     ) -> dict:
         """
         Per-chart autonomous retry loop.
@@ -1267,38 +1403,49 @@ No explanation. No markdown. Just the JSON array."""
         tried_signatures: set[str] = set()
         tried_tables_history: list[dict] = []  # [{tables, failure_reason}] — injected into LLM
 
-        # Pre-sample the top candidate's key columns from the live DB (attempt 1 only).
-        # This gives the SQL generator real category names, date ranges, and value scales
-        # before it writes a single line of SQL — biggest single accuracy lift.
-        sample_context: dict = {}
-        if candidates:
+        # Use pre-sampled context (from Step 3.7) when available — avoids an extra DB
+        # round-trip on attempt 1.  Falls back to live sampling when presample_contexts
+        # is empty (e.g. retry path that doesn't go through the presample step).
+        _presample = presample_contexts or {}
+        sample_context: dict = _presample.get(0, {})
+        if not sample_context and candidates:
             try:
                 sample_context = await sample_candidate(
                     connection_id=connection_id,
                     candidate=candidates[0],
                     chart_spec=chart_spec,
                 )
-                if sample_context:
-                    print(
-                        f"[chart:{chart_id}] sampled keys={list(sample_context.keys())}",
-                        flush=True,
-                    )
             except Exception as _se:
                 print(f"[chart:{chart_id}] ⚠ value sampling failed (non-fatal): {_se}", flush=True)
+        if sample_context:
+            print(
+                f"[chart:{chart_id}] sample_context keys={list(sample_context.keys())} "
+                f"(presample={'yes' if _presample.get(0) else 'no'})",
+                flush=True,
+            )
+            # Row-count sanity check: flag wrong-grain candidates early
+            from agent_service.agents.value_sampler import enrich_sample_context_with_row_count
+            sample_context = enrich_sample_context_with_row_count(sample_context, chart_spec)
 
         # Track consecutive SQL errors to trigger recovery mode
         consecutive_error_counts: dict[str, int] = {}
         error_recovery_mode: Optional[str] = None
 
-        # Build date filter constraint from sampled DB date range
+        # Build date range hint only for charts that have a genuine time dimension.
+        # For KPI cards, bar-by-category, pie, and table charts this was injecting a
+        # BETWEEN covering the entire DB range — useless as a filter and misleading to the LLM.
         date_filter_constraint: Optional[str] = None
-        if sample_context and sample_context.get("actual_date_range"):
+        from agent_service.agents.query_agent import _chart_needs_date_filter as _cndf
+        if _cndf(chart_spec) and sample_context and sample_context.get("actual_date_range"):
             _date_col = (candidates[0].get("key_columns") or {}).get("date") if candidates else None
             if _date_col:
                 from agent_service.agents.value_sampler import build_date_constraint as _bdc
                 date_filter_constraint = _bdc(sample_context["actual_date_range"], _date_col)
                 if date_filter_constraint:
-                    print(f"[chart:{chart_id}] date constraint: {date_filter_constraint}", flush=True)
+                    print(f"[chart:{chart_id}] date range hint: {date_filter_constraint}", flush=True)
+        else:
+            if not _cndf(chart_spec):
+                print(f"[chart:{chart_id}] skipping date filter — chart type/content is not time-based", flush=True)
 
         # ── Layer 4: Load previously tried signatures from DB ──────────────────────
         # The outer verification loop can call _run_chart_replication_loop multiple
@@ -1504,6 +1651,22 @@ No explanation. No markdown. Just the JSON array."""
             cand_tables = candidate.get("tables", []) if candidate else []
             print(f"[chart:{chart_id}] attempt {attempt}/{max_attempts}  strategy={strategy}  tables={cand_tables}", flush=True)
 
+            # On candidate switch (attempt >= 3), swap sample_context from presample cache
+            # so the SQL generator immediately gets the right value context for the new table.
+            if attempt >= 3 and _presample:
+                # Find the presample index that corresponds to the current candidate
+                _new_idx = next(
+                    (i for i, c in enumerate(candidates[:3]) if c.get("tables") == cand_tables),
+                    None,
+                )
+                if _new_idx is not None and _new_idx in _presample and _presample[_new_idx]:
+                    sample_context = _presample[_new_idx]
+                    print(
+                        f"[chart:{chart_id}] updated sample_context from presample[{_new_idx}] "
+                        f"for candidate tables={cand_tables}",
+                        flush=True,
+                    )
+
             if attempt > 1:
                 await publish_pipeline_event(redis, job_id, {
                     "type": "validation.retry",
@@ -1559,6 +1722,12 @@ No explanation. No markdown. Just the JSON array."""
                 retry_feedback = f"SQL generation failed: {str(e)}. Try a simpler query."
                 continue
 
+            # If column pre-check found an issue, inject it into retry_feedback for next attempt
+            # but still execute — the DB error will confirm and provide exact feedback.
+            _col_err = query_plan.get("_column_error")
+            if _col_err and not retry_feedback:
+                retry_feedback = _col_err
+
             # Execute SQL
             print(f"[chart:{chart_id}] executing SQL: {query_plan['sql'][:120].replace(chr(10),' ')}", flush=True)
             execute_result = await call_query_executor(connection_id, query_plan["sql"])
@@ -1579,9 +1748,10 @@ No explanation. No markdown. Just the JSON array."""
                 )
                 # Track consecutive identical errors → switch to targeted recovery mode
                 consecutive_error_counts[_ftype] = consecutive_error_counts.get(_ftype, 0) + 1
-                if consecutive_error_counts.get("column_not_found", 0) >= 2:
+                # Trigger no-alias mode after just 1 column_not_found — alias errors repeat endlessly
+                if consecutive_error_counts.get("column_not_found", 0) >= 1:
                     error_recovery_mode = "no_alias"
-                    print(f"[chart:{chart_id}] ⚠ repeated column_not_found → no-alias recovery mode", flush=True)
+                    print(f"[chart:{chart_id}] ⚠ column_not_found → no-alias recovery mode", flush=True)
                 elif consecutive_error_counts.get("db_error", 0) >= 2:
                     error_recovery_mode = "no_union_order"
                     print(f"[chart:{chart_id}] ⚠ repeated db_error → no-union-order recovery mode", flush=True)
@@ -1652,7 +1822,7 @@ No explanation. No markdown. Just the JSON array."""
                 # Compare the original cropped chart against the SQL result data.
                 # If the vision model spots mismatches and we still have retries,
                 # use the suggestion as targeted retry feedback (non-fatal).
-                if cropped_image_bytes is not None and attempt <= 3:
+                if cropped_image_bytes is not None and attempt <= 2:
                     try:
                         from agent_service.agents.vision_agent import VisionAgent as _VAgentCls2
                         _va2 = _VAgentCls2()
@@ -1743,11 +1913,11 @@ No explanation. No markdown. Just the JSON array."""
                 "failure_reason": f"low_score:{score:.2f} weakest:{weakest}",
             })
 
-            # Option 1: Multi-aggregation probe on attempt 1 when value_match is low.
+            # Option 1: Multi-aggregation probe on attempts 1-3 when value_match is low.
             # Run COUNT/SUM/AVG/COUNT-DISTINCT in parallel and prepend the winning
             # aggregation as a concrete hint to the next SQL generation call.
             if (
-                attempt == 1
+                attempt <= 3
                 and candidates
                 and validation["dimension_scores"].get("value_match", 1.0) < 0.3
                 and chart_spec.get("estimated_values")
@@ -1775,14 +1945,17 @@ No explanation. No markdown. Just the JSON array."""
         confirmed_charts: list[dict],
         original_manifest: dict,
         db: AsyncSession,
+        filter_configs: Optional[list[dict]] = None,
     ) -> Optional[Dashboard]:
         """Create a Dashboard + Widgets from confirmed chart replication results."""
         try:
+            filter_col_names = [f["column"] for f in (filter_configs or [])]
             dashboard = Dashboard(
                 id=uuid.uuid4(),
                 project_id=uuid.UUID(project_id),
                 name=f"Screenshot Dashboard — {len(confirmed_charts)} charts",
                 layout_config={"source": "screenshot_replication"},
+                filter_config=filter_configs or [],
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
             )
@@ -1798,6 +1971,7 @@ No explanation. No markdown. Just the JSON array."""
                 rows = exec_result.get("rows", [])
                 columns = exec_result.get("columns", [])
                 chart_type = query_plan.get("chart_type", "bar_vertical")
+                base_sql = query_plan.get("sql")
 
                 chart_data = self._build_chart_data_for_type(chart_type, rows, columns)
 
@@ -1807,7 +1981,9 @@ No explanation. No markdown. Just the JSON array."""
                     title=query_plan.get("title") or chart_spec.get("title") or f"Chart {i+1}",
                     widget_type="chart",
                     chart_type=chart_type,
-                    sql_query=query_plan.get("sql"),
+                    sql_query=base_sql,
+                    base_sql=base_sql,
+                    filterable_columns=filter_col_names,
                     position_x=grid.get("x", 0),
                     position_y=grid.get("y", i * 4),
                     width=grid.get("w", 6),
@@ -1823,7 +1999,12 @@ No explanation. No markdown. Just the JSON array."""
             await db.commit()
             await db.refresh(dashboard)
             return dashboard
-        except Exception:
+        except Exception as _asm_err:
+            print(f"[assemble] ✗ Dashboard assembly failed: {type(_asm_err).__name__}: {_asm_err}", flush=True)
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             return None
 
     async def _update_screenshot_job_status(
@@ -2229,6 +2410,44 @@ No explanation. No markdown. Just the JSON array."""
                 "error": err_msg,
             })
             raise
+
+
+def _cross_chart_consistency_check(charts: list[dict]) -> list[str]:
+    """
+    Lightweight post-processing: detect charts that likely share source data but
+    returned inconsistent results (e.g. same table, radically different row counts).
+    Returns a list of human-readable warning strings (empty if no issues found).
+    Non-blocking — only logs; never modifies chart data.
+    """
+    issues: list[str] = []
+
+    # Group charts by their primary table
+    table_groups: dict[str, list[dict]] = {}
+    for chart in charts:
+        tables = (chart.get("table_used") or "").split(",")
+        primary = (tables[0] or "").strip()
+        if primary:
+            table_groups.setdefault(primary, []).append(chart)
+
+    for table, group in table_groups.items():
+        if len(group) < 2:
+            continue
+
+        # Check for radically different row counts for same source table
+        row_counts = [c.get("row_count", 0) for c in group if c.get("row_count") is not None]
+        if len(row_counts) >= 2:
+            max_rc = max(row_counts)
+            min_rc = min(row_counts)
+            if max_rc > 0 and min_rc > 0:
+                ratio = max_rc / min_rc
+                if ratio > 20:
+                    titles = [c.get("title", "unknown") for c in group]
+                    issues.append(
+                        f"Table '{table}': charts {titles} have row counts {min_rc}–{max_rc} "
+                        f"(ratio={ratio:.1f}×) — possible wrong GROUP BY or date filter on one chart"
+                    )
+
+    return issues
 
 
 def _is_valid_uuid(val: str) -> bool:

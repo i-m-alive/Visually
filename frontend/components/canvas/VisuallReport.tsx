@@ -293,8 +293,19 @@ interface ChatMsg {
   newWidget?: { title: string; chart_type: string; sql: string; chart_data?: Record<string, unknown> }
 }
 
+// ─── Filter Types ─────────────────────────────────────────────────────────────
+
+interface FilterConfig {
+  id: string
+  column: string
+  display_name: string
+  filter_type: string
+  available_values: string[]
+  table: string
+}
+
 interface Props {
-  canvas: { id: string; name: string; project_id: string }
+  canvas: { id: string; name: string; project_id: string; filter_config?: FilterConfig[] }
   widgets: CanvasWidgetData[]
   projectId: string
   onClose: () => void
@@ -502,14 +513,23 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const [tableAiNaming, setTableAiNaming] = useState<Record<string,boolean>>({})
   // Theme picker
   const [showThemePicker, setShowThemePicker] = useState(false)
+  // Filter panel
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false)
+  const [activeFilters, setActiveFilters] = useState<Record<string, string[]>>({})
+  const [filteredWidgets, setFilteredWidgets] = useState<CanvasWidgetData[] | null>(null)
+  const [filterLoading, setFilterLoading] = useState(false)
+  const filterConfigs: FilterConfig[] = canvas.filter_config ?? []
   const endRef    = useRef<HTMLDivElement>(null)
   const toastRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const connectionId   = widgets.find(w => w.connection_id)?.connection_id
-  const kpis           = widgets.filter(w => ['kpi', 'kpi_card'].includes(w.chart_type))
-  const visualCharts   = widgets.filter(w => ['bar', 'line', 'scatter', 'pie', 'donut', 'bar_horizontal'].includes(w.chart_type))
-  const tables         = widgets.filter(w => ['table', 'data_table', 'pivot_table'].includes(w.chart_type))
+  // Use filtered widget data when filters are active, original widgets otherwise
+  const displayWidgets = filteredWidgets ?? widgets
+  const kpis           = displayWidgets.filter(w => ['kpi', 'kpi_card'].includes(w.chart_type))
+  const visualCharts   = displayWidgets.filter(w => ['bar', 'line', 'scatter', 'pie', 'donut', 'bar_horizontal'].includes(w.chart_type))
+  const tables         = displayWidgets.filter(w => ['table', 'data_table', 'pivot_table'].includes(w.chart_type))
   const recommended    = useMemo(() => getRecommendedQuestions(widgets), [widgets])
+  const hasActiveFilters = Object.values(activeFilters).some(v => v.length > 0)
 
   // ── Inject CSS animations ────────────────────────────────────────────────
   useEffect(() => {
@@ -620,6 +640,46 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     setToast(msg)
     if (toastRef.current) clearTimeout(toastRef.current)
     toastRef.current = setTimeout(() => setToast(null), 3000)
+  }, [])
+
+  // ── Filter requery — re-execute all widget SQL when active filters change ────
+  useEffect(() => {
+    if (!hasActiveFilters) {
+      setFilteredWidgets(null)
+      return
+    }
+    let cancelled = false
+    setFilterLoading(true)
+    canvasApi.requery(canvas.id, activeFilters)
+      .then(r => {
+        if (cancelled) return
+        const updatedMap: Record<string, { rows: Record<string, unknown>[]; columns: string[] }> = {}
+        r.data.widgets?.forEach((w: { widget_id: string; chart_data: { rows: Record<string, unknown>[]; columns: string[] } }) => {
+          updatedMap[w.widget_id] = w.chart_data
+        })
+        setFilteredWidgets(
+          widgets.map(w => updatedMap[w.id]
+            ? { ...w, chart_data: { ...w.chart_data, rows: updatedMap[w.id].rows, columns: updatedMap[w.id].columns } }
+            : w
+          )
+        )
+      })
+      .catch(() => { if (!cancelled) showToast('Filter query failed') })
+      .finally(() => { if (!cancelled) setFilterLoading(false) })
+    return () => { cancelled = true }
+  }, [activeFilters, hasActiveFilters]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggleFilter = useCallback((column: string, value: string) => {
+    setActiveFilters(prev => {
+      const current = prev[column] ?? []
+      const has = current.includes(value)
+      return { ...prev, [column]: has ? current.filter(v => v !== value) : [...current, value] }
+    })
+  }, [])
+
+  const clearAllFilters = useCallback(() => {
+    setActiveFilters({})
+    setFilteredWidgets(null)
   }, [])
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -1458,6 +1518,16 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
 
         <div style={{ flex: 1 }} />
 
+        {/* Filters toggle */}
+        <button onClick={() => setFilterPanelOpen(v => !v)} title="Filters"
+          style={{ width: 52, minHeight: 48, borderRadius: 12, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 3, background: filterPanelOpen ? theme.railActive : 'transparent', color: filterPanelOpen ? '#93C5FD' : theme.railText, border: 'none', cursor: 'pointer', position: 'relative' }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+          <span style={{ fontSize: 9, fontWeight: 500 }}>Filters</span>
+          {hasActiveFilters && (
+            <span style={{ position: 'absolute', top: 6, right: 8, width: 7, height: 7, borderRadius: '50%', background: theme.accent, border: `1.5px solid ${theme.rail}` }} />
+          )}
+        </button>
+
         {/* Theme picker */}
         <div data-theme-picker style={{ position: 'relative' }}>
           <button onClick={() => setShowThemePicker(v => !v)} title="Choose theme (T)"
@@ -1704,9 +1774,104 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           </div>
         </div>
 
-        {/* Scrollable section content */}
-        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', background: theme.bg }}>
-          {renderContent()}
+        {/* Scrollable section content + optional filter sidebar */}
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
+          {/* Filter panel sidebar */}
+          {filterPanelOpen && (
+            <aside style={{ width: 248, flexShrink: 0, background: theme.surface, borderRight: `1px solid ${theme.border}`, display: 'flex', flexDirection: 'column', overflowY: 'auto', animation: 'visually-slideUp 0.18s ease both' }}>
+              {/* Header */}
+              <div style={{ padding: '12px 14px 10px', borderBottom: `1px solid ${theme.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={theme.accent} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: theme.text, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Filters</span>
+                  {hasActiveFilters && (
+                    <span style={{ padding: '1px 6px', background: theme.accent, borderRadius: 8, fontSize: 9, fontWeight: 700, color: 'white' }}>
+                      {Object.values(activeFilters).flat().length}
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {hasActiveFilters && (
+                    <button onClick={clearAllFilters} style={{ fontSize: 10, color: theme.accent, background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontWeight: 600 }}>Clear all</button>
+                  )}
+                  <button onClick={() => setFilterPanelOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: theme.muted, padding: 2, display: 'flex' }}>
+                    <X size={13} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Loading indicator */}
+              {filterLoading && (
+                <div style={{ padding: '7px 14px', display: 'flex', alignItems: 'center', gap: 6, borderBottom: `1px solid ${theme.border}`, background: `${theme.accent}08`, flexShrink: 0 }}>
+                  <Loader2 size={11} style={{ color: theme.accent, animation: 'visually-spin 1s linear infinite' }} />
+                  <span style={{ fontSize: 10, color: theme.muted }}>Re-querying data…</span>
+                </div>
+              )}
+
+              {/* No filters state */}
+              {filterConfigs.length === 0 && (
+                <div style={{ padding: '24px 16px', textAlign: 'center' }}>
+                  <div style={{ width: 40, height: 40, borderRadius: 12, background: theme.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px' }}>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={theme.accent} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                  </div>
+                  <p style={{ fontSize: 12, fontWeight: 600, color: theme.text, margin: '0 0 6px' }}>No filters detected</p>
+                  <p style={{ fontSize: 11, color: theme.muted, margin: 0, lineHeight: 1.5 }}>
+                    Filters are automatically extracted from Power BI screenshots. Upload a screenshot with visible filter panels to enable this feature.
+                  </p>
+                </div>
+              )}
+
+              {/* Filter groups */}
+              {filterConfigs.map(f => {
+                const selected = activeFilters[f.column] ?? []
+                return (
+                  <div key={f.id} style={{ padding: '10px 14px', borderBottom: `1px solid ${theme.border}` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 7 }}>
+                      <p style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: 0 }}>{f.display_name}</p>
+                      {selected.length > 0 && (
+                        <button onClick={() => setActiveFilters(prev => { const n = { ...prev }; delete n[f.column]; return n })}
+                          style={{ fontSize: 9, color: theme.accent, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>✕ clear</button>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      {f.available_values.slice(0, 15).map(val => {
+                        const isChecked = selected.includes(val)
+                        return (
+                          <label key={val} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '2px 4px', borderRadius: 5, background: isChecked ? `${theme.accent}12` : 'transparent', transition: 'background 0.12s' }}>
+                            <input type="checkbox" checked={isChecked} onChange={() => toggleFilter(f.column, val)}
+                              style={{ accentColor: theme.accent, cursor: 'pointer', width: 12, height: 12, flexShrink: 0 }} />
+                            <span style={{ fontSize: 11, color: isChecked ? theme.accent : theme.text, fontWeight: isChecked ? 600 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{val}</span>
+                          </label>
+                        )
+                      })}
+                      {f.available_values.length > 15 && (
+                        <span style={{ fontSize: 10, color: theme.muted, fontStyle: 'italic', padding: '2px 4px' }}>+{f.available_values.length - 15} more values</span>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </aside>
+          )}
+
+          {/* Charts area */}
+          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', background: theme.bg }}>
+            {/* Active filter chips */}
+            {hasActiveFilters && (
+              <div style={{ padding: '6px 20px', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', borderBottom: `1px solid ${theme.border}`, background: `${theme.accent}08`, flexShrink: 0 }}>
+                <span style={{ fontSize: 9, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Filtered by:</span>
+                {Object.entries(activeFilters).flatMap(([col, vals]) =>
+                  vals.map(val => (
+                    <span key={`${col}:${val}`} style={{ padding: '2px 8px', background: theme.accentBg, border: `1px solid ${theme.accent}44`, borderRadius: 10, fontSize: 10, fontWeight: 600, color: theme.accent, display: 'flex', alignItems: 'center', gap: 4 }}>
+                      {val}
+                      <button onClick={() => toggleFilter(col, val)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: theme.accent, padding: 0, lineHeight: 1, fontSize: 11 }}>×</button>
+                    </span>
+                  ))
+                )}
+              </div>
+            )}
+            {renderContent()}
+          </div>
         </div>
       </main>
 

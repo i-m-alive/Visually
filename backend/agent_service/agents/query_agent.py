@@ -5,8 +5,77 @@ from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
 from shared.schemas.agent import IntentResult
 from shared.schemas.schema import SemanticSchemaDocument
 from shared.schemas.chart import QueryPlan
+from agent_service.agents.sql_utils import expand_table_aliases, basic_sql_lint, verify_columns_against_schema
 
 QUERY_AGENT_MODEL = BEDROCK_SONNET_MODEL
+
+# SQL is rarely > 500 tokens — 1024 cuts latency without sacrificing quality
+_SQL_MAX_TOKENS = 1024
+
+# Chart types that are intrinsically temporal — always benefit from a date filter
+_TIME_CHART_TYPES = frozenset({
+    "line", "area", "stacked_area", "area_stacked",
+    "calendar_heatmap", "ribbon", "timeline", "gantt",
+})
+
+# Keywords that indicate a chart has a time dimension even if the type isn't line/area
+_TIME_KEYWORDS = frozenset({
+    "month", "monthly", "year", "yearly", "annual", "quarterly",
+    "week", "weekly", "daily", "ytd", "mtd", "qtd",
+    "trend", "over time", "by month", "by quarter", "by year",
+    "by week", "by date", "by period",
+})
+
+_MONTH_ABBREVS = frozenset({
+    "jan", "feb", "mar", "apr", "may", "jun",
+    "jul", "aug", "sep", "oct", "nov", "dec",
+})
+
+_QUARTER_LABELS = frozenset({"q1", "q2", "q3", "q4"})
+
+
+def _chart_needs_date_filter(chart_spec: dict) -> bool:
+    """
+    Return True only when the chart is genuinely time-based and benefits from
+    a date WHERE clause.
+
+    Rules:
+    - KPI / gauge: NEVER — total aggregates should scan all time
+    - line / area / calendar_heatmap / timeline / gantt: ALWAYS — intrinsically temporal
+    - Everything else (bar, pie, table, treemap …): only when title / axis labels /
+      x_tick_labels contain explicit time references (year pattern, month abbrev,
+      quarter label, or time keyword like "monthly" / "ytd")
+    """
+    chart_type = (chart_spec.get("type") or "").lower().replace("-", "_")
+
+    if chart_type in ("kpi", "kpi_card", "gauge"):
+        return False
+
+    if chart_type in _TIME_CHART_TYPES:
+        return True
+
+    # For bar / pie / table and other types: check whether the chart text mentions time
+    text = " ".join(filter(None, [
+        chart_spec.get("title") or "",
+        chart_spec.get("x_axis_label") or "",
+        chart_spec.get("y_axis_label") or "",
+    ])).lower()
+
+    if any(kw in text for kw in _TIME_KEYWORDS):
+        return True
+
+    # Check x_tick_labels for year patterns (20xx), month abbrevs, or quarter labels
+    ticks = [str(t).lower() for t in (chart_spec.get("x_tick_labels") or [])[:8]]
+    if ticks:
+        import re as _re_dt
+        if any(_re_dt.search(r"\b20\d{2}\b", t) for t in ticks):
+            return True
+        if any(any(m in t for m in _MONTH_ABBREVS) for t in ticks):
+            return True
+        if any(any(q in t for q in _QUARTER_LABELS) for t in ticks):
+            return True
+
+    return False
 
 SYSTEM_PROMPT = """You are an expert SQL query generator for a data visualization platform.
 Given a user's intent, extracted entities, and a database schema document, generate a SQL query that produces correct data for the requested visualization.
@@ -29,7 +98,7 @@ CHART TYPE SQL PATTERNS:
 - bar_horizontal: same as bar_vertical
 - pie: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 8
 - donut: same as pie
-- kpi: SELECT {agg}(metric) AS value FROM table
+- kpi: SELECT {agg}(metric) AS value FROM table  [CRITICAL: NO WHERE, NO GROUP BY — must return exactly 1 row]
 - scatter: SELECT x_col AS x, y_col AS y FROM table LIMIT 1000
 - table: SELECT relevant_cols FROM table ORDER BY sort_col DESC LIMIT 100
 - area: SELECT date_trunc('month', date_col) AS period, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 1
@@ -56,12 +125,46 @@ CHART TYPE SQL PATTERNS:
 - marimekko: SELECT category_col, segment_col, SUM(value_metric) AS value FROM table GROUP BY 1, 2 ORDER BY 1
 - choropleth: SELECT region_col AS region, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC
 
+KPI ABSOLUTE RULES (when chart_type is "kpi"):
+- SELECT exactly ONE aggregate — SUM(col), COUNT(*), AVG(col), or COUNT(DISTINCT col)
+- NO WHERE clause — scan the full table unless a date constraint was explicitly given
+- NO GROUP BY — never group, this is a scalar metric
+- The query MUST return exactly 1 row with 1 numeric column
+- Wrong: SELECT job_role, COUNT(*) FROM jobs GROUP BY 1  → this returns N rows, not 1
+- Right:  SELECT COUNT(*) AS total_jobs FROM jobs
+
 REDSHIFT-SPECIFIC RULES (when db_dialect is "redshift"):
 - Use GROUP BY 1, 2 (ordinal positions), NOT column alias names
 - Use GETDATE() instead of NOW()
 - Use ILIKE for case-insensitive matching
 - VARCHAR max 65535, no TEXT type
 - Use DATE_TRUNC (same as PostgreSQL)
+
+CONCRETE EXAMPLES — copy the pattern, not the table/column names:
+
+BAR CHART (counts by category):
+  Chart: "Open Positions by Job Role", x="Job Role", y="Count"
+  SQL:   SELECT job_role AS "Job Role", COUNT(*) AS "Count"
+         FROM jobs
+         WHERE job_role IS NOT NULL
+         GROUP BY job_role ORDER BY 2 DESC LIMIT 20
+
+LINE CHART (trend over time):
+  Chart: "Monthly Revenue", x="Month", y="Revenue ($)"
+  SQL:   SELECT DATE_TRUNC('month', order_date) AS "Month",
+                SUM(amount) AS "Revenue"
+         FROM orders
+         GROUP BY 1 ORDER BY 1
+
+KPI CARD (single aggregate — NO GROUP BY, NO WHERE unless chart shows a period):
+  Chart: "Total Active Employees"
+  SQL:   SELECT COUNT(*) AS "Total Active Employees" FROM employees
+
+PIE CHART (proportional breakdown):
+  Chart: "Sales by Region", slices=regions
+  SQL:   SELECT region AS "Region", SUM(sales_amount) AS "Sales"
+         FROM sales
+         GROUP BY region ORDER BY 2 DESC LIMIT 8
 
 Return ONLY valid JSON:
 {
@@ -125,7 +228,7 @@ class QueryAgent:
             model_id=QUERY_AGENT_MODEL,
             system_prompt=SYSTEM_PROMPT,
             user_message=json.dumps(user_content, default=str),
-            max_tokens=2048,
+            max_tokens=_SQL_MAX_TOKENS,
             temperature=0.1,
         )
 
@@ -149,6 +252,10 @@ class QueryAgent:
                 "db_dialect": "redshift" if db_type == "redshift" else ("postgresql" if db_type in ("postgresql",) else "mysql"),
                 "tables_joined": [],
             }
+
+        # Post-process: expand short aliases to prevent alias-reference errors
+        if data.get("sql"):
+            data["sql"] = expand_table_aliases(data["sql"])
 
         return QueryPlan(
             sql=data.get("sql", "SELECT 1"),
@@ -234,17 +341,28 @@ class QueryAgent:
             user_content["instruction"] += f" PRIORITY: use {candidate.get('tables')} as recommended by schema analysis."
 
         # Ground-truth DB values from value_sampler — highest-confidence hints available
+        is_kpi = chart_spec.get("type", "") in ("kpi", "kpi_card", "gauge")
+        needs_date = _chart_needs_date_filter(chart_spec)
         if sample_context:
             user_content["ground_truth_from_db"] = sample_context
             notes = []
-            for key in ("dimension_note", "date_note", "metric_note"):
-                if sample_context.get(key):
-                    notes.append(sample_context[key])
-            if sample_context.get("confirmed_dimension_values"):
-                notes.append(
-                    f"CONFIRMED: these dimension values actually exist in the DB: "
-                    f"{sample_context['confirmed_dimension_values']}"
-                )
+            if not is_kpi:
+                # dimension_note and metric_note always useful for non-KPI
+                for key in ("dimension_note", "metric_note"):
+                    if sample_context.get(key):
+                        notes.append(sample_context[key])
+                # date_note only when the chart actually has a time dimension
+                if needs_date and sample_context.get("date_note"):
+                    notes.append(sample_context["date_note"])
+                if sample_context.get("confirmed_dimension_values"):
+                    notes.append(
+                        f"CONFIRMED: these dimension values actually exist in the DB: "
+                        f"{sample_context['confirmed_dimension_values']}"
+                    )
+            else:
+                # KPI only gets metric magnitude hints — no dimension or date filters
+                if sample_context.get("metric_note"):
+                    notes.append(sample_context["metric_note"])
             if notes:
                 user_content["instruction"] += (
                     " GROUND TRUTH FROM DB (use these facts — they are confirmed from the live database): "
@@ -255,16 +373,20 @@ class QueryAgent:
             user_content["retry_feedback"] = retry_feedback
             user_content["instruction"] += " RETRY: apply retry_feedback exactly to fix the previous query."
 
-        # Hard date filter from sampled DB range — must appear in WHERE clause
-        if date_filter_constraint:
-            user_content["date_filter_constraint"] = date_filter_constraint
+        # Date range hint from sampled DB — only for charts that have a time dimension.
+        # Presented as a SOFT HINT (not a mandate) so the LLM can pick a narrower
+        # sub-range when the chart's x_tick_labels point to a specific year/period.
+        if date_filter_constraint and needs_date:
+            user_content["date_range_hint"] = date_filter_constraint
             user_content["instruction"] += (
-                f" HARD DATE REQUIREMENT: your SQL MUST include this WHERE condition: {date_filter_constraint}. "
-                "Do not omit or widen this constraint — it is confirmed from the live database."
+                f" DATE RANGE HINT: the date column spans {date_filter_constraint} in the live DB. "
+                "Do NOT filter outside this range — it will return 0 rows. "
+                "If the chart shows a specific period, filter to that period within this range."
             )
 
-        # Dashboard-level date context (inferred from chart specs across the whole dashboard)
-        if dashboard_date_context and dashboard_date_context.get("date_instruction"):
+        # Dashboard-level date context — only inject for charts that actually need a date filter.
+        # Applying this to KPI cards and bar-by-category charts was forcing incorrect WHERE clauses.
+        if dashboard_date_context and dashboard_date_context.get("date_instruction") and needs_date:
             user_content["dashboard_date_context"] = {
                 "inferred_period": dashboard_date_context.get("inferred_period", ""),
                 "instruction": dashboard_date_context["date_instruction"],
@@ -320,16 +442,16 @@ class QueryAgent:
             user_content["x_tick_label_hints"] = {
                 "labels": x_tick_labels[:15],
                 "instruction": (
-                    f"The chart's X-axis shows EXACTLY these category labels: {x_tick_labels[:15]}. "
-                    "Your SQL must produce rows whose label/category column contains these values "
-                    "(exact match or semantically equivalent). "
-                    "Use WHERE col IN (...) or GROUP BY a column whose values match these labels. "
+                    f"The chart's X-axis shows these category labels: {x_tick_labels[:15]}. "
+                    "GROUP BY a column whose DISTINCT values semantically match these labels. "
+                    "Do NOT add WHERE col IN (...) — this over-filters results and causes zero rows. "
+                    "Let GROUP BY + aggregation naturally produce the matching categories. "
                     "Do NOT group by a column whose values cannot produce these labels."
                 ),
             }
             user_content["instruction"] += (
-                f" X-AXIS REQUIREMENT: chart shows {x_tick_labels[:8]} — "
-                "your GROUP BY / WHERE must produce exactly these categories."
+                f" X-AXIS HINT: chart shows categories like {x_tick_labels[:4]} — "
+                "match these via GROUP BY, NOT a hard WHERE filter."
             )
 
         # SQL error recovery mode — activated after 2+ consecutive identical errors
@@ -337,15 +459,18 @@ class QueryAgent:
             user_content["error_recovery"] = {
                 "mode": "no_alias",
                 "instruction": (
-                    "CRITICAL FIX: previous attempts failed because a table alias was undefined. "
-                    "Rewrite the SQL WITHOUT single-letter table aliases. "
-                    "Either use no aliases (write full table names everywhere) or use clearly "
-                    "defined multi-word aliases. E.g. instead of 'p.col' write the full table name. "
-                    "Never use p, rm, t, s as aliases unless explicitly defined in FROM/JOIN."
+                    "CRITICAL FIX: the previous SQL failed because it referenced an undefined table alias. "
+                    "You MUST rewrite the SQL with NO aliases at all. "
+                    "Write the full table name everywhere — in SELECT, FROM, JOIN, WHERE, GROUP BY. "
+                    "BAD:  SELECT p.name, p.count FROM positions p → 'p' may be undefined\n"
+                    "GOOD: SELECT positions.name, positions.count FROM positions\n"
+                    "BAD:  SELECT cc.job_role FROM candidates cc → 'cc' is not defined\n"
+                    "GOOD: SELECT candidates.job_role FROM candidates\n"
+                    "Every column reference must use either the full table name or no qualifier."
                 ),
             }
             user_content["instruction"] += (
-                " ERROR RECOVERY (no-alias mode): eliminate all undefined table aliases from the SQL."
+                " NO-ALIAS MANDATORY: write full table names everywhere, zero single-letter aliases."
             )
         elif error_recovery_mode == "no_union_order":
             user_content["error_recovery"] = {
@@ -388,6 +513,7 @@ class QueryAgent:
             model_id=QUERY_AGENT_MODEL,
             system_prompt=SYSTEM_PROMPT,
             user_message=json.dumps(user_content, default=str),
+            max_tokens=_SQL_MAX_TOKENS,
             temperature=0.15,
         )
         raw = raw.strip()
@@ -408,6 +534,27 @@ class QueryAgent:
                 "title": chart_spec.get("title") or "Chart",
                 "reasoning": "Fallback due to parse error",
             }
+
+        # Post-process: expand short aliases → full table names
+        generated_sql = data.get("sql", "SELECT 1")
+        generated_sql = expand_table_aliases(generated_sql)
+        data["sql"] = generated_sql
+
+        # Basic lint before returning (non-fatal — logs warning, passes through)
+        db_dialect = data.get("db_dialect", "redshift" if enriched and enriched.db_type == "redshift" else "postgresql")
+        lint_error = basic_sql_lint(generated_sql, db_dialect)
+        if lint_error:
+            print(f"[query_agent] ⚠ SQL lint: {lint_error}", flush=True)
+
+        # Column existence pre-check against schema (non-fatal — appends _column_error)
+        if enriched and candidate and candidate.get("tables"):
+            col_error = verify_columns_against_schema(
+                generated_sql, enriched.compact_tables, candidate.get("tables")
+            )
+            if col_error:
+                print(f"[query_agent] ⚠ column pre-check: {col_error}", flush=True)
+                data["_column_error"] = col_error
+
         return {
             "sql": data.get("sql", "SELECT 1"),
             "chart_type": data.get("chart_type", "table"),
@@ -416,4 +563,5 @@ class QueryAgent:
             "y_axis_label": data.get("y_axis_label", "y"),
             "title": data.get("title") or chart_spec.get("title") or "Chart",
             "reasoning": data.get("reasoning", ""),
+            "_column_error": data.get("_column_error"),
         }

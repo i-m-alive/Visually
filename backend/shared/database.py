@@ -7,7 +7,17 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://visually:visually@localhost:5432/visually_platform"
 )
 
-engine = create_async_engine(DATABASE_URL, echo=False, pool_size=10, max_overflow=20)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=10,
+    max_overflow=20,
+    # Discard stale pool connections before handing them to a request.
+    # Without this, a pipeline session that dies mid-transaction returns the
+    # connection to the pool in a dirty state, causing the next request to fail
+    # with "cannot use Connection.transaction() in a manually started transaction".
+    pool_pre_ping=True,
+)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -17,4 +27,11 @@ class Base(DeclarativeBase):
 
 async def get_db():
     async with AsyncSessionLocal() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            # Always rollback on exception so the connection is returned to the
+            # pool in a clean state — prevents dirty connections from causing
+            # "manually started transaction" errors in subsequent requests.
+            await session.rollback()
+            raise

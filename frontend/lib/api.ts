@@ -98,6 +98,8 @@ export const dashboardApi = {
   get: (dashboardId: string) => api.get(`/dashboards/${dashboardId}`),
   updateTheme: (dashboardId: string, theme: string) =>
     api.patch(`/dashboards/${dashboardId}`, { theme }),
+  rename: (dashboardId: string, name: string) =>
+    api.patch(`/dashboards/${dashboardId}`, { name }),
   delete: (dashboardId: string) => api.delete(`/dashboards/${dashboardId}`),
 }
 
@@ -142,6 +144,8 @@ export const canvasApi = {
     api.patch(`/dashboards/${canvasId}/layout`, { items }),
   addWidget: (canvasId: string, widget: WidgetCreate) =>
     api.post(`/dashboards/${canvasId}/widgets`, widget),
+  requery: (canvasId: string, filters: Record<string, string[]>) =>
+    api.post(`/dashboards/${canvasId}/requery`, { filters }),
 }
 
 export const widgetApi = {

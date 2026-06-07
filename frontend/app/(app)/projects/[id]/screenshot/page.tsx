@@ -195,6 +195,8 @@ export default function ScreenshotPage() {
   const [hint, setHint] = useState<HintRequest | null>(null)
   const [dashboardName, setDashboardName] = useState('')
   const [renamingSaving, setRenamingSaving] = useState(false)
+  const [nameSaved, setNameSaved] = useState(false)
+  const [tokenUsage, setTokenUsage] = useState<Record<string, { input_tokens: number; output_tokens: number; calls: number }> | null>(null)
   const [phase, setPhase] = useState<'idle' | 'uploading' | 'processing' | 'done' | 'error'>('idle')
   const [log, setLog] = useState<LogEntry[]>([])
   const [steps, setSteps] = useState<Record<StepKey, StepStatus>>({
@@ -203,6 +205,7 @@ export default function ScreenshotPage() {
   })
   const logEndRef = useRef<HTMLDivElement>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const processedEventCount = useRef(0)
 
   const jobs = usePipelineStore((s) => s.jobs)
   usePipelineSocket(jobId)
@@ -212,41 +215,68 @@ export default function ScreenshotPage() {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [log])
 
-  // React to pipeline WebSocket events
+  // React to pipeline WebSocket events — processes ALL new events since last render,
+  // never regresses a step from 'done' back to 'active' (parallel charts cause interleaved events).
   useEffect(() => {
     if (!jobId || !jobs[jobId]) return
-    const job = jobs[jobId]
-    const events = job.events as Record<string, unknown>[]
-    if (!events?.length) return
+    const allEvents = jobs[jobId].events as Record<string, unknown>[]
+    if (!allEvents?.length) return
 
-    const lastEvent = events[events.length - 1]
-    const type = lastEvent.type as string
+    // Process only newly arrived events since the last render
+    const newEvents = allEvents.slice(processedEventCount.current)
+    if (!newEvents.length) return
+    processedEventCount.current = allEvents.length
 
-    const entry = eventToLog(lastEvent)
-    if (entry) setLog((prev) => [...prev, entry])
+    // Accumulate log entries and step updates across all new events
+    const newLogEntries: LogEntry[] = []
+    const aggregatedStepUpdate: Partial<Record<StepKey, StepStatus>> = {}
+    let assembledEvent: Record<string, unknown> | null = null
+    let errorEvent: Record<string, unknown> | null = null
+    let hintEvent: Record<string, unknown> | null = null
 
-    const stepUpdate = eventToStepUpdate(type)
-    if (Object.keys(stepUpdate).length) {
-      setSteps((prev) => ({ ...prev, ...stepUpdate }))
+    for (const event of newEvents) {
+      const type = event.type as string
+
+      const entry = eventToLog(event)
+      if (entry) newLogEntries.push(entry)
+
+      // Accumulate step updates — later events win within a batch
+      const stepUpdate = eventToStepUpdate(type)
+      Object.assign(aggregatedStepUpdate, stepUpdate)
+
+      if (type === 'hint.requested' && !hint) hintEvent = event
+      if (type === 'dashboard.assembled') assembledEvent = event
+      if (type === 'pipeline.error') errorEvent = event
     }
 
-    // Hint dialog
-    if (type === 'hint.requested' && !hint) {
-      try {
-        const hintData = typeof lastEvent === 'object' ? lastEvent : JSON.parse(lastEvent as unknown as string)
-        setHint(hintData as HintRequest)
-      } catch {}
+    if (newLogEntries.length) setLog(prev => [...prev, ...newLogEntries])
+
+    if (Object.keys(aggregatedStepUpdate).length) {
+      setSteps(prev => {
+        const next = { ...prev }
+        for (const [k, v] of Object.entries(aggregatedStepUpdate) as [StepKey, StepStatus][]) {
+          // Never regress: don't go from 'done' back to 'active'.
+          // Parallel chart events arrive out of order and would otherwise keep resetting indicators.
+          if (prev[k] !== 'done' && prev[k] !== 'error') next[k] = v
+        }
+        return next
+      })
     }
 
-    if (type === 'dashboard.assembled') {
-      setSteps((prev) => ({
-        ...prev, upload: 'done', vision: 'done', sql: 'done',
-        execute: 'done', validate: 'done', assemble: 'done',
-      }))
+    if (hintEvent) {
+      try { setHint(hintEvent as HintRequest) } catch {}
+    }
+
+    if (assembledEvent) {
+      setSteps({ upload: 'done', vision: 'done', sql: 'done', execute: 'done', validate: 'done', verify: 'done', assemble: 'done' })
+      if (assembledEvent.token_usage && typeof assembledEvent.token_usage === 'object') {
+        setTokenUsage(assembledEvent.token_usage as Record<string, { input_tokens: number; output_tokens: number; calls: number }>)
+      }
       setPhase('done')
     }
-    if (type === 'pipeline.error') {
-      setError(lastEvent.message as string)
+
+    if (errorEvent) {
+      setError(errorEvent.message as string)
       setPhase('error')
     }
   }, [jobs, jobId])
@@ -288,6 +318,7 @@ export default function ScreenshotPage() {
     setSteps({ upload: 'active', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' })
     try {
       const resp = await screenshotApi.upload({ projectId, files })
+      processedEventCount.current = 0
       setJobId(resp.data.job_id)
       setPhase('processing')
       setSteps((prev) => ({ ...prev, upload: 'done', vision: 'active' }))
@@ -570,57 +601,104 @@ export default function ScreenshotPage() {
                   </p>
                 </div>
               </div>
-              {/* Canvas rename input */}
+              {/* Canvas rename — required before navigation */}
               {resultDashboardId && (
-                <div className="flex items-center gap-2 mt-2">
-                  <label className="text-xs text-gray-400 font-semibold shrink-0">Canvas name:</label>
-                  <input
-                    value={dashboardName}
-                    onChange={e => setDashboardName(e.target.value)}
-                    placeholder="e.g. Q2 Insurance Report"
-                    className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-blue-400"
-                    onKeyDown={async e => {
-                      if (e.key === 'Enter' && dashboardName.trim() && resultDashboardId) {
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-gray-500 font-semibold shrink-0">
+                      Canvas name <span className="text-red-400">*</span>
+                    </label>
+                    {nameSaved && (
+                      <span className="text-xs text-green-600 flex items-center gap-1">
+                        <CheckCircle2 size={11} /> Saved
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      autoFocus
+                      value={dashboardName}
+                      onChange={e => { setDashboardName(e.target.value); setNameSaved(false) }}
+                      placeholder="e.g. Q2 Insurance Report"
+                      className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-blue-400"
+                      onKeyDown={async e => {
+                        if (e.key === 'Enter' && dashboardName.trim() && resultDashboardId) {
+                          setRenamingSaving(true)
+                          try { await canvasApi.rename(resultDashboardId, dashboardName.trim()); setNameSaved(true) } catch {}
+                          setRenamingSaving(false)
+                        }
+                      }}
+                    />
+                    <button
+                      disabled={!dashboardName.trim() || renamingSaving}
+                      onClick={async () => {
+                        if (!dashboardName.trim() || !resultDashboardId) return
                         setRenamingSaving(true)
-                        try { await canvasApi.rename(resultDashboardId, dashboardName.trim()) } catch {}
+                        try { await canvasApi.rename(resultDashboardId, dashboardName.trim()); setNameSaved(true) } catch {}
                         setRenamingSaving(false)
-                      }
-                    }}
-                  />
-                  <button
-                    disabled={!dashboardName.trim() || renamingSaving}
-                    onClick={async () => {
-                      if (!dashboardName.trim() || !resultDashboardId) return
-                      setRenamingSaving(true)
-                      try { await canvasApi.rename(resultDashboardId, dashboardName.trim()) } catch {}
-                      setRenamingSaving(false)
-                    }}
-                    className="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1 disabled:opacity-40"
-                  >
-                    {renamingSaving ? <Loader2 size={11} className="animate-spin" /> : null}
-                    Save
-                  </button>
+                      }}
+                      className="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1 disabled:opacity-40"
+                    >
+                      {renamingSaving ? <Loader2 size={11} className="animate-spin" /> : null}
+                      Save
+                    </button>
+                  </div>
+                  {!nameSaved && (
+                    <p className="text-xs text-amber-500">Save a canvas name to continue to dashboard or canvas view.</p>
+                  )}
                 </div>
               )}
+
+              {/* Token usage summary */}
+              {tokenUsage && Object.keys(tokenUsage).length > 0 && (
+                <div className="border border-gray-100 rounded-lg p-3 bg-gray-50">
+                  <p className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">AI Token Usage</p>
+                  <div className="space-y-1">
+                    {Object.entries(tokenUsage).map(([model, stats]) => (
+                      <div key={model} className="flex items-center justify-between text-xs">
+                        <span className="text-gray-500 font-mono truncate max-w-[55%]">
+                          {model.split('.').slice(-2).join('.')}
+                        </span>
+                        <span className="text-gray-400 shrink-0">
+                          ↑ {stats.input_tokens.toLocaleString()} in · {stats.output_tokens.toLocaleString()} out
+                          <span className="text-gray-300 ml-1">({stats.calls}x)</span>
+                        </span>
+                      </div>
+                    ))}
+                    <div className="border-t border-gray-200 pt-1 mt-1 flex justify-between text-xs font-semibold">
+                      <span className="text-gray-500">Total</span>
+                      <span className="text-gray-600">
+                        ↑ {Object.values(tokenUsage).reduce((s, v) => s + v.input_tokens, 0).toLocaleString()} ·{' '}
+                        {Object.values(tokenUsage).reduce((s, v) => s + v.output_tokens, 0).toLocaleString()} out
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="flex justify-end gap-3 flex-wrap">
                 <button
-                  onClick={() => { setPhase('idle'); setFiles([]); setChartStates([]); setJobId(null); setLog([]); setSteps({ upload: 'idle', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' }) }}
+                  onClick={() => { processedEventCount.current = 0; setPhase('idle'); setFiles([]); setChartStates([]); setJobId(null); setLog([]); setNameSaved(false); setTokenUsage(null); setSteps({ upload: 'idle', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' }) }}
                   className="btn-secondary text-sm flex items-center gap-1.5"
                 >
                   <RefreshCw size={13} /> Upload another
                 </button>
                 {resultDashboardId && (
                   <button
+                    disabled={!nameSaved}
                     onClick={() => router.push(`/projects/${projectId}/dashboard`)}
-                    className="btn-secondary flex items-center gap-2 text-sm"
+                    className="btn-secondary flex items-center gap-2 text-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={!nameSaved ? 'Save a canvas name first' : undefined}
                   >
                     <LayoutDashboard size={15} /> Dashboard
                   </button>
                 )}
                 {resultDashboardId && (
                   <button
+                    disabled={!nameSaved}
                     onClick={() => router.push(`/projects/${projectId}/canvas/${resultDashboardId}`)}
-                    className="btn-primary flex items-center gap-2 text-sm"
+                    className="btn-primary flex items-center gap-2 text-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={!nameSaved ? 'Save a canvas name first' : undefined}
                   >
                     <Layers size={15} /> Open in Canvas
                   </button>

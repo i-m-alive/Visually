@@ -489,6 +489,160 @@ def _looks_like_date_table(table: dict) -> bool:
     return matches >= 3
 
 
+async def sample_distinct_for_filter(
+    connection_id: str,
+    table: str,
+    column: str,
+    timeout_seconds: int = 5,
+) -> list[str]:
+    """
+    Sample all distinct non-null values for a filter column.
+    Used to populate the available_values list for detected Power BI filters.
+    Returns empty list on failure (non-fatal).
+    """
+    sql = f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY 1 LIMIT 200"
+    try:
+        result = await asyncio.wait_for(
+            call_query_executor(connection_id, sql, row_limit=200),
+            timeout=timeout_seconds,
+        )
+        if result and not result.get("error"):
+            rows = result.get("rows", [])
+            return [str(r.get(column, "")) for r in rows if r.get(column) is not None]
+        if result and result.get("error"):
+            print(
+                f"[value_sampler] sample_distinct_for_filter {table}.{column} "
+                f"DB error: {str(result['error'])[:120]}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[value_sampler] sample_distinct_for_filter {table}.{column} "
+            f"exception ({type(exc).__name__}): {str(exc)[:120]}",
+            flush=True,
+        )
+    return []
+
+
+async def sample_top_candidates(
+    connection_id: str,
+    candidates: list,
+    chart_spec: dict,
+    max_candidates: int = 3,
+    timeout_seconds: int = 8,
+) -> dict:
+    """
+    Pre-sample the top N candidates in parallel at schema-match time.
+    Returns {0: context_dict, 1: context_dict, 2: context_dict, ...}.
+
+    Called once per chart after schema matching.  Results are stored in a
+    per-chart presample_cache and handed to _run_chart_replication_loop so
+    the orchestrator can switch to a pre-sampled context when the candidate
+    changes on retry, avoiding an extra DB round-trip on each attempt.
+
+    Returns {} on total failure (non-fatal).
+    """
+    if not candidates:
+        return {}
+
+    top = candidates[:max_candidates]
+
+    sample_tasks = [
+        sample_candidate(connection_id, c, chart_spec, timeout_seconds=timeout_seconds)
+        for c in top
+    ]
+    results = await asyncio.gather(*sample_tasks, return_exceptions=True)
+
+    out: dict[int, dict] = {}
+    for idx, result in enumerate(results):
+        if isinstance(result, Exception):
+            print(f"[value_sampler] presample[{idx}] failed: {result}", flush=True)
+            out[idx] = {}
+        else:
+            out[idx] = result or {}
+
+    return out
+
+
+def _row_count_sanity_check(
+    sample_context: dict,
+    chart_spec: dict,
+) -> Optional[str]:
+    """
+    Compare category_counts row count against the chart's data_point_count.
+    Returns a warning string when the candidate table appears to be at the
+    wrong grain, or None when things look fine.
+
+    Injected into sample_context["row_count_warning"] so the LLM receives
+    an explicit signal about wrong-grain tables.
+    """
+    data_point_count = chart_spec.get("data_point_count") or 0
+    if not data_point_count:
+        return None
+
+    cat_counts = sample_context.get("category_counts") or {}
+    if not cat_counts:
+        return None
+
+    actual_distinct = len(cat_counts)
+    if actual_distinct == 0:
+        return None
+
+    ratio = data_point_count / actual_distinct
+    if ratio < 0.3 or ratio > 5:
+        return (
+            f"ROW-COUNT WARNING: chart expects {data_point_count} data points "
+            f"but this candidate table has {actual_distinct} distinct categories "
+            f"(ratio={ratio:.1f}). This table may be at the wrong grain — "
+            f"consider a different table or a different dimension column."
+        )
+    return None
+
+
+def inject_per_column_values(
+    sample_context: dict,
+    candidate: dict,
+    raw_rows: Optional[dict] = None,
+) -> dict:
+    """
+    Inject per-column top values into sample_context for non-dimension columns
+    (e.g. group_by col when different from dimension col).
+
+    Reads from category_counts / dimension_values already in sample_context
+    and adds {col_name: [top_values]} entries so the LLM sees actual DB values
+    for every key column in the candidate.
+    """
+    key_cols = candidate.get("key_columns") or {}
+    group_by_col = key_cols.get("group_by")
+    dimension_col = key_cols.get("dimension")
+
+    # If group_by is a different column from dimension, surface it explicitly
+    if group_by_col and group_by_col != dimension_col:
+        # We can't query here (sync function), but we can tag the context so
+        # the caller knows to run an extra DISTINCT query for this column.
+        existing = sample_context.get("per_column_values") or {}
+        if group_by_col not in existing:
+            existing[group_by_col] = "__needs_sampling__"
+        sample_context["per_column_values"] = existing
+
+    return sample_context
+
+
+def enrich_sample_context_with_row_count(
+    sample_context: dict,
+    chart_spec: dict,
+) -> dict:
+    """
+    Run row-count sanity check and inject warning into sample_context if needed.
+    Returns the (possibly modified) sample_context.
+    """
+    warning = _row_count_sanity_check(sample_context, chart_spec)
+    if warning:
+        sample_context["row_count_warning"] = warning
+        print(f"[value_sampler] ⚠ {warning}", flush=True)
+    return sample_context
+
+
 def detect_date_tables(compact_tables: list) -> list:
     """
     Scan a schema's compact_tables list for date dimension / calendar tables.

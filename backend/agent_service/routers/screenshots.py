@@ -189,6 +189,13 @@ async def _run_screenshot_pipeline_bg(
                 pj.completed_at = datetime.utcnow()
                 await db.commit()
         except Exception as e:
+            # Rollback before publishing the error event so the connection is
+            # returned to the pool clean — avoids "manually started transaction"
+            # errors on subsequent status-poll requests.
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             await publish_pipeline_event(redis, job_id, {
                 "type": "pipeline.error", "job_id": job_id,
                 "message": str(e), "recoverable": False,
@@ -311,3 +318,73 @@ async def submit_hint(
         pass
 
     return {"status": "stored", "hint_id": hint_id, "note": "Hint will apply on next retry"}
+
+
+# ─── Schema Cache API ────────────────────────────────────────────────────────
+
+@router.get("/schema-cache/{connection_id}/export")
+async def export_schema_cache(
+    connection_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Export the cached EnrichedSchema for a connection as a downloadable JSON string.
+    Useful for committing / sharing pre-computed schema caches to speed up cold starts.
+    Returns 404 when no cached schema is available.
+    """
+    from agent_service.agents.schema_cache import export_cache_json
+    from fastapi.responses import Response
+
+    json_str = export_cache_json(connection_id)
+    if json_str is None:
+        raise HTTPException(status_code=404, detail="No cached schema found for this connection. Run a replication first to warm the cache.")
+
+    return Response(
+        content=json_str,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="schema_cache_{connection_id}.json"',
+        },
+    )
+
+
+@router.post("/schema-cache/{connection_id}/import")
+async def import_schema_cache(
+    connection_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Import a previously exported schema cache JSON into the in-process cache.
+    Eliminates cold-start schema enrichment cost — the next replication uses
+    the imported cache immediately.
+    """
+    from agent_service.agents.schema_cache import import_cache_json
+
+    try:
+        json_bytes = await file.read()
+        json_str = json_bytes.decode("utf-8")
+        enriched = import_cache_json(connection_id, json_str)
+        return {
+            "status": "imported",
+            "connection_id": connection_id,
+            "tables": len(enriched.schema_doc.get("tables", [])),
+            "db_type": enriched.db_type,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid schema cache JSON: {exc}")
+
+
+@router.delete("/schema-cache/{connection_id}")
+async def invalidate_schema_cache(
+    connection_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Invalidate (clear) the cached schema for a connection.
+    Call this after a schema migration to force re-enrichment on the next replication.
+    """
+    from agent_service.agents.schema_cache import invalidate
+
+    invalidate(connection_id)
+    return {"status": "invalidated", "connection_id": connection_id}

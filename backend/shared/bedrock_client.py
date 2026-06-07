@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import contextvars
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from typing import NamedTuple
 
 import boto3
 from botocore.config import Config as BotocoreConfig
@@ -25,6 +27,48 @@ BEDROCK_VISION_MODEL = os.getenv("BEDROCK_VISION_MODEL_ID", "anthropic.claude-3-
 
 BEDROCK_MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "2048"))
 BEDROCK_TEMPERATURE = float(os.getenv("BEDROCK_TEMPERATURE", "0.0"))
+
+
+class _TokenUsage(NamedTuple):
+    model_id: str
+    input_tokens: int
+    output_tokens: int
+
+
+_token_bucket: contextvars.ContextVar[list | None] = contextvars.ContextVar("_token_bucket", default=None)
+
+
+def start_token_tracking() -> None:
+    """Call at the start of a pipeline run to begin accumulating token usage."""
+    _token_bucket.set([])
+
+
+def get_token_summary() -> dict:
+    """Return aggregated token counts per model_id → {input_tokens, output_tokens, calls}."""
+    bucket = _token_bucket.get()
+    if not bucket:
+        return {}
+    agg: dict = {}
+    for entry in bucket:
+        m = entry.model_id
+        if m not in agg:
+            agg[m] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+        agg[m]["input_tokens"] += entry.input_tokens
+        agg[m]["output_tokens"] += entry.output_tokens
+        agg[m]["calls"] += 1
+    return agg
+
+
+def _track_usage(model_id: str, result: dict) -> None:
+    bucket = _token_bucket.get()
+    if bucket is None:
+        return
+    usage = result.get("usage", {})
+    bucket.append(_TokenUsage(
+        model_id=model_id,
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+    ))
 
 
 _BEDROCK_CONFIG = BotocoreConfig(
@@ -75,6 +119,7 @@ async def bedrock_invoke(
         )
         result = json.loads(response["body"].read())
         print(f"[bedrock] ← done  {time.time()-t0:.1f}s", flush=True)
+        _track_usage(model_id, result)
         return result["content"][0]["text"]
 
     loop = asyncio.get_event_loop()
@@ -104,6 +149,7 @@ async def bedrock_invoke_with_history(
             accept="application/json",
         )
         result = json.loads(response["body"].read())
+        _track_usage(model_id, result)
         return result["content"][0]["text"]
 
     loop = asyncio.get_event_loop()
@@ -158,6 +204,7 @@ async def bedrock_invoke_with_image(
             )
             result = json.loads(response["body"].read())
             print(f"[bedrock-vision] ← done  {time.time()-t0:.1f}s", flush=True)
+            _track_usage(model_id, result)
             return result["content"][0]["text"]
         except Exception as exc:
             print(f"[bedrock-vision] ✗ FAILED after {time.time()-t0:.1f}s: {type(exc).__name__}: {exc}", flush=True)
@@ -204,6 +251,7 @@ async def bedrock_invoke_with_multiple_images(
             accept="application/json",
         )
         result = json.loads(response["body"].read())
+        _track_usage(model_id, result)
         return result["content"][0]["text"]
 
     loop = asyncio.get_event_loop()

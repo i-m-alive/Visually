@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import {
   Download, LayoutDashboard, BarChart2,
-  Loader2, AlertCircle, ChevronRight, Trash2, Image as ImageIcon, X
+  Loader2, AlertCircle, ChevronRight, Trash2, Image as ImageIcon, X, Pencil, Check
 } from 'lucide-react'
 import { dashboardApi } from '@/lib/api'
 import { ExportModal } from '@/components/export/ExportModal'
@@ -43,6 +43,9 @@ export default function DashboardPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [originalImage, setOriginalImage] = useState<string | null>(null)
+  const [renamingDash, setRenamingDash] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
+  const [renameSaving, setRenameSaving] = useState(false)
 
   // Load dashboard list
   useEffect(() => {
@@ -89,6 +92,19 @@ export default function DashboardPage() {
       setThemeUpdating(false)
     }
   }, [dashboard])
+
+  const handleRenameDashboard = async () => {
+    const trimmed = renameValue.trim()
+    if (!trimmed || !dashboard) { setRenamingDash(false); return }
+    setRenameSaving(true)
+    try {
+      await dashboardApi.rename(dashboard.id, trimmed)
+      setDashboards(prev => prev.map(d => d.id === dashboard.id ? { ...d, name: trimmed } : d))
+      setDashboard(prev => prev ? { ...prev, name: trimmed } : prev)
+    } catch { /* ignore */ }
+    setRenameSaving(false)
+    setRenamingDash(false)
+  }
 
   const handleDeleteDashboard = async (id: string) => {
     if (confirmDeleteId !== id) {
@@ -157,25 +173,61 @@ export default function DashboardPage() {
     <div className="flex-1 flex flex-col min-h-0 bg-gray-50">
       {/* Top bar */}
       <div className="flex items-center gap-3 px-6 py-3 bg-white border-b border-gray-100 flex-shrink-0">
-        {/* Dashboard selector */}
+        {/* Dashboard selector + rename */}
         <div className="flex items-center gap-2 flex-1 min-w-0">
           <BarChart2 className="w-4 h-4 text-gray-400 flex-shrink-0" />
-          {dashboards.length === 1 ? (
-            <span className="text-sm font-600 text-gray-800 truncate">
-              {dashboard?.name ?? dashboards[0].name}
-            </span>
+          {renamingDash && dashboard ? (
+            <div className="flex items-center gap-1.5">
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={e => setRenameValue(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') handleRenameDashboard()
+                  if (e.key === 'Escape') setRenamingDash(false)
+                }}
+                className="text-sm font-semibold text-gray-800 bg-transparent border-b-2 border-blue-500 outline-none w-48"
+              />
+              <button
+                onClick={handleRenameDashboard}
+                disabled={!renameValue.trim() || renameSaving}
+                className="p-1 text-blue-600 hover:bg-blue-50 rounded disabled:opacity-40"
+              >
+                {renameSaving ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+              </button>
+              <button onClick={() => setRenamingDash(false)} className="p-1 text-gray-400 hover:text-gray-600 rounded">
+                <X size={13} />
+              </button>
+            </div>
           ) : (
-            <select
-              value={selectedId ?? ''}
-              onChange={(e) => setSelectedId(e.target.value)}
-              className="text-sm font-500 text-gray-800 border-0 bg-transparent outline-none cursor-pointer max-w-xs"
-            >
-              {dashboards.map((d) => (
-                <option key={d.id} value={d.id}>{d.name}</option>
-              ))}
-            </select>
+            <>
+              {dashboards.length === 1 ? (
+                <span className="text-sm font-600 text-gray-800 truncate">
+                  {dashboard?.name ?? dashboards[0].name}
+                </span>
+              ) : (
+                <select
+                  value={selectedId ?? ''}
+                  onChange={(e) => { setSelectedId(e.target.value); setRenamingDash(false) }}
+                  className="text-sm font-500 text-gray-800 border-0 bg-transparent outline-none cursor-pointer max-w-xs"
+                >
+                  {dashboards.map((d) => (
+                    <option key={d.id} value={d.id}>{d.name}</option>
+                  ))}
+                </select>
+              )}
+              {dashboard && (
+                <button
+                  onClick={() => { setRenameValue(dashboard.name); setRenamingDash(true) }}
+                  className="p-1 text-gray-300 hover:text-blue-500 hover:bg-blue-50 rounded transition-colors"
+                  title="Rename dashboard"
+                >
+                  <Pencil size={12} />
+                </button>
+              )}
+            </>
           )}
-          {dashboard && (
+          {dashboard && !renamingDash && (
             <ChevronRight className="w-3 h-3 text-gray-300 flex-shrink-0" />
           )}
         </div>
