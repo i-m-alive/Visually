@@ -493,22 +493,53 @@ async def sample_distinct_for_filter(
     connection_id: str,
     table: str,
     column: str,
-    timeout_seconds: int = 5,
+    timeout_seconds: int = 15,
+    compact_tables: Optional[list] = None,
 ) -> list[str]:
     """
-    Sample all distinct non-null values for a filter column.
+    Sample distinct non-null values for a filter column.
     Used to populate the available_values list for detected Power BI filters.
     Returns empty list on failure (non-fatal).
+
+    compact_tables: when provided, the column is validated against the table's
+    known schema before any DB query is issued. Columns that don't exist in the
+    schema are skipped immediately — avoids wasted queries on hallucinated names.
+
+    SQL note: DISTINCT + ORDER BY forces a full-table sort on Redshift/large tables
+    and routinely exceeds the timeout. Instead we SELECT with LIMIT and deduplicate
+    in Python — early-stopping scan, no sort, same result set.
     """
-    sql = f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY 1 LIMIT 200"
+    # Pre-check: if we have schema info, skip immediately when column isn't in this table
+    if compact_tables:
+        table_meta = next((t for t in compact_tables if t.get("name") == table), None)
+        if table_meta:
+            col_names = {(c.get("name") or "").lower() for c in (table_meta.get("columns") or [])}
+            if column.lower() not in col_names:
+                print(
+                    f"[value_sampler] skip {table}.{column} — not in schema "
+                    f"({len(col_names)} known columns)",
+                    flush=True,
+                )
+                return []
+
+    # No DISTINCT / ORDER BY — lets the DB exit after the first 500 rows without
+    # sorting the whole table. We deduplicate cheaply in Python.
+    sql = f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL LIMIT 500"
     try:
         result = await asyncio.wait_for(
-            call_query_executor(connection_id, sql, row_limit=200),
+            call_query_executor(connection_id, sql, row_limit=500),
             timeout=timeout_seconds,
         )
         if result and not result.get("error"):
             rows = result.get("rows", [])
-            return [str(r.get(column, "")) for r in rows if r.get(column) is not None]
+            seen: dict = {}
+            for r in rows:
+                v = r.get(column)
+                if v is not None:
+                    key = str(v)
+                    if key not in seen:
+                        seen[key] = key
+            return list(seen.keys())[:200]
         if result and result.get("error"):
             print(
                 f"[value_sampler] sample_distinct_for_filter {table}.{column} "

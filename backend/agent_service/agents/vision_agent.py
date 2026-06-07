@@ -120,6 +120,9 @@ Return JSON in this exact format:
   "color_scheme": "sequential|diverging|categorical|monochrome",
   "kpi_metric_name": "metric label text if this is a KPI card, else null",
   "kpi_value_text": "raw display value if KPI card (e.g. '$1.2M', '4,521'), else null",
+  "kpi_grouped": false,
+  "kpi_group_labels": [],
+  "kpi_group_column": null,
   "reasoning": "brief explanation of your analysis"
 }
 
@@ -127,41 +130,90 @@ For estimated_values:
 - Bar chart: {"Category1": 1200, "Category2": 800}
 - Line chart: {"2024-01": 1200, "2024-02": 1350} (use tick labels as keys)
 - Pie/Donut: {"Segment1": 35.0, "Segment2": 25.0} (as percentages)
-- KPI card: {"value": 1234567, "change_pct": 12.3, "metric_name": "Total Revenue"}
+- KPI card (single value): {"value": 1234567, "change_pct": 12.3, "metric_name": "Total Revenue"}
+- KPI card (multi-value — shows TWO OR MORE labelled numbers side by side): use the label as the key
+  Example: card shows "TAO: 231" and "VCS: 6531" → {"TAO": 231, "VCS": 6531}
+  In this case also set kpi_grouped: true and kpi_group_labels: ["TAO", "VCS"]
 - Table: {"row_count": 10, "col_count": 5, "columns": ["col1", "col2"]}
 
-Mark unclear values with "~" prefix: "~1200"."""
+Mark unclear values with "~" prefix: "~1200".
+
+MULTI-VALUE KPI DETECTION:
+If a KPI card shows multiple labelled numeric values (e.g. "TAO 231 / VCS 6531", or two rows of
+numbers each with a category label), set:
+  "kpi_grouped": true
+  "kpi_group_labels": ["TAO", "VCS"]
+  "kpi_group_column": "employment_type"  (the category column that produces the groups)
+  estimated_values: {"TAO": 231, "VCS": 6531}"""
 
 
 FILTER_DETECTION_SYSTEM_PROMPT = """You are a UI analysis system that identifies interactive filter controls in business intelligence dashboards.
 Return ONLY valid JSON. No prose before or after the JSON block."""
 
-FILTER_DETECTION_USER_PROMPT = """Examine this screenshot for any filter panels, slicer controls, dropdown filters, date range pickers, search boxes, or any UI element that lets users filter the data shown.
+FILTER_DETECTION_USER_PROMPT = """Examine this screenshot for ANY filter panels, slicer controls, dropdown filters, date range pickers, search boxes, or any UI element that lets users filter the data shown.
 
-Common Power BI locations: right-side filter pane, slicer visuals anywhere in the report, top-bar dropdowns.
+CRITICAL — Power BI dashboards almost always have a LEFT-SIDE slicer panel. Look carefully at:
+1. The left edge of the image — vertical list of labelled controls with checkboxes or dropdowns
+2. Each slicer label is usually bold text (e.g. "ParentName", "ClientAdvisor", "Employment Type")
+3. Below the label are the options — either checkboxes, radio buttons, or a dropdown showing "All"
+4. Also check: right-side filter pane, top-bar dropdowns, slicer visuals embedded in the chart area
 
-For each filter control found, return:
-- display_name: the label text visible next to or above the control (e.g. "Job Status", "Region")
-- column_hint: likely database column name in snake_case (e.g. "job_status", "region")
+For EACH filter/slicer control found return:
+- display_name: the label text above the control (e.g. "Employment Type", "ParentName")
+- column_hint: likely snake_case database column name (e.g. "employment_type", "parent_name")
 - filter_type: one of [multi_select, single_select, date_range, search_box]
-- visible_values: list of values/options visible in the filter UI (max 20)
-- selected_values: values that appear currently selected/checked (empty list if none)
+- visible_values: ALL values/options visible in the UI (max 20, include all checkboxes even unchecked)
+- selected_values: values that appear currently selected / checked / highlighted
 
 Return JSON:
 {
   "filters_detected": [
     {
-      "display_name": "Status",
-      "column_hint": "status",
+      "display_name": "Employment Type",
+      "column_hint": "employment_type",
       "filter_type": "multi_select",
-      "visible_values": ["Active", "Closed", "New"],
-      "selected_values": ["Active"]
+      "visible_values": ["TAO", "VCS"],
+      "selected_values": []
+    },
+    {
+      "display_name": "ParentName",
+      "column_hint": "parent_name",
+      "filter_type": "single_select",
+      "visible_values": ["All"],
+      "selected_values": ["All"]
     }
   ],
-  "total_found": 0
+  "total_found": 2
 }
 
-If no filter controls are visible, return {"filters_detected": [], "total_found": 0}."""
+If no filter controls are visible at all, return {"filters_detected": [], "total_found": 0}."""
+
+
+REPORT_METADATA_SYSTEM_PROMPT = """You are a UI analysis system that reads Power BI / Tableau / dashboard report metadata.
+Return ONLY valid JSON. No prose before or after the JSON block."""
+
+REPORT_METADATA_USER_PROMPT = """Analyze this full dashboard screenshot and extract the report-level metadata.
+
+Look for:
+1. REPORT TITLE — the large heading text, usually top-left, often on a coloured banner (e.g. "Job Data", "Sales Dashboard"). This is NOT a chart title — it describes the whole page.
+2. PAGE TABS — navigation tabs near the top of the page that switch between report pages (e.g. "Job Detail", "Placement Detail", "Company Locations"). One tab is usually highlighted/active.
+3. LOGO — any company branding logo (note it but don't treat as content)
+4. COLOUR THEME — primary background/accent colour of the dashboard (e.g. "pink", "blue", "grey")
+
+Return JSON:
+{
+  "report_title": "Job Data",
+  "page_tabs": [
+    {"name": "Job Detail", "active": true},
+    {"name": "Placement Detail", "active": false},
+    {"name": "Company Locations", "active": false}
+  ],
+  "logo_text": "wahve",
+  "colour_theme": "pink"
+}
+
+If there is no visible report title, set "report_title": null.
+If there are no page tabs, set "page_tabs": []."""
 
 
 class VisionAgent:
@@ -222,7 +274,8 @@ class VisionAgent:
     async def analyze_chart(self, image_bytes: bytes, bounding_box: dict, chart_id: str, source_filename: str) -> dict:
         """Analyze a single cropped chart region."""
         print(f"[vision] analyze_chart START  chart_id={chart_id}", flush=True)
-        cropped_bytes = crop_chart_region(image_bytes, bounding_box)
+        # 5% padding (up from 2%) so titles near the bounding-box edge aren't cropped
+        cropped_bytes = crop_chart_region(image_bytes, bounding_box, padding_pct=0.05)
         print(f"[vision] analyze_chart cropped region → {len(cropped_bytes)//1024}KB  sending to Bedrock...", flush=True)
 
         response_text = await bedrock_invoke_with_image(
@@ -250,6 +303,9 @@ class VisionAgent:
             "estimated_values": analysis.get("estimated_values", {}),
             "data_point_count": int(analysis.get("data_point_count") or 0),
             "series_count": analysis.get("series_count", 1),
+            "kpi_grouped": analysis.get("kpi_grouped", False),
+            "kpi_group_labels": analysis.get("kpi_group_labels", []),
+            "kpi_group_column": analysis.get("kpi_group_column"),
             "bounding_box": bounding_box,
             "source_image": source_filename,
             "confidence": 0.9,
@@ -400,6 +456,50 @@ class VisionAgent:
             print(f"[vision] ⚠ detect_filters failed (non-fatal): {exc}", flush=True)
             return []
 
+    async def detect_report_metadata(self, image_bytes: bytes, source_filename: str) -> dict:
+        """
+        Extract report-level metadata: title, page tabs, logo, colour theme.
+        Runs on the FULL (not cropped) image so it can read the header area.
+
+        Returns:
+            {
+                "report_title": str | None,
+                "page_tabs": [{"name": str, "active": bool}],
+                "logo_text": str | None,
+                "colour_theme": str | None,
+            }
+        Non-fatal — always returns a dict, never raises.
+        """
+        print(f"[vision] detect_report_metadata START  file={source_filename}", flush=True)
+        try:
+            normalized_bytes, _, _ = normalize_image(image_bytes, target_width=1000)
+            response_text = await bedrock_invoke_with_image(
+                model_id=self.model_id,
+                system_prompt=REPORT_METADATA_SYSTEM_PROMPT,
+                user_text=REPORT_METADATA_USER_PROMPT,
+                image_bytes=normalized_bytes,
+                image_media_type="image/png",
+                temperature=0.1,
+                max_tokens=512,
+            )
+            result = _parse_json_response(response_text)
+            metadata = {
+                "report_title": result.get("report_title"),
+                "page_tabs":    result.get("page_tabs", []),
+                "logo_text":    result.get("logo_text"),
+                "colour_theme": result.get("colour_theme"),
+            }
+            print(
+                f"[vision] detect_report_metadata → "
+                f"title={metadata['report_title']!r}  "
+                f"tabs={[t['name'] for t in metadata['page_tabs']]}",
+                flush=True,
+            )
+            return metadata
+        except Exception as exc:
+            print(f"[vision] ⚠ detect_report_metadata failed (non-fatal): {exc}", flush=True)
+            return {"report_title": None, "page_tabs": [], "logo_text": None, "colour_theme": None}
+
     async def process_images(self, images: list[dict], job_id: str, redis=None) -> dict:
         """
         Full Vision Agent pipeline for one or more images.
@@ -423,11 +523,37 @@ class VisionAgent:
                 for d in detected
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            return [c for c in results if isinstance(c, dict)]
+            out = []
+            for d_info, result in zip(detected, results):
+                if isinstance(result, dict):
+                    out.append(result)
+                else:
+                    print(
+                        f"[vision] ⚠ analyze_chart dropped {d_info['id']}: "
+                        f"{type(result).__name__}: {str(result)[:80]}",
+                        flush=True,
+                    )
+            return out
 
-        per_image = await asyncio.gather(*[process_one(img) for img in images], return_exceptions=True)
+        # Run chart detection + report metadata extraction in parallel.
+        # Metadata uses only the first image (all pages share the same header/tabs).
+        first_img = images[0]
+        tasks_combined = [
+            self.detect_report_metadata(first_img["bytes"], first_img["filename"]),
+            *[process_one(img) for img in images],
+        ]
+        combined_results = await asyncio.gather(*tasks_combined, return_exceptions=True)
+
+        # First result is metadata, the rest are per-image chart lists
+        metadata_result = combined_results[0]
+        if isinstance(metadata_result, Exception):
+            print(f"[vision] detect_report_metadata raised (non-fatal): {metadata_result}", flush=True)
+            report_metadata = {"report_title": None, "page_tabs": [], "logo_text": None, "colour_theme": None}
+        else:
+            report_metadata = metadata_result
+
         all_charts = []
-        for i, result in enumerate(per_image):
+        for i, result in enumerate(combined_results[1:]):
             if isinstance(result, Exception):
                 import traceback
                 print(f"[vision] process_one[{i}] FAILED: {type(result).__name__}: {result}", flush=True)
@@ -455,4 +581,5 @@ class VisionAgent:
             "charts": with_layout,
             "total": len(with_layout),
             "source_images": [img["filename"] for img in images],
+            "report_metadata": report_metadata,
         }

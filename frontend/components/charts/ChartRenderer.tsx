@@ -26,10 +26,35 @@ interface Props {
   height?: number
   showAnomalies?: boolean
   anomalyIndices?: number[]
+  /** Cross-filter callback — fired when user clicks a bar/slice/row */
+  onDataPointClick?: (column: string, value: unknown) => void
 }
 
-export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [] }: Props) {
+export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
+
+  // Table sort state — must be declared before any early return (React rules of hooks)
+  const [sortCol, setSortCol] = React.useState<string | null>(null)
+  const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
+
+  // sortedRows must live at the top level — moving it inside the if(ct==='table') block
+  // would violate the Rules of Hooks (hook count changes between renders).
+  const _rawRows = result?.chart_data?.rows as Record<string, unknown>[] | undefined
+  const sortedRows = React.useMemo(() => {
+    const rows = _rawRows ?? []
+    if (!sortCol) return rows
+    return [...rows].sort((a, b) => {
+      const av = a[sortCol], bv = b[sortCol]
+      const n = (x: unknown) => typeof x === 'number' ? x : (parseFloat(String(x)) || 0)
+      if (typeof av === 'number' || typeof bv === 'number') {
+        return sortDir === 'asc' ? n(av) - n(bv) : n(bv) - n(av)
+      }
+      return sortDir === 'asc'
+        ? String(av ?? '').localeCompare(String(bv ?? ''))
+        : String(bv ?? '').localeCompare(String(av ?? ''))
+    })
+  }, [_rawRows, sortCol, sortDir])
+
   if (!result) return null
   const { chart_type, title, x_axis_label, y_axis_label, chart_data } = result
   if (!chart_data) return null
@@ -82,6 +107,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     ? rows
     : labels.map((l, i) => ({ [xKey]: l, [yKey]: values[i] }))
 
+  // ── Shared computed values (used by ref-line, labels, comparison) ──────────
+  const numYVals = rechartData.map(r => Number(r[yKey] ?? 0)).filter(n => !isNaN(n) && isFinite(n))
+  const avgY = numYVals.length > 1 ? numYVals.reduce((s, v) => s + v, 0) / numYVals.length : null
+  const fmtAvg = avgY !== null
+    ? (Math.abs(avgY) >= 1e6 ? `Avg ${(avgY / 1e6).toFixed(1)}M` : Math.abs(avgY) >= 1e3 ? `Avg ${(avgY / 1e3).toFixed(1)}K` : `Avg ${Math.round(avgY)}`)
+    : ''
+
   // ── KPI ──────────────────────────────────────────────────────────────────────
   if (ct === 'kpi' || ct === 'kpi_card') {
     const val = values[0] ?? rows[0]?.[columns[0] ?? '']
@@ -123,24 +155,101 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   // ── Table ─────────────────────────────────────────────────────────────────────
   if (ct === 'table' || ct === 'data_table') {
     const cols = columns.length ? columns : (rows[0] ? Object.keys(rows[0]) : [])
+    // sortedRows is hoisted to the top of the component (Rules of Hooks)
+
+    // Heatmap: per-column min/max for numeric columns
+    const colStats: Record<string, { min: number; max: number; isNum: boolean }> = {}
+    cols.forEach(c => {
+      const nums = sortedRows.map(r => {
+        const v = r[c]; return typeof v === 'number' ? v : parseFloat(String(v ?? ''))
+      }).filter(n => !isNaN(n) && isFinite(n))
+      colStats[c] = nums.length > 1
+        ? { min: Math.min(...nums), max: Math.max(...nums), isNum: true }
+        : { min: 0, max: 0, isNum: false }
+    })
+    // Mini-bar: use the first numeric column
+    const primaryNumCol = cols.find(c => colStats[c]?.isNum) ?? null
+    const primaryMax = primaryNumCol && colStats[primaryNumCol] ? colStats[primaryNumCol].max : 1
+
+    function heatmapBg(col: string, rawVal: unknown): string | undefined {
+      const stats = colStats[col]
+      if (!stats?.isNum) return undefined
+      const v = typeof rawVal === 'number' ? rawVal : parseFloat(String(rawVal ?? ''))
+      if (isNaN(v) || stats.max === stats.min) return undefined
+      const intensity = (v - stats.min) / (stats.max - stats.min)
+      return v >= 0
+        ? `rgba(37,99,235,${(intensity * 0.22).toFixed(3)})`
+        : `rgba(220,38,38,${(Math.abs(intensity) * 0.22).toFixed(3)})`
+    }
+
+    const thStyle: React.CSSProperties = {
+      background: 'var(--dash-th-bg, #F3F4F6)',
+      color: 'var(--dash-text-muted, #6B7280)',
+      borderColor: 'var(--dash-table-border, #E5E7EB)',
+    }
     return (
       <div className="overflow-auto w-full" style={{ height }}>
         <table className="w-full text-xs border-collapse">
           <thead className="sticky top-0 z-10">
-            <tr className="bg-gray-50">
+            <tr>
               {cols.map(c => (
-                <th key={c} className="px-3 py-2 text-left font-semibold text-gray-600 border-b whitespace-nowrap">{c}</th>
+                <th
+                  key={c}
+                  className="px-3 py-2 text-left font-semibold border-b whitespace-nowrap select-none cursor-pointer hover:opacity-80"
+                  style={thStyle}
+                  onClick={() => {
+                    if (sortCol === c) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                    else { setSortCol(c); setSortDir('asc') }
+                  }}
+                >
+                  {c}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                </th>
               ))}
+              {primaryNumCol && (
+                <th className="px-2 py-2 border-b" style={{ ...thStyle, width: 68, minWidth: 68 }} title="Value bar" />
+              )}
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, i) => (
-              <tr key={i} className={i % 2 === 0 ? '' : 'bg-gray-50'}>
-                {cols.map(c => (
-                  <td key={c} className="px-3 py-1.5 border-b text-gray-700 whitespace-nowrap">{String(row[c] ?? '')}</td>
-                ))}
-              </tr>
-            ))}
+            {sortedRows.map((row, i) => {
+              const rowBg = i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)'
+              const barVal = primaryNumCol ? (typeof row[primaryNumCol] === 'number' ? row[primaryNumCol] as number : parseFloat(String(row[primaryNumCol] ?? 0))) : 0
+              const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, (barVal as number) / primaryMax)) : 0
+              return (
+                <tr
+                  key={i}
+                  className={onDataPointClick ? 'cursor-pointer hover:opacity-80' : ''}
+                  style={{ background: rowBg }}
+                  onClick={() => onDataPointClick && cols[0] && onDataPointClick(cols[0], row[cols[0]])}
+                >
+                  {cols.map(c => {
+                    const heat = heatmapBg(c, row[c])
+                    return (
+                      <td
+                        key={c}
+                        className="px-3 py-1.5 border-b whitespace-nowrap"
+                        style={{
+                          color: 'var(--dash-row-text, #374151)',
+                          borderColor: 'var(--dash-table-border, #E5E7EB)',
+                          background: heat ?? undefined,
+                          fontWeight: colStats[c]?.isNum ? 500 : undefined,
+                        }}
+                      >
+                        {String(row[c] ?? '')}
+                      </td>
+                    )
+                  })}
+                  {primaryNumCol && (
+                    <td className="px-2 py-1.5 border-b" style={{ borderColor: 'var(--dash-table-border, #E5E7EB)', background: rowBg }}>
+                      <svg width={60} height={10}>
+                        <rect x={0} y={1} width={60} height={8} rx={3} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
+                        <rect x={0} y={1} width={Math.max(3, barPct * 60)} height={8} rx={3} fill={COLORS[0]} opacity={0.75} />
+                      </svg>
+                    </td>
+                  )}
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
@@ -160,23 +269,42 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       if (!lookup[rv]) lookup[rv] = {}
       lookup[rv][cv] = r[valueKey]
     })
+    const thStyle: React.CSSProperties = {
+      background: 'var(--dash-th-bg, #F3F4F6)',
+      color: 'var(--dash-text-muted, #6B7280)',
+      borderColor: 'var(--dash-table-border, #E5E7EB)',
+    }
     return (
       <div className="overflow-auto w-full" style={{ height }}>
         <table className="w-full text-xs border-collapse">
           <thead className="sticky top-0 z-10">
-            <tr className="bg-gray-50">
-              <th className="px-2 py-1.5 border text-left font-semibold text-gray-600">{rowDimKey}</th>
+            <tr>
+              <th className="px-2 py-1.5 border text-left font-semibold" style={thStyle}>{rowDimKey}</th>
               {colValues.map(cv => (
-                <th key={cv} className="px-2 py-1.5 border text-right font-semibold text-gray-600">{cv}</th>
+                <th key={cv} className="px-2 py-1.5 border text-right font-semibold" style={thStyle}>{cv}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {rowValues.map((rv, i) => (
-              <tr key={rv} className={i % 2 === 0 ? '' : 'bg-gray-50'}>
-                <td className="px-2 py-1.5 border font-medium text-gray-700">{rv}</td>
+              <tr
+                key={rv}
+                style={{
+                  background: i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)',
+                }}
+              >
+                <td
+                  className="px-2 py-1.5 border font-medium"
+                  style={{ color: 'var(--dash-row-text, #374151)', borderColor: 'var(--dash-table-border, #E5E7EB)' }}
+                >
+                  {rv}
+                </td>
                 {colValues.map(cv => (
-                  <td key={cv} className="px-2 py-1.5 border text-right text-gray-700">
+                  <td
+                    key={cv}
+                    className="px-2 py-1.5 border text-right"
+                    style={{ color: 'var(--dash-row-text, #374151)', borderColor: 'var(--dash-table-border, #E5E7EB)' }}
+                  >
                     {lookup[rv]?.[cv] != null ? String(lookup[rv][cv]) : '—'}
                   </td>
                 ))}
@@ -206,12 +334,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     const showLegend = height > 200
     return (
       <ResponsiveContainer width="100%" height={height}>
-        <PieChart>
+        <PieChart style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
           <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
             innerRadius={ct === 'donut' ? '45%' : 0}
             outerRadius={showLegend && !manySlices ? '60%' : '72%'}
             label={!manySlices && showLegend ? ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)` : undefined}
             labelLine={!manySlices && showLegend}
+            onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data.name) : undefined}
           >
             {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
           </Pie>
@@ -331,6 +460,10 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
           <XAxis dataKey={xKey} label={{ value: x_axis_label, position: 'insideBottom', offset: -5 }} tick={{ fontSize: 11 }} />
           <YAxis label={{ value: y_axis_label, angle: -90, position: 'insideLeft' }} tick={{ fontSize: 11 }} />
           <Tooltip />
+          {avgY !== null && (
+            <ReferenceLine y={avgY} stroke="#F59E0B" strokeDasharray="4 2"
+              label={{ value: fmtAvg, position: 'insideTopRight', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
+          )}
           <Line type="monotone" dataKey={yKey} stroke={COLORS[0]} strokeWidth={2}
             dot={showAnomalies ? (props: Record<string, unknown>) => {
               const idx = props.index as number
@@ -431,13 +564,24 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
           </p>
         )}
         <ResponsiveContainer width="100%" height={barH}>
-          <BarChart data={displayData} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
+          <BarChart data={displayData} layout="vertical" margin={{ left: 8, right: 56, top: 4, bottom: 4 }}>
             <CartesianGrid strokeDasharray="3 3" horizontal={false} />
             <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
             <YAxis dataKey={xKey} type="category" width={yAxisWidth} tick={<HorizontalYTick />} axisLine={false} tickLine={false} />
             <Tooltip formatter={(v: number) => v.toLocaleString()} />
-            <Bar dataKey={yKey} radius={[0, 3, 3, 0]} maxBarSize={22}>
+            {avgY !== null && (
+              <ReferenceLine x={avgY} stroke="#F59E0B" strokeDasharray="4 2"
+                label={{ value: fmtAvg, position: 'top', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
+            )}
+            <Bar
+              dataKey={yKey}
+              radius={[0, 3, 3, 0]}
+              maxBarSize={22}
+              onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data[xKey]) : undefined}
+            >
               {displayData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+              <LabelList dataKey={yKey} position="right" style={{ fontSize: 9, fill: 'var(--dash-text-muted, #6B7280)' }}
+                formatter={(v: number) => isNaN(v) ? '' : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v)} />
             </Bar>
           </BarChart>
         </ResponsiveContainer>
@@ -1561,8 +1705,39 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     )
   }
 
+  // ── Grouped line (two overlaid series — used by comparison mode) ─────────────
+  if (ct === 'grouped_line') {
+    const seriesKeys = series?.map(s => s.name) ?? columns.slice(1)
+    const lineData = series
+      ? labels.map((l, i) => {
+          const o: Record<string, unknown> = { [xKey]: l }
+          series.forEach(s => { o[s.name] = s.values[i] ?? 0 })
+          return o
+        })
+      : rechartData
+    return (
+      <ResponsiveContainer width="100%" height={height}>
+        <LineChart data={lineData}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey={xKey} tick={{ fontSize: 11 }} />
+          <YAxis tick={{ fontSize: 11 }} />
+          <Tooltip />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {seriesKeys.map((key, i) => (
+            <Line key={key} type="monotone" dataKey={key}
+              stroke={i === 0 ? COLORS[0] : COLORS[4]}
+              strokeWidth={i === 0 ? 2.5 : 2}
+              strokeDasharray={i > 0 ? '5 3' : undefined}
+              dot={{ r: 3 }} />
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+    )
+  }
+
   // ── Bar (vertical, default — also handles bar_vertical) ──────────────────────
   const anomalySet = new Set(anomalyIndices)
+  const gradId = `barG-${yKey}`.replace(/[^a-z0-9-]/gi, '_')
   // If many categories and labels are long, auto-switch to horizontal bar
   const shouldAutoHBar = rechartData.length > 15 && rechartData.some(r => String(r[xKey] ?? '').length > 6)
   if (shouldAutoHBar) {
@@ -1574,13 +1749,26 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       <div>
         {rechartData.length > 50 && <p style={{ fontSize: 10, color: '#9CA3AF', marginBottom: 4 }}>Showing top 50 of {rechartData.length}</p>}
         <ResponsiveContainer width="100%" height={barH}>
-          <BarChart data={capped} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
+          <BarChart data={capped} layout="vertical" margin={{ left: 8, right: 56, top: 4, bottom: 4 }}>
+            <defs>
+              <linearGradient id={gradId} x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor={COLORS[0]} stopOpacity={0.7} />
+                <stop offset="100%" stopColor={COLORS[0]} stopOpacity={1} />
+              </linearGradient>
+            </defs>
             <CartesianGrid strokeDasharray="3 3" horizontal={false} />
             <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
             <YAxis dataKey={xKey} type="category" width={yAxisW} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
             <Tooltip formatter={(v: number) => v.toLocaleString()} />
-            <Bar dataKey={yKey} radius={[0, 3, 3, 0]} maxBarSize={22}>
-              {capped.map((_, i) => <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />)}
+            {avgY !== null && (
+              <ReferenceLine x={avgY} stroke="#F59E0B" strokeDasharray="4 2"
+                label={{ value: fmtAvg, position: 'top', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
+            )}
+            <Bar dataKey={yKey} fill={`url(#${gradId})`} radius={[0, 3, 3, 0]} maxBarSize={22}
+              onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data[xKey]) : undefined}>
+              {showAnomalies && capped.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null)}
+              <LabelList dataKey={yKey} position="right" style={{ fontSize: 9, fill: 'var(--dash-text-muted, #6B7280)' }}
+                formatter={(v: number) => isNaN(v) ? '' : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v)} />
             </Bar>
           </BarChart>
         </ResponsiveContainer>
@@ -1589,15 +1777,26 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   }
   return (
     <ResponsiveContainer width="100%" height={height}>
-      <BarChart data={rechartData}>
+      <BarChart data={rechartData} style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
+        <defs>
+          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={COLORS[0]} stopOpacity={0.95} />
+            <stop offset="100%" stopColor={COLORS[0]} stopOpacity={0.55} />
+          </linearGradient>
+        </defs>
         <CartesianGrid strokeDasharray="3 3" />
         <XAxis dataKey={xKey} tick={{ fontSize: 11 }} interval="preserveStartEnd" />
         <YAxis tick={{ fontSize: 11 }} />
         <Tooltip />
-        <Bar dataKey={yKey} radius={[3, 3, 0, 0]}>
-          {rechartData.map((_, i) => (
-            <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />
-          ))}
+        {avgY !== null && (
+          <ReferenceLine y={avgY} stroke="#F59E0B" strokeDasharray="4 2"
+            label={{ value: fmtAvg, position: 'insideTopRight', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
+        )}
+        <Bar dataKey={yKey} fill={`url(#${gradId})`} radius={[3, 3, 0, 0]}
+          onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data[xKey]) : undefined}>
+          {showAnomalies && rechartData.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null)}
+          <LabelList dataKey={yKey} position="top" style={{ fontSize: 9, fill: 'var(--dash-text-muted, #6B7280)' }}
+            formatter={(v: number) => isNaN(v) ? '' : Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v)} />
         </Bar>
       </BarChart>
     </ResponsiveContainer>

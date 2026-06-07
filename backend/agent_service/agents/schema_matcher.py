@@ -118,9 +118,19 @@ def _tfidf_prefilter(chart_spec: dict, compact_tables: list, top_n: int = 15) ->
         _add(str(lbl))
     for lbl in (chart_spec.get("legend_labels") or [])[:4]:
         _add(str(lbl))
+    # estimated_values keys are a strong signal for KPI charts that have no title
+    # e.g. {"Active Placements": 1234} → adds "active", "placements" to query_terms
+    for key in (chart_spec.get("estimated_values") or {}).keys():
+        _add(str(key))
 
     if not query_terms:
-        return compact_tables[:top_n]
+        # Nothing to match on — rank by table size; largest tables are most likely
+        # to contain the chart data in a typical analytics database.
+        print(
+            f"[schema_matcher] TF-IDF no query terms — fallback to row_count order",
+            flush=True,
+        )
+        return sorted(compact_tables, key=lambda t: t.get("row_count") or 0, reverse=True)[:top_n]
 
     def _score(table: dict) -> float:
         tterms: set[str] = set()
@@ -133,7 +143,7 @@ def _tfidf_prefilter(chart_spec: dict, compact_tables: list, top_n: int = 15) ->
 
         _add_t(table.get("name", ""))
         _add_t(table.get("description", ""))
-        for col in (table.get("columns") or [])[:20]:
+        for col in (table.get("columns") or [])[:30]:
             _add_t(col.get("name", ""))
             _add_t(col.get("description", ""))
         if not tterms:
@@ -141,6 +151,14 @@ def _tfidf_prefilter(chart_spec: dict, compact_tables: list, top_n: int = 15) ->
         return len(query_terms & tterms) / len(query_terms)
 
     scored = sorted(compact_tables, key=_score, reverse=True)
+    # If the top score is still 0 (no term overlap with any table), fall back to
+    # row_count sort — better than an arbitrary stable-sort order.
+    if scored and _score(scored[0]) == 0.0:
+        print(
+            f"[schema_matcher] TF-IDF zero overlap — fallback to row_count order",
+            flush=True,
+        )
+        scored = sorted(compact_tables, key=lambda t: t.get("row_count") or 0, reverse=True)
     result = scored[:top_n]
     print(
         f"[schema_matcher] TF-IDF pre-filter: {len(compact_tables)} → {len(result)} tables",

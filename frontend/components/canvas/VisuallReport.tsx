@@ -4,7 +4,7 @@ import {
   X, Send, Loader2, Plus, BarChart2, Table2, Sparkles,
   LayoutGrid, MessageSquare, ChevronRight, TrendingUp, TrendingDown,
   CheckCircle2, Copy, List, Sun, Moon, Zap, Info, ChevronDown, ChevronUp,
-  Maximize2, Star, Printer, ChevronLeft, Play, Pause, Download,
+  Maximize2, Star, Printer, ChevronLeft, Play, Pause, Download, Calendar,
 } from 'lucide-react'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import { chatApi, canvasApi, type WidgetCreate } from '@/lib/api'
@@ -330,6 +330,32 @@ function getRecommendedQuestions(widgets: CanvasWidgetData[]): string[] {
   return Array.from(new Set(qs)).slice(0, 6)
 }
 
+function detectDateCol(cols: string[], rows: Record<string, unknown>[]): string | null {
+  if (!rows.length) return null
+  return cols.find(c => {
+    const v = String(rows[0]?.[c] ?? '')
+    return /^\d{4}-\d{2}/.test(v) || /^\d{2}[\/\-]\d{2}[\/\-]\d{4}/.test(v)
+  }) ?? null
+}
+
+function applyDateFilter(
+  rows: Record<string, unknown>[],
+  col: string,
+  from: string,
+  to: string,
+): { rows: Record<string, unknown>[]; indices: number[] } {
+  const fromMs = from ? new Date(from).getTime() : -Infinity
+  const toMs   = to   ? new Date(to + 'T23:59:59').getTime() : Infinity
+  const indices: number[] = []
+  const filtered = rows.filter((r, i) => {
+    const ms = new Date(String(r[col] ?? '')).getTime()
+    const keep = isNaN(ms) || (ms >= fromMs && ms <= toMs)
+    if (keep) indices.push(i)
+    return keep
+  })
+  return { rows: filtered, indices }
+}
+
 function toChartResult(w: CanvasWidgetData): ChartResult {
   return {
     chart_type: w.chart_type, title: '',
@@ -421,6 +447,20 @@ function computeTrendBadge(w: CanvasWidgetData): { pct: number; up: boolean } | 
   return { pct: Math.round(pct*10)/10, up: nums[nums.length-1] >= nums[0] }
 }
 
+// Maps canvas THEMES to the --dash-* CSS variables ChartRenderer uses for tables.
+// Without this, ChartRenderer falls back to light-theme defaults even inside a dark canvas.
+function themeTableVars(t: Theme): React.CSSProperties {
+  const dark = ['midnight', 'digitalnative'].includes(t.id)
+  return {
+    '--dash-card-bg':     t.surface,
+    '--dash-row-alt':     dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.03)',
+    '--dash-row-text':    t.text,
+    '--dash-th-bg':       dark ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.05)',
+    '--dash-table-border': t.border,
+    '--dash-text-muted':  t.muted,
+  } as React.CSSProperties
+}
+
 function computeKeyDriver(w: CanvasWidgetData): string | null {
   if (!['bar','bar_vertical','bar_horizontal'].includes(w.chart_type.toLowerCase())) return null
   const values = (w.chart_data?.values as (number|null)[]) ?? []
@@ -457,6 +497,12 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   })
   const theme = THEMES[Math.min(themeIdx, THEMES.length - 1)]
 
+  const [navCollapsed, setNavCollapsed] = useState(false)
+  const [comparisonMode, setComparisonMode] = useState(false)
+  const [newspaperInsights, setNewspaperInsights] = useState<Record<string, string>>({})
+  const [newspaperInsightLoading, setNewspaperInsightLoading] = useState<Record<string, boolean>>({})
+  const [tableVizSuggestions, setTableVizSuggestions] = useState<Record<string, string>>({})
+  const [tableVizSugLoading, setTableVizSugLoading] = useState<Record<string, boolean>>({})
   const [activeSection, setActiveSection] = useState<SectionId>('overview')
   const [layoutMode, setLayoutMode]       = useState<LayoutMode>('grid')
   const [bgPattern, setBgPattern]         = useState<BgPattern>('dots')
@@ -464,6 +510,9 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const [chartTypeOverrides, setChartTypeOverrides] = useState<Record<string,string>>({})
   const [showRawData, setShowRawData]     = useState<Set<string>>(new Set())
   const [splitViewId, setSplitViewId]     = useState<string|null>(null)
+  const [chartDateDraft,    setChartDateDraft]    = useState<Record<string, { from: string; to: string }>>({})
+  const [chartDateFilters,  setChartDateFilters]  = useState<Record<string, { from: string; to: string }>>({})
+  const [chartDateOpen,     setChartDateOpen]     = useState<Set<string>>(new Set())
   const [fullscreenId, setFullscreenId]   = useState<string|null>(null)
   // Focus mode
   const [focusMode, setFocusMode]         = useState(false)
@@ -531,6 +580,32 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const recommended    = useMemo(() => getRecommendedQuestions(widgets), [widgets])
   const hasActiveFilters = Object.values(activeFilters).some(v => v.length > 0)
 
+  // Anomaly callout data — across all displayed widgets
+  const globalAnomalies = useMemo(() => {
+    const results: Array<{ widgetId: string; title: string; label: string; value: number; sigma: number }> = []
+    displayWidgets.forEach(w => {
+      const rawVals = (w.chart_data?.values as (number|null)[]) ?? []
+      const rawRows = (w.chart_data?.rows as Record<string, unknown>[]) ?? []
+      const rawCols = (w.chart_data?.columns as string[]) ?? []
+      const numVals: (number|null)[] = rawVals.length > 0 ? rawVals
+        : rawRows.map(r => { const v = r[rawCols[1] ?? '']; return typeof v === 'number' ? v : parseFloat(String(v ?? 'nan')) || null })
+      const labArr: string[] = (w.chart_data?.labels as string[]) ?? rawRows.map(r => String(r[rawCols[0] ?? ''] ?? ''))
+      const idxs = detectAnomalyIndices(numVals)
+      if (idxs.length > 0) {
+        const nums = numVals.filter((v): v is number => v !== null)
+        const mean = nums.reduce((s, v) => s + v, 0) / nums.length
+        const std  = Math.sqrt(nums.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / nums.length)
+        idxs.slice(0, 2).forEach(idx => {
+          const val = numVals[idx]
+          if (val !== null && std > 0) {
+            results.push({ widgetId: w.id, title: w.title, label: labArr[idx] ?? `Point ${idx + 1}`, value: val, sigma: Math.abs(val - mean) / std })
+          }
+        })
+      }
+    })
+    return results.sort((a, b) => b.sigma - a.sigma).slice(0, 5)
+  }, [displayWidgets])
+
   // ── Inject CSS animations ────────────────────────────────────────────────
   useEffect(() => {
     const id = 'visually-report-styles'
@@ -556,6 +631,9 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
       .vis-ticker-inner { display:flex; gap:48px; white-space:nowrap; animation: vis-ticker-scroll 38s linear infinite; width:max-content; }
       .vis-no-print {}
       @media print { .vis-no-print{display:none!important} }
+      .vis-hide-scroll { scrollbar-width:none; -ms-overflow-style:none; }
+      .vis-hide-scroll::-webkit-scrollbar { display:none; }
+      .vis-nav { transition: width 0.22s cubic-bezier(.4,0,.2,1), opacity 0.2s ease; }
     `
     document.head.appendChild(s)
     return () => { document.getElementById(id)?.remove() }
@@ -680,6 +758,73 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const clearAllFilters = useCallback(() => {
     setActiveFilters({})
     setFilteredWidgets(null)
+  }, [])
+
+  // ── Load AI insights for all charts & tables whenever widgets arrive ─────
+  useEffect(() => {
+    const toLoad = [...visualCharts, ...tables].filter(w => !newspaperInsights[w.id] && !newspaperInsightLoading[w.id])
+    if (toLoad.length === 0) return
+    toLoad.forEach(w => {
+      setNewspaperInsightLoading(prev => ({ ...prev, [w.id]: true }))
+      const rows = (w.chart_data?.rows as Record<string,unknown>[] | undefined) ?? []
+      const cols = (w.chart_data?.columns as string[] | undefined) ?? []
+      const sample = rows.slice(0, 3).map(r => cols.map(c => `${c}:${r[c]}`).join(', ')).join(' | ')
+      chatApi.send({
+        session_id: `insight-${w.id}`,
+        message: `Chart title: "${w.title}" (type: ${w.chart_type}). Columns: ${cols.join(', ')}. Sample: ${sample}. Write exactly 2 short sentences: (1) what this data shows specifically, (2) the single most important business insight. Plain prose, no headers, bullets, or markdown.`,
+        project_id: projectId,
+        connection_id: connectionId,
+      }).then(r => setNewspaperInsights(prev => ({ ...prev, [w.id]: r.data?.text?.trim() ?? '' })))
+        .catch(() => {})
+        .finally(() => setNewspaperInsightLoading(prev => ({ ...prev, [w.id]: false })))
+    })
+  }, [visualCharts.length, tables.length]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Load AI viz suggestions for tables ───────────────────────────────────
+  useEffect(() => {
+    const toLoad = tables.filter(w => !tableVizSuggestions[w.id] && !tableVizSugLoading[w.id])
+    if (toLoad.length === 0) return
+    toLoad.forEach(w => {
+      setTableVizSugLoading(prev => ({ ...prev, [w.id]: true }))
+      const cols = (w.chart_data?.columns as string[] | undefined) ?? []
+      const rows = (w.chart_data?.rows as Record<string,unknown>[] | undefined) ?? []
+      const sample = rows.slice(0, 3).map(r => cols.map(c => `${c}:${r[c]}`).join(', ')).join(' | ')
+      chatApi.send({
+        session_id: `viz-suggest-${w.id}`,
+        message: `Table: "${w.title}". Columns: ${cols.join(', ')}. Sample rows: ${sample}. Reply with ONLY one of: bar, line, pie, bar_horizontal, area — whichever best visualizes this data. No other text.`,
+        project_id: projectId,
+        connection_id: connectionId,
+      }).then(r => {
+        const raw = (r.data?.text?.trim() ?? '').toLowerCase()
+        const match = (['bar_horizontal','bar','line','pie','area'] as const).find(v => raw.includes(v))
+        if (match) setTableVizSuggestions(prev => ({ ...prev, [w.id]: match }))
+      }).catch(() => {})
+        .finally(() => setTableVizSugLoading(prev => ({ ...prev, [w.id]: false })))
+    })
+  }, [tables.length]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Build a comparison chart result (current vs prior half-period) ───────
+  const makeComparisonResult = useCallback((w: CanvasWidgetData): ChartResult => {
+    const wRows  = (w.chart_data?.rows  as Record<string, unknown>[]) ?? []
+    const wCols  = (w.chart_data?.columns as string[]) ?? []
+    if (wRows.length < 4 || wCols.length < 2) return toChartResult(w)
+    const half = Math.floor(wRows.length / 2)
+    const prior   = wRows.slice(0, half)
+    const current = wRows.slice(half)
+    const xK = wCols[0], yK = wCols[1]
+    const maxLen = Math.max(prior.length, current.length)
+    const compRows = Array.from({ length: maxLen }, (_, i) => ({
+      [xK]: current[i]?.[xK] ?? prior[i]?.[xK] ?? `P${i + 1}`,
+      'Current': typeof current[i]?.[yK] === 'number' ? current[i][yK] : parseFloat(String(current[i]?.[yK] ?? 'nan')) || null,
+      'Prior':   typeof prior[i]?.[yK]   === 'number' ? prior[i][yK]   : parseFloat(String(prior[i]?.[yK]   ?? 'nan')) || null,
+    }))
+    const baseType = w.chart_type.toLowerCase()
+    const compType = ['line', 'area'].includes(baseType) ? 'grouped_line' : 'grouped_bar'
+    return {
+      ...toChartResult(w),
+      chart_type: compType,
+      chart_data: { rows: compRows, columns: [xK, 'Current', 'Prior'], labels: [], values: [] },
+    }
   }, [])
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -998,11 +1143,43 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     const caption = computeCaption(w)
     const keyDriver = computeKeyDriver(w)
     const altType = suggestAlternativeChart(w)
-    const chartResult = { ...toChartResult(w), chart_type: activeType }
-    const anomalyIdxs = detectAnomalyIndices((w.chart_data?.values as (number|null)[]) ?? [])
+    const wRows = (w.chart_data?.rows as Record<string, unknown>[]) ?? []
+    const wCols = (w.chart_data?.columns as string[]) ?? (wRows[0] ? Object.keys(wRows[0]) : [])
+    const dateCol       = detectDateCol(wCols, wRows)
+    const dateDraft     = chartDateDraft[w.id]
+    const dateFilter    = chartDateFilters[w.id]
+    const isDateOpen    = chartDateOpen.has(w.id)
+    const hasDateFilter = !!(dateFilter?.from || dateFilter?.to)
+    const hasDraft      = !!(dateDraft?.from || dateDraft?.to)
+    const draftChanged  = dateDraft?.from !== (dateFilter?.from ?? '') || dateDraft?.to !== (dateFilter?.to ?? '')
+    const showApply     = hasDraft && draftChanged
 
-    const rawRows = (w.chart_data?.rows as Record<string,unknown>[]) ?? []
-    const rawCols = (w.chart_data?.columns as string[]) ?? (rawRows[0] ? Object.keys(rawRows[0]) : [])
+    const wLabels = (w.chart_data?.labels  as string[]         | undefined) ?? []
+    const wValues = (w.chart_data?.values  as (number|null)[]  | undefined) ?? []
+
+    const filterResult  = dateCol && hasDateFilter
+      ? applyDateFilter(wRows, dateCol, dateFilter?.from ?? '', dateFilter?.to ?? '')
+      : null
+    const filteredRows   = filterResult?.rows   ?? wRows
+    const keepSet        = filterResult ? new Set(filterResult.indices) : null
+    const filteredLabels = keepSet ? wLabels.filter((_, i) => keepSet.has(i)) : wLabels
+    const filteredValues = keepSet ? wValues.filter((_, i) => keepSet.has(i)) : wValues
+
+    const baseChartData = toChartResult(w).chart_data
+    const filteredChartData = {
+      ...baseChartData,
+      rows:   filteredRows,
+      labels: filteredLabels,
+      values: filteredValues,
+    }
+    const baseResult = comparisonMode && filteredRows.length >= 4
+      ? makeComparisonResult({ ...w, chart_data: { ...w.chart_data, rows: filteredRows } as typeof w.chart_data })
+      : { ...toChartResult(w), chart_type: activeType, chart_data: filteredChartData }
+    const chartResult = baseResult
+    const anomalyIdxs = detectAnomalyIndices(filteredValues.length ? filteredValues : (w.chart_data?.values as (number|null)[]) ?? [])
+
+    const rawRows = filteredRows
+    const rawCols = wCols
 
     return (
       <div key={w.id} id={`vr-chart-${w.id}`} className="vis-card"
@@ -1020,6 +1197,15 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
             {trend && <TrendBadge trend={trend} small />}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
+            {/* Date filter toggle — only shown when a date column exists */}
+            {dateCol && (
+              <button onClick={e => { e.stopPropagation(); setChartDateOpen(prev => { const n = new Set(prev); if (n.has(w.id)) n.delete(w.id); else n.add(w.id); return n }) }}
+                title="Date filter"
+                style={{ width: 24, height: 24, borderRadius: '50%', padding: 0, background: (isDateOpen || hasDateFilter) ? theme.accentBg : 'transparent', border: `1px solid ${(isDateOpen || hasDateFilter) ? theme.accent : theme.border}`, color: (isDateOpen || hasDateFilter) ? theme.accent : theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
+                <Calendar size={11} />
+                {hasDateFilter && <span style={{ position: 'absolute', top: -2, right: -2, width: 6, height: 6, borderRadius: '50%', background: theme.accent }} />}
+              </button>
+            )}
             {/* Info */}
             <button onClick={e => { e.stopPropagation(); openInfo(w) }} title="Explain"
               className={`vis-info-btn${isInfoOpen ? ' active' : ''}`}
@@ -1046,6 +1232,43 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
         {/* Chart type switcher */}
         <ChartTypeSwitcher baseType={w.chart_type.toLowerCase()} active={activeType.toLowerCase()} onSelect={t => setChartOverride(w.id, t)} theme={theme} />
 
+        {/* Date range filter strip */}
+        {isDateOpen && dateCol && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 10px', marginBottom: 8, background: `${theme.accent}08`, border: `1px solid ${theme.accent}22`, borderRadius: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.07em', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 3 }}>
+              <Calendar size={9} />{dateCol}
+            </span>
+            <input type="date" value={dateDraft?.from ?? ''}
+              onChange={e => setChartDateDraft(prev => ({ ...prev, [w.id]: { from: e.target.value, to: prev[w.id]?.to ?? '' } }))}
+              style={{ fontSize: 10, padding: '2px 6px', borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, outline: 'none' }} />
+            <span style={{ fontSize: 10, color: theme.muted }}>→</span>
+            <input type="date" value={dateDraft?.to ?? ''}
+              onChange={e => setChartDateDraft(prev => ({ ...prev, [w.id]: { from: prev[w.id]?.from ?? '', to: e.target.value } }))}
+              style={{ fontSize: 10, padding: '2px 6px', borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, outline: 'none' }} />
+            {showApply && (
+              <button
+                onClick={() => setChartDateFilters(prev => ({ ...prev, [w.id]: { from: dateDraft?.from ?? '', to: dateDraft?.to ?? '' } }))}
+                style={{ fontSize: 10, padding: '3px 12px', borderRadius: 6, border: 'none', background: theme.accent, color: 'white', cursor: 'pointer', fontWeight: 600 }}>
+                Apply
+              </button>
+            )}
+            {(hasDateFilter || hasDraft) && (
+              <button onClick={() => {
+                setChartDateDraft(prev => { const n = { ...prev }; delete n[w.id]; return n })
+                setChartDateFilters(prev => { const n = { ...prev }; delete n[w.id]; return n })
+              }}
+                style={{ fontSize: 9, padding: '2px 8px', borderRadius: 6, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer' }}>
+                Clear
+              </button>
+            )}
+            {hasDateFilter && (
+              <span style={{ fontSize: 9, color: theme.muted, marginLeft: 'auto' }}>
+                {filteredRows.length} / {wRows.length} rows
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Chart content — normal or split view */}
         {w.chart_data ? (
           splitViewId === w.id ? (
@@ -1060,7 +1283,9 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               </div>
             </div>
           ) : (
-            <ChartRenderer result={chartResult} height={h} showAnomalies anomalyIndices={anomalyIdxs} />
+            <div style={themeTableVars(theme)}>
+              <ChartRenderer result={chartResult} height={h} showAnomalies anomalyIndices={anomalyIdxs} />
+            </div>
           )
         ) : (
           <div style={{ height: h, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>
@@ -1071,6 +1296,19 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
 
         {/* Key driver callout */}
         {keyDriver && <KeyDriverCallout text={keyDriver} theme={theme} />}
+
+        {/* AI Insight panel */}
+        {(newspaperInsights[w.id] || newspaperInsightLoading[w.id]) && (
+          <div style={{ marginTop: 10, padding: '9px 12px', background: `${theme.accent}0A`, borderLeft: `3px solid ${theme.accent}`, borderRadius: '0 8px 8px 0', border: `1px solid ${theme.accent}1A` }}>
+            <p style={{ fontSize: 9, fontWeight: 800, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 5px' }}>✦ AI Insight</p>
+            {newspaperInsightLoading[w.id]
+              ? <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {[100, 78].map(pct => <div key={pct} style={{ height: 9, borderRadius: 4, background: `${theme.muted}25`, width: `${pct}%` }} />)}
+                </div>
+              : <p style={{ fontSize: 11, color: theme.text, lineHeight: 1.65, margin: 0 }}>{newspaperInsights[w.id]}</p>
+            }
+          </div>
+        )}
 
         {/* Action row */}
         <div style={{ display: 'flex', gap: 5, marginTop: 10, flexWrap: 'wrap' }}>
@@ -1167,7 +1405,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                 {(() => { const trend = computeTrendBadge(featured); return trend ? <TrendBadge trend={trend} small /> : null })()}
               </div>
               <h3 style={{ fontSize: 16, fontWeight: 800, color: theme.text, margin: '0 0 12px', letterSpacing: '-0.3px' }}>{featured.title}</h3>
-              {featured.chart_data && <ChartRenderer result={{ ...toChartResult(featured), chart_type: chartTypeOverrides[featured.id] ?? featured.chart_type }} height={280} />}
+              {featured.chart_data && <div style={themeTableVars(theme)}><ChartRenderer result={{ ...toChartResult(featured), chart_type: chartTypeOverrides[featured.id] ?? featured.chart_type }} height={280} /></div>}
               {(() => { const c = computeCaption(featured); return c ? <p style={{ fontSize: 11, color: theme.muted, margin: '10px 0 0', fontStyle: 'italic', lineHeight: 1.5 }}>{c}</p> : null })()}
               {(() => { const kd = computeKeyDriver(featured); return kd ? <KeyDriverCallout text={kd} theme={theme} /> : null })()}
             </div>
@@ -1193,25 +1431,68 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           </div>
         </div>
 
-        {/* Secondary charts — 3 columns */}
+        {/* Pull-quote callout — most impressive KPI */}
+        {kpis.length > 0 && (() => {
+          const top = kpis.reduce((best, w) => {
+            const { num: bn } = getKpiMeta(best)
+            const { num: wn } = getKpiMeta(w)
+            return Math.abs(parseFloat(String(wn ?? 0))) > Math.abs(parseFloat(String(bn ?? 0))) ? w : best
+          }, kpis[0])
+          const { num, delta } = getKpiMeta(top)
+          const col = delta?.up === false ? '#DC2626' : delta?.up ? '#16A34A' : theme.accent
+          return (
+            <div style={{ margin: '22px 0 8px', padding: '18px 28px', borderLeft: `5px solid ${col}`, background: `${col}0D`, borderRadius: '0 10px 10px 0', position: 'relative' }}>
+              <p style={{ fontFamily: "'Georgia',serif", fontSize: 22, fontWeight: 900, color: theme.text, margin: '0 0 6px', lineHeight: 1.2, letterSpacing: '-0.4px' }}>
+                "{fmtNum(num)}"
+              </p>
+              <p style={{ fontSize: 11, color: theme.muted, margin: 0, letterSpacing: '0.06em', textTransform: 'uppercase', fontWeight: 600 }}>{top.title}</p>
+              {delta && <div style={{ marginTop: 6 }}><TrendBadge trend={delta} /></div>}
+              <span style={{ position: 'absolute', top: 10, right: 16, fontSize: 40, opacity: 0.07, color: theme.text, fontFamily: "'Georgia',serif", lineHeight: 1 }}>"</span>
+            </div>
+          )
+        })()}
+
+        {/* Secondary charts — 2-column newspaper layout with AI insight */}
         {secondary.length > 0 && (
           <>
             {divider('Trend Analysis', '#7C3AED')}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(320px,1fr))', gap: 14, marginBottom: 8 }}>
-              {secondary.map((w, i) => (
-                <div key={w.id} className="vis-card" style={{ ...cardBase, padding: '16px 18px', animationDelay: `${i * 60}ms` }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-                    <div>
-                      <h4 style={{ fontSize: 13, fontWeight: 700, color: theme.text, margin: 0 }}>{w.title}</h4>
-                      {(() => { const c = computeCaption(w); return c ? <p style={{ fontSize: 10, color: theme.muted, margin: '3px 0 0', fontStyle: 'italic' }}>{c}</p> : null })()}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 8 }}>
+              {secondary.map((w, i) => {
+                const insight = newspaperInsights[w.id]
+                const loading = newspaperInsightLoading[w.id]
+                return (
+                  <div key={w.id} className="vis-card" style={{ ...cardBase, padding: '16px 18px', animationDelay: `${i * 60}ms` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                      <div>
+                        <h4 style={{ fontSize: 13, fontWeight: 700, color: theme.text, margin: 0 }}>{w.title}</h4>
+                        {(() => { const c = computeCaption(w); return c ? <p style={{ fontSize: 10, color: theme.muted, margin: '3px 0 0', fontStyle: 'italic' }}>{c}</p> : null })()}
+                      </div>
+                      {(() => { const t = computeTrendBadge(w); return t ? <TrendBadge trend={t} small /> : null })()}
                     </div>
-                    {(() => { const t = computeTrendBadge(w); return t ? <TrendBadge trend={t} small /> : null })()}
+                    <ChartTypeSwitcher baseType={w.chart_type.toLowerCase()} active={(chartTypeOverrides[w.id] ?? w.chart_type).toLowerCase()} onSelect={t => setChartOverride(w.id, t)} theme={theme} />
+                    {/* 60/40 split: chart | AI insight */}
+                    <div style={{ display: 'grid', gridTemplateColumns: insight || loading ? '3fr 2fr' : '1fr', gap: 14, alignItems: 'start' }}>
+                      <div>
+                        {w.chart_data
+                          ? <div style={themeTableVars(theme)}><ChartRenderer result={{ ...toChartResult(w), chart_type: chartTypeOverrides[w.id] ?? w.chart_type }} height={200} /></div>
+                          : <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>}
+                        {(() => { const kd = computeKeyDriver(w); return kd ? <KeyDriverCallout text={kd} theme={theme} /> : null })()}
+                      </div>
+                      {(insight || loading) && (
+                        <div style={{ borderLeft: `2px solid ${theme.accent}40`, paddingLeft: 14, paddingTop: 4 }}>
+                          <p style={{ fontSize: 9, fontWeight: 800, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 8px' }}>AI Insight</p>
+                          {loading
+                            ? <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                {[100, 85, 70].map(w => <div key={w} style={{ height: 10, borderRadius: 4, background: `${theme.muted}30`, width: `${w}%`, animation: 'pulse 1.5s ease-in-out infinite' }} />)}
+                              </div>
+                            : <p style={{ fontFamily: "'Georgia',serif", fontSize: 12, color: theme.text, lineHeight: 1.65, margin: 0 }}>{insight}</p>
+                          }
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <ChartTypeSwitcher baseType={w.chart_type.toLowerCase()} active={(chartTypeOverrides[w.id] ?? w.chart_type).toLowerCase()} onSelect={t => setChartOverride(w.id, t)} theme={theme} />
-                  {w.chart_data && <ChartRenderer result={{ ...toChartResult(w), chart_type: chartTypeOverrides[w.id] ?? w.chart_type }} height={200} />}
-                  {(() => { const kd = computeKeyDriver(w); return kd ? <KeyDriverCallout text={kd} theme={theme} /> : null })()}
-                </div>
-              ))}
+                )
+              })}
             </div>
           </>
         )}
@@ -1271,7 +1552,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                           ))}
                         </div>
                         {w.chart_data
-                          ? <ChartRenderer result={{ ...toChartResult(w), chart_type: activeViz }} height={260} />
+                          ? <div style={themeTableVars(theme)}><ChartRenderer result={{ ...toChartResult(w), chart_type: activeViz }} height={260} /></div>
                           : <div style={{ height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>
                         }
                       </div>
@@ -1323,7 +1604,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
 
         {/* Key Findings Strip */}
         {(kpis.length > 0 || visualCharts.length > 0) && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 22, overflowX: 'auto', paddingBottom: 2 }}>
+          <div className="vis-hide-scroll" style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 22, overflowX: 'auto', paddingBottom: 2 }}>
             <span style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', flexShrink: 0 }}>Live</span>
             {kpis.map((w, i) => {
               const { num, delta } = getKpiMeta(w)
@@ -1390,7 +1671,18 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
             {tables.map((w, i) => {
               const isExpanded = expandedTables.has(w.id)
               const isInfoOpen = infoWidgetId === w.id
-              const rows = (w.chart_data?.rows as Record<string, unknown>[] | undefined) ?? []
+              const tRows = (w.chart_data?.rows as Record<string, unknown>[] | undefined) ?? []
+              const tCols = (w.chart_data?.columns as string[] | undefined) ?? (tRows[0] ? Object.keys(tRows[0]) : [])
+              const tDateCol      = detectDateCol(tCols, tRows)
+              const tDateDraft    = chartDateDraft[w.id]
+              const tDateFilter   = chartDateFilters[w.id]
+              const tDateOpen     = chartDateOpen.has(w.id)
+              const tHasFilter    = !!(tDateFilter?.from || tDateFilter?.to)
+              const tHasDraft     = !!(tDateDraft?.from || tDateDraft?.to)
+              const tDraftChanged = tDateDraft?.from !== (tDateFilter?.from ?? '') || tDateDraft?.to !== (tDateFilter?.to ?? '')
+              const tShowApply    = tHasDraft && tDraftChanged
+              const tFilterResult = tDateCol && tHasFilter ? applyDateFilter(tRows, tDateCol, tDateFilter?.from ?? '', tDateFilter?.to ?? '') : null
+              const rows          = tFilterResult?.rows ?? tRows
               return (
                 <div key={w.id} id={`vr-table-${w.id}`} className="vis-card"
                   style={{ ...cardBase, animationDelay: `${i * 80}ms`, marginBottom: 10, padding: 0, overflow: 'hidden' }}
@@ -1416,13 +1708,22 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                       <span style={{ fontSize: 13, fontWeight: 700, color: theme.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {tableAiNames[w.id] ?? w.title}
                       </span>
-                      {rows.length > 0 && (
-                        <span style={{ padding: '2px 7px', background: theme.accentBg, border: `1px solid ${theme.border}`, borderRadius: 10, fontSize: 10, fontWeight: 600, color: theme.accent, flexShrink: 0 }}>
-                          {rows.length} rows
+                      {tRows.length > 0 && (
+                        <span style={{ padding: '2px 7px', background: tHasFilter ? `${theme.accent}18` : theme.accentBg, border: `1px solid ${tHasFilter ? theme.accent : theme.border}`, borderRadius: 10, fontSize: 10, fontWeight: 600, color: theme.accent, flexShrink: 0 }}>
+                          {tHasFilter ? `${rows.length} / ${tRows.length}` : rows.length} rows
                         </span>
                       )}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
+                      {/* Date filter button */}
+                      {tDateCol && (
+                        <button onClick={e => { e.stopPropagation(); setChartDateOpen(prev => { const n = new Set(prev); if (n.has(w.id)) n.delete(w.id); else n.add(w.id); return n }) }}
+                          title="Date filter"
+                          style={{ width: 24, height: 24, borderRadius: '50%', padding: 0, background: (tDateOpen || tHasFilter) ? theme.accentBg : 'transparent', border: `1px solid ${(tDateOpen || tHasFilter) ? theme.accent : theme.border}`, color: (tDateOpen || tHasFilter) ? theme.accent : theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative', flexShrink: 0 }}>
+                          <Calendar size={11} />
+                          {tHasFilter && <span style={{ position: 'absolute', top: -2, right: -2, width: 6, height: 6, borderRadius: '50%', background: theme.accent }} />}
+                        </button>
+                      )}
                       {/* AI rename */}
                       <button onClick={e => { e.stopPropagation(); aiRenameTable(w) }} title="AI auto-name this table"
                         className="vis-info-btn"
@@ -1444,6 +1745,51 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                   {/* Accordion body */}
                   {isExpanded && (
                     <div style={{ padding: '10px 16px 14px' }}>
+                      {/* Date range filter strip */}
+                      {tDateOpen && tDateCol && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 10px', marginBottom: 10, background: `${theme.accent}08`, border: `1px solid ${theme.accent}22`, borderRadius: 8, flexWrap: 'wrap' }}>
+                          <span style={{ fontSize: 9, fontWeight: 700, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.07em', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 3 }}>
+                            <Calendar size={9} />{tDateCol}
+                          </span>
+                          <input type="date" value={tDateDraft?.from ?? ''}
+                            onChange={e => setChartDateDraft(prev => ({ ...prev, [w.id]: { from: e.target.value, to: prev[w.id]?.to ?? '' } }))}
+                            style={{ fontSize: 10, padding: '2px 6px', borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, outline: 'none' }} />
+                          <span style={{ fontSize: 10, color: theme.muted }}>→</span>
+                          <input type="date" value={tDateDraft?.to ?? ''}
+                            onChange={e => setChartDateDraft(prev => ({ ...prev, [w.id]: { from: prev[w.id]?.from ?? '', to: e.target.value } }))}
+                            style={{ fontSize: 10, padding: '2px 6px', borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, outline: 'none' }} />
+                          {tShowApply && (
+                            <button onClick={() => setChartDateFilters(prev => ({ ...prev, [w.id]: { from: tDateDraft?.from ?? '', to: tDateDraft?.to ?? '' } }))}
+                              style={{ fontSize: 10, padding: '3px 12px', borderRadius: 6, border: 'none', background: theme.accent, color: 'white', cursor: 'pointer', fontWeight: 600 }}>
+                              Apply
+                            </button>
+                          )}
+                          {(tHasFilter || tHasDraft) && (
+                            <button onClick={() => {
+                              setChartDateDraft(prev => { const n = { ...prev }; delete n[w.id]; return n })
+                              setChartDateFilters(prev => { const n = { ...prev }; delete n[w.id]; return n })
+                            }} style={{ fontSize: 9, padding: '2px 8px', borderRadius: 6, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer' }}>
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {/* AI viz suggestion */}
+                      {(tableVizSuggestions[w.id] || tableVizSugLoading[w.id]) && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10, padding: '5px 10px', background: `${theme.accent}0A`, border: `1px solid ${theme.accent}22`, borderRadius: 8 }}>
+                          <span style={{ fontSize: 9, fontWeight: 700, color: theme.accent, flexShrink: 0 }}>✦ AI recommends:</span>
+                          {tableVizSugLoading[w.id]
+                            ? <span style={{ fontSize: 10, color: theme.muted }}>analyzing…</span>
+                            : <>
+                                <span style={{ fontSize: 10, fontWeight: 700, color: theme.accent }}>{tableVizSuggestions[w.id]}</span>
+                                <button onClick={() => setTableChartTypes(prev => ({ ...prev, [w.id]: tableVizSuggestions[w.id]! }))}
+                                  style={{ padding: '2px 9px', fontSize: 10, borderRadius: 6, background: theme.accent, border: 'none', color: 'white', cursor: 'pointer', fontWeight: 600 }}>
+                                  Apply
+                                </button>
+                              </>
+                          }
+                        </div>
+                      )}
                       {/* Visualize-as selector */}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
                         <span style={{ fontSize: 9, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>View as:</span>
@@ -1457,13 +1803,38 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                           )
                         })}
                       </div>
-                      {w.chart_data ? (
-                        <ChartRenderer
-                          result={{ ...toChartResult(w), chart_type: tableChartTypes[w.id] ?? 'table' }}
-                          height={280}
-                        />
-                      ) : (
+                      {w.chart_data ? (() => {
+                        const tKeepSet = tFilterResult ? new Set(tFilterResult.indices) : null
+                        const tLabels  = (w.chart_data?.labels as string[] | undefined) ?? []
+                        const tValues  = (w.chart_data?.values as (number|null)[] | undefined) ?? []
+                        const filteredTableData = {
+                          ...toChartResult(w).chart_data,
+                          rows:   rows,
+                          labels: tKeepSet ? tLabels.filter((_, idx) => tKeepSet.has(idx)) : tLabels,
+                          values: tKeepSet ? tValues.filter((_, idx) => tKeepSet.has(idx)) : tValues,
+                        }
+                        return (
+                          <div style={themeTableVars(theme)}>
+                            <ChartRenderer
+                              result={{ ...toChartResult(w), chart_type: tableChartTypes[w.id] ?? 'table', chart_data: filteredTableData }}
+                              height={280}
+                            />
+                          </div>
+                        )
+                      })() : (
                         <div style={{ height: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>
+                      )}
+                      {/* AI insight for table */}
+                      {(newspaperInsights[w.id] || newspaperInsightLoading[w.id]) && (
+                        <div style={{ marginTop: 10, padding: '9px 12px', background: `${theme.accent}0A`, borderLeft: `3px solid ${theme.accent}`, borderRadius: '0 8px 8px 0', border: `1px solid ${theme.accent}1A` }}>
+                          <p style={{ fontSize: 9, fontWeight: 800, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 5px' }}>✦ AI Insight</p>
+                          {newspaperInsightLoading[w.id]
+                            ? <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                {[100, 75].map(pct => <div key={pct} style={{ height: 9, borderRadius: 4, background: `${theme.muted}25`, width: `${pct}%` }} />)}
+                              </div>
+                            : <p style={{ fontSize: 11, color: theme.text, lineHeight: 1.65, margin: 0 }}>{newspaperInsights[w.id]}</p>
+                          }
+                        </div>
                       )}
                     </div>
                   )}
@@ -1493,7 +1864,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
       )}
 
       {/* ── Left Rail ──────────────────────────────────────────────────────── */}
-      <nav style={{ width: 74, background: theme.rail, display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '14px 0', flexShrink: 0, gap: 2, boxShadow: '2px 0 12px rgba(0,0,0,0.15)', position: 'relative', zIndex: 50, overflow: 'visible' }}>
+      <nav className="vis-nav" style={{ width: navCollapsed ? 0 : 74, opacity: navCollapsed ? 0 : 1, overflow: navCollapsed ? 'hidden' : 'visible', background: theme.rail, display: 'flex', flexDirection: 'column', alignItems: 'center', padding: navCollapsed ? 0 : '14px 0', flexShrink: 0, gap: 2, boxShadow: navCollapsed ? 'none' : '2px 0 12px rgba(0,0,0,0.15)', position: 'relative', zIndex: 50 }}>
         <div style={{ marginBottom: 14 }}>
           <div style={{ width: 38, height: 38, borderRadius: 11, background: 'linear-gradient(135deg,#2563EB,#7C3AED)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <Sparkles size={17} color="white" />
@@ -1535,22 +1906,31 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
             <div style={{ width: 18, height: 18, borderRadius: 5, background: `linear-gradient(135deg,${theme.heroFrom},${theme.heroTo})`, border: '2px solid rgba(255,255,255,0.25)' }} />
             <span style={{ fontSize: 8, fontWeight: 500 }}>Theme</span>
           </button>
-          {showThemePicker && (
-            <div style={{ position: 'absolute', left: 62, bottom: 0, width: 210, background: theme.surface, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '8px 6px', zIndex: 200, boxShadow: '0 8px 32px rgba(0,0,0,0.28)' }}>
-              <p style={{ fontSize: 9, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 0 6px 6px' }}>Select Theme</p>
-              {THEMES.map((t, i) => (
-                <button key={t.id} onClick={() => { setThemeIdx(i); setShowThemePicker(false) }}
-                  style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '7px 8px', borderRadius: 9, border: 'none', background: themeIdx === i ? theme.accentBg : 'transparent', cursor: 'pointer', marginBottom: 2 }}>
-                  <div style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, background: `linear-gradient(135deg,${t.heroFrom},${t.heroTo})`, boxShadow: themeIdx === i ? `0 0 0 2px ${t.accent}` : 'none' }} />
-                  <div style={{ textAlign: 'left', flex: 1 }}>
-                    <p style={{ fontSize: 11, fontWeight: themeIdx === i ? 700 : 500, color: theme.text, margin: 0 }}>{t.label}</p>
-                    <p style={{ fontSize: 9, color: theme.muted, margin: 0 }}>{t.fontFamily.split(',')[0].replace(/'/g,'').trim()}</p>
-                  </div>
-                  {themeIdx === i && <span style={{ color: theme.accent, fontSize: 13, flexShrink: 0 }}>✓</span>}
-                </button>
-              ))}
-            </div>
-          )}
+          {showThemePicker && (() => {
+            const isDarkTheme = ['midnight', 'digitalnative'].includes(theme.id)
+            const pickerBg    = isDarkTheme ? '#16172A' : (theme.surface.startsWith('rgba') ? '#FFFFFF' : theme.surface)
+            const pickerText  = isDarkTheme ? '#E2E8F0' : theme.text
+            const pickerMuted = isDarkTheme ? 'rgba(255,255,255,0.45)' : theme.muted
+            const activeBg    = isDarkTheme ? 'rgba(255,255,255,0.12)' : theme.accentBg
+            return (
+              <div style={{ position: 'absolute', left: 62, bottom: 0, width: 216, background: pickerBg, border: `1px solid ${isDarkTheme ? 'rgba(255,255,255,0.12)' : theme.border}`, borderRadius: 14, padding: '8px 6px', zIndex: 200, boxShadow: '0 8px 40px rgba(0,0,0,0.45)' }}>
+                <p style={{ fontSize: 9, fontWeight: 700, color: pickerMuted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 0 6px 6px' }}>Select Theme</p>
+                {THEMES.map((t, i) => (
+                  <button key={t.id} onClick={() => { setThemeIdx(i); setShowThemePicker(false) }}
+                    style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '7px 8px', borderRadius: 9, border: 'none', background: themeIdx === i ? activeBg : 'transparent', cursor: 'pointer', marginBottom: 2 }}
+                    onMouseEnter={e => { if (themeIdx !== i) e.currentTarget.style.background = isDarkTheme ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }}
+                    onMouseLeave={e => { if (themeIdx !== i) e.currentTarget.style.background = 'transparent' }}>
+                    <div style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, background: `linear-gradient(135deg,${t.heroFrom},${t.heroTo})`, boxShadow: themeIdx === i ? `0 0 0 2px ${t.accent}` : 'none' }} />
+                    <div style={{ textAlign: 'left', flex: 1 }}>
+                      <p style={{ fontSize: 11, fontWeight: themeIdx === i ? 700 : 500, color: pickerText, margin: 0 }}>{t.label}</p>
+                      <p style={{ fontSize: 9, color: pickerMuted, margin: 0 }}>{t.fontFamily.split(',')[0].replace(/'/g,'').trim()}</p>
+                    </div>
+                    {themeIdx === i && <span style={{ color: t.accent, fontSize: 13, flexShrink: 0 }}>✓</span>}
+                  </button>
+                ))}
+              </div>
+            )
+          })()}
         </div>
 
         {/* AI Chat */}
@@ -1571,6 +1951,23 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           <span style={{ fontSize: 9, fontWeight: 500 }}>Canvas</span>
         </button>
       </nav>
+
+      {/* ── Nav collapse toggle — floats at the left edge of the content area ── */}
+      <button
+        onClick={() => setNavCollapsed(v => !v)}
+        title={navCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        style={{
+          position: 'absolute', left: navCollapsed ? 6 : 68, top: '50%', transform: 'translateY(-50%)',
+          zIndex: 60, width: 20, height: 40, borderRadius: 8,
+          background: theme.rail, border: `1px solid ${theme.border}`,
+          color: theme.railText, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          boxShadow: '2px 0 8px rgba(0,0,0,0.2)',
+          transition: 'left 0.22s cubic-bezier(.4,0,.2,1)',
+        }}
+      >
+        {navCollapsed ? <ChevronRight size={11} /> : <ChevronLeft size={11} />}
+      </button>
 
       {/* ── Main Content ──────────────────────────────────────────────────── */}
       <main style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
@@ -1701,7 +2098,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
 
         {/* Above-the-fold compact KPI bar */}
         {kpis.length > 0 && (
-          <div className="vis-no-print" style={{ padding: '5px 28px', background: theme.surface, borderBottom: `1px solid ${theme.border}`, display: 'flex', gap: 20, flexShrink: 0, alignItems: 'center', overflowX: 'auto' }}>
+          <div className="vis-no-print vis-hide-scroll" style={{ padding: '5px 28px', background: theme.surface, borderBottom: `1px solid ${theme.border}`, display: 'flex', gap: 20, flexShrink: 0, alignItems: 'center', overflowX: 'auto' }}>
             <span style={{ fontSize: 9, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', flexShrink: 0 }}>At a glance</span>
             {kpis.slice(0, 5).map(w => {
               const { num, delta } = getKpiMeta(w)
@@ -1750,6 +2147,10 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
             <button onClick={() => setFocusMode(v => !v)}
               style={{ padding: '1px 7px', fontSize: 9, borderRadius: 4, border: `1px solid ${focusMode ? theme.accent : theme.border}`, background: focusMode ? theme.accentBg : 'none', color: focusMode ? theme.accent : theme.muted, cursor: 'pointer' }}>
               {focusMode ? '◎ Focus' : '○ Focus'}
+            </button>
+            <button onClick={() => setComparisonMode(v => !v)} title="Overlay current vs prior period"
+              style={{ padding: '1px 7px', fontSize: 9, borderRadius: 4, border: `1px solid ${comparisonMode ? theme.accent : theme.border}`, background: comparisonMode ? theme.accentBg : 'none', color: comparisonMode ? theme.accent : theme.muted, cursor: 'pointer' }}>
+              ⇆ Compare
             </button>
             <button onClick={() => setShowTicker(v => !v)}
               style={{ padding: '1px 7px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer' }}>
@@ -1856,6 +2257,19 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
 
           {/* Charts area */}
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', background: theme.bg }}>
+            {/* ── Anomaly callout strip ── */}
+            {globalAnomalies.length > 0 && (
+              <div style={{ padding: '6px 20px', background: 'rgba(239,68,68,0.07)', borderBottom: `1px solid rgba(239,68,68,0.18)`, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
+                <span style={{ fontSize: 9, fontWeight: 800, color: '#DC2626', textTransform: 'uppercase', letterSpacing: '0.07em', flexShrink: 0 }}>⚠ Anomalies</span>
+                {globalAnomalies.map((a, i) => (
+                  <button key={i} onClick={() => { setActiveSection('charts'); setTimeout(() => document.getElementById(`vr-chart-${a.widgetId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 80) }}
+                    style={{ padding: '2px 9px', background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 10, fontSize: 10, color: '#DC2626', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <strong>{a.title}</strong>: {a.label} = {Math.abs(a.value) >= 1e3 ? `${(a.value/1e3).toFixed(1)}K` : a.value.toLocaleString()}
+                    <span style={{ opacity: 0.65, fontSize: 9 }}>{a.sigma.toFixed(1)}σ</span>
+                  </button>
+                ))}
+              </div>
+            )}
             {/* Active filter chips */}
             {hasActiveFilters && (
               <div style={{ padding: '6px 20px', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', borderBottom: `1px solid ${theme.border}`, background: `${theme.accent}08`, flexShrink: 0 }}>
@@ -2012,14 +2426,16 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 14 }}>
             {messages.map((msg, i) => {
               const isLatestAI = msg.role === 'assistant' && msg.typing && i === messages.length - 1
-              const bubbleBg = msg.role === 'user' ? '#2563EB' : (theme.id === 'midnight' ? 'rgba(255,255,255,0.08)' : '#F3F4F6')
+              const isDarkTheme = ['midnight', 'digitalnative'].includes(theme.id)
+              const bubbleBg = msg.role === 'user' ? '#2563EB' : (isDarkTheme ? 'rgba(255,255,255,0.10)' : '#F3F4F6')
+              const bubbleText = msg.role === 'user' ? 'white' : theme.text
               return (
                 <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 8 }}>
-                  <div style={{ maxWidth: '90%', padding: '9px 13px', borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '4px 16px 16px 16px', background: bubbleBg, color: msg.role === 'user' ? 'white' : theme.text, fontSize: 13, lineHeight: 1.55 }}>
+                  <div style={{ maxWidth: '90%', padding: '9px 13px', borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '4px 16px 16px 16px', background: bubbleBg, color: bubbleText, fontSize: 13, lineHeight: 1.55 }}>
                     {isLatestAI
                       ? <TypewriterText text={msg.content} active speed={10} />
                       : msg.role === 'assistant'
-                        ? <MarkdownText text={msg.content} color={theme.text} fontSize={13} />
+                        ? <MarkdownText text={msg.content} color={bubbleText} fontSize={13} />
                         : msg.content
                     }
                   </div>
@@ -2061,7 +2477,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                 <div style={{ width: 28, height: 28, borderRadius: '50%', background: 'linear-gradient(135deg,#2563EB,#7C3AED)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <Sparkles size={12} color="white" />
                 </div>
-                <div style={{ padding: '10px 14px', background: theme.id === 'midnight' ? 'rgba(255,255,255,0.08)' : '#F3F4F6', borderRadius: '4px 16px 16px 16px', display: 'flex', gap: 4, alignItems: 'center' }}>
+                <div style={{ padding: '10px 14px', background: ['midnight', 'digitalnative'].includes(theme.id) ? 'rgba(255,255,255,0.10)' : '#F3F4F6', borderRadius: '4px 16px 16px 16px', display: 'flex', gap: 4, alignItems: 'center' }}>
                   {[0, 1, 2].map(d => (
                     <span key={d} style={{ width: 5, height: 5, borderRadius: '50%', background: theme.muted, display: 'inline-block', animation: `visually-pulse 1.2s ease ${d * 0.2}s infinite` }} />
                   ))}

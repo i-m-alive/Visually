@@ -1,5 +1,5 @@
 'use client'
-import { useState, useRef, useEffect, useCallback } from 'react'
+import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { Send, Bot, Loader2, X, Plus, Sparkles } from 'lucide-react'
 import { chatApi, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
@@ -24,6 +24,49 @@ interface Props {
   widgets: CanvasWidgetData[]
   onClose: () => void
   onWidgetAdded: () => void
+}
+
+function inlineRender(text: string): React.ReactNode[] {
+  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/)
+  return parts.map((p, i) => {
+    if (p.startsWith('**') && p.endsWith('**')) return <strong key={i}>{p.slice(2, -2)}</strong>
+    if (p.startsWith('*') && p.endsWith('*')) return <em key={i}>{p.slice(1, -1)}</em>
+    if (p.startsWith('`') && p.endsWith('`')) return <code key={i} style={{ fontFamily: 'monospace', fontSize: '0.88em', background: 'rgba(0,0,0,0.08)', padding: '1px 4px', borderRadius: 3 }}>{p.slice(1, -1)}</code>
+    return p
+  })
+}
+
+function MarkdownText({ text }: { text: string }) {
+  const lines = text.split('\n')
+  const elements: React.ReactNode[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (!line.trim()) { i++; continue }
+    const h3 = line.match(/^###\s+(.+)/)
+    const h2 = line.match(/^##\s+(.+)/)
+    const h1 = line.match(/^#\s+(.+)/)
+    if (h1 || h2 || h3) {
+      const txt = (h1?.[1] ?? h2?.[1] ?? h3?.[1] ?? '').trim()
+      elements.push(<p key={i} style={{ fontSize: h1 ? 13 : 12, fontWeight: 700, color: 'inherit', margin: '8px 0 3px', lineHeight: 1.3 }}>{inlineRender(txt)}</p>)
+      i++; continue
+    }
+    if (/^[•\-\*]\s/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^[•\-\*]\s/.test(lines[i])) { items.push(lines[i].replace(/^[•\-\*]\s+/, '').trim()); i++ }
+      elements.push(<ul key={`ul-${i}`} style={{ margin: '3px 0', paddingLeft: 16, color: 'inherit' }}>{items.map((it, j) => <li key={j} style={{ fontSize: 12, lineHeight: 1.6, marginBottom: 1 }}>{inlineRender(it)}</li>)}</ul>)
+      continue
+    }
+    if (/^\d+\.\s/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push(lines[i].replace(/^\d+\.\s+/, '').trim()); i++ }
+      elements.push(<ol key={`ol-${i}`} style={{ margin: '3px 0', paddingLeft: 18, color: 'inherit' }}>{items.map((it, j) => <li key={j} style={{ fontSize: 12, lineHeight: 1.6, marginBottom: 1 }}>{inlineRender(it)}</li>)}</ol>)
+      continue
+    }
+    elements.push(<p key={i} style={{ fontSize: 12, lineHeight: 1.65, color: 'inherit', margin: '2px 0' }}>{inlineRender(line)}</p>)
+    i++
+  }
+  return <div>{elements}</div>
 }
 
 function buildRecommendations(widgets: CanvasWidgetData[]): string[] {
@@ -191,7 +234,9 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidge
                   ? 'bg-brand text-white rounded-tr-sm'
                   : 'bg-gray-100 text-gray-800 rounded-tl-sm'
               }`}>
-                {msg.content}
+                {msg.role === 'assistant'
+                  ? <MarkdownText text={msg.content} />
+                  : msg.content}
               </div>
 
               {/* Inline chart preview */}

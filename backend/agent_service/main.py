@@ -605,6 +605,7 @@ async def get_dashboard(
     )
     widgets = widgets_result.scalars().all()
 
+    layout_cfg = dashboard.layout_config or {}
     return {
         "id": str(dashboard.id),
         "name": dashboard.name,
@@ -613,6 +614,9 @@ async def get_dashboard(
         "project_id": str(dashboard.project_id),
         "created_at": dashboard.created_at.isoformat(),
         "filter_config": dashboard.filter_config or [],
+        "report_title": layout_cfg.get("report_title"),
+        "page_tabs": layout_cfg.get("page_tabs", []),
+        "colour_theme": layout_cfg.get("colour_theme"),
         "widgets": [
             {
                 "id": str(w.id),
@@ -657,6 +661,30 @@ async def update_dashboard(
     dashboard.updated_at = datetime.utcnow()
     await db.commit()
     return {"id": str(dashboard.id), "name": dashboard.name, "theme": dashboard.theme}
+
+
+class FilterConfigPatch(_BM):
+    filter_config: list = []
+
+
+@app.patch("/dashboards/{dashboard_id}/filter-config")
+async def update_filter_config(
+    dashboard_id: str,
+    body: FilterConfigPatch,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace the filter_config list for a dashboard (used when slicers are edited in the UI)."""
+    result = await db.execute(
+        select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
+    )
+    dashboard = result.scalar_one_or_none()
+    if not dashboard:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+    dashboard.filter_config = body.filter_config
+    dashboard.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"id": dashboard_id, "filter_config": dashboard.filter_config}
 
 
 @app.delete("/dashboards/{dashboard_id}")
@@ -717,13 +745,27 @@ import re as _re
 
 
 def _inject_filters_into_sql(base_sql: str, filters: dict) -> str:
-    """Append WHERE/AND clauses for active filters to a base SQL query."""
+    """Append WHERE/AND clauses for active filters to a base SQL query.
+
+    Supports three value shapes:
+    - list of strings/ints  → single-value = or multi-value IN
+    - {"start": ..., "end": ...} dict → BETWEEN (date range)
+    """
     active = {col: vals for col, vals in filters.items() if vals}
     if not active:
         return base_sql
     clauses = []
     for col, vals in active.items():
         safe_col = _re.sub(r"[^\w.]", "", col)
+        # Date range dict: {"start": "2024-01-01", "end": "2024-12-31"}
+        if isinstance(vals, dict) and "start" in vals and "end" in vals:
+            start = str(vals["start"]).replace("'", "''")
+            end   = str(vals["end"]).replace("'", "''")
+            clauses.append(f"{safe_col} BETWEEN '{start}' AND '{end}'")
+            continue
+        # Normalise: scalar → one-item list
+        if not isinstance(vals, list):
+            vals = [vals]
         safe_vals = [str(v).replace("'", "''") for v in vals]
         if len(safe_vals) == 1:
             clauses.append(f"{safe_col} = '{safe_vals[0]}'")

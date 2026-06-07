@@ -101,6 +101,12 @@ export const dashboardApi = {
   rename: (dashboardId: string, name: string) =>
     api.patch(`/dashboards/${dashboardId}`, { name }),
   delete: (dashboardId: string) => api.delete(`/dashboards/${dashboardId}`),
+  requery: (
+    dashboardId: string,
+    filters: Record<string, string[] | { start: string; end: string }>,
+  ) => api.post(`/dashboards/${dashboardId}/requery`, { filters }),
+  updateFilterConfig: (dashboardId: string, filterConfig: unknown[]) =>
+    api.patch(`/dashboards/${dashboardId}/filter-config`, { filter_config: filterConfig }),
 }
 
 export interface LayoutItem {

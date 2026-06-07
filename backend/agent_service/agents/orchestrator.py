@@ -764,6 +764,17 @@ No explanation. No markdown. Just the JSON array."""
         print(f"[pipeline:{job_id}] calling VisionAgent.process_images ...", flush=True)
         manifest = await vision_agent.process_images(uploaded_images, job_id, redis)
         charts = manifest["charts"]
+        report_metadata: dict = manifest.get(
+            "report_metadata",
+            {"report_title": None, "page_tabs": [], "logo_text": None, "colour_theme": None},
+        )
+        if report_metadata.get("report_title"):
+            print(
+                f"[pipeline:{job_id}] Report metadata → "
+                f"title={report_metadata['report_title']!r}  "
+                f"tabs={[t['name'] for t in report_metadata.get('page_tabs', [])]}",
+                flush=True,
+            )
         print(f"[pipeline:{job_id}] VisionAgent done → {len(charts)} charts detected", flush=True)
         await self._save_manifest(screenshot_job_id, manifest, db)
 
@@ -856,12 +867,18 @@ No explanation. No markdown. Just the JSON array."""
             enriched=enriched,
         )
 
-        # Step 3b: Sample available values for each detected filter column
-        # Uses candidate tables from schema matching to discover the full value set
+        # Step 3b: Resolve filter column names then sample available values.
+        # resolve_all_filters maps vision-generated hints ("employment_type") to real
+        # DB column names using fuzzy scoring against compact_tables — avoids sampling
+        # columns that don't exist in the schema.
         filter_configs: list[dict] = []
         if detected_filters:
-            print(f"[pipeline:{job_id}] ── STEP 3b: Filter value sampling  filters={len(detected_filters)}", flush=True)
+            print(f"[pipeline:{job_id}] ── STEP 3b: Filter column resolution + value sampling  filters={len(detected_filters)}", flush=True)
             from agent_service.agents.value_sampler import sample_distinct_for_filter as _sdf
+            from agent_service.agents.filter_resolver import resolve_all_filters
+
+            resolved_filters = resolve_all_filters(detected_filters, enriched.compact_tables)
+
             candidate_tables: list[str] = []
             for cands in chart_candidates.values():
                 if cands:
@@ -869,21 +886,35 @@ No explanation. No markdown. Just the JSON array."""
                         if t not in candidate_tables:
                             candidate_tables.append(t)
 
-            for flt in detected_filters:
-                col_hint = flt.get("column_hint", "")
-                if not col_hint:
+            for flt in resolved_filters:
+                # Use the schema-resolved column name; fall back to raw hint
+                col_to_use = flt.get("resolved_column") or flt.get("column_hint", "")
+                resolved_table = flt.get("resolved_table")
+                display_name = flt.get("display_name", col_to_use.replace("_", " ").title())
+                if not col_to_use:
                     continue
-                for table in candidate_tables[:5]:
+
+                # If resolver found a specific table, try that first; otherwise try candidates
+                tables_to_try = []
+                if resolved_table:
+                    tables_to_try.append(resolved_table)
+                tables_to_try.extend(t for t in candidate_tables[:5] if t != resolved_table)
+
+                for table in tables_to_try:
                     try:
-                        available_vals = await _sdf(connection_id, table, col_hint)
+                        available_vals = await _sdf(
+                            connection_id, table, col_to_use,
+                            compact_tables=enriched.compact_tables,
+                        )
                         if available_vals:
                             filter_configs.append({
                                 "id": str(uuid.uuid4()),
-                                "column": col_hint,
-                                "display_name": flt.get("display_name", col_hint.replace("_", " ").title()),
+                                "column": col_to_use,
+                                "display_name": display_name,
                                 "filter_type": flt.get("filter_type", "multi_select"),
                                 "available_values": available_vals,
                                 "table": table,
+                                "resolution_score": flt.get("resolution_score", 0.0),
                             })
                             break
                     except Exception:
@@ -1196,6 +1227,8 @@ No explanation. No markdown. Just the JSON array."""
             confirmed_charts=all_charts,
             original_manifest=manifest,
             filter_configs=filter_configs,
+            report_metadata=report_metadata,
+            connection_id=connection_id,
             db=db,
         )
 
@@ -1946,15 +1979,26 @@ No explanation. No markdown. Just the JSON array."""
         original_manifest: dict,
         db: AsyncSession,
         filter_configs: Optional[list[dict]] = None,
+        report_metadata: Optional[dict] = None,
+        connection_id: Optional[str] = None,
     ) -> Optional[Dashboard]:
         """Create a Dashboard + Widgets from confirmed chart replication results."""
         try:
             filter_col_names = [f["column"] for f in (filter_configs or [])]
+            meta = report_metadata or {}
+            dashboard_name = meta.get("report_title") or f"Screenshot Dashboard — {len(confirmed_charts)} charts"
+            layout_config = {
+                "source": "screenshot_replication",
+                "report_title": meta.get("report_title"),
+                "page_tabs": meta.get("page_tabs", []),
+                "logo_text": meta.get("logo_text"),
+                "colour_theme": meta.get("colour_theme"),
+            }
             dashboard = Dashboard(
                 id=uuid.uuid4(),
                 project_id=uuid.UUID(project_id),
-                name=f"Screenshot Dashboard — {len(confirmed_charts)} charts",
-                layout_config={"source": "screenshot_replication"},
+                name=dashboard_name,
+                layout_config=layout_config,
                 filter_config=filter_configs or [],
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
@@ -1984,6 +2028,7 @@ No explanation. No markdown. Just the JSON array."""
                     sql_query=base_sql,
                     base_sql=base_sql,
                     filterable_columns=filter_col_names,
+                    connection_id=uuid.UUID(connection_id) if connection_id else None,
                     position_x=grid.get("x", 0),
                     position_y=grid.get("y", i * 4),
                     width=grid.get("w", 6),

@@ -15,6 +15,78 @@
   }
 }
 
+/* ── Dashboard theme tokens ─────────────────────────────────────────────────── */
+[data-theme="frost"] {
+  --dash-bg: #F3F4F6;
+  --dash-card-bg: #FFFFFF;
+  --dash-card-border: #E5E7EB;
+  --dash-header-bg: #FFFFFF;
+  --dash-header-border: #F3F4F6;
+  --dash-text: #111827;
+  --dash-text-muted: #6B7280;
+  --dash-row-alt: #F9FAFB;
+  --dash-row-text: #374151;
+  --dash-th-bg: #F3F4F6;
+  --dash-table-border: #E5E7EB;
+  --dash-filter-bg: #FFFFFF;
+}
+[data-theme="sage"] {
+  --dash-bg: #F0FDF4;
+  --dash-card-bg: #FFFFFF;
+  --dash-card-border: #BBF7D0;
+  --dash-header-bg: #FFFFFF;
+  --dash-header-border: #D1FAE5;
+  --dash-text: #111827;
+  --dash-text-muted: #4B7A5F;
+  --dash-row-alt: #F0FDF4;
+  --dash-row-text: #374151;
+  --dash-th-bg: #DCFCE7;
+  --dash-table-border: #BBF7D0;
+  --dash-filter-bg: #FFFFFF;
+}
+[data-theme="ember"] {
+  --dash-bg: #FFF7ED;
+  --dash-card-bg: #FFFFFF;
+  --dash-card-border: #FED7AA;
+  --dash-header-bg: #FFFFFF;
+  --dash-header-border: #FFEDD5;
+  --dash-text: #111827;
+  --dash-text-muted: #9A6033;
+  --dash-row-alt: #FFF7ED;
+  --dash-row-text: #374151;
+  --dash-th-bg: #FFEDD5;
+  --dash-table-border: #FED7AA;
+  --dash-filter-bg: #FFFFFF;
+}
+[data-theme="slate"] {
+  --dash-bg: #0F172A;
+  --dash-card-bg: #1E293B;
+  --dash-card-border: #334155;
+  --dash-header-bg: #1E293B;
+  --dash-header-border: #334155;
+  --dash-text: #F1F5F9;
+  --dash-text-muted: #94A3B8;
+  --dash-row-alt: #263348;
+  --dash-row-text: #E2E8F0;
+  --dash-th-bg: #263348;
+  --dash-table-border: #334155;
+  --dash-filter-bg: #1E293B;
+}
+[data-theme="obsidian"] {
+  --dash-bg: #030712;
+  --dash-card-bg: #111827;
+  --dash-card-border: #1F2937;
+  --dash-header-bg: #111827;
+  --dash-header-border: #1F2937;
+  --dash-text: #F9FAFB;
+  --dash-text-muted: #9CA3AF;
+  --dash-row-alt: #1A2332;
+  --dash-row-text: #E5E7EB;
+  --dash-th-bg: #1A2332;
+  --dash-table-border: #1F2937;
+  --dash-filter-bg: #111827;
+}
+
 @layer components {
   .btn-primary {
     @apply bg-brand text-white px-4 py-2 rounded-lg font-medium hover:bg-brand-dark transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
