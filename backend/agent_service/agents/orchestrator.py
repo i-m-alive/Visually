@@ -1253,6 +1253,20 @@ No explanation. No markdown. Just the JSON array."""
         # Tracks whether classify_failure requested an early candidate switch
         _force_switch = False
 
+        # ── Layer 1: Query signature tracking ─────────────────────────────────────
+        # Normalised semantic key — captures tables + metric + date columns, which
+        # are what distinguishes meaningful query variants, not cosmetic SQL text.
+        # Two queries that use the same tables/metric/date → same signature → skip.
+        def _query_signature(cand: Optional[dict]) -> str:
+            if not cand:
+                return ""
+            tables = tuple(sorted(cand.get("tables", [])))
+            key_cols = cand.get("key_columns") or {}
+            return f"{tables}|{key_cols.get('metric', '')}|{key_cols.get('date', '')}"
+
+        tried_signatures: set[str] = set()
+        tried_tables_history: list[dict] = []  # [{tables, failure_reason}] — injected into LLM
+
         # Pre-sample the top candidate's key columns from the live DB (attempt 1 only).
         # This gives the SQL generator real category names, date ranges, and value scales
         # before it writes a single line of SQL — biggest single accuracy lift.
@@ -1285,6 +1299,74 @@ No explanation. No markdown. Just the JSON array."""
                 date_filter_constraint = _bdc(sample_context["actual_date_range"], _date_col)
                 if date_filter_constraint:
                     print(f"[chart:{chart_id}] date constraint: {date_filter_constraint}", flush=True)
+
+        # ── Layer 4: Load previously tried signatures from DB ──────────────────────
+        # The outer verification loop can call _run_chart_replication_loop multiple
+        # times for the same chart. Each call starts fresh — without this load, the
+        # model would repeat all the same failed combinations from the prior pass.
+        try:
+            _prev_q = await db.execute(
+                select(ChartReplicationState).where(
+                    ChartReplicationState.job_id == uuid.UUID(screenshot_job_id),
+                    ChartReplicationState.chart_id == chart_id,
+                )
+            )
+            _prev_state = _prev_q.scalar_one_or_none()
+            if _prev_state and _prev_state.validation_details:
+                _pd = _prev_state.validation_details or {}
+                tried_signatures.update(_pd.get("tried_signatures", []))
+                tried_tables_history.extend(_pd.get("tried_tables_history", []))
+                if tried_signatures:
+                    print(
+                        f"[chart:{chart_id}] ✓ loaded {len(tried_signatures)} prior tried "
+                        f"signatures from DB for cross-retry continuity",
+                        flush=True,
+                    )
+        except Exception as _pe:
+            print(
+                f"[chart:{chart_id}] ⚠ could not load prior exploration state (non-fatal): {_pe}",
+                flush=True,
+            )
+
+        # ── Layer 3: Calendar / date dimension table detection ─────────────────────
+        # Some BI dashboards use a separate date/calendar table as a join target for
+        # time-filtering (the Power BI dim_date pattern). Detect these tables upfront
+        # so they can be injected as last-resort candidates when all standard combos fail.
+        from agent_service.agents.value_sampler import detect_date_tables as _detect_date_tables
+        date_table_candidates: list[dict] = []
+        try:
+            if candidates and hasattr(enriched, "compact_tables"):
+                _detected_dates = _detect_date_tables(enriched.compact_tables)
+                if _detected_dates:
+                    _existing = {t for c in candidates for t in c.get("tables", [])}
+                    _new_date_tbls = [t for t in _detected_dates if t not in _existing]
+                    _fact_table = candidates[0].get("tables", [""])[0] if candidates else ""
+                    for _dt in _new_date_tbls[:2]:
+                        _dtc_cols = dict(candidates[0].get("key_columns") or {}) if candidates else {}
+                        date_table_candidates.append({
+                            "tables": [_fact_table, _dt] if _fact_table else [_dt],
+                            "key_columns": _dtc_cols,
+                            "join": (
+                                f"{_fact_table} JOIN {_dt} USING (<date_key>)"
+                                if _fact_table else _dt
+                            ),
+                            "reasoning": (
+                                f"Calendar/date dimension table '{_dt}' paired with "
+                                f"'{_fact_table}' for Power BI-style date filtering."
+                            ),
+                            "is_date_candidate": True,
+                        })
+                    if date_table_candidates:
+                        print(
+                            f"[chart:{chart_id}] detected date tables: {_detected_dates[:5]} "
+                            f"→ {len(date_table_candidates)} extra candidate(s)",
+                            flush=True,
+                        )
+        except Exception as _de:
+            print(
+                f"[chart:{chart_id}] ⚠ date table detection failed (non-fatal): {_de}",
+                flush=True,
+            )
 
         # Phase 3A: Parallel Candidate Racing ────────────────────────────────
         # When the top two candidates are within 0.20 confidence of each other,
@@ -1386,6 +1468,32 @@ No explanation. No markdown. Just the JSON array."""
 
         for attempt in range(1, max_attempts + 1):
             candidate = _pick_candidate(attempt)
+
+            # ── Signature-aware candidate override (Layers 1 + 3 escalation) ───────
+            # If the picked candidate was already tried this run, advance to the next
+            # untried candidate. When all standard candidates are exhausted at attempt
+            # ≥ 3, escalate to Power BI-style date dimension table candidates (Layer 3).
+            cand_sig = _query_signature(candidate)
+            if cand_sig and cand_sig in tried_signatures:
+                _all_pool = (candidates or []) + date_table_candidates
+                _untried = [c for c in _all_pool if _query_signature(c) not in tried_signatures]
+                if _untried:
+                    candidate = _untried[0]
+                    cand_sig = _query_signature(candidate)
+                    print(
+                        f"[chart:{chart_id}] attempt {attempt} — prior signature hit, "
+                        f"switching to untried candidate: tables={candidate.get('tables', [])}",
+                        flush=True,
+                    )
+                elif attempt >= 3 and date_table_candidates:
+                    candidate = date_table_candidates[0]
+                    cand_sig = _query_signature(candidate)
+                    print(
+                        f"[chart:{chart_id}] all standard candidates exhausted → escalating to "
+                        f"date table candidate: {candidate.get('tables', [])}",
+                        flush=True,
+                    )
+
             strategy = (
                 "initial" if attempt == 1
                 else "refine_sql" if attempt == 2
@@ -1427,6 +1535,9 @@ No explanation. No markdown. Just the JSON array."""
                     return {**best_result, "status": "low_confidence", "score": best_score}
                 break
 
+            # Mark this candidate's signature as in-progress (Layer 1)
+            tried_signatures.add(cand_sig)
+
             # Generate SQL using current candidate tables
             try:
                 await self._update_replication_state(
@@ -1442,6 +1553,7 @@ No explanation. No markdown. Just the JSON array."""
                     date_filter_constraint=date_filter_constraint,
                     error_recovery_mode=error_recovery_mode,
                     dashboard_date_context=dashboard_date_context,
+                    previously_tried=tried_tables_history[-4:] if tried_tables_history else None,
                 )
             except Exception as e:
                 retry_feedback = f"SQL generation failed: {str(e)}. Try a simpler query."
@@ -1473,9 +1585,18 @@ No explanation. No markdown. Just the JSON array."""
                 elif consecutive_error_counts.get("db_error", 0) >= 2:
                     error_recovery_mode = "no_union_order"
                     print(f"[chart:{chart_id}] ⚠ repeated db_error → no-union-order recovery mode", flush=True)
+                tried_tables_history.append({
+                    "tables": candidate.get("tables", []) if candidate else [],
+                    "failure_reason": f"sql_error:{failure['failure_type']}",
+                })
                 await self._update_replication_state(
                     screenshot_job_id, chart_id, "retrying", attempt,
-                    query_plan["sql"], None, None, db
+                    query_plan["sql"], None,
+                    {
+                        "tried_signatures": list(tried_signatures),
+                        "tried_tables_history": tried_tables_history[-8:],
+                    },
+                    db,
                 )
                 continue
 
@@ -1515,7 +1636,13 @@ No explanation. No markdown. Just the JSON array."""
             await self._update_replication_state(
                 screenshot_job_id, chart_id,
                 "confirmed" if validation["passed"] else "retrying",
-                attempt, query_plan["sql"], score, validation, db
+                attempt, query_plan["sql"], score,
+                {
+                    **validation,
+                    "tried_signatures": list(tried_signatures),
+                    "tried_tables_history": tried_tables_history[-8:],
+                },
+                db,
             )
 
             print(f"[chart:{chart_id}] validation score={score:.2f}  passed={validation['passed']}  dims={validation['dimension_scores']}", flush=True)
@@ -1610,6 +1737,11 @@ No explanation. No markdown. Just the JSON array."""
             if validation.get("value_mismatch"):
                 extra += f" Value mismatch: {validation['value_mismatch']}"
             retry_feedback = failure["retry_instruction"] + f" ({extra})"
+
+            tried_tables_history.append({
+                "tables": candidate.get("tables", []) if candidate else [],
+                "failure_reason": f"low_score:{score:.2f} weakest:{weakest}",
+            })
 
             # Option 1: Multi-aggregation probe on attempt 1 when value_match is low.
             # Run COUNT/SUM/AVG/COUNT-DISTINCT in parallel and prepend the winning

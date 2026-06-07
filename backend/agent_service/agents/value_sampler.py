@@ -451,3 +451,61 @@ def _fuzzy_match(db_value: str, vision_label: str, threshold: float = 0.55) -> b
         return db_value.lower().strip() == vision_label.lower().strip()
     union = dw | vw
     return len(dw & vw) / len(union) >= threshold if union else False
+
+
+# ── Calendar / date dimension table detection (Layer 3) ───────────────────────
+# Common naming patterns for date dimension / calendar tables in BI databases.
+# These follow the Power BI / data-warehouse convention where a dedicated date
+# table is joined as a regular table for time-filtering rather than filtering
+# raw date columns directly (e.g.  WHERE date_table.year = 2024 instead of
+# WHERE EXTRACT(year FROM orders.order_date) = 2024).
+_DATE_DIM_PATTERNS = (
+    "dim_date", "date_dim", "calendar", "time_dim", "dim_time",
+    "date_table", "fiscal_calendar", "dim_calendar", "tbl_date",
+    "dim_day", "day_dim", "date_range", "date_master", "date_lookup",
+)
+
+# Column names that strongly suggest a table IS a date dimension table
+_DATE_DIM_COLUMN_SIGNALS = (
+    "date_key", "full_date", "calendar_date", "fiscal_year",
+    "fiscal_quarter", "week_number", "day_of_week", "is_weekend",
+    "is_holiday", "quarter_name", "month_name", "year_number",
+    "day_name", "month_number", "week_of_year", "day_of_month",
+)
+
+
+def _looks_like_date_table(table: dict) -> bool:
+    """Return True when a table's column names strongly suggest it is a date dimension."""
+    columns = [
+        (col.get("name") or "").lower()
+        for col in (table.get("columns") or [])
+    ]
+    if not columns:
+        return False
+    matches = sum(
+        1 for c in columns
+        if any(sig in c for sig in _DATE_DIM_COLUMN_SIGNALS)
+    )
+    return matches >= 3
+
+
+def detect_date_tables(compact_tables: list) -> list:
+    """
+    Scan a schema's compact_tables list for date dimension / calendar tables.
+    Returns table names that look like date dimensions.
+
+    Each entry in compact_tables must be a dict with at least:
+      {"name": str, "columns": [{"name": str, ...}, ...]}
+
+    Used by the orchestrator to build last-resort candidates when all standard
+    table combinations have been exhausted (Power BI calendar-table pattern).
+    """
+    results = []
+    for table in compact_tables:
+        name = (table.get("name") or "").lower()
+        if any(pat in name for pat in _DATE_DIM_PATTERNS):
+            results.append(table["name"])
+            continue
+        if _looks_like_date_table(table):
+            results.append(table["name"])
+    return results

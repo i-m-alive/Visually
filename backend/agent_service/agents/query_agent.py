@@ -172,6 +172,7 @@ class QueryAgent:
         date_filter_constraint: Optional[str] = None,  # hard WHERE date constraint from sampler
         error_recovery_mode: Optional[str] = None,     # "no_alias" | "no_union_order"
         dashboard_date_context: Optional[dict] = None, # global date window across all charts
+        previously_tried: Optional[list] = None,       # [{tables, failure_reason}] — Layer 2 exploration
     ) -> dict:
         """
         Generate SQL from a Vision Agent ChartSpec (screenshot replication mode).
@@ -358,6 +359,29 @@ class QueryAgent:
             }
             user_content["instruction"] += (
                 " ERROR RECOVERY (no-union-order mode): wrap UNION in a subquery, ORDER BY outside only."
+            )
+
+        # ── Layer 2: Previously tried table combinations ─────────────────────────
+        # Injected by the orchestrator from tried_tables_history. The LLM must
+        # explore a NEW set of tables / joins not present in this list.
+        if previously_tried:
+            _tried_entries = previously_tried[-4:]  # last 4 only — context cost
+            _tried_summary = "; ".join(
+                "tables={} reason={}".format(
+                    p.get("tables", []),
+                    (p.get("failure_reason") or "failed")[:80],
+                )
+                for p in _tried_entries
+            )
+            user_content["previously_tried_combinations"] = _tried_entries
+            user_content["instruction"] += (
+                f" EXPLORATION REQUIRED: {len(_tried_entries)} table combination(s) have ALREADY "
+                f"been tried and FAILED — {_tried_summary}. "
+                "You MUST use a DIFFERENT set of tables and/or join keys. "
+                "Look for alternative paths: different fact tables, different join keys, "
+                "sub-queries, CTEs, or a completely different aggregation grain that "
+                "avoids the failed combinations entirely. "
+                "Repeating a failed combination will guarantee another retry."
             )
 
         raw = await bedrock_invoke(
