@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import {
   X, Send, Loader2, Plus, BarChart2, Table2, Sparkles,
   LayoutGrid, MessageSquare, ChevronRight, TrendingUp, TrendingDown,
-  CheckCircle2, Copy, List, Sun, Moon, Zap,
+  CheckCircle2, Copy, List, Sun, Moon, Zap, Info, ChevronDown, ChevronUp,
 } from 'lucide-react'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import { chatApi, canvasApi, type WidgetCreate } from '@/lib/api'
@@ -90,6 +90,30 @@ function TypewriterText({ text, active, speed = 10 }: { text: string; active: bo
     return () => clearInterval(id)
   }, [text, active, speed])
   return <>{shown}</>
+}
+
+function SqlToggleSection({ sql, theme }: { sql: string; theme: Theme }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <button onClick={() => setOpen(v => !v)} style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '7px 10px',
+        background: 'transparent', border: `1px solid ${theme.border}`, borderRadius: 8,
+        fontSize: 11, fontWeight: 600, color: theme.muted, cursor: 'pointer', width: '100%', textAlign: 'left',
+      }}>
+        {open ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+        View SQL Query
+      </button>
+      {open && (
+        <pre style={{
+          marginTop: 6, padding: '10px 12px', background: theme.bg, border: `1px solid ${theme.border}`,
+          borderRadius: 8, fontSize: 10.5, color: theme.text, overflowX: 'auto', overflowY: 'auto',
+          lineHeight: 1.55, fontFamily: '"SF Mono","JetBrains Mono",monospace', maxHeight: 200,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0,
+        }}>{sql}</pre>
+      )}
+    </div>
+  )
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -193,6 +217,12 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const [execSummary, setExecSummary]   = useState('')
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [summaryExpanded, setSummaryExpanded] = useState(true)
+  // Info panel state
+  const [infoWidgetId, setInfoWidgetId]           = useState<string | null>(null)
+  const [widgetDescriptions, setWidgetDescriptions] = useState<Record<string, string>>({})
+  const [descLoading, setDescLoading]             = useState<Record<string, boolean>>({})
+  // Table accordion state — tables are collapsed by default
+  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
   const endRef    = useRef<HTMLDivElement>(null)
   const toastRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -214,8 +244,12 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
       @keyframes visually-pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
       @keyframes visually-gradient { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
       @keyframes visually-fadeIn { from{opacity:0} to{opacity:1} }
+      @keyframes visually-spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
       .vis-card { transition: transform 0.18s ease, box-shadow 0.18s ease; cursor: default; }
       .vis-card:hover { transform: translateY(-3px); box-shadow: 0 12px 32px rgba(0,0,0,0.13) !important; }
+      .vis-info-btn { opacity: 0; transition: opacity 0.15s, border-color 0.15s, color 0.15s; }
+      .vis-card:hover .vis-info-btn { opacity: 1; }
+      .vis-info-btn.active { opacity: 1; }
     `
     document.head.appendChild(s)
     return () => { document.getElementById(id)?.remove() }
@@ -230,11 +264,14 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        if (infoWidgetId) { setInfoWidgetId(null); return }
+        onClose()
+      }
       if (e.key === '1') setActiveSection('overview')
       if (e.key === '2' && visualCharts.length > 0) setActiveSection('charts')
       if (e.key === '3' && tables.length > 0) setActiveSection('data')
-      if (e.key === 'c' || e.key === 'C') setShowChat(v => !v)
+      if (e.key === 'c' || e.key === 'C') { setInfoWidgetId(null); setShowChat(v => !v) }
       if (e.key === 't' || e.key === 'T') setThemeIdx(v => (v + 1) % THEMES.length)
     }
     window.addEventListener('keydown', h)
@@ -356,6 +393,30 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     } catch { showToast('Could not copy — try a different browser') }
   }, [theme.id, showToast])
 
+  // ── Open info panel for a widget ─────────────────────────────────────────
+  const openInfo = useCallback(async (w: CanvasWidgetData) => {
+    setInfoWidgetId(w.id)
+    if (widgetDescriptions[w.id] || descLoading[w.id]) return
+    setDescLoading(prev => ({ ...prev, [w.id]: true }))
+    try {
+      const kpiNote = ['kpi', 'kpi_card'].includes(w.chart_type) ? (() => {
+        const { num, delta } = getKpiMeta(w)
+        return ` Current value: ${num.toLocaleString()}.${delta ? ` ${delta.up ? 'Up' : 'Down'} ${delta.pct.toFixed(1)}% vs prior.` : ''}`
+      })() : ''
+      const resp = await chatApi.send({
+        session_id: `info-${w.id}-${canvas.id}`,
+        message: `Chart: "${w.title}" (type: ${w.chart_type}).${w.sql_query ? ` SQL: ${w.sql_query}` : ''}${kpiNote}\n\nWrite a 3-sentence insight note: (1) what does this ${w.chart_type} specifically measure, (2) what is the key signal or trend visible in the data, (3) what business action this metric suggests. Be specific to the numbers. Prose only — no bullet points or headers.`,
+        project_id: projectId,
+        connection_id: connectionId,
+      })
+      setWidgetDescriptions(prev => ({ ...prev, [w.id]: resp.data?.text ?? 'Unable to generate insight.' }))
+    } catch {
+      setWidgetDescriptions(prev => ({ ...prev, [w.id]: `This ${w.chart_type} displays ${w.title} from your connected database.` }))
+    } finally {
+      setDescLoading(prev => ({ ...prev, [w.id]: false }))
+    }
+  }, [widgetDescriptions, descLoading, projectId, connectionId, canvas.id])
+
   // ── Shared styles ────────────────────────────────────────────────────────
   const cardBase: React.CSSProperties = {
     background: theme.surface, borderRadius: 16, padding: '18px 20px',
@@ -376,12 +437,28 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     const { num, spark, delta } = getKpiMeta(w)
     const hasValues = spark.length > 0
     const borderColor = delta ? (delta.up ? '#16A34A' : '#DC2626') : theme.accent
+    const isInfoOpen = infoWidgetId === w.id
     return (
       <div key={w.id} id={`vr-kpi-${w.id}`} className="vis-card"
         onContextMenu={e => { e.preventDefault(); copyAsPng(`vr-kpi-${w.id}`) }}
-        style={{ ...cardBase, animationDelay: `${idx * 60}ms`, borderLeft: `3px solid ${borderColor}` }}
+        style={{ ...cardBase, animationDelay: `${idx * 60}ms`, borderLeft: `3px solid ${borderColor}`, position: 'relative' }}
       >
-        <p style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 0 6px' }}>{w.title}</p>
+        {/* Info button — appears on hover or when panel is open */}
+        <button
+          onClick={(e) => { e.stopPropagation(); openInfo(w) }}
+          title="Explain this metric"
+          className={`vis-info-btn${isInfoOpen ? ' active' : ''}`}
+          style={{
+            position: 'absolute', top: 10, right: 10,
+            width: 22, height: 22, borderRadius: '50%', padding: 0,
+            background: isInfoOpen ? theme.accentBg : 'transparent',
+            border: `1px solid ${isInfoOpen ? theme.accent : theme.border}`,
+            color: isInfoOpen ? theme.accent : theme.muted,
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        ><Info size={11} /></button>
+
+        <p style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 0 6px', paddingRight: 26 }}>{w.title}</p>
         {hasValues ? (
           <>
             <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 8 }}>
@@ -407,24 +484,41 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   }
 
   // ── Chart card renderer ──────────────────────────────────────────────────
-  const renderChart = (w: CanvasWidgetData, idx: number, h = 220) => (
-    <div key={w.id} id={`vr-chart-${w.id}`} className="vis-card"
-      onContextMenu={e => { e.preventDefault(); copyAsPng(`vr-chart-${w.id}`) }}
-      style={{ ...cardBase, animationDelay: `${idx * 60}ms` }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <p style={{ fontSize: 13, fontWeight: 700, color: theme.text, margin: 0 }}>{w.title}</p>
-        <button onClick={() => copyAsPng(`vr-chart-${w.id}`)} title="Copy as PNG (right-click)"
-          style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 3, color: theme.muted, opacity: 0.45 }}
-          onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-          onMouseLeave={e => (e.currentTarget.style.opacity = '0.45')}
-        ><Copy size={12} /></button>
+  const renderChart = (w: CanvasWidgetData, idx: number, h = 220) => {
+    const isInfoOpen = infoWidgetId === w.id
+    return (
+      <div key={w.id} id={`vr-chart-${w.id}`} className="vis-card"
+        onContextMenu={e => { e.preventDefault(); copyAsPng(`vr-chart-${w.id}`) }}
+        style={{ ...cardBase, animationDelay: `${idx * 60}ms` }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, gap: 8 }}>
+          <p style={{ fontSize: 13, fontWeight: 700, color: theme.text, margin: 0, flex: 1 }}>{w.title}</p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            {/* Info button */}
+            <button onClick={(e) => { e.stopPropagation(); openInfo(w) }} title="Explain this chart"
+              className={`vis-info-btn${isInfoOpen ? ' active' : ''}`}
+              style={{
+                width: 24, height: 24, borderRadius: '50%', padding: 0,
+                background: isInfoOpen ? theme.accentBg : 'transparent',
+                border: `1px solid ${isInfoOpen ? theme.accent : theme.border}`,
+                color: isInfoOpen ? theme.accent : theme.muted,
+                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}
+            ><Info size={12} /></button>
+            {/* Copy button */}
+            <button onClick={() => copyAsPng(`vr-chart-${w.id}`)} title="Copy as PNG"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 3, color: theme.muted, opacity: 0.45 }}
+              onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+              onMouseLeave={e => (e.currentTarget.style.opacity = '0.45')}
+            ><Copy size={12} /></button>
+          </div>
+        </div>
+        {w.chart_data
+          ? <ChartRenderer result={toChartResult(w)} height={h} />
+          : <div style={{ height: h, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>}
       </div>
-      {w.chart_data
-        ? <ChartRenderer result={toChartResult(w)} height={h} />
-        : <div style={{ height: h, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>}
-    </div>
-  )
+    )
+  }
 
   // ── Section content ──────────────────────────────────────────────────────
   const renderContent = () => {
@@ -495,20 +589,86 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           </div>
         )}
 
-        {/* Data tables */}
+        {/* Data tables — accordion: collapsed by default, click header to expand */}
         {(activeSection === 'overview' || activeSection === 'data') && tables.length > 0 && (
           <div>
             {activeSection === 'overview' && <p style={secLabel}>Data Tables</p>}
-            {tables.map((w, i) => (
-              <div key={w.id} id={`vr-table-${w.id}`} className="vis-card"
-                style={{ ...cardBase, animationDelay: `${i * 80}ms`, marginBottom: 16 }}
-              >
-                <p style={{ fontSize: 13, fontWeight: 700, color: theme.text, margin: '0 0 12px' }}>{w.title}</p>
-                {w.chart_data
-                  ? <ChartRenderer result={toChartResult(w)} height={260} />
-                  : <div style={{ height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>}
+            {activeSection === 'data' && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                <p style={secLabel}>Data Tables ({tables.length})</p>
+                <button
+                  onClick={() => setExpandedTables(prev => {
+                    if (prev.size === tables.length) return new Set()
+                    return new Set(tables.map(t => t.id))
+                  })}
+                  style={{ fontSize: 11, fontWeight: 600, color: theme.accent, background: 'none', border: 'none', cursor: 'pointer', padding: '2px 0' }}
+                >
+                  {expandedTables.size === tables.length ? 'Collapse all' : 'Expand all'}
+                </button>
               </div>
-            ))}
+            )}
+            {tables.map((w, i) => {
+              const isExpanded = expandedTables.has(w.id)
+              const isInfoOpen = infoWidgetId === w.id
+              const rows = (w.chart_data?.rows as Record<string, unknown>[] | undefined) ?? []
+              return (
+                <div key={w.id} id={`vr-table-${w.id}`} className="vis-card"
+                  style={{ ...cardBase, animationDelay: `${i * 80}ms`, marginBottom: 10, padding: 0, overflow: 'hidden' }}
+                >
+                  {/* Accordion header */}
+                  <div
+                    onClick={() => setExpandedTables(prev => {
+                      const next = new Set(prev)
+                      if (next.has(w.id)) next.delete(w.id); else next.add(w.id)
+                      return next
+                    })}
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      padding: '13px 16px', cursor: 'pointer', userSelect: 'none',
+                      borderBottom: isExpanded ? `1px solid ${theme.border}` : 'none',
+                      transition: 'background 0.15s',
+                    }}
+                    onMouseEnter={e => (e.currentTarget.style.background = theme.bg)}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <Table2 size={14} color={theme.accent} />
+                      <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>{w.title}</span>
+                      {rows.length > 0 && (
+                        <span style={{ padding: '2px 7px', background: theme.accentBg, border: `1px solid ${theme.border}`, borderRadius: 10, fontSize: 10, fontWeight: 600, color: theme.accent }}>
+                          {rows.length} rows
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={e => e.stopPropagation()}>
+                      {/* Info button */}
+                      <button onClick={() => openInfo(w)} title="Explain this table"
+                        className={`vis-info-btn${isInfoOpen ? ' active' : ''}`}
+                        style={{
+                          width: 24, height: 24, borderRadius: '50%', padding: 0,
+                          background: isInfoOpen ? theme.accentBg : 'transparent',
+                          border: `1px solid ${isInfoOpen ? theme.accent : theme.border}`,
+                          color: isInfoOpen ? theme.accent : theme.muted,
+                          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        }}
+                      ><Info size={12} /></button>
+                      <div onClick={e => { e.stopPropagation(); setExpandedTables(prev => { const next = new Set(prev); if (next.has(w.id)) next.delete(w.id); else next.add(w.id); return next }) }}
+                        style={{ color: theme.muted, display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                        {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                      </div>
+                    </div>
+                  </div>
+                  {/* Accordion body */}
+                  {isExpanded && (
+                    <div style={{ padding: '4px 0 8px' }}>
+                      {w.chart_data
+                        ? <ChartRenderer result={toChartResult(w)} height={260} />
+                        : <div style={{ height: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', color: theme.muted, fontSize: 12 }}>No data</div>}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         )}
       </div>
@@ -561,7 +721,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
         </button>
 
         {/* AI Chat */}
-        <button onClick={() => setShowChat(v => !v)} style={{
+        <button onClick={() => { setInfoWidgetId(null); setShowChat(v => !v) }} style={{
           width: 52, minHeight: 48, borderRadius: 12, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'center', gap: 3,
           background: showChat ? theme.railActive : 'transparent',
@@ -679,9 +839,103 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
         </div>
       </main>
 
-      {/* ── Right Chat Panel ──────────────────────────────────────────────── */}
-      {showChat && (
-        <aside style={{ width: 360, background: theme.surface, borderLeft: `1px solid ${theme.border}`, display: 'flex', flexDirection: 'column', flexShrink: 0, boxShadow: '-4px 0 20px rgba(0,0,0,0.07)' }}>
+      {/* ── Right Panel: Info or Chat ─────────────────────────────────────── */}
+      {(infoWidgetId !== null || showChat) && (
+        <aside style={{ width: 360, background: theme.surface, borderLeft: `1px solid ${theme.border}`, display: 'flex', flexDirection: 'column', flexShrink: 0, boxShadow: '-4px 0 20px rgba(0,0,0,0.07)', animation: 'visually-slideUp 0.22s ease both' }}>
+
+        {/* ── Info Panel (shown when a widget's ⓘ was clicked) ─────────── */}
+        {infoWidgetId !== null && (() => {
+          const iw = widgets.find(w => w.id === infoWidgetId)
+          if (!iw) return null
+          const isKpi = ['kpi', 'kpi_card'].includes(iw.chart_type)
+          const kpiM = isKpi ? getKpiMeta(iw) : null
+          const desc = widgetDescriptions[iw.id]
+          const loading = descLoading[iw.id]
+          return (
+            <>
+              {/* Header */}
+              <div style={{ padding: '14px 16px', borderBottom: `1px solid ${theme.border}`, flexShrink: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ width: 34, height: 34, borderRadius: 10, background: theme.accentBg, border: `1px solid ${theme.accent}44`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Info size={16} color={theme.accent} />
+                    </div>
+                    <div>
+                      <p style={{ fontSize: 14, fontWeight: 700, color: theme.text, margin: 0 }}>Widget Insight</p>
+                      <p style={{ fontSize: 10, color: theme.muted, margin: 0, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{iw.chart_type}</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setInfoWidgetId(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: theme.muted, padding: 4 }}><X size={15} /></button>
+                </div>
+              </div>
+
+              {/* Body */}
+              <div style={{ flex: 1, overflowY: 'auto', padding: '18px 16px' }}>
+                <h3 style={{ fontSize: 15, fontWeight: 700, color: theme.text, margin: '0 0 10px', lineHeight: 1.35 }}>{iw.title}</h3>
+                <span style={{ padding: '3px 9px', background: theme.accentBg, border: `1px solid ${theme.border}`, borderRadius: 8, fontSize: 10, fontWeight: 700, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.06em', display: 'inline-block', marginBottom: 18 }}>{iw.chart_type}</span>
+
+                {/* AI Description */}
+                <div style={{ marginBottom: 20 }}>
+                  <p style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.07em', margin: '0 0 8px' }}>What this measures</p>
+                  {loading ? (
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '10px 0' }}>
+                      <Loader2 size={13} style={{ color: theme.accent, animation: 'visually-spin 1s linear infinite' }} />
+                      <span style={{ fontSize: 12, color: theme.muted }}>Generating insight…</span>
+                    </div>
+                  ) : desc ? (
+                    <p style={{ fontSize: 13, color: theme.text, lineHeight: 1.7, margin: 0 }}>{desc}</p>
+                  ) : (
+                    <p style={{ fontSize: 13, color: theme.muted, lineHeight: 1.7, margin: 0 }}>Insight will appear here once loaded.</p>
+                  )}
+                </div>
+
+                {/* KPI current state */}
+                {isKpi && kpiM && (
+                  <div style={{ marginBottom: 20, padding: '12px 14px', background: theme.bg, borderRadius: 12, border: `1px solid ${theme.border}` }}>
+                    <p style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.07em', margin: '0 0 8px' }}>Current Value</p>
+                    <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+                      <p style={{ fontSize: 30, fontWeight: 800, color: theme.text, margin: 0, fontFamily: '"SF Mono","JetBrains Mono",monospace', fontVariantNumeric: 'tabular-nums' }}>
+                        {kpiM.num.toLocaleString()}
+                      </p>
+                      {kpiM.spark.length >= 2 && (
+                        <Sparkline data={kpiM.spark} color={kpiM.delta?.up === false ? '#DC2626' : '#16A34A'} width={72} height={32} />
+                      )}
+                    </div>
+                    {kpiM.delta && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 6 }}>
+                        {kpiM.delta.up ? <TrendingUp size={11} color="#16A34A" /> : <TrendingDown size={11} color="#DC2626" />}
+                        <span style={{ fontSize: 12, fontWeight: 600, color: kpiM.delta.up ? '#16A34A' : '#DC2626' }}>
+                          {kpiM.delta.pct.toFixed(1)}% vs prior period
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* SQL toggle */}
+                {iw.sql_query && <SqlToggleSection sql={iw.sql_query} theme={theme} />}
+              </div>
+
+              {/* Footer */}
+              <div style={{ padding: '12px 16px', borderTop: `1px solid ${theme.border}`, display: 'flex', gap: 8, flexShrink: 0 }}>
+                <button
+                  onClick={() => {
+                    const q = `Tell me more about "${iw.title}" — what's driving this and what should I do about it?`
+                    setInfoWidgetId(null)
+                    setShowChat(true)
+                    setInput(q)
+                  }}
+                  style={{ flex: 1, padding: '9px 0', background: 'linear-gradient(135deg,#2563EB,#7C3AED)', border: 'none', borderRadius: 10, fontSize: 12, fontWeight: 700, color: 'white', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                >
+                  <MessageSquare size={13} /> Ask AI about this
+                </button>
+              </div>
+            </>
+          )
+        })()}
+
+        {/* ── Chat Panel (shown when no info panel) ────────────────────── */}
+        {infoWidgetId === null && showChat && <>
 
           {/* Chat header */}
           <div style={{ padding: '14px 16px', borderBottom: `1px solid ${theme.border}`, flexShrink: 0 }}>
@@ -795,6 +1049,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               1/2/3 sections · C copilot · T theme · Esc back
             </p>
           </div>
+        </>}
         </aside>
       )}
 
