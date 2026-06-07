@@ -24,9 +24,11 @@ interface Props {
   compact?: boolean
   colors?: string[]
   height?: number
+  showAnomalies?: boolean
+  anomalyIndices?: number[]
 }
 
-export function ChartRenderer({ result, compact = false, colors, height: heightProp }: Props) {
+export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [] }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
   if (!result) return null
   const { chart_type, title, x_axis_label, y_axis_label, chart_data } = result
@@ -296,6 +298,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
 
   // ── Line ──────────────────────────────────────────────────────────────────────
   if (ct === 'line') {
+    const anomalySet = new Set(anomalyIndices)
     return (
       <ResponsiveContainer width="100%" height={height}>
         <LineChart data={rechartData}>
@@ -303,7 +306,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
           <XAxis dataKey={xKey} label={{ value: x_axis_label, position: 'insideBottom', offset: -5 }} tick={{ fontSize: 11 }} />
           <YAxis label={{ value: y_axis_label, angle: -90, position: 'insideLeft' }} tick={{ fontSize: 11 }} />
           <Tooltip />
-          <Line type="monotone" dataKey={yKey} stroke={COLORS[0]} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey={yKey} stroke={COLORS[0]} strokeWidth={2}
+            dot={showAnomalies ? (props: Record<string, unknown>) => {
+              const idx = props.index as number
+              if (!anomalySet.has(idx)) return <circle key={idx} cx={props.cx as number} cy={props.cy as number} r={0} fill="none" />
+              return <circle key={idx} cx={props.cx as number} cy={props.cy as number} r={5} fill="#EF4444" stroke="white" strokeWidth={1.5} />
+            } : false}
+          />
         </LineChart>
       </ResponsiveContainer>
     )
@@ -361,15 +370,38 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
 
   // ── Horizontal bar ────────────────────────────────────────────────────────────
   if (ct === 'bar_horizontal') {
-    const barH = Math.max(height, rechartData.length * 28)
+    // Dynamically size the Y-axis label column so long names like
+    // "Commercial Lines Account Manager" don't wrap into adjacent bars.
+    const longestLabel = rechartData.reduce((max, row) => {
+      const label = String(row[xKey] ?? '')
+      return label.length > max ? label.length : max
+    }, 0)
+    // ~6.5px per character, capped at 220px, minimum 120px
+    const yAxisWidth = Math.min(220, Math.max(120, longestLabel * 6.5))
+    const maxChars = Math.floor(yAxisWidth / 6.5)
+
+    // Custom tick: truncates long labels with ellipsis; SVG <title> shows full text on hover
+    const HorizontalYTick = ({ x, y, payload }: { x?: number; y?: number; payload?: { value: string } }) => {
+      const full = String(payload?.value ?? '')
+      const display = full.length > maxChars ? full.slice(0, maxChars - 1) + '…' : full
+      return (
+        <g transform={`translate(${x},${y})`}>
+          <title>{full}</title>
+          <text x={0} y={0} dy={4} textAnchor="end" fontSize={11} fill="#6B7280">{display}</text>
+        </g>
+      )
+    }
+
+    // Give each bar at least 34px of vertical space to avoid crowding
+    const barH = Math.max(height, rechartData.length * 34)
     return (
       <ResponsiveContainer width="100%" height={barH}>
-        <BarChart data={rechartData} layout="vertical">
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis type="number" tick={{ fontSize: 11 }} />
-          <YAxis dataKey={xKey} type="category" width={110} tick={{ fontSize: 11 }} />
-          <Tooltip />
-          <Bar dataKey={yKey}>
+        <BarChart data={rechartData} layout="vertical" margin={{ left: 8, right: 16, top: 4, bottom: 4 }}>
+          <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+          <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+          <YAxis dataKey={xKey} type="category" width={yAxisWidth} tick={<HorizontalYTick />} axisLine={false} tickLine={false} />
+          <Tooltip formatter={(v: number) => v.toLocaleString()} />
+          <Bar dataKey={yKey} radius={[0, 3, 3, 0]} maxBarSize={26}>
             {rechartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
           </Bar>
         </BarChart>
@@ -1494,6 +1526,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   }
 
   // ── Bar (vertical, default — also handles bar_vertical) ──────────────────────
+  const anomalySet = new Set(anomalyIndices)
   return (
     <ResponsiveContainer width="100%" height={height}>
       <BarChart data={rechartData}>
@@ -1502,7 +1535,9 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
         <YAxis tick={{ fontSize: 11 }} />
         <Tooltip />
         <Bar dataKey={yKey} radius={[3, 3, 0, 0]}>
-          {rechartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+          {rechartData.map((_, i) => (
+            <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />
+          ))}
         </Bar>
       </BarChart>
     </ResponsiveContainer>
