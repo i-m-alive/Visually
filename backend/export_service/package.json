@@ -1,0 +1,12 @@
+{
+  "name": "visually-export-service",
+  "version": "1.0.0",
+  "description": "Export service for Visually — produces standalone HTML dashboard exports",
+  "private": true,
+  "scripts": {
+    "start": "uvicorn export_service.main:app --host 0.0.0.0 --port 8005 --reload"
+  },
+  "dependencies": {
+    "puppeteer-core": "^22.0.0"
+  }
+}
