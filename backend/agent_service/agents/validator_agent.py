@@ -12,6 +12,48 @@ RETRY_STRATEGIES = {
     1: "adjust_aggregation",
     2: "alternate_table",
     3: "expand_join",
+    4: "broaden_query",
+}
+
+# Maps any chart type string (from vision OR SQL) to its canonical family name.
+# Both sides get canonicalized before comparison, so "column" vs "bar_vertical"
+# both map to "bar_vertical" and score 1.0 instead of 0.0.
+_CHART_TYPE_CANONICAL: dict[str, str] = {
+    # bar_vertical family
+    "bar": "bar_vertical", "bar_chart": "bar_vertical", "bar_vertical": "bar_vertical",
+    "column": "bar_vertical", "column_chart": "bar_vertical",
+    "stacked_bar": "bar_vertical", "stacked_bar_100": "bar_vertical",
+    "stacked_column": "bar_vertical", "grouped_bar": "bar_vertical",
+    "waterfall": "bar_vertical", "histogram": "bar_vertical",
+    # bar_horizontal family
+    "bar_horizontal": "bar_horizontal", "horizontal_bar": "bar_horizontal",
+    "stacked_bar_horizontal": "bar_horizontal",
+    # line family (area/combo share same data structure)
+    "line": "line", "line_chart": "line", "area": "line",
+    "stacked_area": "line", "combo": "line",
+    # pie family
+    "pie": "pie", "pie_chart": "pie", "donut": "pie", "sunburst": "pie",
+    # kpi family
+    "kpi": "kpi_card", "kpi_card": "kpi_card", "card": "kpi_card",
+    "metric": "kpi_card", "gauge": "kpi_card", "scorecard": "kpi_card",
+    "multi_row_card": "kpi_card", "number": "kpi_card",
+    # table family
+    "table": "table", "data_table": "table", "pivot_table": "table",
+    # scatter family
+    "scatter": "scatter", "scatter_plot": "scatter", "bubble": "scatter",
+    # other
+    "treemap": "treemap", "funnel": "funnel",
+    "heatmap": "heatmap", "calendar_heatmap": "heatmap",
+}
+
+# Synonym map for axis label comparison — collapses semantically equivalent words
+_LABEL_SYNONYMS: dict[str, str] = {
+    "count": "total", "number": "total", "no": "total", "num": "total",
+    "sum": "total", "quantity": "total", "qty": "total",
+    "amount": "value", "revenue": "value", "sales": "value",
+    "date": "period", "month": "period", "time": "period",
+    "year": "period", "week": "period", "quarter": "period",
+    "category": "type", "company": "organization", "org": "organization",
 }
 
 
@@ -69,13 +111,23 @@ class ValidatorAgent:
             + completeness_score * 0.30
         )
 
-    async def validate(self, query_plan: QueryPlan, execute_result: dict, attempt: int = 1) -> ValidationResult:
+    async def validate(
+        self,
+        query_plan: QueryPlan,
+        execute_result: dict,
+        attempt: int = 1,
+        expected_chart_type: Optional[str] = None,
+    ) -> ValidationResult:
         row_count = execute_result.get("row_count", 0)
         columns = execute_result.get("columns", [])
         actual_x = columns[0] if columns else ""
         actual_y = columns[1] if len(columns) > 1 else ""
 
-        chart_type_score = self.validate_chart_type(query_plan.chart_type, query_plan.chart_type)
+        # Compare against user-requested chart type when available; neutral score when none specified
+        if expected_chart_type:
+            chart_type_score = self.validate_chart_type(expected_chart_type, query_plan.chart_type)
+        else:
+            chart_type_score = 0.7  # neutral — no ground-truth type to compare against
         label_score = await self.validate_axis_labels(query_plan.x_axis_label, query_plan.y_axis_label, actual_x, actual_y)
         shape_score = self.analyze_shape_match(row_count)
         completeness_score = self.check_completeness(row_count)
@@ -89,7 +141,7 @@ class ValidatorAgent:
         passed = score >= 0.80
 
         retry_feedback = None
-        if not passed and attempt <= 3:
+        if not passed and attempt <= 4:
             # Skip LLM feedback for obvious DB errors — the error message itself is sufficient
             # and calling the LLM wastes ~500ms per retry.
             if execute_result.get("error"):
@@ -160,7 +212,7 @@ Provide ONE specific, actionable fix instruction. Return only a single sentence.
                 model_id=VALIDATOR_MODEL,
                 system_prompt="You are a SQL debugging assistant. Give one specific fix instruction in one sentence.",
                 user_message=prompt,
-                max_tokens=200,
+                max_tokens=500,
                 temperature=0.0,
             )
         except Exception:
@@ -215,9 +267,18 @@ def _kl_divergence(p: list, q: list) -> float:
     return (kl_pq + kl_qp) / 2
 
 
+def _norm_label_word(w: str) -> str:
+    w = w.lower().rstrip("s")  # simple plural strip
+    return _LABEL_SYNONYMS.get(w, w)
+
+
 def _label_similarity(a: str, b: str) -> float:
-    words_a = set(a.replace("($)", "").replace("(k)", "").replace("(%)", "").split())
-    words_b = set(b.replace("($)", "").replace("(k)", "").replace("(%)", "").split())
+    def _tokenize(s: str) -> set:
+        s = s.replace("($)", "").replace("(k)", "").replace("(%)", "").replace("_", " ").replace("-", " ")
+        return {_norm_label_word(w) for w in s.split() if len(w) > 1}
+
+    words_a = _tokenize(a)
+    words_b = _tokenize(b)
     if not words_a and not words_b:
         return 1.0
     intersection = len(words_a & words_b)
@@ -232,7 +293,7 @@ def _compute_shape_score_screenshot(
     actual_columns: list,
 ) -> float:
     estimated = chart_spec.get("estimated_values", {})
-    if chart_type in ("line", "area", "stacked_area"):
+    if chart_type in ("line", "area", "stacked_area", "combo"):
         est_vals = [float(str(v).replace("~", "") or 0) for v in estimated.values() if v is not None]
         if not actual_rows or not est_vals:
             return 0.5
@@ -245,7 +306,7 @@ def _compute_shape_score_screenshot(
         act_vals = [float(row.get(numeric_col, 0) or 0) for row in actual_rows[:len(est_vals)]]
         dist = _dtw_distance(est_vals, act_vals)
         return max(0.0, 1.0 - dist * 2)
-    elif chart_type in ("bar_vertical", "bar_horizontal", "pie", "donut", "funnel"):
+    elif chart_type in ("bar_vertical", "bar_horizontal", "pie", "donut", "funnel", "treemap", "heatmap", "scatter"):
         est_vals = [float(str(v).replace("~", "") or 0) for v in estimated.values() if v is not None]
         if not actual_rows or not est_vals:
             return 0.5
@@ -265,12 +326,16 @@ def _compute_shape_score_screenshot(
         kpi_act = float(list(actual_rows[0].values())[0] or 0) if actual_rows else 0
         if kpi_act == 0:
             # SQL returned 0 — likely a wrong filter or wrong table, not a shape problem.
-            # Return a low-but-non-zero score so the retry feedback targets the value.
             return 0.2
-        em = _math.floor(_math.log10(abs(float(str(kpi_est).replace("~", "")) or 1) + 1))
-        am = _math.floor(_math.log10(abs(kpi_act) + 1))
-        diff = abs(em - am)
-        return 1.0 if diff == 0 else (0.7 if diff == 1 else 0.2)
+        try:
+            est_num = float(str(kpi_est).replace("~", "").replace(",", "") or 1)
+            # Smooth decay based on log-ratio instead of integer OOM bucket steps.
+            # log_ratio = 0 → score 1.0; log_ratio = 1 OOM → ~0.65; 2 OOM → ~0.15
+            log_ratio = abs(_math.log10(abs(est_num) + 1) - _math.log10(abs(kpi_act) + 1))
+            score = _math.exp(-1.5 * log_ratio)
+            return round(max(0.0, min(1.0, score)), 3)
+        except (ValueError, ZeroDivisionError):
+            return 0.5
     elif chart_type in ("table", "data_table"):
         # Table widgets show N visible rows but the SQL should return ALL relevant rows —
         # so data_point_count from the screenshot is the viewport size, not the query limit.
@@ -299,12 +364,12 @@ def _extract_column_from_error(error: str) -> str:
 def _detect_scale_mismatch(
     estimated: dict,
     rows: list,
-    tolerance_ratio: float = 5.0,
+    tolerance_ratio: float = 3.0,
 ) -> Optional[str]:
     """
     Compare vision-estimated values against actual SQL results.
     Returns a human-readable mismatch description when values differ by
-    more than tolerance_ratio (default 5×), otherwise None.
+    more than tolerance_ratio (default 3×), otherwise None.
     """
     def parse_est(val_str: str) -> Optional[float]:
         s = str(val_str).replace("~", "").replace(",", "").strip()
@@ -574,7 +639,8 @@ def score_value_match(
     estimated_values: dict,
     rows: list,
     chart_type: str,
-    tolerance: float = 0.40,
+    tolerance: float = 0.30,
+    estimated_values_uncertain: bool = False,
 ) -> tuple:
     """
     Compare vision-estimated values against actual SQL result data using fuzzy numeric matching.
@@ -586,7 +652,24 @@ def score_value_match(
 
     The mismatch_description is injected into retry_feedback so the next SQL attempt
     knows *specifically* what magnitude to target.
+
+    Adaptive tolerance:
+      - uncertain OCR (any ~ prefix): widen to 0.50 — vision estimate might be 20% off
+      - percentage/rate columns: tight 0.15 — percentages are exact
+      - count/number columns: moderate 0.25
+      - default (revenue, amounts, etc.): 0.30
     """
+    # Adapt tolerance based on context: blurry vision → wider; exact metrics → tighter.
+    if estimated_values_uncertain:
+        tolerance = 0.50
+    else:
+        # Inspect column names in estimated_values for metric type hints
+        col_names_lower = " ".join(str(k).lower() for k in estimated_values.keys())
+        if any(t in col_names_lower for t in ("pct", "percent", "rate", "ratio", "share")):
+            tolerance = 0.15
+        elif any(t in col_names_lower for t in ("count", "num", "qty", "quantity", "total_count")):
+            tolerance = 0.25
+
     def _parse(val_str: str) -> Optional[float]:
         s = str(val_str).replace("~", "").replace(",", "").strip()
         m = re.match(r"([\d.]+)\s*([kKmMbBtT]?)", s)
@@ -689,17 +772,26 @@ def score_chart_screenshot_mode(
     dim_scores: dict[str, float] = {}
     value_mismatch: Optional[str] = None
 
-    type_aliases = {"bar": "bar_vertical", "bar_chart": "bar_vertical", "line_chart": "line", "kpi": "kpi_card"}
-    expected_type = type_aliases.get(chart_spec.get("type", ""), chart_spec.get("type", ""))
-    rendered_type = type_aliases.get(query_plan.get("chart_type", ""), query_plan.get("chart_type", ""))
-    dim_scores["chart_type"] = 1.0 if expected_type == rendered_type else 0.0
+    exp_raw = (chart_spec.get("type") or "").lower().strip().replace(" ", "_")
+    ren_raw = (query_plan.get("chart_type") or "").lower().strip().replace(" ", "_")
+    expected_type = _CHART_TYPE_CANONICAL.get(exp_raw, exp_raw)
+    rendered_type = _CHART_TYPE_CANONICAL.get(ren_raw, ren_raw)
+    if expected_type == rendered_type:
+        dim_scores["chart_type"] = 1.0
+    elif {expected_type, rendered_type} == {"bar_vertical", "bar_horizontal"}:
+        # Same data, just different orientation — partial credit instead of 0.
+        dim_scores["chart_type"] = 0.6
+    else:
+        dim_scores["chart_type"] = 0.0
 
     exp_x = (chart_spec.get("x_axis_label") or "").lower().strip()
     exp_y = (chart_spec.get("y_axis_label") or "").lower().strip()
     ren_x = (query_plan.get("x_axis_label") or "").lower().strip()
     ren_y = (query_plan.get("y_axis_label") or "").lower().strip()
-    x_score = _label_similarity(exp_x, ren_x) if exp_x and ren_x else 0.7
-    y_score = _label_similarity(exp_y, ren_y) if exp_y and ren_y else 0.7
+    # If vision didn't detect a label (empty spec), treat as no constraint → 1.0.
+    # If vision detected one but SQL didn't produce it, apply a mild penalty → 0.5.
+    x_score = _label_similarity(exp_x, ren_x) if exp_x and ren_x else (1.0 if not exp_x else 0.5)
+    y_score = _label_similarity(exp_y, ren_y) if exp_y and ren_y else (1.0 if not exp_y else 0.5)
     dim_scores["axis_labels"] = (x_score + y_score) / 2
 
     rows = execute_result.get("rows", [])
@@ -719,12 +811,14 @@ def score_chart_screenshot_mode(
     expected_count = int(chart_spec.get("data_point_count") or 5)
     actual_count = int(execute_result.get("row_count") or 0)
     if actual_count == 0:
-        dim_scores["completeness"] = 0.0
-    elif expected_type in ("kpi_card", "gauge"):
+        # data_shape already captures the zero-row failure at full weight.
+        # Give completeness a neutral 0.5 to avoid double-penalizing the same issue.
+        dim_scores["completeness"] = 0.5
+    elif expected_type == "kpi_card":
         # KPI/gauge return exactly 1 row — that IS complete. Vision data_point_count
         # is unreliable for KPI (defaults to 5), so skip the ratio comparison entirely.
         dim_scores["completeness"] = 1.0
-    elif expected_type in ("table", "data_table"):
+    elif expected_type == "table":
         # Table charts should return all matching rows — the screenshot's data_point_count
         # is the viewport size, not the total result set. Any non-empty result gets 0.8.
         dim_scores["completeness"] = 0.8
@@ -737,6 +831,7 @@ def score_chart_screenshot_mode(
         estimated_values=chart_spec.get("estimated_values") or {},
         rows=rows,
         chart_type=chart_spec.get("type", ""),
+        estimated_values_uncertain=bool(chart_spec.get("estimated_values_uncertain", False)),
     )
     dim_scores["value_match"] = vm_score
 

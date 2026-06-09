@@ -15,7 +15,7 @@ if _agent_root not in sys.path:
     sys.path.insert(0, _agent_root)
 
 from shared.bedrock_client import bedrock_invoke_with_image, BEDROCK_VISION_MODEL
-from utils.image_processor import normalize_image, crop_chart_region  # import once at module level
+from utils.image_processor import normalize_image, crop_chart_region, deduplicate_bboxes  # import once at module level
 
 VISION_MODEL_ID = BEDROCK_VISION_MODEL
 
@@ -102,6 +102,10 @@ CRITICAL: KPI card recognition rules — use chart_type "kpi" (NOT "kpi_card") w
 Do NOT use "kpi" for single-bar charts or single-point line charts — those have axes."""
 
 ANALYSIS_USER_PROMPT = """Analyze this chart image and extract all information you can see.
+
+OCR INSTRUCTIONS: Read all text carefully. If title text appears cut off at the edge, infer the
+complete title from context (e.g. "Open Jobs by" → likely "Open Jobs by Role" if x-axis shows roles).
+For garbled/blurry text, output your best guess prefixed with "~" (e.g. "~Job Postings by Dept").
 
 Return JSON in this exact format:
 {
@@ -224,7 +228,8 @@ class VisionAgent:
     async def detect_charts(self, image_bytes: bytes, source_filename: str) -> list[dict]:
         """Detect all chart bounding boxes in an image."""
         print(f"[vision] detect_charts START  file={source_filename}  size={len(image_bytes)//1024}KB", flush=True)
-        normalized_bytes, original_w, original_h = normalize_image(image_bytes, target_width=1000)
+        # 1400px normalization keeps axis-label text legible after resize (was 1000px).
+        normalized_bytes, original_w, original_h = normalize_image(image_bytes, target_width=1400)
         print(f"[vision] image normalised → {original_w}×{original_h}px  normalised={len(normalized_bytes)//1024}KB", flush=True)
 
         try:
@@ -268,15 +273,27 @@ class VisionAgent:
                 "original_h": original_h,
                 "bounding_box": {"x_pct": 0.0, "y_pct": 0.0, "w_pct": 1.0, "h_pct": 1.0},
             }]
+
+        # Remove overlapping bounding boxes — same region detected twice confuses analysis.
+        before_dedup = len(filtered)
+        filtered = deduplicate_bboxes(filtered, iou_threshold=0.40)
+        if len(filtered) < before_dedup:
+            print(f"[vision] bbox dedup: {before_dedup} → {len(filtered)} (removed {before_dedup - len(filtered)} overlapping)", flush=True)
+
         print(f"[vision] detect_charts → {len(filtered)} charts after confidence filter (threshold={self.min_confidence_threshold})", flush=True)
         return filtered
 
     async def analyze_chart(self, image_bytes: bytes, bounding_box: dict, chart_id: str, source_filename: str) -> dict:
         """Analyze a single cropped chart region."""
         print(f"[vision] analyze_chart START  chart_id={chart_id}", flush=True)
-        # 5% padding (up from 2%) so titles near the bounding-box edge aren't cropped
-        cropped_bytes = crop_chart_region(image_bytes, bounding_box, padding_pct=0.05)
-        print(f"[vision] analyze_chart cropped region → {len(cropped_bytes)//1024}KB  sending to Bedrock...", flush=True)
+        # 5% padding so titles near the bounding-box edge aren't cropped.
+        # crop_chart_region now also returns ocr_quality_score (0-1) based on crop area.
+        cropped_bytes, ocr_quality = crop_chart_region(image_bytes, bounding_box, padding_pct=0.05)
+        print(
+            f"[vision] analyze_chart cropped region → {len(cropped_bytes)//1024}KB  "
+            f"ocr_quality={ocr_quality:.2f}  sending to Bedrock...",
+            flush=True,
+        )
 
         response_text = await bedrock_invoke_with_image(
             model_id=self.model_id,
@@ -285,14 +302,30 @@ class VisionAgent:
             image_bytes=cropped_bytes,
             image_media_type="image/png",
             temperature=0.1,
+            max_tokens=1536,  # raised from default to handle complex multi-series charts
         )
 
         analysis = _parse_json_response(response_text)
 
-        print(f"[vision] analyze_chart DONE  chart_id={chart_id}  type={analysis.get('chart_type')}  title={analysis.get('title')!r}", flush=True)
+        # Track which estimated_values have the uncertainty prefix "~".
+        # This flag flows through to the validator so it widens tolerance accordingly.
+        raw_estimates: dict = analysis.get("estimated_values") or {}
+        has_uncertain = any(
+            isinstance(v, str) and str(v).startswith("~")
+            for v in raw_estimates.values()
+        )
+
+        # Two-stage KPI: if this is a KPI card, parse number and unit separately so
+        # "1.2M" is stored as {value: 1200000, unit: "M"} rather than the raw string.
+        chart_type_raw = analysis.get("chart_type", "bar_vertical")
+        kpi_value_text = analysis.get("kpi_value_text")
+        if chart_type_raw in ("kpi", "kpi_card") and kpi_value_text:
+            raw_estimates = self._parse_kpi_value_stages(kpi_value_text, raw_estimates)
+
+        print(f"[vision] analyze_chart DONE  chart_id={chart_id}  type={chart_type_raw}  title={analysis.get('title')!r}  ocr_quality={ocr_quality:.2f}", flush=True)
         return {
             "id": chart_id,
-            "type": analysis.get("chart_type", "bar_vertical"),
+            "type": chart_type_raw,
             "title": analysis.get("title"),
             "subtitle": analysis.get("subtitle"),
             "x_axis_label": analysis.get("x_axis_label"),
@@ -300,7 +333,8 @@ class VisionAgent:
             "x_tick_labels": analysis.get("x_tick_labels", []),
             "y_scale": analysis.get("y_scale"),
             "legend_labels": analysis.get("legend_labels", []),
-            "estimated_values": analysis.get("estimated_values", {}),
+            "estimated_values": raw_estimates,
+            "estimated_values_uncertain": has_uncertain,
             "data_point_count": int(analysis.get("data_point_count") or 0),
             "series_count": analysis.get("series_count", 1),
             "kpi_grouped": analysis.get("kpi_grouped", False),
@@ -308,10 +342,33 @@ class VisionAgent:
             "kpi_group_column": analysis.get("kpi_group_column"),
             "bounding_box": bounding_box,
             "source_image": source_filename,
-            "confidence": 0.9,
-            "low_confidence": False,
+            # Real quality score based on crop size — replaces the hardcoded 0.9.
+            "confidence": round(0.5 + 0.5 * ocr_quality, 2),
+            "ocr_quality_score": round(ocr_quality, 2),
+            "low_confidence": ocr_quality < 0.25,
             "analysis_reasoning": analysis.get("reasoning", ""),
         }
+
+    def _parse_kpi_value_stages(self, kpi_value_text: str, existing_estimates: dict) -> dict:
+        """
+        Two-stage KPI parsing: extract numeric value and unit (K/M/B) separately.
+        Converts "1.2M" → numeric 1_200_000 so validators can compare exactly.
+        Adds/updates the "value" key in estimated_values.
+        """
+        import re as _re_kpi
+        s = str(kpi_value_text).replace(",", "").replace("$", "").replace("%", "").strip()
+        m = _re_kpi.match(r"~?([\d.]+)\s*([kKmMbBtT]?)", s)
+        if not m:
+            return existing_estimates
+        num = float(m.group(1))
+        suffix = m.group(2).lower()
+        multiplier = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}.get(suffix, 1.0)
+        parsed_value = num * multiplier
+        updated = dict(existing_estimates)
+        # Only overwrite if existing "value" is a raw string or missing.
+        if not isinstance(updated.get("value"), (int, float)):
+            updated["value"] = parsed_value
+        return updated
 
     def analyze_layout(self, chart_specs: list[dict]) -> list[dict]:
         """Assign grid layout positions from bounding boxes."""
@@ -389,7 +446,7 @@ class VisionAgent:
         """
         import json as _json
         try:
-            rows = execute_result.get("rows", [])[:10]
+            rows = execute_result.get("rows", [])[:20]  # raised from 10 so more data is visible
             columns = execute_result.get("columns", [])
             row_count = execute_result.get("row_count", 0)
             data_summary = (
@@ -438,7 +495,7 @@ class VisionAgent:
         """Detect filter panels and slicer controls in a BI screenshot."""
         print(f"[vision] detect_filters START  file={source_filename}", flush=True)
         try:
-            normalized_bytes, _, _ = normalize_image(image_bytes, target_width=1000)
+            normalized_bytes, _, _ = normalize_image(image_bytes, target_width=1400)
             response_text = await bedrock_invoke_with_image(
                 model_id=self.model_id,
                 system_prompt=FILTER_DETECTION_SYSTEM_PROMPT,
@@ -472,7 +529,7 @@ class VisionAgent:
         """
         print(f"[vision] detect_report_metadata START  file={source_filename}", flush=True)
         try:
-            normalized_bytes, _, _ = normalize_image(image_bytes, target_width=1000)
+            normalized_bytes, _, _ = normalize_image(image_bytes, target_width=1400)
             response_text = await bedrock_invoke_with_image(
                 model_id=self.model_id,
                 system_prompt=REPORT_METADATA_SYSTEM_PROMPT,
@@ -559,6 +616,10 @@ class VisionAgent:
                 print(f"[vision] process_one[{i}] FAILED: {type(result).__name__}: {result}", flush=True)
                 print(traceback.format_exception(type(result), result, result.__traceback__), flush=True)
             elif isinstance(result, list):
+                # Prefix IDs with image index so multi-image runs never have duplicate
+                # chart IDs before deduplication (e.g. img0_chart_001, img1_chart_001).
+                for chart in result:
+                    chart["id"] = f"img{i}_{chart.get('id', 'chart_001')}"
                 all_charts.extend(result)
 
         deduped = self.deduplicate_charts(all_charts)

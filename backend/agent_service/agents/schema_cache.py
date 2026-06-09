@@ -29,7 +29,7 @@ from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
 
 _CACHE_MODEL = BEDROCK_SONNET_MODEL
 
-SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", "86400"))   # 24 h default
+SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", "259200"))  # 72 h default
 _REDIS_KEY_PREFIX = "schema_cache"
 
 # ── in-process L1 cache ───────────────────────────────────────────────────────
@@ -120,12 +120,19 @@ class EnrichedSchema:
         for tname, sem in self.table_semantics.items():
             if table_names and tname not in table_names:
                 continue
-            lines.append(
+            use_for = sem.get("use_for") or []
+            never_use_for = sem.get("never_use_for") or []
+            line = (
                 f"  [{tname}] {sem.get('purpose', '')} | grain: {sem.get('grain', '')} | "
                 f"metrics: {sem.get('key_metric_cols', [])} | "
                 f"dims: {sem.get('key_dimension_cols', [])} | "
                 f"dates: {sem.get('key_date_cols', [])}"
             )
+            if use_for:
+                line += f" | use_for: {use_for}"
+            if never_use_for:
+                line += f" | never_use_for: {never_use_for}"
+            lines.append(line)
         return "\n".join(lines)
 
 
@@ -199,7 +206,7 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
         f"  tables={len(schema_doc.get('tables', []))}",
         flush=True,
     )
-    enriched = await _build(schema_doc, db_type)
+    enriched = await _build(schema_doc, db_type, connection_id)
     _store[connection_id] = enriched
 
     # Persist to Redis
@@ -290,6 +297,51 @@ def import_cache_json(connection_id: str, json_str: str) -> EnrichedSchema:
 
 # ── Internal builder ──────────────────────────────────────────────────────────
 
+async def _load_db_metadata(connection_id: str) -> dict:
+    """
+    Load persisted schema metadata from the DB (written by metadata_extractor).
+    Returns:
+      {
+        "tables":  {qualified_table_name: SchemaTableMetadata ORM object},
+        "columns": {qualified_table_name: {column_name: SchemaColumnMetadata ORM object}},
+      }
+    Non-fatal — returns empty dicts on any failure (cold path still works without it).
+    """
+    if not connection_id:
+        return {"tables": {}, "columns": {}}
+    try:
+        import uuid as _uuid
+        from sqlalchemy import select as _select
+        from shared.database import AsyncSessionLocal
+        from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
+
+        conn_uuid = _uuid.UUID(connection_id)
+        async with AsyncSessionLocal() as db:
+            tbl_rows = (await db.execute(
+                _select(SchemaTableMetadata)
+                .where(SchemaTableMetadata.connection_id == conn_uuid)
+            )).scalars().all()
+            col_rows = (await db.execute(
+                _select(SchemaColumnMetadata)
+                .where(SchemaColumnMetadata.connection_id == conn_uuid)
+            )).scalars().all()
+
+        tables_meta = {r.table_name: r for r in tbl_rows}
+        columns_meta: dict[str, dict] = {}
+        for r in col_rows:
+            columns_meta.setdefault(r.table_name, {})[r.column_name] = r
+
+        print(
+            f"[schema_cache] DB metadata loaded  tables={len(tables_meta)}"
+            f"  column_rows={len(col_rows)}",
+            flush=True,
+        )
+        return {"tables": tables_meta, "columns": columns_meta}
+    except Exception as exc:
+        print(f"[schema_cache] ⚠ _load_db_metadata failed (non-fatal): {exc}", flush=True)
+        return {"tables": {}, "columns": {}}
+
+
 def _qualified(table: dict) -> str:
     schema = (table.get("schema") or "").strip()
     name = (table.get("name") or "").strip()
@@ -300,6 +352,8 @@ def _build_relationship_graph(tables: list, qualified_name_map: dict) -> Relatio
     graph = RelationshipGraph()
     bare_names = set(qualified_name_map.keys())
 
+    # Pass 1: declared FK relationships (from crawler — only populated on engines that
+    # enforce FK constraints, e.g. Postgres.  Empty on Redshift / most data warehouses).
     for table in tables:
         bare_tname = table.get("name", "")
         qualified_tname = qualified_name_map.get(bare_tname, bare_tname)
@@ -314,11 +368,82 @@ def _build_relationship_graph(tables: list, qualified_name_map: dict) -> Relatio
                 condition = f"{qualified_tname}.{fk_col} = {qualified_ref}.{ref_col}"
                 graph.add_edge(qualified_tname, qualified_ref, condition)
 
-    print(f"[schema_cache] relationship_graph built  edges={len(graph)}", flush=True)
+    declared_edges = len(graph)
+
+    # Pass 2: heuristic FK inference from shared column names.
+    # Critical for Redshift / data warehouses where FKs are declared but unenforced
+    # (or not declared at all).  Two rules:
+    #   Rule A: underscore-delimited IDs — _id / _key / _sk / _fk / _ref
+    #   Rule B: compact IDs without underscore (Bullhorn / legacy style) — ends in "id"
+    #           with length > 4 to exclude bare "id" column (which exists in every table
+    #           and would create false edges everywhere).  e.g. joborderid, placementid,
+    #           clientcorporationid, candidateid all qualify; "id" itself does not.
+    # O(n²) on table count but pure-Python set intersection is negligible for ≤500 tables.
+    _FK_SUFFIXES = ("_id", "_key", "_sk", "_fk", "_ref")
+    tbl_col_index: dict[str, set] = {}
+    for table in tables:
+        bare_tname = table.get("name", "")
+        qualified_tname = qualified_name_map.get(bare_tname, bare_tname)
+        cols = {(c.get("name") or "").lower() for c in table.get("columns", [])}
+        tbl_col_index[qualified_tname] = cols
+
+    def _is_fk_col(col_name: str) -> bool:
+        return (
+            any(col_name.endswith(s) for s in _FK_SUFFIXES)
+            or (col_name.endswith("id") and len(col_name) > 4)
+        )
+
+    # Noise words stripped when deriving the "bare" table name for FK column matching.
+    # e.g. "staging.bullhorn_core_placement" → "placement"
+    _BARE_NOISE = ("staging", "target", "public", "bullhorn", "classic", "core", "bqp")
+
+    def _bare_table_name(qualified: str) -> str:
+        """Strip schema prefix and vendor prefixes to get a short, matchable name."""
+        name = qualified.split(".")[-1].lower()
+        for noise in _BARE_NOISE:
+            name = name.replace(noise + "_", "").replace("_" + noise, "")
+        return name.replace("_", "")
+
+    def _best_fk_col(fk_cols: list[str], tbl_a: str, tbl_b: str) -> str:
+        """
+        Pick the most semantically meaningful shared FK column for a table pair.
+
+        Prefers a column whose name starts with the bare name of one of the tables —
+        e.g. 'placementid' over 'clientcorporationid' when one table is
+        'bullhorn_core_placement'. Falls back to alphabetically first.
+
+        Without this, 'clientcorporationid' (c < j < p) would always win because it
+        sorts first alphabetically, producing wrong join conditions for most pairs.
+        """
+        bare_a = _bare_table_name(tbl_a)
+        bare_b = _bare_table_name(tbl_b)
+        for col in sorted(fk_cols):
+            if (bare_a and col.startswith(bare_a)) or (bare_b and col.startswith(bare_b)):
+                return col
+        return sorted(fk_cols)[0]  # alphabetically first as last resort
+
+    q_names = list(tbl_col_index.keys())
+    for i, tbl_a in enumerate(q_names):
+        for tbl_b in q_names[i + 1:]:
+            if graph.get_join_condition(tbl_a, tbl_b):
+                continue  # already have a declared edge — keep it
+            shared = tbl_col_index[tbl_a] & tbl_col_index[tbl_b]
+            fk_shared = sorted(c for c in shared if _is_fk_col(c))
+            if fk_shared:
+                join_col = _best_fk_col(fk_shared, tbl_a, tbl_b)
+                condition = f"{tbl_a}.{join_col} = {tbl_b}.{join_col}"
+                graph.add_edge(tbl_a, tbl_b, condition)
+
+    heuristic_edges = len(graph) - declared_edges
+    print(
+        f"[schema_cache] relationship_graph  declared={declared_edges}"
+        f"  heuristic={heuristic_edges}  total={len(graph)}",
+        flush=True,
+    )
     return graph
 
 
-async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
+async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> EnrichedSchema:
     tables = schema_doc.get("tables", [])
 
     qualified_name_map: dict[str, str] = {
@@ -331,6 +456,12 @@ async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
         schemas = {q.split(".")[0] for q in qualified_name_map.values() if "." in q}
         print(f"[schema_cache] schema-qualifying table names  schemas={schemas}", flush=True)
 
+    # Load persisted DB metadata (written by metadata_extractor after each crawl).
+    # Non-fatal — all enrichments below fall back to LLM paths when db_meta is empty.
+    db_meta = await _load_db_metadata(connection_id)
+    db_tables = db_meta["tables"]    # {qualified_name: SchemaTableMetadata}
+    db_cols   = db_meta["columns"]   # {qualified_name: {col_name: SchemaColumnMetadata}}
+
     # column_map
     column_map: dict[str, list] = {}
     for table in tables:
@@ -339,41 +470,141 @@ async def _build(schema_doc: dict, db_type: str) -> EnrichedSchema:
             key = col.get("name", "").lower()
             if not key:
                 continue
+            # Prefer DB business_name as the column description when available
+            db_col = db_cols.get(qualified_tname, {}).get(col.get("name", ""))
+            description = (
+                (db_col.description if db_col and db_col.description else None)
+                or col.get("description")
+                or ""
+            )
             column_map.setdefault(key, []).append({
                 "table": qualified_tname,
                 "type": col.get("type"),
-                "description": col.get("description") or "",
+                "description": description,
             })
 
     ambiguous_columns = [k for k, v in column_map.items() if len(v) > 1]
 
-    # compact_tables — built once here, reused everywhere
+    # compact_tables — built once here, reused everywhere.
+    # DB metadata enriches each column: richer descriptions + example_values as top_values
+    # (so value_sampler skips live DB queries for pre-collected filter values).
     compact_tables = []
     for t in tables:
         qualified_tname = qualified_name_map.get(t.get("name", ""), t.get("name", ""))
+        all_cols = t.get("columns", [])
+        db_tbl = db_tables.get(qualified_tname)
+        tbl_cols_meta = db_cols.get(qualified_tname, {})
+
+        # Table-level: prefer DB description / business_name
+        tbl_description = (
+            (db_tbl.description if db_tbl and db_tbl.description else None)
+            or t.get("description")
+            or ""
+        )
+
+        enriched_cols = []
+        for c in all_cols:
+            cname = c.get("name") or ""
+            db_col = tbl_cols_meta.get(cname)
+
+            col_desc = (
+                (db_col.description if db_col and db_col.description else None)
+                or c.get("description")
+                or ""
+            )
+
+            # Merge stats: start from crawler stats, then inject DB example_values as
+            # top_values in the format value_sampler expects — {col_name: value} rows.
+            stats = dict(c.get("stats") or {})
+            if db_col and db_col.example_values and not stats.get("top_values"):
+                stats["top_values"] = [{cname: v} for v in db_col.example_values]
+
+            enriched_cols.append({
+                "name": cname,
+                "type": c.get("type"),
+                "description": col_desc[:250],
+                "semantic_type": db_col.semantic_type if db_col else None,
+                "stats": stats or None,
+            })
+
         compact_tables.append({
             "name": qualified_tname,
-            "description": (t.get("description") or "")[:150],
+            "description": tbl_description[:350],
             "row_count": t.get("row_count"),
-            "columns": [
-                {
-                    "name": c.get("name"),
-                    "type": c.get("type"),
-                    "description": (c.get("description") or "")[:80],
-                }
-                for c in t.get("columns", [])[:30]
-            ],
-            "relationships": t.get("relationships", [])[:6],
+            "columns": enriched_cols,
+            "all_column_names": [c.get("name") for c in all_cols if c.get("name")],
+            "relationships": t.get("relationships", [])[:10],
         })
 
-    # relationship_graph — pure Python
+    # relationship_graph — Pass 1 (declared) + Pass 2 (heuristic)
     relationship_graph = _build_relationship_graph(tables, qualified_name_map)
 
-    # LLM jobs in parallel
-    disambiguation, table_semantics = await asyncio.gather(
-        _disambiguate_columns(ambiguous_columns, column_map, tables),
-        _analyze_table_semantics(compact_tables, db_type),
-    )
+    # Pass 3: inject confirmed FKs from DB metadata (overrides / supplements heuristics).
+    # These were SQL-validated by metadata_extractor Phase B at crawl time.
+    confirmed_fk_count = 0
+    for tbl_name, cols_meta in db_cols.items():
+        for col_name, col_meta in cols_meta.items():
+            if (
+                col_meta.fk_confirmed
+                and col_meta.fk_target_table
+                and col_meta.fk_target_column
+            ):
+                condition = (
+                    f"{tbl_name}.{col_name}"
+                    f" = {col_meta.fk_target_table}.{col_meta.fk_target_column}"
+                )
+                relationship_graph.add_edge(tbl_name, col_meta.fk_target_table, condition)
+                confirmed_fk_count += 1
+
+    if confirmed_fk_count:
+        print(
+            f"[schema_cache] Pass 3: injected {confirmed_fk_count} confirmed FK edge(s)"
+            f" from DB metadata",
+            flush=True,
+        )
+
+    # Table semantics — build from DB metadata first, then run LLM only for uncovered tables.
+    db_covered_semantics: dict = {}
+    for qualified_tname, db_tbl in db_tables.items():
+        db_covered_semantics[qualified_tname] = {
+            "purpose": db_tbl.description or "",
+            "grain": db_tbl.grain or "",
+            "key_metric_cols": db_tbl.key_metric_cols or [],
+            "key_dimension_cols": db_tbl.key_dimension_cols or [],
+            "key_date_cols": db_tbl.key_date_cols or [],
+            "use_for": db_tbl.use_for or [],
+            "never_use_for": db_tbl.never_use_for or [],
+            "is_fact_table": db_tbl.is_fact_table,
+            "business_name": db_tbl.business_name or "",
+        }
+
+    tables_needing_llm = [
+        ct for ct in compact_tables
+        if ct["name"] not in db_covered_semantics
+    ]
+    if tables_needing_llm:
+        print(
+            f"[schema_cache] table_semantics: {len(db_covered_semantics)} from DB,"
+            f" {len(tables_needing_llm)} need LLM",
+            flush=True,
+        )
+    else:
+        print(
+            f"[schema_cache] table_semantics: all {len(db_covered_semantics)} table(s)"
+            f" covered by DB metadata — skipping LLM call",
+            flush=True,
+        )
+
+    # LLM jobs in parallel: disambiguation always runs; table semantics only for uncovered tables
+    if tables_needing_llm:
+        disambiguation, llm_semantics = await asyncio.gather(
+            _disambiguate_columns(ambiguous_columns, column_map, tables),
+            _analyze_table_semantics(tables_needing_llm, db_type),
+        )
+        table_semantics = {**db_covered_semantics, **llm_semantics}
+    else:
+        disambiguation = await _disambiguate_columns(ambiguous_columns, column_map, tables)
+        table_semantics = db_covered_semantics
 
     return EnrichedSchema(
         schema_doc=schema_doc,
@@ -453,7 +684,7 @@ async def _disambiguate_columns(
 
     table_cols: dict[str, list] = {}
     for t in tables:
-        table_cols[t.get("name", "")] = [c.get("name") for c in t.get("columns", [])[:20]]
+        table_cols[t.get("name", "")] = [c.get("name") for c in t.get("columns", [])]
 
     def _build_batch_prompt(batch: list[str]) -> str:
         entries = []

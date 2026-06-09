@@ -18,8 +18,11 @@ import re
 from typing import Optional
 from utils.http_clients import call_query_executor
 
-# Safe, read-only sampling templates (SELECT-only, row-limited)
-_DISTINCT_SQL  = "SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL ORDER BY 1 LIMIT 25"
+# Safe, read-only sampling templates (SELECT-only, row-limited).
+# No DISTINCT / ORDER BY on the dimension query — forces a full-table sort on
+# Redshift / large tables and routinely causes timeouts.  We fetch more rows and
+# deduplicate cheaply in Python (_format_context) — same result set, no sort cost.
+_DISTINCT_SQL  = "SELECT {col} FROM {table} WHERE {col} IS NOT NULL LIMIT 200"
 _DATE_RANGE_SQL = "SELECT MIN({col}) AS min_date, MAX({col}) AS max_date FROM {table}"
 _METRIC_RANGE_SQL = "SELECT MIN({col}) AS min_val, MAX({col}) AS max_val, AVG({col}) AS avg_val FROM {table}"
 
@@ -29,6 +32,7 @@ async def sample_candidate(
     candidate: dict,       # from SchemaMatcher: {tables, key_columns, join, ...}
     chart_spec: dict,      # from VisionAgent:   {type, x_tick_labels, estimated_values, ...}
     timeout_seconds: int = 8,
+    compact_tables: Optional[list] = None,  # pass EnrichedSchema.compact_tables to use pre-crawled stats
 ) -> dict:
     """
     Run exploratory queries for the top candidate's key columns.
@@ -45,13 +49,34 @@ async def sample_candidate(
     date_col      = key_cols.get("date")
     metric_col    = key_cols.get("metric")
 
+    # Check pre-crawled stats stored in compact_tables.  When the crawler already
+    # sampled top_values for a column, inject them directly and skip the live query —
+    # avoids Redshift full-table scans at SQL-generation time.
+    raw_prefilled: dict[str, list] = {}
+    if compact_tables:
+        for tbl_meta in compact_tables:
+            if tbl_meta.get("name") == primary_table:
+                for col_meta in (tbl_meta.get("columns") or []):
+                    cname = col_meta.get("name")
+                    stats = col_meta.get("stats") or {}
+                    top_vals = stats.get("top_values")
+                    if cname and top_vals:
+                        raw_prefilled[cname] = top_vals
+                break
+
     # Build the list of (label, sql) pairs for this candidate
     queries: list[tuple[str, str]] = []
 
     if dimension_col:
-        queries.append(("dimension_values", _DISTINCT_SQL.format(
-            col=dimension_col, table=primary_table,
-        )))
+        if dimension_col in raw_prefilled:
+            # Use pre-crawled top_values — skip live query
+            raw_prefilled["dimension_values"] = [
+                {dimension_col: r.get(dimension_col)} for r in raw_prefilled[dimension_col]
+            ]
+        else:
+            queries.append(("dimension_values", _DISTINCT_SQL.format(
+                col=dimension_col, table=primary_table,
+            )))
         # Also get per-category counts — reveals which categories dominate
         # and lets the LLM match estimated_values to actual category magnitudes
         queries.append(("category_counts", (
@@ -66,8 +91,12 @@ async def sample_candidate(
     else:
         # Option 6: Try common date column names to prevent wrong_date_range failures.
         # Run as separate queries; failures are silently ignored (non-fatal).
-        _AUTO_DATE_COLS = ["dateadded", "created_at", "startdate", "start_date", "createdate"]
-        for _dc in _AUTO_DATE_COLS[:3]:
+        _AUTO_DATE_COLS = [
+            "date", "created_at", "order_date", "event_date", "sale_date",
+            "invoice_date", "report_date", "transaction_date", "updated_at",
+            "start_date", "startdate", "dateadded", "createdate", "timestamp",
+        ]
+        for _dc in _AUTO_DATE_COLS[:5]:
             queries.append((f"auto_date_{_dc}", _DATE_RANGE_SQL.format(
                 col=_dc, table=primary_table,
             )))
@@ -76,25 +105,29 @@ async def sample_candidate(
             col=metric_col, table=primary_table,
         )))
 
-    if not queries:
+    if not queries and not raw_prefilled:
         return {}
 
-    # Execute all sampling queries concurrently (fast, cheap)
-    results = await asyncio.gather(
-        *[
-            call_query_executor(connection_id, sql, row_limit=25)
-            for _, sql in queries
-        ],
-        return_exceptions=True,
-    )
-
+    # Execute live sampling queries concurrently (fast, cheap)
     raw: dict[str, list] = {}
-    for (label, _sql), result in zip(queries, results):
-        if isinstance(result, Exception):
-            print(f"[value_sampler] ⚠ {label} failed: {result}", flush=True)
-            continue
-        if result and not result.get("error"):
-            raw[label] = result.get("rows", [])
+    # Seed with any pre-crawled data so _format_context sees it
+    raw.update(raw_prefilled)
+
+    if queries:
+        results = await asyncio.gather(
+            *[
+                call_query_executor(connection_id, sql, row_limit=200)
+                for _, sql in queries
+            ],
+            return_exceptions=True,
+        )
+
+        for (label, _sql), result in zip(queries, results):
+            if isinstance(result, Exception):
+                print(f"[value_sampler] ⚠ {label} failed: {result}", flush=True)
+                continue
+            if result and not result.get("error"):
+                raw[label] = result.get("rows", [])
 
     return _format_context(raw, dimension_col, date_col, metric_col, chart_spec)
 
@@ -116,12 +149,18 @@ def _format_context(
     # ── 1. Dimension values ───────────────────────────────────────────────────
     dim_rows = raw.get("dimension_values", [])
     if dim_rows and dimension_col:
-        actual_vals = [
-            str(r.get(dimension_col, ""))
-            for r in dim_rows
-            if r.get(dimension_col) is not None
-        ]
-        context["actual_dimension_values"] = actual_vals[:20]
+        # Dedup in Python — _DISTINCT_SQL no longer uses SELECT DISTINCT / ORDER BY
+        # to avoid full-table sorts on Redshift.  Insertion-order dict preserves
+        # first-seen order (roughly frequency-ordered on most engines).
+        seen_dim: dict = {}
+        for r in dim_rows:
+            v = r.get(dimension_col)
+            if v is not None:
+                key = str(v)
+                if key not in seen_dim:
+                    seen_dim[key] = key
+        actual_vals = list(seen_dim.keys())
+        context["actual_dimension_values"] = actual_vals[:25]
 
         # Cross-reference with vision x_tick_labels
         vision_ticks = chart_spec.get("x_tick_labels") or []
@@ -493,7 +532,7 @@ async def sample_distinct_for_filter(
     connection_id: str,
     table: str,
     column: str,
-    timeout_seconds: int = 15,
+    timeout_seconds: int = 25,
     compact_tables: Optional[list] = None,
 ) -> list[str]:
     """
@@ -509,7 +548,7 @@ async def sample_distinct_for_filter(
     and routinely exceeds the timeout. Instead we SELECT with LIMIT and deduplicate
     in Python — early-stopping scan, no sort, same result set.
     """
-    # Pre-check: if we have schema info, skip immediately when column isn't in this table
+    # Pre-check: if we have schema info, validate column existence and serve from cache.
     if compact_tables:
         table_meta = next((t for t in compact_tables if t.get("name") == table), None)
         if table_meta:
@@ -522,12 +561,36 @@ async def sample_distinct_for_filter(
                 )
                 return []
 
+            # Serve from pre-crawled top_values when available — avoids live Redshift query
+            for col_meta in (table_meta.get("columns") or []):
+                if (col_meta.get("name") or "").lower() == column.lower():
+                    stats = col_meta.get("stats") or {}
+                    top_vals = stats.get("top_values")
+                    if top_vals:
+                        cached = [
+                            str(r.get(column) or r.get(list(r.keys())[0], ""))
+                            for r in top_vals
+                            if r
+                        ]
+                        cached = [v for v in cached if v][:200]
+                        if cached:
+                            print(
+                                f"[value_sampler] {table}.{column} → "
+                                f"{len(cached)} values from cache (no DB query)",
+                                flush=True,
+                            )
+                            return cached
+                    break
+
     # No DISTINCT / ORDER BY — lets the DB exit after the first 500 rows without
     # sorting the whole table. We deduplicate cheaply in Python.
     sql = f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL LIMIT 500"
     try:
         result = await asyncio.wait_for(
-            call_query_executor(connection_id, sql, row_limit=500),
+            call_query_executor(
+                connection_id, sql, row_limit=500,
+                timeout_seconds=max(timeout_seconds - 3, 10),
+            ),
             timeout=timeout_seconds,
         )
         if result and not result.get("error"):
@@ -561,6 +624,7 @@ async def sample_top_candidates(
     chart_spec: dict,
     max_candidates: int = 3,
     timeout_seconds: int = 8,
+    compact_tables: Optional[list] = None,
 ) -> dict:
     """
     Pre-sample the top N candidates in parallel at schema-match time.
@@ -579,7 +643,7 @@ async def sample_top_candidates(
     top = candidates[:max_candidates]
 
     sample_tasks = [
-        sample_candidate(connection_id, c, chart_spec, timeout_seconds=timeout_seconds)
+        sample_candidate(connection_id, c, chart_spec, timeout_seconds=timeout_seconds, compact_tables=compact_tables)
         for c in top
     ]
     results = await asyncio.gather(*sample_tasks, return_exceptions=True)

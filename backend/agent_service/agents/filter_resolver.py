@@ -16,6 +16,20 @@ import re
 from typing import Optional
 
 
+# ── Boolean / categorical synonym expansion ───────────────────────────────────
+# Vision model describes boolean columns with paired English words ("open/closed",
+# "yes/no") but DB columns use compact names ("isopen", "flag", "is_active").
+# Expanding hint words to known synonyms before scoring catches these mismatches.
+_BOOLEAN_NORMALIZATIONS: dict[str, list[str]] = {
+    "open_closed":       ["isopen", "is_open", "open", "openordered", "openclosed"],
+    "yes_no":            ["isyes", "flag", "isno"],
+    "active_inactive":   ["isactive", "is_active", "active", "inactive"],
+    "true_false":        ["enabled", "is_enabled", "flag", "isactive"],
+    "on_off":            ["enabled", "is_enabled", "flag"],
+    "employed_terminated": ["isemployed", "is_employed", "status", "empstatus"],
+    "placed_unplaced":   ["isplaced", "is_placed", "placed", "placement_status"],
+}
+
 # ── Text normalisation ────────────────────────────────────────────────────────
 
 def _words(text: str) -> list[str]:
@@ -93,6 +107,22 @@ def resolve_filter_column(
     """
     hint_words  = _words(column_hint)
     label_words = _words(display_name)
+
+    # Boolean synonym expansion: e.g. "open" + "closed" → also try "isopen", "is_open"
+    _hint_joined = "_".join(hint_words)
+    _extra: list[str] = []
+    for _key, _synonyms in _BOOLEAN_NORMALIZATIONS.items():
+        if _hint_joined == _key or any(w in hint_words for w in _key.split("_")):
+            _extra.extend(_words(s) for s in _synonyms)  # type: ignore[arg-type]
+    if _extra:
+        # Flatten nested lists
+        _flat: list[str] = []
+        for item in _extra:
+            if isinstance(item, list):
+                _flat.extend(item)
+            else:
+                _flat.append(item)
+        hint_words = list(dict.fromkeys(hint_words + _flat))  # deduplicate, preserve order
 
     best: Optional[dict] = None
     best_score = 0.0

@@ -12,6 +12,7 @@ from shared.models.projects import Project
 from shared.models.project_members import ProjectMember, MemberRole
 from shared.models.database_connections import DatabaseConnection, DbType
 from shared.models.schema_snapshots import SchemaSnapshot
+from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
 from shared.encryption import encrypt, decrypt
 from shared.schemas.projects import (
     ProjectCreate, ProjectResponse,
@@ -255,4 +256,85 @@ async def get_schema(
         "version": snapshot.version,
         "created_at": snapshot.created_at.isoformat(),
         "schema": snapshot.schema_document,
+    }
+
+
+@router.get("/{project_id}/schema/metadata")
+async def get_schema_metadata(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns AI-extracted metadata for this project's schema.
+    Written by the background metadata_extractor after every crawl.
+    Returns 404 when no metadata has been extracted yet.
+    """
+    conn_result = await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+            DatabaseConnection.is_active == True,
+        ).limit(1)
+    )
+    conn = conn_result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="No active connection found")
+
+    tbl_rows = (await db.execute(
+        select(SchemaTableMetadata)
+        .where(SchemaTableMetadata.connection_id == conn.id)
+        .order_by(SchemaTableMetadata.table_name)
+    )).scalars().all()
+
+    if not tbl_rows:
+        raise HTTPException(
+            status_code=404,
+            detail="Metadata not extracted yet — trigger a crawl and wait ~1 minute for background extraction to finish.",
+        )
+
+    col_rows = (await db.execute(
+        select(SchemaColumnMetadata)
+        .where(SchemaColumnMetadata.connection_id == conn.id)
+        .order_by(SchemaColumnMetadata.table_name, SchemaColumnMetadata.column_name)
+    )).scalars().all()
+
+    cols_by_table: dict[str, list] = {}
+    for c in col_rows:
+        cols_by_table.setdefault(c.table_name, []).append({
+            "column_name": c.column_name,
+            "business_name": c.business_name,
+            "description": c.description,
+            "semantic_type": c.semantic_type,
+            "fk_target_table": c.fk_target_table,
+            "fk_target_column": c.fk_target_column,
+            "fk_confirmed": c.fk_confirmed,
+            "example_values": c.example_values or [],
+            "is_kpi_metric": c.is_kpi_metric,
+            "is_dimension": c.is_dimension,
+            "is_filter_eligible": c.is_filter_eligible,
+        })
+
+    tables = [
+        {
+            "table_name": t.table_name,
+            "business_name": t.business_name,
+            "description": t.description,
+            "grain": t.grain,
+            "is_fact_table": t.is_fact_table,
+            "use_for": t.use_for or [],
+            "never_use_for": t.never_use_for or [],
+            "key_metric_cols": t.key_metric_cols or [],
+            "key_dimension_cols": t.key_dimension_cols or [],
+            "key_date_cols": t.key_date_cols or [],
+            "generation_method": t.generation_method,
+            "generated_at": t.generated_at.isoformat() if t.generated_at else None,
+            "columns": cols_by_table.get(t.table_name, []),
+        }
+        for t in tbl_rows
+    ]
+
+    return {
+        "connection_id": str(conn.id),
+        "total_tables": len(tables),
+        "tables": tables,
     }

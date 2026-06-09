@@ -11,6 +11,7 @@ from .refresh_tokens import RefreshToken
 from .phase2 import DashboardVersion, SchemaChangeAlert, QueryHistory
 from .phase3 import ScreenshotJob, ChartReplicationState, UploadedFile, HintQueueEntry
 from .phase4 import ExportJob, ExportToken, ExportChatSession
+from .schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
 
 __all__ = [
     "User", "Project", "ProjectMember", "DatabaseConnection",
@@ -19,4 +20,5 @@ __all__ = [
     "DashboardVersion", "SchemaChangeAlert", "QueryHistory",
     "ScreenshotJob", "ChartReplicationState", "UploadedFile", "HintQueueEntry",
     "ExportJob", "ExportToken", "ExportChatSession",
+    "SchemaTableMetadata", "SchemaColumnMetadata",
 ]

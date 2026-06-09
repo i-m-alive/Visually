@@ -4,28 +4,36 @@ import contextvars
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from typing import NamedTuple
 
 import boto3
 from botocore.config import Config as BotocoreConfig
+
+# Load .env from the repo root (visually/.env) so that all services pick up the
+# correct model IDs and credentials regardless of which directory they start from.
+# override=False means system env vars set externally still win, but .env values
+# fill in anything that isn't already in the environment.
+try:
+    from dotenv import load_dotenv, find_dotenv
+    _dotenv_path = find_dotenv(usecwd=False)
+    if _dotenv_path:
+        load_dotenv(_dotenv_path, override=True)
+except ImportError:
+    pass
 
 # Dedicated thread pool for Bedrock — the default executor has only cpu_count+4 threads
 # which causes queuing when many charts run in parallel. 24 workers allows up to 24
 # concurrent Bedrock calls without blocking the event loop.
 _BEDROCK_EXECUTOR = ThreadPoolExecutor(max_workers=24, thread_name_prefix="bedrock")
 
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+# Configurable model IDs — read from env so .env values always win over any
+# stale system-level env vars that point to old model IDs.
+BEDROCK_SONNET_MODEL = os.getenv("BEDROCK_SONNET_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+BEDROCK_HAIKU_MODEL  = os.getenv("BEDROCK_HAIKU_MODEL_ID",  "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+BEDROCK_OPUS_MODEL   = os.getenv("BEDROCK_OPUS_MODEL_ID",   "us.anthropic.claude-opus-4-5-20251101-v1:0")
+BEDROCK_VISION_MODEL = os.getenv("BEDROCK_VISION_MODEL_ID", "us.anthropic.claude-opus-4-5-20251101-v1:0")
 
-# Configurable model IDs — set via env vars, fall back to Claude 3 defaults
-BEDROCK_SONNET_MODEL = os.getenv("BEDROCK_SONNET_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
-BEDROCK_HAIKU_MODEL = os.getenv("BEDROCK_HAIKU_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
-BEDROCK_VISION_MODEL = os.getenv("BEDROCK_VISION_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
-
-BEDROCK_MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "2048"))
+BEDROCK_MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "8192"))
 BEDROCK_TEMPERATURE = float(os.getenv("BEDROCK_TEMPERATURE", "0.0"))
 
 
@@ -74,21 +82,29 @@ def _track_usage(model_id: str, result: dict) -> None:
 _BEDROCK_CONFIG = BotocoreConfig(
     connect_timeout=10,   # fail fast if can't reach AWS
     read_timeout=120,     # 2 min max for vision/LLM response
-    retries={"max_attempts": 1},
+    retries={"max_attempts": 3},
 )
 
 
 def get_bedrock_client():
-    kwargs = {
+    # Re-read credentials from env on every call so that:
+    # - Updating AWS_SESSION_TOKEN in .env and reloading takes effect without restart
+    # - If the running process reloads .env (e.g. via dotenv override), new tokens work
+    access_key    = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key    = os.getenv("AWS_SECRET_ACCESS_KEY")
+    session_token = os.getenv("AWS_SESSION_TOKEN")
+    region        = os.getenv("AWS_REGION", "us-east-1")
+
+    kwargs: dict = {
         "service_name": "bedrock-runtime",
-        "region_name": AWS_REGION,
+        "region_name": region,
         "config": _BEDROCK_CONFIG,
     }
-    if AWS_ACCESS_KEY_ID:
-        kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
-        kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
-    if AWS_SESSION_TOKEN:
-        kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    if access_key:
+        kwargs["aws_access_key_id"] = access_key
+        kwargs["aws_secret_access_key"] = secret_key
+    if session_token:
+        kwargs["aws_session_token"] = session_token
     return boto3.client(**kwargs)
 
 

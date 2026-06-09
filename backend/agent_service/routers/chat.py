@@ -16,6 +16,7 @@ from shared.models.widgets import Widget
 from shared.encryption import decrypt
 from shared.export_tokens import validate_export_token
 from agent_service.agents.chat_agent import ChatAgent
+import agent_service.agents.schema_cache as _schema_cache
 
 router = APIRouter(tags=["chat"])
 _agent = ChatAgent()
@@ -51,40 +52,60 @@ async def chat(
     # Load conversation history from Redis
     history = await ChatAgent.load_history(session_id, redis)
 
-    # Load schema snapshot for this project
-    schema_doc = await _get_project_schema(req.project_id, db)
+    # Load schema context (raw doc + connection meta needed for enrichment)
+    schema_doc, connection_id_for_schema, db_type = await _get_schema_context(
+        req.project_id, db
+    )
+
+    # Use req.connection_id if caller supplied it; otherwise fall back to the
+    # connection we found via the project.
+    effective_connection_id = req.connection_id or connection_id_for_schema
+
+    # Enrich the schema (L1→L2→L3 cache: usually a sub-millisecond L1 hit).
+    # Falls back to schema_doc=={} gracefully when no schema is available.
+    enriched = None
+    if schema_doc and effective_connection_id:
+        try:
+            enriched = await _schema_cache.get_or_build(
+                effective_connection_id, schema_doc, db_type
+            )
+        except Exception as _e:
+            print(f"[chat] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
 
     # Load dashboard widgets if dashboard_id provided
     dashboard_widgets = []
     if req.dashboard_id:
         dashboard_widgets = await _get_dashboard_widgets(req.dashboard_id, db)
 
-    # Call Chat Agent
+    # Call Chat Agent — pass enriched schema when available
     result = await _agent.respond(
         message=req.message,
         conversation_history=history,
         schema_doc=schema_doc,
         dashboard_widgets=dashboard_widgets,
+        enriched_schema=enriched,
     )
 
     # Execute inline SQL if agent returned one
     inline_chart = None
     if result["sql_to_execute"]:
         sql_spec = result["sql_to_execute"]
-        connection_id = req.connection_id
-        if not connection_id:
-            conn = await _get_primary_connection(req.project_id, db)
-            if conn:
-                connection_id = str(conn.id)
-
-        if connection_id and sql_spec.get("sql"):
-            exec_result = await _execute_sql(connection_id, sql_spec["sql"])
+        # effective_connection_id already resolved above — no extra DB trip needed
+        if effective_connection_id and sql_spec.get("sql"):
+            exec_result = await _execute_sql(effective_connection_id, sql_spec["sql"])
             if not exec_result.get("error") and exec_result.get("rows"):
                 render_result = await _render_chart(sql_spec, exec_result["rows"])
                 columns = exec_result.get("columns", [])
                 rows = exec_result.get("rows", [])
                 labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
-                values = [r.get(columns[1]) for r in rows] if len(columns) > 1 else []
+                # For single-column results (KPI scalars), treat that column as the value.
+                # For multi-column results, column[0] is the label, column[1] is the value.
+                if len(columns) > 1:
+                    values = [r.get(columns[1]) for r in rows]
+                elif len(columns) == 1:
+                    values = [r.get(columns[0]) for r in rows]
+                else:
+                    values = []
                 inline_chart = {
                     "chart_type": sql_spec.get("chart_type", "table"),
                     "title": sql_spec.get("title", "Chart"),
@@ -149,12 +170,27 @@ async def export_chat(
     if not export_token_record:
         raise HTTPException(status_code=401, detail="Invalid, expired, or revoked export token")
 
+    # Load schema for this export's project so the AI has context
+    export_enriched = None
+    export_schema_doc = {}
+    try:
+        export_schema_doc, export_conn_id, export_db_type = await _get_schema_context(
+            str(export_token_record.project_id), db
+        )
+        if export_schema_doc and export_conn_id:
+            export_enriched = await _schema_cache.get_or_build(
+                export_conn_id, export_schema_doc, export_db_type
+            )
+    except Exception as _e:
+        print(f"[export-chat] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
+
     # Respond using ChatAgent in read-only mode (no dashboard actions)
     result = await _agent.respond(
         message=req.message,
         conversation_history=req.history[-20:],
-        schema_doc={},
+        schema_doc=export_schema_doc,
         dashboard_widgets=[],
+        enriched_schema=export_enriched,
     )
 
     # Strip any dashboard actions — export chat is read-only
@@ -175,7 +211,10 @@ async def clear_chat(
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-async def _get_project_schema(project_id: str, db: AsyncSession) -> dict:
+async def _get_schema_context(
+    project_id: str, db: AsyncSession
+) -> tuple[dict, str, str]:
+    """Returns (schema_doc, connection_id_str, db_type_str)."""
     conn_result = await db.execute(
         select(DatabaseConnection)
         .where(DatabaseConnection.project_id == uuid.UUID(project_id))
@@ -184,7 +223,9 @@ async def _get_project_schema(project_id: str, db: AsyncSession) -> dict:
     )
     conn = conn_result.scalar_one_or_none()
     if not conn:
-        return {}
+        return {}, "", "postgresql"
+    connection_id_str = str(conn.id)
+    db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
     snap_result = await db.execute(
         select(SchemaSnapshot)
         .where(SchemaSnapshot.connection_id == conn.id)
@@ -192,7 +233,8 @@ async def _get_project_schema(project_id: str, db: AsyncSession) -> dict:
         .limit(1)
     )
     snapshot = snap_result.scalar_one_or_none()
-    return snapshot.schema_document if snapshot else {}
+    schema_doc = snapshot.schema_document if snapshot else {}
+    return schema_doc, connection_id_str, db_type
 
 
 async def _get_dashboard_widgets(dashboard_id: str, db: AsyncSession) -> list[dict]:

@@ -39,6 +39,9 @@ _USER_TEMPLATE = """DASHBOARD OVERVIEW — {chart_count} charts detected.
 CURRENT COLUMN ASSIGNMENTS PER CHART:
 {charts_summary}
 
+TABLE SEMANTICS (business purpose of each table):
+{semantics_block}
+
 COLUMN DISAMBIGUATION CONTEXT:
 {disambiguation_block}
 
@@ -110,9 +113,19 @@ async def coordinate_columns(
 
     disambiguation_block = enriched.get_disambiguation_text()
 
+    # Collect all tables referenced across charts for focused semantics
+    all_referenced_tables = list({
+        t
+        for spec in chart_specs
+        for cand in all_candidates.get(spec.get("id", ""), [])[:1]
+        for t in (cand.get("tables") or [])
+    })
+    semantics_block = enriched.get_table_semantics_text(all_referenced_tables or None)
+
     user_msg = _USER_TEMPLATE.format(
         chart_count=len(chart_specs),
         charts_summary="\n\n".join(summary_parts),
+        semantics_block=semantics_block or "(no table semantics available)",
         disambiguation_block=disambiguation_block or "(no ambiguous columns detected)",
     )
 

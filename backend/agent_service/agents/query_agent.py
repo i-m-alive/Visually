@@ -1,16 +1,35 @@
 import json
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
 from shared.schemas.agent import IntentResult
 from shared.schemas.schema import SemanticSchemaDocument
 from shared.schemas.chart import QueryPlan
 from agent_service.agents.sql_utils import expand_table_aliases, basic_sql_lint, verify_columns_against_schema
 
+if TYPE_CHECKING:
+    from agent_service.agents.schema_cache import EnrichedSchema
+    from agent_service.agents.spec_reader import ChartSpecHint
+
+
+def _score_table(intent_text: str, table: dict) -> float:
+    """Word-overlap score between intent text and a compact_table entry."""
+    words = set(re.sub(r"[^a-z0-9_]", " ", intent_text.lower()).split())
+    table_text = (
+        (table.get("description") or "")
+        + " " + table.get("name", "")
+        + " " + " ".join(c.get("name", "") for c in table.get("columns", []))
+    )
+    twords = set(re.sub(r"[^a-z0-9_]", " ", table_text.lower()).split())
+    if not twords:
+        return 0.0
+    return len(words & twords) / (len(words) + 1)
+
 QUERY_AGENT_MODEL = BEDROCK_SONNET_MODEL
 
-# SQL is rarely > 500 tokens — 1024 cuts latency without sacrificing quality
-_SQL_MAX_TOKENS = 1024
+# 4096 tokens: context-enriched prompts (Mode 3) produce larger SQL with CTEs,
+# multi-table JOINs, CASE expressions, and date filters that can exceed 1024 tokens.
+_SQL_MAX_TOKENS = 4096
 
 # Chart types that are intrinsically temporal — always benefit from a date filter
 _TIME_CHART_TYPES = frozenset({
@@ -34,21 +53,79 @@ _MONTH_ABBREVS = frozenset({
 _QUARTER_LABELS = frozenset({"q1", "q2", "q3", "q4"})
 
 
+_KPI_PERIOD_KEYWORDS = frozenset({
+    "ytd", "mtd", "qtd", "this year", "this month", "this quarter",
+    "current year", "last year", "last month", "last quarter",
+    "year to date", "month to date", "quarter to date",
+})
+_KPI_PERIOD_MONTH_ABBREVS = frozenset({
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+})
+
+
+def _detect_tick_granularity(x_tick_labels: list) -> str | None:
+    """
+    Infer date grouping granularity (year/quarter/month) from x-axis tick labels.
+    Returns "year" | "quarter" | "month" | "week" | None.
+    """
+    if not x_tick_labels:
+        return None
+    ticks = [str(t).lower().strip() for t in x_tick_labels[:8]]
+    import re as _re_gran
+    # Quarters: Q1, Q2, Q1 2024, FY24 Q1, etc.
+    if sum(1 for t in ticks if any(q in t for q in ("q1", "q2", "q3", "q4"))) >= 2:
+        return "quarter"
+    # Month abbreviations
+    if sum(1 for t in ticks if any(m in t for m in _MONTH_ABBREVS)) >= 3:
+        return "month"
+    # Full month names
+    _FULL_MONTHS = {
+        "january", "february", "march", "april", "june",
+        "july", "august", "september", "october", "november", "december",
+    }
+    if sum(1 for t in ticks if any(mn in t for mn in _FULL_MONTHS)) >= 3:
+        return "month"
+    # Year labels: 2020, 2021 (only years, no month detail)
+    year_ticks = [t for t in ticks if _re_gran.match(r"^20\d{2}$", t.strip())]
+    if len(year_ticks) >= 3:
+        return "year"
+    # Week indicators: "Week 1", "W01", "wk 3"
+    if sum(1 for t in ticks if _re_gran.search(r"\b(week|wk|w)\s*\d", t)) >= 2:
+        return "week"
+    return None
+
+
 def _chart_needs_date_filter(chart_spec: dict) -> bool:
     """
     Return True only when the chart is genuinely time-based and benefits from
     a date WHERE clause.
 
     Rules:
-    - KPI / gauge: NEVER — total aggregates should scan all time
+    - KPI / gauge: NEVER — UNLESS title/metric name contains explicit period keywords
+      (YTD, 2024, last year, etc.) in which case a date WHERE is required.
     - line / area / calendar_heatmap / timeline / gantt: ALWAYS — intrinsically temporal
     - Everything else (bar, pie, table, treemap …): only when title / axis labels /
       x_tick_labels contain explicit time references (year pattern, month abbrev,
       quarter label, or time keyword like "monthly" / "ytd")
     """
     chart_type = (chart_spec.get("type") or "").lower().replace("-", "_")
+    import re as _re_dt2
 
     if chart_type in ("kpi", "kpi_card", "gauge"):
+        # KPI needs a date filter when its title/metric explicitly names a period
+        kpi_text = " ".join(filter(None, [
+            chart_spec.get("title") or "",
+            chart_spec.get("kpi_metric_name") or "",
+            chart_spec.get("subtitle") or "",
+        ])).lower()
+        if any(kw in kpi_text for kw in _KPI_PERIOD_KEYWORDS):
+            return True
+        # Year pattern in title: "Revenue 2024", "2023 Headcount"
+        if _re_dt2.search(r"\b20\d{2}\b", kpi_text):
+            return True
+        # Month abbreviation in KPI title
+        if any(m in kpi_text for m in _KPI_PERIOD_MONTH_ABBREVS):
+            return True
         return False
 
     if chart_type in _TIME_CHART_TYPES:
@@ -132,6 +209,24 @@ KPI ABSOLUTE RULES (when chart_type is "kpi"):
 - The query MUST return exactly 1 row with 1 numeric column
 - Wrong: SELECT job_role, COUNT(*) FROM jobs GROUP BY 1  → this returns N rows, not 1
 - Right:  SELECT COUNT(*) AS total_jobs FROM jobs
+- EXCEPTION — when kpi_grouped=true in chart_spec: the KPI card shows multiple values
+  broken down by a dimension (e.g. "TAO: 231 / VCS: 6531"). In this case:
+  USE the kpi_group_labels as the GROUP BY dimension values.
+  SQL: SELECT {group_col}, COUNT(*) AS value FROM table GROUP BY 1 ORDER BY 1
+  where {group_col} is the column whose distinct values match kpi_group_labels.
+
+PBIT FIELD BINDINGS (when pbit_field_bindings is present in the request — ABSOLUTE PRIORITY):
+- The field_bindings dict maps visual roles to columns/measures:
+    Category / Axis / X → GROUP BY dimension column
+    Y / Values / Measure → aggregate metric (COUNT, SUM, AVG, or a measure expression)
+    Legend / Series / Color → secondary GROUP BY for series breakdown
+    Tooltips → additional SELECT columns (do not GROUP BY these)
+- Column references in field_bindings follow "TableName.ColumnName" or "TableName.[Measure]" format.
+  Strip brackets and use only the column/measure name in SQL.
+- If a measure name appears in both field_bindings and the measures dict, use the measures.sql expression
+  directly as the SELECT expression (it is the translated DAX formula).
+- NEVER invent a column not in field_bindings — only columns/measures listed there go in SELECT.
+- db_tables lists the EXACT DB tables to use — do not add or replace these.
 
 REDSHIFT-SPECIFIC RULES (when db_dialect is "redshift"):
 - Use GROUP BY 1, 2 (ordinal positions), NOT column alias names
@@ -139,6 +234,13 @@ REDSHIFT-SPECIFIC RULES (when db_dialect is "redshift"):
 - Use ILIKE for case-insensitive matching
 - VARCHAR max 65535, no TEXT type
 - Use DATE_TRUNC (same as PostgreSQL)
+- COLUMN REFERENCE RULE (critical): column references in SELECT/WHERE/JOIN ON must use
+  ONLY "alias.column" or "table_name.column" — NEVER the 3-level "schema.table.column"
+  form (this is invalid SQL and will raise "invalid reference to FROM-clause entry").
+  Always assign aliases to schema-qualified tables in FROM:
+    CORRECT:  FROM staging.bullhorn_client_corporation AS cc  →  SELECT cc.name
+    WRONG:    SELECT staging.bullhorn_client_corporation.name  (3-level = invalid)
+  If two tables share a column name, qualify with the alias, not the schema prefix.
 
 CONCRETE EXAMPLES — copy the pattern, not the table/column names:
 
@@ -188,21 +290,61 @@ class QueryAgent:
         db_type: str,
         retry_feedback: Optional[str] = None,
         attempt: int = 1,
+        enriched: Optional["EnrichedSchema"] = None,
     ) -> QueryPlan:
-        important = schema.important_tables[:5]
-        tables_context = []
-        for table in schema.tables:
-            if table.name in important or attempt > 1:
-                tables_context.append({
-                    "name": table.name,
-                    "description": table.description,
-                    "row_count": table.row_count,
+        # Prefer enriched compact_tables with TF-IDF ranking when available
+        if enriched and enriched.compact_tables:
+            intent_text = (intent.reasoning or "") + " " + " ".join(
+                intent.entities.metrics + intent.entities.dimensions
+            )
+            scored = sorted(
+                enriched.compact_tables,
+                key=lambda t: _score_table(intent_text, t),
+                reverse=True,
+            )
+            # On retries widen to top 12; first attempt top 8
+            top_n = 12 if attempt > 1 else 8
+            top_tables = scored[:top_n]
+            tables_context = [
+                {
+                    "name": t.get("name"),
+                    "description": t.get("description"),
+                    "row_count": t.get("row_count", 0),
                     "columns": [
-                        {"name": c.name, "type": c.type, "is_primary_key": c.is_primary_key, "description": c.description}
-                        for c in table.columns
+                        {
+                            "name": c.get("name"),
+                            "type": c.get("type"),
+                            "is_primary_key": c.get("semantic_type") == "pk",
+                            "description": c.get("description") or "",
+                            "semantic_type": c.get("semantic_type"),
+                        }
+                        for c in t.get("columns", [])
                     ],
-                    "relationships": [{"column": r.column, "references": r.references} for r in table.relationships],
-                })
+                    "relationships": [
+                        {"column": r.get("column"), "references": r.get("references")}
+                        for r in (t.get("relationships") or [])
+                    ],
+                }
+                for t in top_tables
+            ]
+            important = [t.get("name") for t in top_tables[:5]]
+            semantics = enriched.get_table_semantics_text(important)
+        else:
+            important = schema.important_tables[:5]
+            tables_context = []
+            for table in schema.tables:
+                if table.name in important or attempt > 1:
+                    tables_context.append({
+                        "name": table.name,
+                        "description": table.description,
+                        "row_count": table.row_count,
+                        "columns": [
+                            {"name": c.name, "type": c.type, "is_primary_key": c.is_primary_key, "description": c.description}
+                            for c in table.columns
+                        ],
+                        "relationships": [{"column": r.column, "references": r.references} for r in table.relationships],
+                    })
+            semantics = ""
 
         user_content: dict = {
             "user_intent": intent.reasoning,
@@ -218,18 +360,22 @@ class QueryAgent:
             "db_type": db_type,
             "schema": {"important_tables": important, "tables": tables_context},
         }
+        if semantics:
+            user_content["table_semantics"] = semantics
 
         if retry_feedback:
             user_content["retry_feedback"] = retry_feedback
             user_content["attempt"] = attempt
             user_content["instruction"] = "This is a retry. Apply the retry_feedback to fix the previous query."
 
+        # Increase temperature on retries to force diverse SQL exploration
+        _temp = 0.10 if attempt == 1 else min(0.20 + (attempt - 1) * 0.10, 0.45)
         raw = await bedrock_invoke(
             model_id=QUERY_AGENT_MODEL,
             system_prompt=SYSTEM_PROMPT,
             user_message=json.dumps(user_content, default=str),
             max_tokens=_SQL_MAX_TOKENS,
-            temperature=0.1,
+            temperature=_temp,
         )
 
         raw = raw.strip()
@@ -280,6 +426,14 @@ class QueryAgent:
         error_recovery_mode: Optional[str] = None,     # "no_alias" | "no_union_order"
         dashboard_date_context: Optional[dict] = None, # global date window across all charts
         previously_tried: Optional[list] = None,       # [{tables, failure_reason}] — Layer 2 exploration
+        failure_type: Optional[str] = None,            # from classify_failure — drives temperature
+        parsed_context: Optional[dict] = None,         # structured signals from context_parser (Mode 3)
+        user_context: str = "",                        # raw free-text from user (Mode 3)
+        spec_hint: Optional["ChartSpecHint"] = None,  # per-chart SQL template from spec_reader (Mode 3 PDF)
+        calc_col_map: Optional[dict] = None,           # {col_name: sql_expression} — PDF calculated columns
+        business_rules: Optional[list] = None,         # required WHERE constraints from PDF spec
+        pbit_column_hint: Optional[dict] = None,       # PBIT visual field bindings — highest priority
+        resolved_spec=None,                            # ResolvedChartSpec from context_synthesizer
     ) -> dict:
         """
         Generate SQL from a Vision Agent ChartSpec (screenshot replication mode).
@@ -290,14 +444,19 @@ class QueryAgent:
         schema = enriched.schema_doc
         db_type = enriched.db_type
 
-        # Use candidate tables first, then fill with other tables
+        # Build the table context sent in the prompt.
+        # user_mandated=True means the user explicitly selected these tables —
+        # do NOT append any extra tables. Sending extra tables lets the model
+        # "accidentally" reference them even when told not to.
         all_tables = {t.get("name"): t for t in enriched.compact_tables}
         if candidate and candidate.get("tables"):
             focus_names = candidate["tables"]
             tables_context = [all_tables[n] for n in focus_names if n in all_tables]
-            # Add a few more for join context
-            rest = [t for n, t in all_tables.items() if n not in focus_names][:6]
-            tables_context = tables_context + rest
+            if not candidate.get("user_mandated"):
+                # Non-mandated: add a few neighbours for optional join context
+                rest = [t for n, t in all_tables.items() if n not in focus_names][:6]
+                tables_context = tables_context + rest
+            # user_mandated: show ONLY the selected tables — nothing else visible
         else:
             tables_context = enriched.compact_tables[:12]
 
@@ -315,7 +474,9 @@ class QueryAgent:
                 "x_tick_labels": chart_spec.get("x_tick_labels", []),
                 "estimated_values": chart_spec.get("estimated_values", {}),
                 "data_point_count": chart_spec.get("data_point_count", 0),
-                "legend_labels": chart_spec.get("legend_labels", []),
+                    "legend_labels": chart_spec.get("legend_labels", []),
+                "kpi_grouped": chart_spec.get("kpi_grouped", False),
+                "kpi_group_labels": chart_spec.get("kpi_group_labels", []),
             },
             "db_type": db_type,
             "schema": {"tables": tables_context},
@@ -331,6 +492,232 @@ class QueryAgent:
             ),
         }
 
+        # Inject FK join conditions from the relationship graph for candidate tables.
+        # The LLM cannot infer join keys reliably from column name similarity alone —
+        # injecting the exact FK conditions eliminates wrong-column JOIN errors.
+        if candidate and candidate.get("tables") and hasattr(enriched, "relationship_graph"):
+            _rg = enriched.relationship_graph
+            _cand_tables = candidate.get("tables", [])
+            _join_lines = []
+            for _ta in _cand_tables:
+                nbrs = (_rg.edges or {}).get(_ta, {})
+                for _tb, _cond in nbrs.items():
+                    if _tb in _cand_tables and _cond:
+                        _join_lines.append(_cond)
+            if _join_lines:
+                user_content["join_conditions"] = list(dict.fromkeys(_join_lines))  # deduplicate
+
+        # Mode 3: inject user context as the highest-priority instruction block.
+        # This runs BEFORE all other instruction appends so it can override schema inference.
+        if parsed_context or user_context:
+            from agent_service.agents.context_parser import build_context_instruction as _bci
+            ctx_instruction = _bci(parsed_context or {}, user_context)
+            if ctx_instruction:
+                user_content["instruction"] = ctx_instruction + " | " + user_content["instruction"]
+                user_content["user_context"] = user_context or ""
+                # Inject structured signals for the model to parse directly
+                if parsed_context:
+                    _ctx_signals: dict = {}
+                    if parsed_context.get("implied_filters"):
+                        _ctx_signals["required_filters"] = parsed_context["implied_filters"]
+                    _dr = parsed_context.get("implied_date_range") or {}
+                    if _dr.get("start"):
+                        _ctx_signals["required_date_range"] = _dr
+                    if parsed_context.get("implied_aggregation"):
+                        _ctx_signals["required_aggregation"] = parsed_context["implied_aggregation"]
+                    if parsed_context.get("implied_groupby_hint"):
+                        _ctx_signals["required_groupby"] = parsed_context["implied_groupby_hint"]
+                    if parsed_context.get("sql_constraints"):
+                        _ctx_signals["sql_constraints"] = parsed_context["sql_constraints"]
+                    if _ctx_signals:
+                        user_content["context_signals"] = _ctx_signals
+
+        # Business rules from PDF spec — mandatory WHERE constraints that Power BI enforces at the
+        # model level (e.g. "isdeleted = FALSE on all bullhorn_ tables"). Every query must apply these.
+        if business_rules:
+            rules_text = "; ".join(business_rules[:10])
+            user_content["instruction"] = (
+                f"⚑ MANDATORY SQL CONSTRAINTS (from report specification — apply to EVERY query): "
+                f"{rules_text}. "
+                "These are not optional — omitting them returns soft-deleted or inactive records "
+                "that were excluded from the original Power BI report. "
+                "| " + user_content["instruction"]
+            )
+            user_content["business_rules"] = business_rules[:10]
+            print(
+                f"[query_agent] ✓ business_rules injected: {len(business_rules)} rule(s)",
+                flush=True,
+            )
+
+        # Spec hint from PDF documentation — injected as the HIGHEST priority instruction block.
+        # When present, the SQL template from the document overrides all schema inference.
+        # The model must use the documented business logic, filters, and aggregation exactly.
+        if spec_hint and spec_hint.sql_template:
+            spec_instruction = (
+                "⚑ DOCUMENTATION SPEC — A verified SQL template exists for this exact chart. "
+                "You MUST replicate this template with FULL FIDELITY. Rules: "
+                "(1) Keep EVERY expression in the SELECT list — do NOT drop window functions "
+                "(OVER, PARTITION BY), CTEs, CASE WHEN expressions, or percentage calculations. "
+                "(2) Keep the same GROUP BY, ORDER BY, and WHERE filter logic. "
+                "(3) Only allowed adaptations: add/remove schema prefix, fix column name casing "
+                "when a column does not exist as written. "
+                "(4) Do NOT simplify a window function to a plain aggregate. "
+                "(5) Do NOT replace a CTE with an inline subquery unless the CTE itself fails. "
+                "(6) If the template has COALESCE(col, ...) but col is listed as an FK integer "
+                "in calc_col_substitutions, use the CASE WHEN from calc_col_substitutions instead. "
+                "FAILURE MODE TO AVOID: the template shows `ROUND(100 * COUNT(...) / SUM(COUNT(...)) OVER (), 1)` "
+                "and you write just `COUNT(*)` — this produces raw counts instead of percentages and "
+                "the chart will fail validation. "
+                f"SQL TEMPLATE FROM DOCUMENTATION:\n{spec_hint.sql_template}"
+            )
+            user_content["instruction"] = spec_instruction + " | " + user_content["instruction"]
+            user_content["spec_hint"] = {
+                "title": spec_hint.title,
+                "visual_type": spec_hint.visual_type,
+                "tables_needed": spec_hint.tables_needed,
+                "filters": spec_hint.filters,
+                "measures_used": spec_hint.measures_used,
+            }
+            print(
+                f"[query_agent] ✓ spec hint injected: '{spec_hint.title}'"
+                f"  sql={spec_hint.sql_template[:100].replace(chr(10), ' ')}",
+                flush=True,
+            )
+
+        # Calculated column substitutions from PDF spec_reader global context.
+        # These are Power BI calculated columns that do NOT exist as raw DB columns —
+        # they are CASE WHEN expressions derived from raw FK / status columns.
+        # Example: 'replacement' → CASE WHEN p.replacement IS NOT NULL THEN 'Replaced' ELSE 'Not Replacing' END
+        # Without this, the model groups by the raw FK integer (IDs like 4145, 6208)
+        # instead of the meaningful category labels shown in the chart.
+        if calc_col_map:
+            subst_parts = [
+                f"'{col}' → {expr}"
+                for col, expr in list(calc_col_map.items())[:8]
+            ]
+            user_content["calc_col_substitutions"] = calc_col_map
+            user_content["instruction"] = (
+                "⚑ CALCULATED COLUMN SUBSTITUTIONS (CRITICAL): the following columns are Power BI "
+                "calculated columns. They contain raw IDs or FK integers in the database — they do NOT "
+                "contain the category labels shown in the chart. When you need to GROUP BY or SELECT "
+                "any of these columns, you MUST replace them with the CASE WHEN expression shown. "
+                "Grouping by the raw column will produce numeric IDs (4145, 6208 etc.) instead of "
+                "meaningful categories. Substitutions: "
+                + "; ".join(subst_parts)
+                + " | " + user_content["instruction"]
+            )
+            print(
+                f"[query_agent] ✓ calc_col_map injected: {len(calc_col_map)} substitution(s): "
+                f"{list(calc_col_map.keys())}",
+                flush=True,
+            )
+
+        # Context synthesis result — pre-resolved SQL components.
+        # Only inject on attempt 1 (first try) and only when confidence is high.
+        # On retries the model must be free to explore — don't lock it to potentially
+        # wrong synthesized components across all 5 attempts.
+        if resolved_spec and resolved_spec.primary_table and resolved_spec.confidence >= 0.65 and attempt == 1:
+            _rs_parts = [
+                f"primary_table: {resolved_spec.primary_table}",
+                f"chart_type: {resolved_spec.chart_type}",
+            ]
+            if resolved_spec.dimension_column:
+                _rs_parts.append(f"dimension (x-axis/GROUP BY): {resolved_spec.dimension_column}")
+            if resolved_spec.metric_expression:
+                _rs_parts.append(f"metric (aggregation): {resolved_spec.metric_expression}")
+            if resolved_spec.date_column:
+                _rs_parts.append(f"date_column: {resolved_spec.date_column}")
+            if resolved_spec.join_tables:
+                _rs_parts.append(f"join_tables: {', '.join(resolved_spec.join_tables)}")
+            if resolved_spec.join_conditions:
+                _rs_parts.append(f"join_conditions: {'; '.join(resolved_spec.join_conditions)}")
+            if resolved_spec.where_conditions:
+                _rs_parts.append(f"where: {'; '.join(resolved_spec.where_conditions)}")
+            if resolved_spec.group_by_columns:
+                _rs_parts.append(f"group_by: {', '.join(resolved_spec.group_by_columns)}")
+            if resolved_spec.order_by:
+                _rs_parts.append(f"order_by: {resolved_spec.order_by}")
+            if resolved_spec.limit:
+                _rs_parts.append(f"limit: {resolved_spec.limit}")
+
+            _rs_instruction = (
+                "⚡ CONTEXT SYNTHESIS SUGGESTION (start with these, adapt if SQL fails): "
+                + " | ".join(_rs_parts)
+                + f" | confidence={resolved_spec.confidence:.2f} sources={resolved_spec.sources_used}"
+                + " | " + user_content["instruction"]
+            )
+            user_content["instruction"] = _rs_instruction
+            user_content["resolved_spec"] = {
+                "primary_table": resolved_spec.primary_table,
+                "join_tables": resolved_spec.join_tables,
+                "join_conditions": resolved_spec.join_conditions,
+                "dimension": resolved_spec.dimension_column,
+                "metric_expression": resolved_spec.metric_expression,
+                "where": resolved_spec.where_conditions,
+                "group_by": resolved_spec.group_by_columns,
+                "chart_type": resolved_spec.chart_type,
+            }
+            print(
+                f"[query_agent] ✓ resolved_spec injected (attempt 1): table={resolved_spec.primary_table}"
+                f" dim={resolved_spec.dimension_column}"
+                f" metric={resolved_spec.metric_expression[:60]}"
+                f" conf={resolved_spec.confidence:.2f}",
+                flush=True,
+            )
+
+        # PBIT field bindings — ground truth from the Power BI model file.
+        # This is the HIGHEST priority instruction: it overrides all schema inference,
+        # spec_hint templates, and context_parser signals.  The field bindings come
+        # directly from the PBIT visual's projections — they are the exact columns and
+        # measures Power BI uses to render this chart.
+        if pbit_column_hint:
+            _pb_bindings = pbit_column_hint.get("field_bindings") or {}
+            _pb_db_tables = pbit_column_hint.get("db_tables") or []
+            _pb_measures = pbit_column_hint.get("measures") or {}
+            _pb_joins = pbit_column_hint.get("join_conditions") or []
+            _pb_title = pbit_column_hint.get("title", "")
+
+            _binding_lines = []
+            for _role, _refs in _pb_bindings.items():
+                _binding_lines.append(f"{_role}: {', '.join(_refs)}")
+
+            _measure_lines = [
+                f"  [{mname}] = {mexpr}"
+                for mname, mexpr in list(_pb_measures.items())[:8]
+            ]
+
+            _pbit_instruction = (
+                "⚑ PBIT FILE — GROUND TRUTH FIELD BINDINGS (ABSOLUTE HIGHEST PRIORITY): "
+                "These bindings come directly from the Power BI PBIT model file and represent "
+                "the EXACT columns/measures this chart was built with. You MUST use them. "
+                "Rules: "
+                "(1) Use ONLY the tables listed in db_tables — do NOT add other tables. "
+                "(2) Build the SELECT and GROUP BY from the field_bindings below — Category → GROUP BY dimension, "
+                "Y/Values → aggregate metric, Legend/Series → secondary GROUP BY. "
+                "(3) If a field binding references a measure (contains [brackets]), "
+                "use its translated SQL expression from the measures dict. "
+                "(4) If join_conditions are provided, use them verbatim in the JOIN ON clause. "
+                "(5) Do NOT invent columns — every column in SELECT must come from field_bindings or measures. "
+                f"db_tables: {_pb_db_tables} | "
+                f"field_bindings: {'; '.join(_binding_lines)} | "
+                + (f"measures: {chr(10).join(_measure_lines)} | " if _measure_lines else "")
+                + (f"join_conditions: {'; '.join(_pb_joins)} | " if _pb_joins else "")
+                + (f"visual_title: {_pb_title}" if _pb_title else "")
+            )
+            user_content["instruction"] = _pbit_instruction + " | " + user_content["instruction"]
+            user_content["pbit_field_bindings"] = {
+                "field_bindings": _pb_bindings,
+                "db_tables": _pb_db_tables,
+                "measures": _pb_measures,
+                "join_conditions": _pb_joins,
+            }
+            print(
+                f"[query_agent] ✓ PBIT field bindings injected: "
+                f"tables={_pb_db_tables}  bindings={list(_pb_bindings.keys())}  "
+                f"measures={list(_pb_measures.keys())}  joins={len(_pb_joins)}",
+                flush=True,
+            )
+
         if candidate:
             user_content["schema_analysis"] = {
                 "recommended_tables": candidate.get("tables", []),
@@ -338,7 +725,18 @@ class QueryAgent:
                 "join_condition": candidate.get("join"),
                 "reasoning": candidate.get("reasoning", ""),
             }
-            user_content["instruction"] += f" PRIORITY: use {candidate.get('tables')} as recommended by schema analysis."
+            if candidate.get("user_mandated"):
+                # User explicitly specified these tables — do not deviate regardless of schema
+                _mandated = candidate.get("tables", [])
+                user_content["instruction"] += (
+                    f" CRITICAL — USER-MANDATED TABLES: the user has explicitly specified that"
+                    f" ONLY {_mandated} must be used. Do NOT reference any other table."
+                    f" Do NOT join with tables outside this list."
+                    f" If the data you need appears to require another table, find it within"
+                    f" {_mandated} instead."
+                )
+            else:
+                user_content["instruction"] += f" PRIORITY: use {candidate.get('tables')} as recommended by schema analysis."
 
         # Ground-truth DB values from value_sampler — highest-confidence hints available
         is_kpi = chart_spec.get("type", "") in ("kpi", "kpi_card", "gauge")
@@ -395,9 +793,32 @@ class QueryAgent:
                 f" DASHBOARD DATE: {dashboard_date_context['date_instruction']}"
             )
 
+        # ── x_tick_labels granularity hint ────────────────────────────────────
+        x_tick_labels_raw = chart_spec.get("x_tick_labels") or []
+        granularity = _detect_tick_granularity(x_tick_labels_raw)
+        if granularity and _chart_needs_date_filter(chart_spec):
+            _trunc_map = {"quarter": "quarter", "month": "month", "year": "year", "week": "week"}
+            _trunc_fn = _trunc_map.get(granularity, "month")
+            user_content["instruction"] += (
+                f" DATE GRANULARITY: x-axis tick labels indicate {granularity}-level grouping — "
+                f"use DATE_TRUNC('{_trunc_fn}', date_col) AS period for the time dimension. "
+                f"Do NOT group at day or month level when the chart shows {granularity}s."
+            )
+
         # ── Option 2: Magnitude anchor ─────────────────────────────────────────
         estimated_values = chart_spec.get("estimated_values") or {}
-        if estimated_values:
+        # If vision OCR was uncertain, magnitude anchor is unreliable — skip it and
+        # let the model infer from schema semantics instead.
+        has_uncertain_estimates = any(
+            isinstance(v, str) and str(v).startswith("~")
+            for v in estimated_values.values()
+        )
+        if has_uncertain_estimates:
+            user_content["instruction"] += (
+                " NOTE: vision OCR values are uncertain (marked ~) — do NOT anchor to their "
+                "magnitude. Focus on correct table + aggregation from schema semantics."
+            )
+        if estimated_values and not has_uncertain_estimates:
             import re as _re2
             def _parse_est_val(v: str):
                 s = str(v).replace("~", "").replace(",", "").strip()
@@ -490,7 +911,7 @@ class QueryAgent:
         # Injected by the orchestrator from tried_tables_history. The LLM must
         # explore a NEW set of tables / joins not present in this list.
         if previously_tried:
-            _tried_entries = previously_tried[-4:]  # last 4 only — context cost
+            _tried_entries = previously_tried[-8:]  # keep last 8 — prevents LLM from re-trying forgotten combos
             _tried_summary = "; ".join(
                 "tables={} reason={}".format(
                     p.get("tables", []),
@@ -509,12 +930,24 @@ class QueryAgent:
                 "Repeating a failed combination will guarantee another retry."
             )
 
+        # Adaptive temperature — jump aggressively when the issue is a wrong table/data,
+        # stay low when fixing syntax errors (deterministic fix needed).
+        if attempt == 1:
+            _temp = 0.15
+        elif failure_type in ("table_not_found", "permission_denied", "zero_rows", "wrong_table"):
+            _temp = 0.38  # wrong data source → need radically different SQL structure
+        elif failure_type in ("column_not_found", "syntax_error", "db_error", "alias_error"):
+            _temp = 0.12  # structural fix → keep low temp for determinism
+        elif failure_type in ("value_mismatch", "low_score_value"):
+            _temp = 0.25  # aggregation change → moderate exploration
+        else:
+            _temp = min(0.20 + (attempt - 1) * 0.08, 0.40)  # fallback: gentle ramp
         raw = await bedrock_invoke(
             model_id=QUERY_AGENT_MODEL,
             system_prompt=SYSTEM_PROMPT,
             user_message=json.dumps(user_content, default=str),
             max_tokens=_SQL_MAX_TOKENS,
-            temperature=0.15,
+            temperature=_temp,
         )
         raw = raw.strip()
         if raw.startswith("```"):
@@ -540,6 +973,22 @@ class QueryAgent:
         generated_sql = expand_table_aliases(generated_sql)
         data["sql"] = generated_sql
 
+        # Truncation detection: unbalanced parentheses or response near token limit are
+        # reliable signs that the LLM stopped mid-SQL due to max_tokens.
+        _open = generated_sql.count("(")
+        _close = generated_sql.count(")")
+        if _open != _close:
+            print(
+                f"[query_agent] ⚠ SQL truncation likely: "
+                f"unbalanced parens ({_open} open, {_close} close) — "
+                f"SQL may be incomplete. Flagging for retry.",
+                flush=True,
+            )
+            data["_truncation_warning"] = (
+                f"Unbalanced parentheses ({_open} open vs {_close} close) — SQL may be truncated. "
+                "Rewrite using simpler structure without deeply nested subqueries."
+            )
+
         # Basic lint before returning (non-fatal — logs warning, passes through)
         db_dialect = data.get("db_dialect", "redshift" if enriched and enriched.db_type == "redshift" else "postgresql")
         lint_error = basic_sql_lint(generated_sql, db_dialect)
@@ -564,4 +1013,5 @@ class QueryAgent:
             "title": data.get("title") or chart_spec.get("title") or "Chart",
             "reasoning": data.get("reasoning", ""),
             "_column_error": data.get("_column_error"),
+            "_truncation_warning": data.get("_truncation_warning"),
         }

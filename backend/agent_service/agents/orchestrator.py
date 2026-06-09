@@ -27,6 +27,9 @@ from agent_service.services.ws_manager import manager as _ws_manager
 DASHBOARD_DECOMPOSE_MODEL = BEDROCK_HAIKU_MODEL
 DASHBOARD_MAX_CHARTS = 5        # max charts per dashboard (count cap)
 CHART_CONCURRENCY = 10          # parallel Bedrock chart slots (can exceed DASHBOARD_MAX_CHARTS)
+# Windows select() caps at 512 FDs. Pre-sampling spawns N_charts × 3 candidates × ~5 DB queries
+# concurrently. Cap chart-level parallelism so total open sockets stays well under 512.
+PRESAMPLE_CONCURRENCY = 6       # max charts sampling in parallel at step 3.7
 
 # In-process hint communication — maps hint_id → asyncio.Event / response string
 _hint_events: dict[str, asyncio.Event] = {}
@@ -111,14 +114,24 @@ class Orchestrator:
             conn_rec = conn_result.scalar_one_or_none()
             db_type = conn_rec.db_type.value if conn_rec else "postgresql"
 
-            # STEP 3+4+5+6: Query → Execute → Render → Validate (with one retry)
+            # Build enriched schema (L1/L2 cache hit is sub-ms; L3 cold build is async)
+            enriched = None
+            try:
+                enriched = await _schema_cache.get_or_build(connection_id, schema_doc, db_type)
+            except Exception as _e:
+                print(f"[pipeline:{job_id}] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
+
+            # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
             final_result = None
             retry_feedback: Optional[str] = None
+            _MAX_SINGLE_VIZ_ATTEMPTS = 4
+            # Extract user-requested chart type (None if user didn't specify one)
+            expected_chart_type: Optional[str] = getattr(intent.entities, "chart_type", None)
 
-            for attempt in range(1, 3):
-                # Step 3: Generate query
+            for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1):
+                # Step 3: Generate query — pass attempt so temperature scales on retries
                 await set_pipeline_state(redis, job_id, "step", f"generating_query_attempt_{attempt}")
-                query_plan = await self._query.generate(intent, schema, db_type, retry_feedback)
+                query_plan = await self._query.generate(intent, schema, db_type, retry_feedback, attempt, enriched)
                 await emit({
                     "type": "query.generated",
                     "job_id": job_id,
@@ -138,12 +151,12 @@ class Orchestrator:
                         "row_count": 0,
                         "duration_ms": execute_result.get("duration_ms", 0),
                     })
-                    if attempt == 1:
+                    if attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
                         retry_feedback = f"Query execution failed: {execute_result['error']}. Fix the SQL syntax or table/column names."
                         await emit({
                             "type": "validation.retry",
                             "job_id": job_id,
-                            "attempt": 2,
+                            "attempt": attempt + 1,
                             "strategy": "fix_sql_error",
                         })
                         continue
@@ -151,7 +164,7 @@ class Orchestrator:
                         await emit({
                             "type": "pipeline.error",
                             "job_id": job_id,
-                            "message": f"Query failed after retry: {execute_result['error']}",
+                            "message": f"Query failed after {_MAX_SINGLE_VIZ_ATTEMPTS} attempts: {execute_result['error']}",
                             "recoverable": False,
                         })
                         await self._fail_job(job_id, execute_result["error"], db)
@@ -174,8 +187,11 @@ class Orchestrator:
                 })
                 await set_pipeline_state(redis, job_id, "step", "chart_rendered")
 
-                # Step 6: Validate
-                validation = await self._validator.validate(query_plan, execute_result, attempt)
+                # Step 6: Validate — pass expected_chart_type so type comparison is accurate
+                validation = await self._validator.validate(
+                    query_plan, execute_result, attempt,
+                    expected_chart_type=expected_chart_type,
+                )
                 await emit({
                     "type": "validation.scored",
                     "job_id": job_id,
@@ -184,12 +200,12 @@ class Orchestrator:
                     "dimension_scores": validation.dimension_scores.model_dump(),
                 })
 
-                if not validation.passed and attempt == 1 and validation.retry_feedback:
+                if not validation.passed and attempt < _MAX_SINGLE_VIZ_ATTEMPTS and validation.retry_feedback:
                     retry_feedback = validation.retry_feedback.feedback
                     await emit({
                         "type": "validation.retry",
                         "job_id": job_id,
-                        "attempt": 2,
+                        "attempt": attempt + 1,
                         "strategy": validation.retry_feedback.strategy,
                     })
                     continue
@@ -212,7 +228,7 @@ class Orchestrator:
                 break
 
             if not final_result:
-                # Both attempts failed — use last results with low confidence
+                # All attempts failed — use last results with low confidence
                 chart_data = self._build_chart_data(query_plan, execute_result, {})
                 final_result = {
                     "job_id": job_id,
@@ -746,12 +762,44 @@ No explanation. No markdown. Just the JSON array."""
         connection_id: str,
         redis,
         db: AsyncSession,
+        mode: str = "db",
+        user_table_hints: list[str] = [],
+        csv_data: list[dict] = [],
+        user_context: str = "",
+        pbit_bytes: Optional[bytes] = None,
+        user_column_hints: list = [],
     ) -> dict:
-        """Full screenshot replication pipeline: vision → schema match → per-chart SQL loop → assemble."""
+        """Full screenshot replication pipeline: vision → schema match → per-chart SQL loop → assemble.
+
+        mode="db"  — (default) use the live database connection.
+        mode="csv" — use uploaded CSV files via DuckDB; connection_id is overridden
+                     with a "csv_session:" path so ALL downstream calls (value sampler,
+                     executor, validator) transparently route to DuckDB.
+
+        user_table_hints — table names injected at position 0 with confidence=1.0 after
+                           schema matching (Mode 2 — user knows which tables to use).
+        user_context     — free-text description of the screenshot provided by the user
+                           (Mode 3 — Guided Replication). Parsed into structured SQL
+                           signals and injected into schema matching and SQL generation.
+        """
         from agent_service.agents.vision_agent import VisionAgent
         from shared.bedrock_client import start_token_tracking, get_token_summary
         vision_agent = VisionAgent()
         start_token_tracking()
+
+        # CSV mode: override connection_id so every downstream call routes to DuckDB.
+        # The session directory is deterministic (/tmp/csv_{job_id}) so we can set it
+        # here before the parallel schema-fetch task runs.
+        csv_session_dir: str = ""
+        if mode == "csv":
+            import os as _os
+            csv_session_dir = f"/tmp/csv_{job_id}"
+            _os.makedirs(csv_session_dir, exist_ok=True)
+            connection_id = f"csv_session:{csv_session_dir}"
+            print(
+                f"[pipeline:{job_id}] CSV mode — session dir: {csv_session_dir}",
+                flush=True,
+            )
 
         async def emit(event: dict):
             await publish_pipeline_event(redis, job_id, event)
@@ -822,14 +870,29 @@ No explanation. No markdown. Just the JSON array."""
                 return []
 
         async def _schema_fetch_task() -> tuple:
-            schema_doc = await self._get_schema(project_id, db)
-            db_type = await self._get_connection_db_type(connection_id, db)
-            print(
-                f"[pipeline:{job_id}] schema fetched → tables={len(schema_doc.get('tables', []))}  db_type={db_type}",
-                flush=True,
-            )
-            enriched = await _schema_cache.get_or_build(connection_id, schema_doc, db_type)
-            return schema_doc, db_type, enriched
+            if mode == "csv":
+                from agent_service.agents.csv_ingestor import save_csvs, ingest_csvs
+                from agent_service.agents.csv_relationship_detector import detect_relationships
+                # Write CSV bytes to disk, parse into schema_doc, detect FK joins
+                save_csvs(csv_data, job_id)
+                _schema_doc = ingest_csvs(csv_session_dir)
+                _schema_doc = detect_relationships(csv_session_dir, _schema_doc)
+                _db_type = "duckdb"
+                print(
+                    f"[pipeline:{job_id}] CSV schema built → "
+                    f"tables={len(_schema_doc.get('tables', []))}  db_type={_db_type}",
+                    flush=True,
+                )
+            else:
+                _schema_doc = await self._get_schema(project_id, db)
+                _db_type = await self._get_connection_db_type(connection_id, db)
+                print(
+                    f"[pipeline:{job_id}] schema fetched → "
+                    f"tables={len(_schema_doc.get('tables', []))}  db_type={_db_type}",
+                    flush=True,
+                )
+            _enriched = await _schema_cache.get_or_build(connection_id, _schema_doc, _db_type)
+            return _schema_doc, _db_type, _enriched
 
         (detected_filters, (schema_doc, db_type, enriched)) = await asyncio.gather(
             _detect_filters_task(),
@@ -840,13 +903,325 @@ No explanation. No markdown. Just the JSON array."""
                     "table_count": len(schema_doc.get("tables", [])),
                     "ambiguous_columns": len(enriched.ambiguous_columns)})
 
+        # Step 2.5: Parse user context (Mode 3 — Guided Replication)
+        # context_parser runs always; spec_reader runs in parallel for BI documentation PDFs.
+        # Both outputs are used downstream: context_parser for schema-matching keywords,
+        # spec_reader for per-chart SQL templates injected into query_agent.
+        parsed_context: dict = {}
+        report_spec = None          # ReportSpec from spec_reader (None when not a BI spec doc)
+        chart_spec_hints: dict = {} # {chart_id: ChartSpecHint} — built after vision + spec parse
+        calc_col_map: dict = {}     # {col_name: case_when_sql} — PDF calculated column substitutions
+        _spec_business_rules: list = []  # Required WHERE conditions from PDF spec (e.g. isdeleted = FALSE)
+
+        if user_context and user_context.strip():
+            print(f"[pipeline:{job_id}] ── STEP 2.5: Parsing user context (Mode 3)", flush=True)
+            from agent_service.agents.context_parser import parse_user_context as _puc
+            from agent_service.agents.spec_reader import (
+                parse_report_spec as _prs,
+                is_spec_document as _isd,
+                match_chart_to_spec as _mcts,
+            )
+
+            _is_spec = _isd(user_context)
+            if _is_spec:
+                print(f"[pipeline:{job_id}] spec document detected — running spec_reader in parallel", flush=True)
+                _puc_result, _spec_result = await asyncio.gather(
+                    _puc(user_context),
+                    _prs(user_context, db_type),
+                    return_exceptions=True,
+                )
+            else:
+                _puc_result = await _puc(user_context)
+                _spec_result = None
+
+            parsed_context = _puc_result if not isinstance(_puc_result, Exception) else {}
+
+            # spec_result is a ReportSpec dataclass or None/Exception
+            if _is_spec and not isinstance(_spec_result, Exception) and _spec_result is not None:
+                report_spec = _spec_result
+                # Match each vision-detected chart to a documented ChartSpecHint
+                for _chart in charts:
+                    _hint = _mcts(_chart, report_spec)
+                    if _hint:
+                        chart_spec_hints[_chart["id"]] = _hint
+                print(
+                    f"[pipeline:{job_id}] spec_reader: "
+                    f"{len(report_spec.charts)} chart specs extracted, "
+                    f"{len(chart_spec_hints)}/{len(charts)} vision charts matched",
+                    flush=True,
+                )
+                # Build calculated column substitution map for query_agent (Fix 2).
+                # Calculated columns are Power BI derived fields that don't exist as raw DB columns
+                # (e.g. 'replacement' → CASE WHEN p.replacement IS NOT NULL THEN 'Replaced' ELSE ...).
+                # Injecting these prevents the model from grouping by raw FK integers.
+                for _cc in (report_spec.calculated_columns or []):
+                    _cc_name = (_cc.get("name") or "").strip().lower()
+                    _cc_expr = (_cc.get("sql_expression") or "").strip()
+                    if _cc_name and _cc_expr:
+                        calc_col_map[_cc_name] = _cc_expr
+                if calc_col_map:
+                    print(
+                        f"[pipeline:{job_id}] calc_col_map: {len(calc_col_map)} calculated column "
+                        f"substitution(s): {list(calc_col_map.keys())}",
+                        flush=True,
+                    )
+                # Capture business rules (e.g. "isdeleted = FALSE on all bullhorn_ tables").
+                # These are REQUIRED WHERE conditions that Power BI enforces at the model level
+                # but are not obvious from column names alone.
+                _spec_business_rules: list[str] = list(report_spec.business_rules or [])
+                if _spec_business_rules:
+                    print(
+                        f"[pipeline:{job_id}] business_rules: {len(_spec_business_rules)} rule(s) from spec",
+                        flush=True,
+                    )
+
+            await emit({
+                "type": "context.parsed",
+                "job_id": job_id,
+                "chart_intent": parsed_context.get("chart_intent", ""),
+                "filter_count": len(parsed_context.get("implied_filters") or []),
+                "has_date_range": bool((parsed_context.get("implied_date_range") or {}).get("start")),
+                "spec_charts_extracted": len(report_spec.charts) if report_spec else 0,
+                "spec_charts_matched": len(chart_spec_hints),
+            })
+
+        # Step 2.6: PBIT parsing — run after schema fetch so we have compact_tables for name mapping.
+        # parse_pbit + translate DAX→SQL happen in parallel; result enriches calc_col_map,
+        # business_rules, and builds per-chart pbit_column_hints for query_agent injection.
+        pbit_model = None
+        pbit_column_hints: dict = {}   # {chart_id: pbit_column_hint dict}
+
+        if pbit_bytes:
+            print(f"[pipeline:{job_id}] ── STEP 2.6: PBIT parsing", flush=True)
+            try:
+                from agent_service.utils.pbit_parser import (
+                    parse_pbit as _parse_pbit,
+                    translate_pbit_to_sql as _translate_pbit,
+                    build_calc_col_map_from_pbit as _pbit_calc_map,
+                    build_measure_map_from_pbit as _pbit_meas_map,
+                    find_best_pbit_match as _find_best_pbit,
+                    build_pbit_chart_hint as _build_pbit_hint,
+                    map_pbit_tables_to_db as _map_pbit_tables,
+                )
+                # Parse ZIP synchronously (fast I/O) then translate DAX async
+                _raw_model = _parse_pbit(pbit_bytes)
+                pbit_model = await _translate_pbit(_raw_model, db_type)
+
+                # Merge PBIT calculated columns into calc_col_map (PBIT overrides spec_reader)
+                _pbit_cc = _pbit_calc_map(pbit_model)
+                if _pbit_cc:
+                    calc_col_map = {**calc_col_map, **_pbit_cc}
+                    print(
+                        f"[pipeline:{job_id}] PBIT calc_col_map merged: "
+                        f"{len(_pbit_cc)} column(s) — total {len(calc_col_map)}",
+                        flush=True,
+                    )
+
+                # Inject PBIT relationships into business_rules if not already present
+                # (relationships encode FK integrity; useful as sql_constraints)
+                _pbit_meas = _pbit_meas_map(pbit_model)
+                if _pbit_meas:
+                    print(
+                        f"[pipeline:{job_id}] PBIT measures translated: "
+                        f"{len(_pbit_meas)} measure(s) available for injection",
+                        flush=True,
+                    )
+
+                # Build per-chart PBIT hints by matching PBIT visuals to vision charts
+                _matched = 0
+                for _chart in charts:
+                    _best_visual = _find_best_pbit(
+                        _chart, pbit_model.visuals, min_score=0.15
+                    )
+                    if _best_visual:
+                        _hint = _build_pbit_hint(
+                            _best_visual,
+                            _pbit_meas,
+                            enriched.compact_tables,
+                            pbit_model.relationships,
+                        )
+                        pbit_column_hints[_chart["id"]] = _hint
+                        _matched += 1
+                        print(
+                            f"[pipeline:{job_id}] PBIT match: chart={_chart['id']} "
+                            f"→ visual='{_best_visual.title}' "
+                            f"type={_best_visual.chart_type_hint} "
+                            f"bindings={list(_best_visual.field_bindings.keys())} "
+                            f"db_tables={_hint.get('db_tables', [])}",
+                            flush=True,
+                        )
+
+                print(
+                    f"[pipeline:{job_id}] PBIT: {_matched}/{len(charts)} charts matched to visuals",
+                    flush=True,
+                )
+                await emit({
+                    "type": "pbit.parsed",
+                    "job_id": job_id,
+                    "measures": len(pbit_model.measures),
+                    "calculated_columns": len(pbit_model.calculated_columns),
+                    "relationships": len(pbit_model.relationships),
+                    "visuals_matched": _matched,
+                    "total_visuals": len(pbit_model.visuals),
+                })
+            except Exception as _pbit_err:
+                print(
+                    f"[pipeline:{job_id}] ⚠ PBIT parsing failed (non-fatal): {_pbit_err}",
+                    flush=True,
+                )
+
         # Step 3: Schema matching — rank candidate tables for every chart IN PARALLEL (one task per chart)
         print(f"[pipeline:{job_id}] ── STEP 3: Schema matching  charts={len(charts)}", flush=True)
         await emit({"type": "schema.matching", "job_id": job_id, "chart_count": len(charts)})
 
         async def match_one(chart_spec: dict) -> list:
-            candidates = await self._schema_matcher.rank_candidates(chart_spec, enriched)
+            candidates = await self._schema_matcher.rank_candidates(
+                chart_spec,
+                enriched,
+                user_context=user_context,
+                parsed_context=parsed_context if parsed_context else None,
+            )
             print(f"[schema_match:{chart_spec['id']}] → {[(c['tables'], round(c.get('confidence',0),2)) for c in candidates[:3]]}", flush=True)
+
+            # PBIT-derived table hint: if a PBIT visual was matched to this chart AND it has
+            # mapped DB tables, prepend a PBIT-mandated candidate at position 0.
+            # This takes priority over both user_table_hints and schema_matcher output.
+            _cid = chart_spec["id"]
+            _pbit_hint = pbit_column_hints.get(_cid)
+            if _pbit_hint and _pbit_hint.get("db_tables"):
+                _pbit_db_tables = _pbit_hint["db_tables"]
+                # Build key_columns from PBIT field bindings
+                _pbit_key_cols = {"dimension": None, "metric": None, "date": None, "group_by": None}
+                for _role, _refs in (_pbit_hint.get("field_bindings") or {}).items():
+                    if not _refs:
+                        continue
+                    _col = _refs[0].split(".", 1)[-1].strip("[]")
+                    _role_lower = _role.lower()
+                    if "category" in _role_lower or "axis" in _role_lower or "x" == _role_lower:
+                        _pbit_key_cols["dimension"] = _col
+                    elif "y" == _role_lower or "value" in _role_lower or "measure" in _role_lower:
+                        _pbit_key_cols["metric"] = _col
+                    elif "date" in _role_lower or "time" in _role_lower:
+                        _pbit_key_cols["date"] = _col
+                    elif "group" in _role_lower or "legend" in _role_lower or "series" in _role_lower:
+                        _pbit_key_cols["group_by"] = _col
+                # Build join condition from PBIT relationships
+                _pbit_join = (
+                    " | ".join(_pbit_hint["join_conditions"])
+                    if _pbit_hint.get("join_conditions") else None
+                )
+                _pbit_cand = {
+                    "tables":        _pbit_db_tables,
+                    "key_columns":   _pbit_key_cols,
+                    "join":          _pbit_join,
+                    "reasoning":     "PBIT field bindings — ground-truth table/column selection",
+                    "confidence":    1.0,
+                    "user_mandated": True,
+                    "from_pbit":     True,
+                }
+                candidates = [_pbit_cand] + [
+                    _c for _c in candidates
+                    if sorted(_c.get("tables", [])) != sorted(_pbit_db_tables)
+                ]
+                print(
+                    f"[schema_match:{_cid}] ✓ PBIT tables prepended: {_pbit_db_tables}"
+                    f"  key_cols={_pbit_key_cols}  join={_pbit_join}",
+                    flush=True,
+                )
+
+            # Apply user_column_hints: override key_columns on any candidate whose table set
+            # matches the hints. This lets users pick exact dimension/metric/date columns.
+            if user_column_hints:
+                for _candidate in candidates:
+                    for _uch in user_column_hints:
+                        _uch_table = _uch.get("table", "")
+                        if _uch_table in _candidate.get("tables", []):
+                            _existing_kc = dict(_candidate.get("key_columns") or {})
+                            for _kname in ("dimension", "metric", "date", "group_by"):
+                                if _uch.get(_kname):
+                                    _existing_kc[_kname] = _uch[_kname]
+                            _candidate["key_columns"] = _existing_kc
+                            _candidate["user_mandated"] = True
+                            print(
+                                f"[schema_match:{_cid}] ✓ user_column_hints applied for "
+                                f"table={_uch_table}: {_existing_kc}",
+                                flush=True,
+                            )
+                            break
+
+            # Mode 2: prepend user-specified table hint at position 0 with confidence=1.0.
+            # The schema matcher pool is preserved as the fallback candidate list so that
+            # if the hint table cannot produce a valid query the pipeline still has options.
+            if user_table_hints:
+                _hint_key_cols = {
+                    "dimension": None, "metric": None, "date": None, "group_by": None
+                }
+
+                # Fix A: exact-match search first
+                for _c in candidates:
+                    if sorted(_c.get("tables", [])) == sorted(user_table_hints):
+                        _hint_key_cols = _c.get("key_columns", _hint_key_cols)
+                        break
+
+                # Fix B: partial match — if any hint table appears in a candidate, borrow
+                # non-null key_columns from it (better than staying all-null)
+                if all(v is None for v in _hint_key_cols.values()):
+                    for _c in candidates:
+                        if any(t in _c.get("tables", []) for t in user_table_hints):
+                            for k, v in (_c.get("key_columns") or {}).items():
+                                if v is not None and _hint_key_cols.get(k) is None:
+                                    _hint_key_cols[k] = v
+
+                # Fix C: if still all-null, run a fast targeted LLM inference pass
+                if all(v is None for v in _hint_key_cols.values()):
+                    print(
+                        f"[schema_match:{chart_spec['id']}] hint tables not in candidates "
+                        "— running targeted key_column inference",
+                        flush=True,
+                    )
+                    _hint_key_cols = await _infer_key_columns_for_hint(
+                        user_table_hints, chart_spec, enriched
+                    )
+
+                # Fix D: collect FK join conditions for ALL pairs in the user-hint table set.
+                # Previously only hints[0] vs hints[1] was checked, which produced a single
+                # (often wrong) join when ≥3 tables were specified.  Now every pair is looked
+                # up and all found conditions are surfaced to the query agent.
+                _hint_join = None
+                if len(user_table_hints) >= 2:
+                    _join_parts: list[str] = []
+                    for _hi in range(len(user_table_hints)):
+                        for _hj in range(_hi + 1, len(user_table_hints)):
+                            _cond = enriched.relationship_graph.get_join_condition(
+                                user_table_hints[_hi], user_table_hints[_hj]
+                            )
+                            if _cond:
+                                _join_parts.append(_cond)
+                    if _join_parts:
+                        _hint_join = " | ".join(_join_parts)
+                        print(
+                            f"[schema_match:{chart_spec['id']}] FK joins for hint"
+                            f" ({len(_join_parts)} pairs): {_hint_join}",
+                            flush=True,
+                        )
+
+                _hint_cand = {
+                    "tables":       user_table_hints,
+                    "key_columns":  _hint_key_cols,
+                    "join":         _hint_join,
+                    "reasoning":    "user-specified table hint — always tried first",
+                    "confidence":   1.0,
+                    "user_mandated": True,   # signals query_agent to never deviate
+                }
+                candidates = [_hint_cand] + [
+                    _c for _c in candidates
+                    if sorted(_c.get("tables", [])) != sorted(user_table_hints)
+                ]
+                print(
+                    f"[schema_match:{chart_spec['id']}] ✓ user hint prepended: {user_table_hints}"
+                    f"  key_cols={_hint_key_cols}  join={_hint_join}",
+                    flush=True,
+                )
             return candidates
 
         # All charts matched simultaneously — no semaphore here (pure LLM calls, low resource cost)
@@ -886,20 +1261,16 @@ No explanation. No markdown. Just the JSON array."""
                         if t not in candidate_tables:
                             candidate_tables.append(t)
 
-            for flt in resolved_filters:
-                # Use the schema-resolved column name; fall back to raw hint
+            async def _sample_one_filter(flt: dict) -> Optional[dict]:
                 col_to_use = flt.get("resolved_column") or flt.get("column_hint", "")
                 resolved_table = flt.get("resolved_table")
                 display_name = flt.get("display_name", col_to_use.replace("_", " ").title())
                 if not col_to_use:
-                    continue
-
-                # If resolver found a specific table, try that first; otherwise try candidates
+                    return None
                 tables_to_try = []
                 if resolved_table:
                     tables_to_try.append(resolved_table)
                 tables_to_try.extend(t for t in candidate_tables[:5] if t != resolved_table)
-
                 for table in tables_to_try:
                     try:
                         available_vals = await _sdf(
@@ -907,7 +1278,7 @@ No explanation. No markdown. Just the JSON array."""
                             compact_tables=enriched.compact_tables,
                         )
                         if available_vals:
-                            filter_configs.append({
+                            return {
                                 "id": str(uuid.uuid4()),
                                 "column": col_to_use,
                                 "display_name": display_name,
@@ -915,27 +1286,74 @@ No explanation. No markdown. Just the JSON array."""
                                 "available_values": available_vals,
                                 "table": table,
                                 "resolution_score": flt.get("resolution_score", 0.0),
-                            })
-                            break
+                            }
                     except Exception:
                         continue
+                return None
+
+            # All filters sampled in parallel — previously sequential (each waited for prior)
+            _filter_results = await asyncio.gather(
+                *[_sample_one_filter(flt) for flt in resolved_filters],
+                return_exceptions=True,
+            )
+            filter_configs = [r for r in _filter_results if isinstance(r, dict)]
             print(f"[pipeline:{job_id}] Filter configs → {len(filter_configs)} with available values", flush=True)
 
-        # Step 3.7: Pre-sample top 3 candidates for every chart IN PARALLEL.
-        # Results are cached per-chart so that when the candidate switches on retry we
-        # already have the sample context without an extra DB round-trip.
-        print(f"[pipeline:{job_id}] ── STEP 3.7: Pre-sampling top candidates  charts={len(charts)}", flush=True)
+        # Steps 3.6 + 3.7: Context synthesis (merge all signals) + pre-sampling, run in PARALLEL.
+        # Synthesis produces a ResolvedChartSpec per chart so query_agent gets pre-decided
+        # table/column/metric rather than having to reconcile competing sources itself.
+        print(
+            f"[pipeline:{job_id}] ── STEPS 3.6+3.7: Context synthesis + pre-sampling (parallel)"
+            f"  charts={len(charts)}",
+            flush=True,
+        )
         from agent_service.agents.value_sampler import sample_top_candidates as _stc
-        presample_tasks = [
-            _stc(
-                connection_id=connection_id,
-                candidates=chart_candidates.get(c["id"], []),
-                chart_spec=c,
-                max_candidates=3,
-            )
-            for c in charts
-        ]
-        presample_results = await asyncio.gather(*presample_tasks, return_exceptions=True)
+        from agent_service.agents.context_synthesizer import synthesize_chart_context as _synthesize
+        _presample_sem = asyncio.Semaphore(PRESAMPLE_CONCURRENCY)
+
+        async def _presample_one(chart_spec):
+            async with _presample_sem:
+                return await _stc(
+                    connection_id=connection_id,
+                    candidates=chart_candidates.get(chart_spec["id"], []),
+                    chart_spec=chart_spec,
+                    max_candidates=3,
+                    compact_tables=enriched.compact_tables,
+                )
+
+        async def _synthesize_one(chart_spec: dict):
+            cid = chart_spec["id"]
+            try:
+                resolved = await _synthesize(
+                    chart_spec=chart_spec,
+                    candidates=chart_candidates.get(cid, []),
+                    enriched=enriched,
+                    pbit_hint=pbit_column_hints.get(cid),
+                    spec_hint=chart_spec_hints.get(cid),
+                    user_context=user_context,
+                    parsed_context=parsed_context if parsed_context else None,
+                    calc_col_map=calc_col_map if calc_col_map else None,
+                    business_rules=_spec_business_rules if _spec_business_rules else None,
+                    user_column_hints=user_column_hints if user_column_hints else None,
+                    db_type=db_type,
+                )
+            except Exception as _se:
+                print(f"[pipeline:{job_id}] ⚠ synthesis exception chart={cid}: {_se}", flush=True)
+                resolved = None
+            return cid, resolved
+
+        _synthesis_raw, presample_results = await asyncio.gather(
+            asyncio.gather(*[_synthesize_one(c) for c in charts], return_exceptions=True),
+            asyncio.gather(*[_presample_one(c) for c in charts], return_exceptions=True),
+        )
+
+        resolved_chart_specs: dict = {}
+        for _sr in _synthesis_raw:
+            if isinstance(_sr, tuple):
+                _scid, _sresolved = _sr
+                if _sresolved is not None:
+                    resolved_chart_specs[_scid] = _sresolved
+
         # chart_presample_cache: {chart_id: {0: ctx, 1: ctx, 2: ctx}}
         chart_presample_cache: dict[str, dict] = {}
         for c, res in zip(charts, presample_results):
@@ -944,6 +1362,11 @@ No explanation. No markdown. Just the JSON array."""
                 chart_presample_cache[c["id"]] = {}
             else:
                 chart_presample_cache[c["id"]] = res or {}
+
+        print(
+            f"[pipeline:{job_id}] synthesis complete: {len(resolved_chart_specs)}/{len(charts)} charts resolved",
+            flush=True,
+        )
 
         # Step 4: N PARALLEL AGENTS — one dedicated agent per chart, all running simultaneously
         # Extract global date context from all chart specs (year/month from x_tick_labels)
@@ -978,10 +1401,17 @@ No explanation. No markdown. Just the JSON array."""
                     if img_dict.get("filename") == src_filename:
                         from utils.image_processor import crop_chart_region as _crop
                         bb = chart_spec.get("bounding_box", {})
-                        cropped_image = _crop(img_dict["bytes"], bb)
+                        cropped_image, _ = _crop(img_dict["bytes"], bb)
                         break
             except Exception as _ce:
                 print(f"[chart:{cid}] ⚠ could not crop image for visual comparison (non-fatal): {_ce}", flush=True)
+
+            # Pick up the PDF spec hint for this chart (None when no spec or no match)
+            _spec_hint = chart_spec_hints.get(cid)
+            # Pick up the PBIT visual hint for this chart (None when no PBIT or no match)
+            _pbit_hint = pbit_column_hints.get(cid)
+            # Pick up the pre-resolved chart spec (merged all context sources in step 3.6)
+            _resolved_spec = resolved_chart_specs.get(cid)
 
             # Each chart gets its own DB session — sharing one AsyncSession across
             # concurrent asyncio.gather tasks causes "concurrent operations are not
@@ -1000,6 +1430,13 @@ No explanation. No markdown. Just the JSON array."""
                     cropped_image_bytes=cropped_image,
                     dashboard_date_context=dashboard_date_context,
                     presample_contexts=chart_presample_cache.get(cid, {}),
+                    user_context=user_context,
+                    parsed_context=parsed_context if parsed_context else None,
+                    spec_hint=_spec_hint,
+                    calc_col_map=calc_col_map if calc_col_map else None,
+                    business_rules=_spec_business_rules if _spec_business_rules else None,
+                    pbit_column_hint=_pbit_hint if _pbit_hint else None,
+                    resolved_spec=_resolved_spec,
                 )
 
         chart_results = await asyncio.gather(
@@ -1066,7 +1503,24 @@ No explanation. No markdown. Just the JSON array."""
                 if c.get("status") == "low_confidence"
             } - {None}
 
-            needs_retry_ids = zero_row_ids | low_conf_ids
+            # Charts that barely passed (0.72–0.80) on the first loop — retry them in
+            # loop 2 to push them to higher confidence before calling them done.
+            barely_passed_ids: set = set()
+            if loop_idx == 1:
+                barely_passed_ids = {
+                    c.get("chart_spec", {}).get("id")
+                    for c in all_charts
+                    if 0.72 <= c.get("score", 0.0) <= 0.80
+                    and c.get("status") != "low_confidence"
+                } - {None}
+                if barely_passed_ids:
+                    print(
+                        f"[pipeline:{job_id}] borderline charts flagged for loop-2 retry: "
+                        f"{len(barely_passed_ids)} charts with score 0.72-0.80",
+                        flush=True,
+                    )
+
+            needs_retry_ids = zero_row_ids | low_conf_ids | barely_passed_ids
 
             if not needs_retry_ids:
                 # All confirmed with no low-confidence — truly done
@@ -1126,6 +1580,9 @@ No explanation. No markdown. Just the JSON array."""
                 raw_candidates = chart_candidates.get(cid, [])
 
                 async def _retry_one(spec=chart_spec, feedback=vfeedback, candidates=raw_candidates):
+                    _sh = chart_spec_hints.get(spec["id"])
+                    _ph = pbit_column_hints.get(spec["id"])
+                    _rs = resolved_chart_specs.get(spec["id"])
                     from shared.database import AsyncSessionLocal
                     async with AsyncSessionLocal() as retry_db:
                         return await self._run_chart_replication_loop(
@@ -1138,8 +1595,13 @@ No explanation. No markdown. Just the JSON array."""
                             redis=redis,
                             db=retry_db,
                             verify_feedback=feedback,
-                            max_attempts=5,
+                            max_attempts=4 + loop_idx,  # loop 1→5, loop 2→6, loop 3→7
                             dashboard_date_context=dashboard_date_context,
+                            spec_hint=_sh,
+                            calc_col_map=calc_col_map if calc_col_map else None,
+                            business_rules=_spec_business_rules if _spec_business_rules else None,
+                            pbit_column_hint=_ph if _ph else None,
+                            resolved_spec=_rs,
                         )
 
                 retry_tasks.append(_retry_one())
@@ -1288,6 +1750,13 @@ No explanation. No markdown. Just the JSON array."""
         redis,
         candidates: list,
         sample_context: dict,
+        parsed_context: Optional[dict] = None,
+        user_context: str = "",
+        spec_hint=None,  # Optional[ChartSpecHint] from spec_reader
+        calc_col_map: Optional[dict] = None,  # {col_name: case_when_sql} from spec_reader global ctx
+        business_rules: Optional[list] = None,  # Required WHERE conditions from PDF spec
+        pbit_column_hint: Optional[dict] = None,  # PBIT visual field bindings (ground truth)
+        resolved_spec=None,  # ResolvedChartSpec from context_synthesizer (highest priority)
     ) -> Optional[dict]:
         """
         Race top 2-3 close candidates simultaneously (confidence gap < 0.20).
@@ -1304,8 +1773,8 @@ No explanation. No markdown. Just the JSON array."""
             return None
 
         gap = candidates[0].get("confidence", 0) - candidates[1].get("confidence", 0)
-        if gap >= 0.20:
-            return None  # clear winner — skip racing
+        if gap >= 0.30:
+            return None  # clear winner (30+ pt gap) — skip racing to save latency
 
         race_candidates = candidates[: min(3, len(candidates))]
         await publish_pipeline_event(redis, job_id, {
@@ -1332,6 +1801,13 @@ No explanation. No markdown. Just the JSON array."""
                     retry_feedback=None,
                     candidate=candidate,
                     sample_context=sample_context,
+                    parsed_context=parsed_context,
+                    user_context=user_context,
+                    spec_hint=spec_hint,
+                    calc_col_map=calc_col_map,
+                    business_rules=business_rules,
+                    pbit_column_hint=pbit_column_hint,
+                    resolved_spec=resolved_spec,
                 )
                 result = await call_query_executor(connection_id, query_plan["sql"])
                 if result.get("error"):
@@ -1399,6 +1875,13 @@ No explanation. No markdown. Just the JSON array."""
         max_attempts: int = 5,
         dashboard_date_context: Optional[dict] = None,
         presample_contexts: Optional[dict] = None,
+        user_context: str = "",
+        parsed_context: Optional[dict] = None,
+        spec_hint=None,  # Optional[ChartSpecHint] from spec_reader
+        calc_col_map: Optional[dict] = None,  # {col_name: case_when_sql} from spec_reader global ctx
+        business_rules: Optional[list] = None,  # Required WHERE conditions from PDF spec
+        pbit_column_hint: Optional[dict] = None,  # PBIT visual field bindings (ground truth)
+        resolved_spec=None,  # ResolvedChartSpec from context_synthesizer (highest priority)
     ) -> dict:
         """
         Per-chart autonomous retry loop.
@@ -1421,6 +1904,8 @@ No explanation. No markdown. Just the JSON array."""
         retry_feedback = verify_feedback or None
         # Tracks whether classify_failure requested an early candidate switch
         _force_switch = False
+        # Failure type from the last classify_failure call — drives adaptive temperature.
+        _last_failure_type: Optional[str] = None
 
         # ── Layer 1: Query signature tracking ─────────────────────────────────────
         # Normalised semantic key — captures tables + metric + date columns, which
@@ -1459,6 +1944,14 @@ No explanation. No markdown. Just the JSON array."""
             # Row-count sanity check: flag wrong-grain candidates early
             from agent_service.agents.value_sampler import enrich_sample_context_with_row_count
             sample_context = enrich_sample_context_with_row_count(sample_context, chart_spec)
+            # Grain mismatch: if the top candidate is at the wrong entity level, skip it
+            # immediately on attempt 1 rather than wasting two tries on a bad candidate.
+            if sample_context.get("row_count_warning"):
+                _force_switch = True
+                print(
+                    f"[chart:{chart_id}] grain mismatch detected — forcing candidate switch on attempt 1",
+                    flush=True,
+                )
 
         # Track consecutive SQL errors to trigger recovery mode
         consecutive_error_counts: dict[str, int] = {}
@@ -1521,15 +2014,39 @@ No explanation. No markdown. Just the JSON array."""
                     _existing = {t for c in candidates for t in c.get("tables", [])}
                     _new_date_tbls = [t for t in _detected_dates if t not in _existing]
                     _fact_table = candidates[0].get("tables", [""])[0] if candidates else ""
+
+                    # Build a table→columns map for real FK join key detection.
+                    _tbl_col_map: dict[str, list[str]] = {
+                        t.get("name", ""): [c.get("name", "") for c in t.get("columns", [])]
+                        for t in (enriched.compact_tables or [])
+                    }
+
+                    def _find_join_key(fact: str, dim: str) -> str:
+                        """Try to find a real shared column or FK column for the join."""
+                        fact_cols = set(_tbl_col_map.get(fact, []))
+                        dim_cols  = set(_tbl_col_map.get(dim, []))
+                        # Shared columns — most reliable join
+                        shared = fact_cols & dim_cols
+                        if shared:
+                            return f"{fact} JOIN {dim} USING ({next(iter(shared))})"
+                        # Common FK patterns: date_id, date_key, date_sk, dim_date_id
+                        _date_key_patterns = ("date_id", "date_key", "date_sk", "dim_date_id",
+                                              "datekey", "dateid", "date_dim_id")
+                        for pat in _date_key_patterns:
+                            if pat in fact_cols and pat in dim_cols:
+                                return f"{fact} JOIN {dim} ON {fact}.{pat} = {dim}.{pat}"
+                            if pat in fact_cols:
+                                return f"{fact} JOIN {dim} ON {fact}.{pat} = {dim}.date_key"
+                        # Fallback: let the LLM figure it out
+                        return f"{fact} JOIN {dim} ON <infer_join_key_from_schema>"
+
                     for _dt in _new_date_tbls[:2]:
                         _dtc_cols = dict(candidates[0].get("key_columns") or {}) if candidates else {}
+                        _join_str = _find_join_key(_fact_table, _dt) if _fact_table else _dt
                         date_table_candidates.append({
                             "tables": [_fact_table, _dt] if _fact_table else [_dt],
                             "key_columns": _dtc_cols,
-                            "join": (
-                                f"{_fact_table} JOIN {_dt} USING (<date_key>)"
-                                if _fact_table else _dt
-                            ),
+                            "join": _join_str,
                             "reasoning": (
                                 f"Calendar/date dimension table '{_dt}' paired with "
                                 f"'{_fact_table}' for Power BI-style date filtering."
@@ -1548,6 +2065,63 @@ No explanation. No markdown. Just the JSON array."""
                 flush=True,
             )
 
+        # ── Per-chart FK dimension CASE WHEN override ─────────────────────────
+        # When spec hint SQL uses COALESCE(col, ...) on a column that is actually
+        # an FK integer (listed in the table's relationships), the LLM groups by
+        # raw integer IDs instead of meaningful category labels.
+        # Detect such columns and add a CASE WHEN derived from the chart's
+        # x_tick_labels (the category names the original screenshot shows).
+        _chart_calc_col_map = dict(calc_col_map) if calc_col_map else {}
+        try:
+            if spec_hint and getattr(spec_hint, "sql_template", None):
+                import re as _re_fk
+                _coalesce_cols = {
+                    m.lower()
+                    for m in _re_fk.findall(r'COALESCE\s*\(\s*(\w+)', spec_hint.sql_template, _re_fk.IGNORECASE)
+                }
+                if _coalesce_cols:
+                    _fk_col_set: set = set()
+                    for _tbl in (getattr(enriched, "compact_tables", None) or []):
+                        for _rel in (_tbl.get("relationships") or []):
+                            if _rel.get("column"):
+                                _fk_col_set.add(_rel["column"].lower())
+                    _x_ticks = [
+                        str(lbl).strip()
+                        for lbl in (chart_spec.get("x_tick_labels") or [])
+                        if str(lbl).strip()
+                    ]
+                    for _col in _coalesce_cols & _fk_col_set:
+                        if _col in _chart_calc_col_map:
+                            continue
+                        if len(_x_ticks) < 2:
+                            continue
+                        _null_labels = [
+                            l for l in _x_ticks
+                            if any(n in l.lower() for n in ("not ", "no ", "blank", "none", "n/a"))
+                        ]
+                        _nonnull_labels = [l for l in _x_ticks if l not in _null_labels and l.lower() != "(blank)"]
+                        if _null_labels and _nonnull_labels:
+                            _case_expr = (
+                                f"CASE WHEN {_col} IS NOT NULL THEN '{_nonnull_labels[0]}'"
+                                f" ELSE '{_null_labels[0]}' END"
+                            )
+                        elif len(_x_ticks) >= 2:
+                            _case_expr = (
+                                f"CASE WHEN {_col} IS NOT NULL THEN '{_x_ticks[0]}'"
+                                f" ELSE '{_x_ticks[1]}' END"
+                            )
+                        else:
+                            continue
+                        _chart_calc_col_map[_col] = _case_expr
+                        print(
+                            f"[pipeline:{chart_id}] FK dim override: '{_col}' → {_case_expr[:100]}",
+                            flush=True,
+                        )
+        except Exception as _fk_e:
+            print(f"[pipeline:{chart_id}] ⚠ FK dim override failed (non-fatal): {_fk_e}", flush=True)
+        # Rebind so all downstream calls (race, attempt loop) pick up the extended map
+        calc_col_map = _chart_calc_col_map
+
         # Phase 3A: Parallel Candidate Racing ────────────────────────────────
         # When the top two candidates are within 0.20 confidence of each other,
         # race them simultaneously.  The first to pass validation short-circuits
@@ -1561,6 +2135,13 @@ No explanation. No markdown. Just the JSON array."""
                 redis=redis,
                 candidates=candidates,
                 sample_context=sample_context,
+                parsed_context=parsed_context,
+                user_context=user_context,
+                spec_hint=spec_hint,
+                calc_col_map=calc_col_map,
+                business_rules=business_rules,
+                pbit_column_hint=pbit_column_hint,
+                resolved_spec=resolved_spec,
             )
             if race_winner is not None:
                 rw_qp = race_winner["query_plan"]
@@ -1630,9 +2211,16 @@ No explanation. No markdown. Just the JSON array."""
                     "via": "racing",
                 }
 
+        # Confidence gap between top-2 candidates — used to decide early switching.
+        _conf_gap = (
+            candidates[0].get("confidence", 0) - candidates[1].get("confidence", 0)
+            if len(candidates) >= 2 else 1.0
+        )
+
         # Map attempt number → which candidate to use.
         # attempts 1,2 → candidates[0]; attempts 3,4 → candidates[1]; attempt 5 → accept best.
         # classify_failure can set _force_switch=True to advance the index early.
+        # When top-2 candidates are nearly tied (gap < 0.10) try alternative at attempt 2.
         def _pick_candidate(attempt: int) -> Optional[dict]:
             nonlocal _force_switch
             if _force_switch:
@@ -1640,7 +2228,12 @@ No explanation. No markdown. Just the JSON array."""
                 _force_switch = False
                 idx = min(attempt, len(candidates) - 1)
                 return candidates[idx] if candidates else None
-            if attempt <= 2:
+            if attempt == 1:
+                return candidates[0] if candidates else None
+            elif attempt == 2:
+                # When candidates are nearly tied, try cand[1] earlier to save 1 wasted attempt.
+                if _conf_gap < 0.10 and len(candidates) >= 2:
+                    return candidates[1]
                 return candidates[0] if candidates else None
             elif attempt <= 4:
                 return candidates[1] if len(candidates) > 1 else (candidates[0] if candidates else None)
@@ -1749,11 +2342,25 @@ No explanation. No markdown. Just the JSON array."""
                     date_filter_constraint=date_filter_constraint,
                     error_recovery_mode=error_recovery_mode,
                     dashboard_date_context=dashboard_date_context,
-                    previously_tried=tried_tables_history[-4:] if tried_tables_history else None,
+                    previously_tried=tried_tables_history[-8:] if tried_tables_history else None,
+                    failure_type=_last_failure_type,
+                    parsed_context=parsed_context,
+                    user_context=user_context,
+                    spec_hint=spec_hint,
+                    calc_col_map=calc_col_map,
+                    business_rules=business_rules,
+                    pbit_column_hint=pbit_column_hint,
+                    resolved_spec=resolved_spec,
                 )
             except Exception as e:
                 retry_feedback = f"SQL generation failed: {str(e)}. Try a simpler query."
                 continue
+
+            # If SQL was likely truncated (unbalanced parens), inject that as retry feedback.
+            _trunc_warn = query_plan.get("_truncation_warning")
+            if _trunc_warn:
+                retry_feedback = _trunc_warn
+                print(f"[chart:{chart_id}] ⚠ SQL truncation detected — injecting simplify feedback", flush=True)
 
             # If column pre-check found an issue, inject it into retry_feedback for next attempt
             # but still execute — the DB error will confirm and provide exact feedback.
@@ -1774,6 +2381,7 @@ No explanation. No markdown. Just the JSON array."""
                 if failure["switch_candidate"]:
                     _force_switch = True
                 _ftype = failure["failure_type"]
+                _last_failure_type = _ftype
                 print(
                     f"[chart:{chart_id}] SQL error  failure_type={_ftype} "
                     f"switch={failure['switch_candidate']}  issue={failure['specific_issue'][:80]}",
@@ -1855,7 +2463,7 @@ No explanation. No markdown. Just the JSON array."""
                 # Compare the original cropped chart against the SQL result data.
                 # If the vision model spots mismatches and we still have retries,
                 # use the suggestion as targeted retry feedback (non-fatal).
-                if cropped_image_bytes is not None and attempt <= 2:
+                if cropped_image_bytes is not None and attempt <= 3:
                     try:
                         from agent_service.agents.vision_agent import VisionAgent as _VAgentCls2
                         _va2 = _VAgentCls2()
@@ -1918,6 +2526,30 @@ No explanation. No markdown. Just the JSON array."""
                 })
                 return {**best_result, "status": "confirmed", "score": score}
 
+            # Near-threshold visual comparison — run comparison even when score is 0.60-0.72
+            # so we get targeted visual feedback before the final retry attempt.
+            if 0.58 <= score < 0.72 and cropped_image_bytes is not None and attempt <= 3:
+                try:
+                    from agent_service.agents.vision_agent import VisionAgent as _VAgentNT
+                    _va_nt = _VAgentNT()
+                    vis_nt = await _va_nt.compare_charts(
+                        original_bytes=cropped_image_bytes,
+                        query_plan=query_plan,
+                        execute_result=execute_result,
+                    )
+                    if vis_nt.get("suggestion"):
+                        print(
+                            f"[chart:{chart_id}] near-threshold visual hint: {vis_nt['suggestion'][:120]}",
+                            flush=True,
+                        )
+                        # Prepend visual hint to the retry feedback that follows
+                        retry_feedback = (
+                            f"Visual analysis found: {'; '.join(vis_nt.get('mismatches', [])[:2])}. "
+                            f"Fix: {vis_nt['suggestion']} "
+                        )
+                except Exception as _nte:
+                    print(f"[chart:{chart_id}] ⚠ near-threshold visual comparison (non-fatal): {_nte}", flush=True)
+
             # Classify why it failed and build targeted retry feedback
             failure = classify_failure(
                 sql_result=execute_result,
@@ -1926,6 +2558,7 @@ No explanation. No markdown. Just the JSON array."""
             )
             if failure["switch_candidate"]:
                 _force_switch = True
+            _last_failure_type = failure["failure_type"]
             print(
                 f"[chart:{chart_id}] low score={score:.2f}  failure_type={failure['failure_type']} "
                 f"switch={failure['switch_candidate']}",
@@ -1983,6 +2616,8 @@ No explanation. No markdown. Just the JSON array."""
         connection_id: Optional[str] = None,
     ) -> Optional[Dashboard]:
         """Create a Dashboard + Widgets from confirmed chart replication results."""
+        from agent_service.utils.date_extractor import extract_date_filter
+
         try:
             filter_col_names = [f["column"] for f in (filter_configs or [])]
             meta = report_metadata or {}
@@ -1994,12 +2629,48 @@ No explanation. No markdown. Just the JSON array."""
                 "logo_text": meta.get("logo_text"),
                 "colour_theme": meta.get("colour_theme"),
             }
+
+            # Collect date filter columns discovered across all charts so the frontend
+            # can show a global date picker.  One filter_config entry per unique column.
+            date_filter_map: dict[str, dict] = {}
+
+            # First pass: scan each chart's SQL for date conditions
+            widget_date_filters: list[Optional[dict]] = []
+            for result in confirmed_charts:
+                sql = result.get("query_plan", {}).get("sql")
+                df = extract_date_filter(sql) if sql else None
+                widget_date_filters.append(df)
+                if df:
+                    col = df["column"]
+                    if col not in date_filter_map:
+                        date_filter_map[col] = {
+                            "id":               str(uuid.uuid4()),
+                            "column":           col,
+                            "display_name":     col.replace("_", " ").title(),
+                            "filter_type":      "date_range",
+                            "available_values": [],
+                            "table":            df.get("table_qualified") or "",
+                        }
+
+            # Merge date filter entries with the existing filter_configs (from vision-detected
+            # categorical filters) — de-duplicate by column name
+            combined_filter_configs = list(filter_configs or [])
+            for df_entry in date_filter_map.values():
+                if not any(fc.get("column") == df_entry["column"] for fc in combined_filter_configs):
+                    combined_filter_configs.append(df_entry)
+
+            if date_filter_map:
+                print(
+                    f"[assemble] date filter column(s) detected: {list(date_filter_map.keys())}",
+                    flush=True,
+                )
+
             dashboard = Dashboard(
                 id=uuid.uuid4(),
                 project_id=uuid.UUID(project_id),
                 name=dashboard_name,
                 layout_config=layout_config,
-                filter_config=filter_configs or [],
+                filter_config=combined_filter_configs,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
             )
@@ -2019,6 +2690,12 @@ No explanation. No markdown. Just the JSON array."""
 
                 chart_data = self._build_chart_data_for_type(chart_type, rows, columns)
 
+                # Store the detected date filter in the widget's config so the frontend
+                # knows the initial date range for this chart's data.
+                widget_config: Optional[dict] = None
+                if widget_date_filters[i]:
+                    widget_config = {"date_filter": widget_date_filters[i]}
+
                 widget = Widget(
                     id=uuid.uuid4(),
                     dashboard_id=dashboard.id,
@@ -2036,6 +2713,7 @@ No explanation. No markdown. Just the JSON array."""
                     validation_score=result.get("score"),
                     validation_status=result.get("status", "confirmed"),
                     chart_data=chart_data,
+                    config=widget_config,
                     created_at=datetime.utcnow(),
                     updated_at=datetime.utcnow(),
                 )
@@ -2455,6 +3133,80 @@ No explanation. No markdown. Just the JSON array."""
                 "error": err_msg,
             })
             raise
+
+
+async def _infer_key_columns_for_hint(
+    hint_tables: list[str],
+    chart_spec: dict,
+    enriched,
+) -> dict:
+    """
+    Targeted key_column inference for user-specified hint tables when schema_matcher
+    didn't naturally rank them (so key_columns would otherwise default to all-null).
+    One fast Haiku call with only the hint tables' columns in context.
+    """
+    import re as _re
+    _default = {"dimension": None, "metric": None, "date": None, "group_by": None}
+
+    hint_metas = [t for t in (enriched.compact_tables or []) if t.get("name") in hint_tables]
+    if not hint_metas:
+        return _default
+
+    chart_summary = {
+        "type": chart_spec.get("type"),
+        "title": chart_spec.get("title"),
+        "x_axis_label": chart_spec.get("x_axis_label"),
+        "y_axis_label": chart_spec.get("y_axis_label"),
+        "x_tick_labels": (chart_spec.get("x_tick_labels") or [])[:8],
+        "estimated_values": chart_spec.get("estimated_values") or {},
+        "data_point_count": chart_spec.get("data_point_count", 0),
+    }
+
+    prompt = (
+        f"CHART:\n{json.dumps(chart_summary, indent=2)}\n\n"
+        f"TABLES (user-specified — must use these):\n{json.dumps(hint_metas, indent=2)}\n\n"
+        "Identify the best columns from these tables to reproduce the chart.\n"
+        "Return ONLY valid JSON:\n"
+        '{"dimension": "col_for_xaxis_groupby", "metric": "col_to_aggregate", '
+        '"date": "date_col_or_null", "group_by": "secondary_groupby_or_null"}\n\n'
+        "Rules:\n"
+        "- dimension: categorical column for x-axis / GROUP BY\n"
+        "- metric: numeric column for SUM/COUNT/AVG\n"
+        "- date: date/timestamp for time-series charts, null otherwise\n"
+        "- group_by: secondary grouping for stacked/grouped charts, null otherwise\n"
+        "- Only use column names that exist in the tables above\n"
+        "- For KPI charts: dimension=null, metric=the single numeric value column"
+    )
+
+    try:
+        raw = await bedrock_invoke(
+            model_id=BEDROCK_HAIKU_MODEL,
+            system_prompt="You are a database schema analyst. Return only valid JSON, no prose.",
+            user_message=prompt,
+            temperature=0.0,
+            max_tokens=256,
+        )
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = _re.sub(r"^```(?:json)?\s*\n?", "", raw)
+            raw = _re.sub(r"\n?```\s*$", "", raw)
+        result = json.loads(raw)
+        if isinstance(result, dict):
+            cols = {
+                "dimension": result.get("dimension") or None,
+                "metric":    result.get("metric")    or None,
+                "date":      result.get("date")      or None,
+                "group_by":  result.get("group_by")  or None,
+            }
+            print(
+                f"[orchestrator] hint key_column inference → {cols}",
+                flush=True,
+            )
+            return cols
+    except Exception as _e:
+        print(f"[orchestrator] ⚠ hint key_column inference failed: {_e}", flush=True)
+
+    return _default
 
 
 def _cross_chart_consistency_check(charts: list[dict]) -> list[str]:

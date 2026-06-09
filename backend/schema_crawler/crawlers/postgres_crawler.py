@@ -12,6 +12,7 @@ from bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL  # noqa: E402
 
 SCHEMA_MODEL = BEDROCK_SONNET_MODEL
 
+_PII_SIGNALS = frozenset({"email", "phone", "ssn", "dob", "password", "secret", "token", "auth", "credit", "card"})
 
 SEMANTIC_TABLE_KEYWORDS = {
     "order", "sale", "customer", "event", "transaction", "revenue",
@@ -29,7 +30,15 @@ async def _run_with_timeout(coro, timeout: float):
 async def crawl_postgres(
     host: str, port: int, database: str, user: str, password: str, ssl: bool,
     connection_id: str,
-) -> dict:
+) -> tuple[dict, dict]:
+    """
+    Returns (schema_doc, sample_rows_map).
+
+    schema_doc   — the standard schema document stored in SchemaSnapshot.
+    sample_rows_map — {qualified_table_name: [row_dict, ...]} with up to 25 randomly
+                      sampled rows per table.  PII columns are masked before returning.
+                      The caller passes this to the metadata extractor; it is NOT persisted.
+    """
     start = datetime.now(timezone.utc)
 
     conn = await asyncpg.connect(
@@ -43,7 +52,13 @@ async def crawl_postgres(
         tables_raw = await conn.fetch("""
             SELECT table_schema, table_name, table_type
             FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+            WHERE table_schema NOT IN (
+                'pg_catalog', 'information_schema', 'pg_internal',
+                'pg_toast', 'pg_temp', 'sys', 'catalog',
+                'svv_tables', 'svv_columns', 'svv_all_columns'
+            )
+            AND table_schema NOT LIKE 'pg_temp_%'
+            AND table_type IN ('BASE TABLE', 'VIEW')
             ORDER BY table_schema, table_name
         """)
 
@@ -52,7 +67,11 @@ async def crawl_postgres(
                    data_type, character_maximum_length, numeric_precision,
                    is_nullable, column_default
             FROM information_schema.columns
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+            WHERE table_schema NOT IN (
+                'pg_catalog', 'information_schema', 'pg_internal',
+                'pg_toast', 'pg_temp', 'sys', 'catalog'
+            )
+            AND table_schema NOT LIKE 'pg_temp_%'
             ORDER BY table_schema, table_name, ordinal_position
         """)
 
@@ -96,8 +115,10 @@ async def crawl_postgres(
             key = f"{col['table_schema']}.{col['table_name']}"
             col_map.setdefault(key, []).append(dict(col))
 
-        # Step 2: sample data
+        # Step 2: sample data + sample rows
         table_data = {}
+        sample_rows_map: dict[str, list] = {}
+
         for t in tables_raw:
             tkey = f"{t['table_schema']}.{t['table_name']}"
             tname = t["table_name"]
@@ -115,21 +136,21 @@ async def crawl_postgres(
                 pass
 
             col_stats = {}
-            for col in (col_map.get(tkey) or [])[:20]:
+            for col in (col_map.get(tkey) or [])[:50]:
                 cname = col["column_name"]
                 dtype = col["data_type"].lower()
                 try:
-                    if any(t in dtype for t in ("character", "text", "varchar")):
+                    if any(s in dtype for s in ("character", "text", "varchar")):
                         vals = await _run_with_timeout(
                             conn.fetch(
                                 f'SELECT "{cname}", COUNT(*) as cnt FROM {full_name} '
-                                f'WHERE "{cname}" IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 10'
+                                f'WHERE "{cname}" IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 50'
                             ),
                             timeout=5.0
                         )
                         if vals:
                             col_stats[cname] = {"top_values": [dict(r) for r in vals]}
-                    elif any(t in dtype for t in ("integer", "numeric", "real", "double", "bigint", "smallint", "decimal", "float")):
+                    elif any(s in dtype for s in ("integer", "numeric", "real", "double", "bigint", "smallint", "decimal", "float")):
                         stat = await _run_with_timeout(
                             conn.fetchrow(
                                 f'SELECT MIN("{cname}") as min, MAX("{cname}") as max, '
@@ -157,6 +178,40 @@ async def crawl_postgres(
                             }
                 except Exception:
                     pass
+
+            # ── Sample rows (25 rows, random distribution, PII masked) ────────
+            col_names = [c["column_name"] for c in (col_map.get(tkey) or [])]
+            sample_rows: list[dict] = []
+            try:
+                if row_count > 0 and row_count <= 100:
+                    # Small table — just take all rows up to 25
+                    raw_rows = await _run_with_timeout(
+                        conn.fetch(f"SELECT * FROM {full_name} LIMIT 25"),
+                        timeout=8.0,
+                    )
+                else:
+                    # Larger table — TABLESAMPLE for random distribution
+                    raw_rows = await _run_with_timeout(
+                        conn.fetch(f"SELECT * FROM {full_name} TABLESAMPLE BERNOULLI(1) LIMIT 25"),
+                        timeout=8.0,
+                    )
+                if raw_rows:
+                    sample_rows = [dict(r) for r in raw_rows]
+                    # Mask PII columns before storing
+                    pii_cols = {c for c in col_names if any(sig in c.lower() for sig in _PII_SIGNALS)}
+                    for row in sample_rows:
+                        for pii_col in pii_cols:
+                            if pii_col in row:
+                                row[pii_col] = "[REDACTED]"
+                    # Stringify non-serialisable types (dates, Decimals, etc.)
+                    sample_rows = [
+                        {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                         for k, v in row.items()}
+                        for row in sample_rows
+                    ]
+            except Exception:
+                pass
+            sample_rows_map[tkey] = sample_rows
 
             table_data[tkey] = {
                 "table_schema": tschema,
@@ -202,7 +257,7 @@ async def crawl_postgres(
         # Step 5: importance ranking
         ranked_tables = _rank_tables(table_data)
 
-        # Build final document
+        # Build final schema_doc (no sample rows — kept clean for SchemaSnapshot)
         tables_out = []
         for rank_idx, (tkey, tdata) in enumerate(ranked_tables, start=1):
             desc = descriptions.get(tdata["table_name"], {})
@@ -240,10 +295,9 @@ async def crawl_postgres(
             })
 
         important_tables = [t["name"] for t in tables_out[:5]]
-
         crawl_duration = (datetime.now(timezone.utc) - start).total_seconds()
 
-        return {
+        schema_doc = {
             "connection_id": connection_id,
             "crawled_at": start.isoformat(),
             "tables": tables_out,
@@ -252,41 +306,37 @@ async def crawl_postgres(
             "version": 1,
             "crawl_duration_seconds": crawl_duration,
         }
+        return schema_doc, sample_rows_map
+
     finally:
         await conn.close()
 
 
-async def _generate_descriptions(table_data: dict) -> dict:
+async def _describe_batch(batch: list, batch_idx: int) -> dict:
     schema_summary = {}
-    for tkey, tdata in table_data.items():
+    for _tkey, tdata in batch:
         tname = tdata["table_name"]
         schema_summary[tname] = {
             "columns": [
-                {
-                    "name": col["column_name"],
-                    "type": col["data_type"],
-                    "sample_values": tdata["col_stats"].get(col["column_name"], {}),
-                }
-                for col in tdata["columns"][:30]
+                {"name": col["column_name"], "type": col["data_type"]}
+                for col in tdata["columns"][:15]
             ],
             "row_count": tdata["row_count"],
         }
-
     prompt = json.dumps(schema_summary, default=str)
-
     for attempt in range(2):
         try:
             text = await bedrock_invoke(
                 model_id=SCHEMA_MODEL,
                 system_prompt=(
-                    "You are a database analyst. Given raw database schema metadata including table names, "
-                    "column names, data types, and sample values, generate semantic descriptions.\n\n"
-                    "For each table: write 1-2 sentences describing what business entity or process this "
-                    "table represents, and what one row represents.\n"
-                    "For each column: write a short phrase (5-15 words) describing what this column measures or identifies.\n\n"
-                    "Return ONLY valid JSON. No prose, no markdown, no explanation."
+                    "You are a database analyst. Generate semantic descriptions for the given schema.\n"
+                    "For each table: 1-2 sentences about the business entity it represents.\n"
+                    "For each column: a short phrase (5-12 words) describing what it measures or identifies.\n"
+                    "Return ONLY valid JSON in this exact shape: "
+                    '{\"table_name\": {\"description\": \"...\", \"columns\": {\"col_name\": \"...\"}}}. '
+                    "No prose, no markdown, no explanation."
                 ),
-                user_message=f"Generate descriptions for this schema:\n{prompt}",
+                user_message=f"Generate descriptions:\n{prompt}",
                 max_tokens=4096,
                 temperature=0.1,
             )
@@ -296,10 +346,20 @@ async def _generate_descriptions(table_data: dict) -> dict:
                 text = re.sub(r"```$", "", text).strip()
             parsed = json.loads(text)
             return parsed.get("tables", parsed)
-        except (json.JSONDecodeError, Exception):
-            if attempt == 1:
-                return {}
+        except Exception as exc:
+            print(f"[schema_crawler] postgres descriptions batch {batch_idx} attempt {attempt+1} failed: {exc}")
     return {}
+
+
+async def _generate_descriptions(table_data: dict) -> dict:
+    _BATCH = 10
+    items = list(table_data.items())
+    batches = [items[i: i + _BATCH] for i in range(0, len(items), _BATCH)]
+    batch_results = await asyncio.gather(*[_describe_batch(b, idx) for idx, b in enumerate(batches)])
+    results: dict = {}
+    for r in batch_results:
+        results.update(r)
+    return results
 
 
 def _rank_tables(table_data: dict) -> list:
@@ -321,7 +381,6 @@ def _rank_tables(table_data: dict) -> list:
         )
         richness = non_id_numeric / len(cols) if cols else 0
 
-        # centrality: how many other tables reference this one
         centrality_count = sum(
             1 for other in table_data.values()
             for rel in other.get("all_relationships", [])

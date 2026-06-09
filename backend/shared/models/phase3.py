@@ -13,7 +13,7 @@ class ScreenshotJob(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
-    uploaded_files: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
+    uploaded_files: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     chart_manifest: Mapped[dict] = mapped_column(JSONB, nullable=True)
     result_dashboard_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("dashboards.id"), nullable=True)
     total_charts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

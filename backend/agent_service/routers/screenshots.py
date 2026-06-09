@@ -7,8 +7,9 @@ GET  /screenshot/jobs/{job_id}/charts — chart replication state list
 """
 import uuid
 import os
+import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from pydantic import BaseModel
@@ -51,6 +52,31 @@ ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB per file
 MAX_FILES = 5
 
+PBIT_MIME_TYPES = {
+    "application/octet-stream",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/vnd.ms-powerbi.template",
+}
+MAX_PBIT_SIZE = 50 * 1024 * 1024   # 50 MB
+
+CSV_MIME_TYPES = {"text/csv", "application/csv", "text/plain", "text/x-csv", "application/octet-stream"}
+MAX_CSV_SIZE = 50 * 1024 * 1024   # 50 MB per CSV
+MAX_CSV_FILES = 10
+
+# Context document upload (Mode 3 — Guided Replication)
+CONTEXT_DOC_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
+    "application/msword",                   # .doc
+    "application/vnd.ms-powerpoint",        # .ppt
+    "text/plain",
+    "application/octet-stream",             # generic fallback (some browsers send this)
+}
+MAX_CONTEXT_DOC_SIZE = 10 * 1024 * 1024   # 10 MB per context document
+MAX_CONTEXT_DOC_FILES = 3
+
 
 class HintRequest(BaseModel):
     hint_id: str
@@ -65,35 +91,178 @@ async def upload_screenshots(
     background_tasks: BackgroundTasks,
     project_id: str = Form(...),
     connection_id: Optional[str] = Form(None),
-    files: list[UploadFile] = File(...),
+    mode: str = Form("db"),
+    user_table_hints: Optional[str] = Form(None),
+    user_context: Optional[str] = Form(None),
+    files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """Upload screenshot files and start the replication pipeline."""
+    """Upload screenshot files and start the replication pipeline.
+
+    mode="db"  — (default) AI auto-matches tables from the connected database.
+    mode="csv" — no live DB needed; csv_files are used as the data source via DuckDB.
+
+    user_table_hints   — JSON-encoded list of table names (e.g. '["staging.jobs"]')
+                         that override schema matching and are tried first (Mode 2).
+    user_context       — free-text description of the screenshot (Mode 3 — Guided Replication).
+                         e.g. "Active placements by employment type for Q1 2024"
+    pbit_file          — (form field, not FastAPI param) .pbit Power BI Template file.
+                         Provides ground-truth field bindings, DAX measures, and relationships.
+                         Highest-priority context source — overrides spec_reader and schema inference.
+    user_column_hints  — (form field) JSON-encoded list of per-table column selections.
+                         Format: [{"table": "staging.x", "dimension": "col1", "metric": "col2",
+                                   "date": "col3", "group_by": "col4"}]
+                         Overrides schema_matcher key_columns; combined with user_table_hints.
+    """
     user_id = await _resolve_user_id(request, db)
+
+    # Validate project_id early so we return 400 instead of 500
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid project_id: {project_id!r} is not a valid UUID")
+
+    # Parse user table hints sent as a JSON string in form data
+    hints: list[str] = []
+    if user_table_hints:
+        try:
+            parsed = json.loads(user_table_hints)
+            if isinstance(parsed, list):
+                hints = [str(t) for t in parsed if t]
+        except Exception:
+            pass
+
+    # Normalise user_context — strip whitespace, default to empty string
+    ctx: str = (user_context or "").strip()
 
     if len(files) > MAX_FILES:
         raise HTTPException(status_code=400, detail=f"Maximum {MAX_FILES} files per upload")
 
-    # Resolve connection if not provided
-    if not connection_id:
-        conn_result = await db.execute(
-            select(DatabaseConnection)
-            .where(DatabaseConnection.project_id == uuid.UUID(project_id))
-            .where(DatabaseConnection.is_active == True)
-            .limit(1)
+    # Parse csv_files and context_files from the cached form data directly — avoids
+    # Pydantic v2 coercion failure when exactly one file is uploaded.
+    # Use multi_items() instead of getlist() for broadest Starlette compatibility.
+    from starlette.datastructures import UploadFile as _StarletteUploadFile
+    _form = await request.form()
+    _form_keys = [k for k, _ in _form.multi_items()]
+    print(f"[upload_screenshots] form keys: {_form_keys}", flush=True)
+    csv_files: List[UploadFile] = [
+        v for k, v in _form.multi_items()
+        if k == "csv_files" and isinstance(v, _StarletteUploadFile)
+    ]
+    context_doc_files: List[UploadFile] = [
+        v for k, v in _form.multi_items()
+        if k == "context_files" and isinstance(v, _StarletteUploadFile)
+    ]
+    pbit_file_uploads: List[UploadFile] = [
+        v for k, v in _form.multi_items()
+        if k == "pbit_file" and isinstance(v, _StarletteUploadFile)
+    ]
+    print(
+        f"[upload_screenshots] csv_files={len(csv_files)}  context_docs={len(context_doc_files)}"
+        f"  pbit_files={len(pbit_file_uploads)}",
+        flush=True,
+    )
+
+    # Extract text from context documents and merge with typed user_context
+    if context_doc_files:
+        if len(context_doc_files) > MAX_CONTEXT_DOC_FILES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum {MAX_CONTEXT_DOC_FILES} context document files allowed",
+            )
+        from agent_service.utils.context_doc_extractor import extract_text as _extract_text, merge_context as _merge_context
+        doc_extracts: list[tuple[str, str]] = []
+        for cf in context_doc_files:
+            cf_bytes = await cf.read()
+            if len(cf_bytes) > MAX_CONTEXT_DOC_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Context document '{cf.filename}' exceeds the 10 MB limit",
+                )
+            extracted = _extract_text(cf.filename or "document", cf_bytes)
+            if extracted:
+                doc_extracts.append((cf.filename or "document", extracted))
+                print(
+                    f"[upload_screenshots] extracted {len(extracted)} chars from '{cf.filename}'",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[upload_screenshots] ⚠ no text extracted from '{cf.filename}' (unsupported or empty)",
+                    flush=True,
+                )
+        ctx = _merge_context(ctx, doc_extracts)
+
+    # Read PBIT file (Power BI Template) — optional; enables ground-truth field binding injection
+    pbit_bytes: Optional[bytes] = None
+    if pbit_file_uploads:
+        pf = pbit_file_uploads[0]
+        pf_bytes = await pf.read()
+        if len(pf_bytes) > MAX_PBIT_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PBIT file '{pf.filename}' exceeds the 50 MB limit",
+            )
+        pbit_bytes = pf_bytes
+        print(
+            f"[upload_screenshots] PBIT file received: '{pf.filename}'  size={len(pf_bytes)} bytes",
+            flush=True,
         )
-        conn = conn_result.scalar_one_or_none()
-        if not conn:
-            raise HTTPException(status_code=400, detail="No active database connection found for this project")
-        connection_id = str(conn.id)
+
+    # Parse user column hints (per-table column selections sent as JSON string)
+    # Format: [{"table": "staging.x", "dimension": "col1", "metric": "col2", "date": "col3"}]
+    user_col_hints: list = []
+    _raw_col_hints = _form.get("user_column_hints", "")
+    if _raw_col_hints:
+        try:
+            parsed_col_hints = json.loads(_raw_col_hints)
+            if isinstance(parsed_col_hints, list):
+                user_col_hints = [h for h in parsed_col_hints if isinstance(h, dict)]
+        except Exception:
+            pass
+
+    # Validate and read CSV files for CSV mode
+    csv_data: list[dict] = []
+    if mode == "csv":
+        incoming_csvs: list[UploadFile] = csv_files
+        if not incoming_csvs:
+            raise HTTPException(status_code=400, detail="CSV mode requires at least one CSV file")
+        if len(incoming_csvs) > MAX_CSV_FILES:
+            raise HTTPException(status_code=400, detail=f"Maximum {MAX_CSV_FILES} CSV files per upload")
+        for cf in incoming_csvs:
+            cf_bytes = await cf.read()
+            if len(cf_bytes) > MAX_CSV_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"CSV file '{cf.filename}' exceeds the 50 MB limit",
+                )
+            csv_data.append({"filename": cf.filename or "data.csv", "bytes": cf_bytes})
+
+    # Resolve connection_id — CSV mode needs no live DB connection
+    if mode != "csv":
+        if not connection_id:
+            conn_result = await db.execute(
+                select(DatabaseConnection)
+                .where(DatabaseConnection.project_id == project_uuid)
+                .where(DatabaseConnection.is_active == True)
+                .limit(1)
+            )
+            conn = conn_result.scalar_one_or_none()
+            if not conn:
+                raise HTTPException(status_code=400, detail="No active database connection found for this project")
+            connection_id = str(conn.id)
+    else:
+        # Sentinel value — orchestrator replaces it with "csv_session:/tmp/csv_{job_id}"
+        connection_id = "csv_mode"
 
     # Validate + upload files
     uploaded = []
     stored_files = []
     for f in files:
+        print(f"[upload_screenshots] screenshot file: {f.filename!r} content_type={f.content_type!r}", flush=True)
         if f.content_type not in ALLOWED_MIME_TYPES:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {f.content_type}")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {f.content_type!r} (allowed: image/png, image/jpeg, image/webp, image/gif)")
         data = await f.read()
         if len(data) > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"File {f.filename} exceeds 20 MB limit")
@@ -109,7 +278,7 @@ async def upload_screenshots(
     # Create ScreenshotJob
     screenshot_job = ScreenshotJob(
         id=uuid.uuid4(),
-        project_id=uuid.UUID(project_id),
+        project_id=project_uuid,
         user_id=user_id,
         status="pending",
         uploaded_files=uploaded,
@@ -124,11 +293,17 @@ async def upload_screenshots(
     job_id = str(uuid.uuid4())
     pipeline_job = PipelineJob(
         id=uuid.UUID(job_id),
-        project_id=uuid.UUID(project_id),
+        project_id=project_uuid,
         user_id=user_id,
         job_type="SCREENSHOT",
         status="pending",
-        input_payload={"screenshot_job_id": str(screenshot_job.id), "connection_id": connection_id},
+        input_payload={
+            "screenshot_job_id": str(screenshot_job.id),
+            "connection_id": connection_id,
+            "mode": mode,
+            "user_table_hints": hints,
+            "user_context": ctx,
+        },
         created_at=datetime.utcnow(),
     )
     db.add(pipeline_job)
@@ -144,6 +319,12 @@ async def upload_screenshots(
         project_id=project_id,
         user_id=str(user_id),
         connection_id=connection_id,
+        mode=mode,
+        user_table_hints=hints,
+        csv_data=csv_data,
+        user_context=ctx,
+        pbit_bytes=pbit_bytes,
+        user_column_hints=user_col_hints,
     )
 
     return {
@@ -161,6 +342,12 @@ async def _run_screenshot_pipeline_bg(
     project_id: str,
     user_id: str,
     connection_id: str,
+    mode: str = "db",
+    user_table_hints: list[str] = [],
+    csv_data: list[dict] = [],
+    user_context: str = "",
+    pbit_bytes: Optional[bytes] = None,
+    user_column_hints: list[dict] = [],
 ):
     """Background task: run screenshot pipeline."""
     from shared.database import AsyncSessionLocal
@@ -178,6 +365,12 @@ async def _run_screenshot_pipeline_bg(
                 connection_id=connection_id,
                 redis=redis,
                 db=db,
+                mode=mode,
+                user_table_hints=user_table_hints,
+                csv_data=csv_data,
+                user_context=user_context,
+                pbit_bytes=pbit_bytes,
+                user_column_hints=user_column_hints,
             )
             # Mark pipeline job complete
             from sqlalchemy import select as _select

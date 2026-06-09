@@ -14,8 +14,10 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, BackgroundTasks, status
+from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, BackgroundTasks, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,12 +52,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Sanitize validation errors — strip non-JSON-serializable values (e.g. UploadFile)
+    from the 'input' field so jsonable_encoder never tries to encode file objects."""
+    errors = []
+    for error in exc.errors():
+        sanitized = {k: v for k, v in error.items() if k != "input"}
+        errors.append(sanitized)
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 @app.middleware("http")
 async def add_cors_on_error(request, call_next):
-    from fastapi.responses import JSONResponse
+    import traceback  # noqa: PLC0415
     try:
         response = await call_next(request)
     except Exception as exc:
+        traceback.print_exc()
         response = JSONResponse({"detail": str(exc)}, status_code=500)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
@@ -433,6 +448,66 @@ async def get_schema(project_id: str, current_user: User = Depends(get_current_u
             "schema": snapshot.schema_document}
 
 
+@app.get("/projects/{project_id}/schema/metadata")
+async def get_schema_metadata(project_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
+    conn_result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.project_id == uuid.UUID(project_id), DatabaseConnection.is_active == True).limit(1))
+    conn = conn_result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="No active connection found")
+
+    tbl_rows = (await db.execute(
+        select(SchemaTableMetadata)
+        .where(SchemaTableMetadata.connection_id == conn.id)
+        .order_by(SchemaTableMetadata.table_name)
+    )).scalars().all()
+
+    if not tbl_rows:
+        raise HTTPException(status_code=404, detail="Metadata not extracted yet — trigger a crawl and wait ~1 minute.")
+
+    col_rows = (await db.execute(
+        select(SchemaColumnMetadata)
+        .where(SchemaColumnMetadata.connection_id == conn.id)
+        .order_by(SchemaColumnMetadata.table_name, SchemaColumnMetadata.column_name)
+    )).scalars().all()
+
+    cols_by_table: dict[str, list] = {}
+    for c in col_rows:
+        cols_by_table.setdefault(c.table_name, []).append({
+            "column_name": c.column_name,
+            "business_name": c.business_name,
+            "description": c.description,
+            "semantic_type": c.semantic_type,
+            "fk_target_table": c.fk_target_table,
+            "fk_target_column": c.fk_target_column,
+            "fk_confirmed": c.fk_confirmed,
+            "example_values": c.example_values or [],
+            "is_kpi_metric": c.is_kpi_metric,
+            "is_dimension": c.is_dimension,
+            "is_filter_eligible": c.is_filter_eligible,
+        })
+
+    tables = [
+        {
+            "table_name": t.table_name,
+            "business_name": t.business_name,
+            "description": t.description,
+            "grain": t.grain,
+            "is_fact_table": t.is_fact_table,
+            "use_for": t.use_for or [],
+            "never_use_for": t.never_use_for or [],
+            "key_metric_cols": t.key_metric_cols or [],
+            "key_dimension_cols": t.key_dimension_cols or [],
+            "key_date_cols": t.key_date_cols or [],
+            "generated_at": t.generated_at.isoformat() if t.generated_at else None,
+            "columns": cols_by_table.get(t.table_name, []),
+        }
+        for t in tbl_rows
+    ]
+    return {"connection_id": str(conn.id), "tables": tables}
+
+
 # ─── AGENT ROUTES ────────────────────────────────────────────────────────────
 
 class IntentSubmitRequest(BaseModel):
@@ -745,36 +820,61 @@ import re as _re
 
 
 def _inject_filters_into_sql(base_sql: str, filters: dict) -> str:
-    """Append WHERE/AND clauses for active filters to a base SQL query.
+    """Apply active filters to a base SQL query.
 
     Supports three value shapes:
     - list of strings/ints  → single-value = or multi-value IN
     - {"start": ..., "end": ...} dict → BETWEEN (date range)
+
+    Date range filters REPLACE any existing condition for the same column in
+    base_sql instead of appending — prevents conflicting date conditions when
+    the user changes the date range on a dashboard whose SQL was already generated
+    with a hard-coded date WHERE clause.
     """
     active = {col: vals for col, vals in filters.items() if vals}
     if not active:
         return base_sql
-    clauses = []
+
+    modified = base_sql.rstrip(";")
+    append_clauses: list[str] = []
+
     for col, vals in active.items():
         safe_col = _re.sub(r"[^\w.]", "", col)
-        # Date range dict: {"start": "2024-01-01", "end": "2024-12-31"}
         if isinstance(vals, dict) and "start" in vals and "end" in vals:
             start = str(vals["start"]).replace("'", "''")
             end   = str(vals["end"]).replace("'", "''")
-            clauses.append(f"{safe_col} BETWEEN '{start}' AND '{end}'")
-            continue
-        # Normalise: scalar → one-item list
-        if not isinstance(vals, list):
-            vals = [vals]
-        safe_vals = [str(v).replace("'", "''") for v in vals]
-        if len(safe_vals) == 1:
-            clauses.append(f"{safe_col} = '{safe_vals[0]}'")
+            new_clause = f"{safe_col} BETWEEN '{start}' AND '{end}'"
+            # Try to replace an existing condition for this column (avoids stacking)
+            replaced = False
+            esc = _re.escape(safe_col)
+            for pat in [
+                rf"(?:AND\s+)?{esc}\s+BETWEEN\s+'[^']*'\s+AND\s+'[^']*'",
+                rf"(?:AND\s+)?{esc}\s*>=\s*'[^']*'(?:\s+AND\s+{esc}\s*<=\s*'[^']*')?",
+                rf"(?:AND\s+)?{esc}\s*<=\s*'[^']*'(?:\s+AND\s+{esc}\s*>=\s*'[^']*')?",
+            ]:
+                new_s, n = _re.subn(pat, new_clause, modified, flags=_re.IGNORECASE)
+                if n:
+                    modified = new_s
+                    replaced = True
+                    break
+            if not replaced:
+                append_clauses.append(new_clause)
         else:
-            vals_sql = ", ".join(f"'{v}'" for v in safe_vals)
-            clauses.append(f"{safe_col} IN ({vals_sql})")
-    has_where = bool(_re.search(r"\bWHERE\b", base_sql, _re.IGNORECASE))
-    connector = " AND " if has_where else " WHERE "
-    return base_sql.rstrip(";") + connector + " AND ".join(clauses)
+            if not isinstance(vals, list):
+                vals = [vals]
+            safe_vals = [str(v).replace("'", "''") for v in vals]
+            if len(safe_vals) == 1:
+                append_clauses.append(f"{safe_col} = '{safe_vals[0]}'")
+            else:
+                vals_sql = ", ".join(f"'{v}'" for v in safe_vals)
+                append_clauses.append(f"{safe_col} IN ({vals_sql})")
+
+    if append_clauses:
+        has_where = bool(_re.search(r"\bWHERE\b", modified, _re.IGNORECASE))
+        connector = " AND " if has_where else " WHERE "
+        modified += connector + " AND ".join(append_clauses)
+
+    return modified
 
 
 class RequeryRequest(_BM):

@@ -2,6 +2,17 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# Load .env BEFORE any shared module imports so DATABASE_URL, Redis URL, and
+# AWS credentials are set before module-level os.getenv() calls evaluate them.
+try:
+    from dotenv import load_dotenv, find_dotenv
+    _dotenv_path = find_dotenv(usecwd=False)
+    if _dotenv_path:
+        load_dotenv(_dotenv_path, override=True)
+except ImportError:
+    pass
+
+import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -22,10 +33,23 @@ from schema_crawler.crawlers.postgres_crawler import crawl_postgres
 from schema_crawler.crawlers.mysql_crawler import crawl_mysql
 from schema_crawler.crawlers.redshift_crawler import crawl_redshift
 from schema_crawler.diff import compute_schema_diff, flag_affected_widgets
+from schema_crawler.metadata_extractor import run_metadata_extraction
 
 app = FastAPI(title="Visually Schema Crawler", version="2.0.0")
 
 _crawl_jobs: dict[str, dict] = {}
+
+# Strong references to fire-and-forget background tasks.
+# asyncio only keeps weak refs to tasks — without this the GC cancels them
+# before they complete, which silently drops metadata extraction jobs.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 class CrawlRequest(BaseModel):
@@ -57,8 +81,18 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
 
             db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
 
+            # Build connection kwargs for metadata extractor (Phases B + C DB queries)
+            db_conn_kwargs = {
+                "host": conn.host or "localhost",
+                "port": conn.port or (5439 if db_type == "redshift" else 5432),
+                "database": conn.database_name or "",
+                "user": conn.username or "",
+                "password": password,
+                "ssl": conn.ssl_enabled,
+            }
+
             if db_type == "redshift":
-                schema_doc = await crawl_redshift(
+                schema_doc, sample_rows_map = await crawl_redshift(
                     host=conn.host or "localhost",
                     port=conn.port or 5439,
                     database=conn.database_name or "",
@@ -69,7 +103,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     iam_role_arn=iam_role_arn,
                 )
             elif db_type == "postgresql":
-                schema_doc = await crawl_postgres(
+                schema_doc, sample_rows_map = await crawl_postgres(
                     host=conn.host or "localhost",
                     port=conn.port or 5432,
                     database=conn.database_name or "",
@@ -79,6 +113,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     connection_id=connection_id,
                 )
             elif db_type == "mysql":
+                # MySQL crawler does not collect sample rows yet
                 schema_doc = await crawl_mysql(
                     host=conn.host or "localhost",
                     port=conn.port or 3306,
@@ -88,6 +123,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     ssl=conn.ssl_enabled,
                     connection_id=connection_id,
                 )
+                sample_rows_map = {}
             else:
                 _crawl_jobs[job_id] = {"status": "failed", "result": None, "error": f"Unsupported db_type: {db_type}"}
                 return
@@ -175,6 +211,19 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                         pass
 
             await db.commit()
+
+            # Fire-and-forget: enrich schema metadata in the background.
+            # Non-fatal — crawl result is already persisted above.
+            _fire_and_forget(
+                run_metadata_extraction(
+                    connection_id=connection_id,
+                    snapshot_version=new_snapshot.version,
+                    schema_doc=schema_doc,
+                    sample_rows_map=sample_rows_map,
+                    db_conn_kwargs=db_conn_kwargs,
+                    db_type=db_type,
+                )
+            )
 
             _crawl_jobs[job_id] = {
                 "status": "completed",
