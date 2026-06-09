@@ -4,9 +4,10 @@ import { useParams, useRouter } from 'next/navigation'
 import {
   Camera, Loader2, AlertCircle, CheckCircle2, ArrowRight,
   LayoutDashboard, Eye, Database, Zap, ShieldCheck, Layers,
-  HelpCircle, RefreshCw, Clock, ScanSearch,
+  HelpCircle, RefreshCw, Clock, ScanSearch, FileText, Calendar,
+  ChevronDown, ChevronRight, Upload,
 } from 'lucide-react'
-import { screenshotApi, canvasApi } from '@/lib/api'
+import { screenshotApi, canvasApi, projectApi } from '@/lib/api'
 import { UploadDropzone } from '@/components/screenshot/UploadDropzone'
 import { HintDialog } from '@/components/screenshot/HintDialog'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
@@ -19,6 +20,15 @@ interface HintRequest {
   chart_type?: string
   message: string
   options: { value: string; label: string }[]
+}
+
+interface FilterConfig {
+  id: string
+  column: string
+  display_name: string
+  filter_type: string
+  available_values: string[]
+  table: string
 }
 
 interface LogEntry {
@@ -49,6 +59,15 @@ function eventToLog(event: Record<string, unknown>): LogEntry | null {
     case 'vision.parsed': {
       const n = event.chart_count as number
       return { ts, level: 'success', text: `✓ Detected ${n} chart${n !== 1 ? 's' : ''} in the screenshot` }
+    }
+    case 'context.parsed': {
+      const intent = event.chart_intent as string | undefined
+      const filters = event.filter_count as number | undefined
+      const hasDate = event.has_date_range as boolean | undefined
+      return {
+        ts, level: 'success',
+        text: `✓ Context parsed${intent ? `: "${intent}"` : ''}${filters ? ` · ${filters} filter${filters !== 1 ? 's' : ''}` : ''}${hasDate ? ' · date range detected' : ''}`,
+      }
     }
     case 'schema.matching':
       return { ts, level: 'info', text: '🔍 Schema analysis — matching chart columns to database tables' }
@@ -203,6 +222,23 @@ export default function ScreenshotPage() {
     upload: 'idle', vision: 'idle', sql: 'idle',
     execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle',
   })
+  // Mode 1 / Mode 2 / Mode 3 / CSV / PBIT state
+  const [uiMode, setUiMode] = useState<'db' | 'db_hint' | 'context' | 'csv' | 'pbit'>('db')
+  const [csvFiles, setCsvFiles] = useState<File[]>([])
+  const [tableHints, setTableHints] = useState<string[]>([])
+  const [allTables, setAllTables] = useState<Array<{ qualified: string; name: string; columns: string[] }>>([])
+  const [tableSearch, setTableSearch] = useState('')
+  const [loadingTables, setLoadingTables] = useState(false)
+  const [userContext, setUserContext] = useState('')
+  const [contextFiles, setContextFiles] = useState<File[]>([])
+  // PBIT mode state
+  const [pbitFile, setPbitFile] = useState<File | null>(null)
+  const [columnHints, setColumnHints] = useState<Record<string, { dimension: string; metric: string; date: string; group_by: string }>>({})
+  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
+  // Date filter state (for done card)
+  const [resultDateFilters, setResultDateFilters] = useState<FilterConfig[]>([])
+  const [resultDateRange, setResultDateRange] = useState<Record<string, { start: string; end: string }>>({})
+  const [applyingDate, setApplyingDate] = useState(false)
   const logEndRef = useRef<HTMLDivElement>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const processedEventCount = useRef(0)
@@ -309,15 +345,94 @@ export default function ScreenshotPage() {
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [phase, jobId])
 
+  const resultDashboardId = screenshotJob?.result_dashboard_id as string | undefined
+
+  // When the pipeline completes, load the new dashboard to discover date filter columns
+  useEffect(() => {
+    if (!resultDashboardId) return
+    canvasApi.get(resultDashboardId).then(resp => {
+      const data = resp.data as {
+        filter_config?: FilterConfig[]
+        widgets?: Array<{ config?: { date_filter?: { column: string; start: string; end: string | null } } }>
+      }
+      const dateFCs = (data.filter_config || []).filter(fc => fc.filter_type === 'date_range')
+      setResultDateFilters(dateFCs)
+      const seed: Record<string, { start: string; end: string }> = {}
+      for (const w of data.widgets || []) {
+        const df = w.config?.date_filter
+        if (df?.column && df.start && !seed[df.column]) {
+          seed[df.column] = { start: df.start, end: df.end ?? df.start }
+        }
+      }
+      setResultDateRange(seed)
+    }).catch(() => {})
+  }, [resultDashboardId])
+
+  const handleModeChange = async (newMode: 'db' | 'db_hint' | 'context' | 'csv' | 'pbit') => {
+    setUiMode(newMode)
+    // Table Hint, Guided, and PBIT modes all show the table picker — load schema once
+    if ((newMode === 'db_hint' || newMode === 'context' || newMode === 'pbit') && allTables.length === 0) {
+      setLoadingTables(true)
+      try {
+        const resp = await projectApi.getSchema(projectId)
+        const rawTables: Array<{ name: string; schema?: string; columns?: Array<{ name: string }> }> = resp.data?.schema?.tables || []
+        setAllTables(
+          rawTables.map(t => ({
+            qualified: t.schema ? `${t.schema}.${t.name}` : t.name,
+            name: t.name,
+            columns: (t.columns || []).map((c: { name: string }) => c.name),
+          }))
+        )
+      } catch {}
+      setLoadingTables(false)
+    }
+  }
+
   const handleUpload = async () => {
     if (!files.length) return
+    if (uiMode === 'csv' && csvFiles.length === 0) {
+      setError('Please add at least one CSV file before uploading')
+      return
+    }
+    if (uiMode === 'context' && !userContext.trim() && contextFiles.length === 0) {
+      setError('Please describe what the screenshot shows or upload a context document (Guided mode requires at least one)')
+      return
+    }
+    if (uiMode === 'pbit' && !pbitFile && tableHints.length === 0) {
+      setError('Please upload a PBIT file or select at least one table in PBIT mode')
+      return
+    }
     setUploading(true)
     setError(null)
     setPhase('uploading')
-    setLog([{ ts: Date.now(), level: 'info', text: `📤 Uploading ${files.length} screenshot${files.length !== 1 ? 's' : ''}...` }])
+    const csvNote = uiMode === 'csv' ? ` + ${csvFiles.length} CSV file${csvFiles.length !== 1 ? 's' : ''}` : ''
+    const modeNote = uiMode === 'context' ? ' [Guided mode — context + AI]'
+      : uiMode === 'db_hint' ? ' [Table Hint mode]'
+      : uiMode === 'pbit' ? ' [PBIT mode — Power BI ground truth]'
+      : ''
+    setLog([{ ts: Date.now(), level: 'info', text: `📤 Uploading ${files.length} screenshot${files.length !== 1 ? 's' : ''}${csvNote}${modeNote}...` }])
     setSteps({ upload: 'active', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' })
+
+    // Build user_column_hints from PBIT mode column selections
+    const builtColumnHints = uiMode === 'pbit'
+      ? Object.entries(columnHints)
+          .filter(([table]) => tableHints.includes(table))
+          .map(([table, cols]) => ({ table, ...cols }))
+          .filter(h => h.dimension || h.metric || h.date || h.group_by)
+      : undefined
+
     try {
-      const resp = await screenshotApi.upload({ projectId, files })
+      const resp = await screenshotApi.upload({
+        projectId,
+        files,
+        mode: uiMode === 'csv' ? 'csv' : 'db',
+        userTableHints: (uiMode === 'db_hint' || uiMode === 'context' || uiMode === 'pbit') && tableHints.length > 0 ? tableHints : undefined,
+        csvFiles: uiMode === 'csv' ? csvFiles : undefined,
+        userContext: uiMode === 'context' && userContext.trim() ? userContext.trim() : undefined,
+        contextFiles: uiMode === 'context' && contextFiles.length > 0 ? contextFiles : undefined,
+        pbitFile: uiMode === 'pbit' && pbitFile ? pbitFile : undefined,
+        userColumnHints: builtColumnHints?.length ? builtColumnHints : undefined,
+      })
       processedEventCount.current = 0
       setJobId(resp.data.job_id)
       setPhase('processing')
@@ -343,8 +458,6 @@ export default function ScreenshotPage() {
     } catch {}
     setHint(null)
   }
-
-  const resultDashboardId = screenshotJob?.result_dashboard_id as string | undefined
 
   const stepIcon = (key: StepKey, Icon: React.ElementType) => {
     const s = steps[key]
@@ -388,17 +501,481 @@ export default function ScreenshotPage() {
           {/* Upload card (idle/uploading) */}
           {(phase === 'idle' || phase === 'uploading') && (
             <div className="card p-5 space-y-4">
+
+              {/* Mode selector */}
+              <div className="flex gap-1 p-1 bg-gray-100 rounded-xl">
+                {(
+                  [
+                    { id: 'db'      as const, label: 'Auto' },
+                    { id: 'db_hint' as const, label: 'Tables' },
+                    { id: 'context' as const, label: 'Guided' },
+                    { id: 'pbit'    as const, label: 'PBIT' },
+                    { id: 'csv'     as const, label: 'CSV' },
+                  ]
+                ).map(m => (
+                  <button
+                    key={m.id}
+                    onClick={() => handleModeChange(m.id)}
+                    disabled={uploading}
+                    className={`flex-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all disabled:opacity-50 ${
+                      uiMode === m.id
+                        ? 'bg-white text-gray-900 shadow-sm'
+                        : 'text-gray-500 hover:text-gray-700'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Mode description */}
+              <p className="text-xs text-gray-400">
+                {uiMode === 'db'      && 'AI automatically matches your charts to the connected database tables.'}
+                {uiMode === 'db_hint' && 'You specify which database tables the screenshot uses — bypasses the automatic schema matcher.'}
+                {uiMode === 'context' && 'Describe what the screenshot shows and optionally pick tables — AI uses your context to generate more accurate SQL.'}
+                {uiMode === 'pbit'    && 'Upload a Power BI PBIT file — provides exact field bindings, DAX measures, and relationships for ground-truth replication.'}
+                {uiMode === 'csv'     && 'Upload CSV files as the data source. No database connection required.'}
+              </p>
+
+              {/* Screenshot dropzone (shown for all modes) */}
               <UploadDropzone onFilesSelected={setFiles} disabled={uploading} />
+
+              {/* Table Hint mode — searchable multi-select */}
+              {uiMode === 'db_hint' && (
+                <div className="border border-gray-200 rounded-xl p-3 space-y-2">
+                  <p className="text-xs font-semibold text-gray-600">Select tables this screenshot uses</p>
+                  {loadingTables ? (
+                    <div className="flex items-center gap-2 text-xs text-gray-400">
+                      <Loader2 size={12} className="animate-spin" /> Loading schema…
+                    </div>
+                  ) : allTables.length === 0 ? (
+                    <p className="text-xs text-amber-500">
+                      No schema found — crawl the schema first from the project Schema page.
+                    </p>
+                  ) : (
+                    <>
+                      <input
+                        type="text"
+                        placeholder="Search tables…"
+                        value={tableSearch}
+                        onChange={e => setTableSearch(e.target.value)}
+                        className="w-full text-xs border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-brand"
+                      />
+                      <div className="max-h-36 overflow-y-auto space-y-0.5 pr-1">
+                        {allTables
+                          .filter(t => t.qualified.toLowerCase().includes(tableSearch.toLowerCase()))
+                          .slice(0, 50)
+                          .map(t => (
+                            <label
+                              key={t.qualified}
+                              className="flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-gray-50 cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={tableHints.includes(t.qualified)}
+                                onChange={e => {
+                                  if (e.target.checked) {
+                                    setTableHints(prev => [...prev, t.qualified])
+                                  } else {
+                                    setTableHints(prev => prev.filter(x => x !== t.qualified))
+                                  }
+                                }}
+                                className="accent-brand"
+                              />
+                              <span className="font-mono text-xs text-gray-700 truncate">{t.qualified}</span>
+                            </label>
+                          ))}
+                      </div>
+                      {tableHints.length > 0 && (
+                        <div className="flex flex-wrap gap-1 pt-1">
+                          {tableHints.map(t => (
+                            <span
+                              key={t}
+                              className="flex items-center gap-1 px-2 py-0.5 bg-blue-50 text-blue-700 text-xs rounded-full"
+                            >
+                              <Database size={9} />
+                              <span className="max-w-[120px] truncate">{t.split('.').pop()}</span>
+                              <button
+                                onClick={() => setTableHints(prev => prev.filter(x => x !== t))}
+                                className="hover:text-blue-500 ml-0.5"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Guided mode (Mode 3) — context textarea + optional table picker */}
+              {uiMode === 'context' && (
+                <div className="border border-blue-200 rounded-xl p-3 space-y-3">
+                  {/* Context textarea */}
+                  <div className="space-y-1">
+                    <p className="text-xs font-semibold text-gray-600">
+                      Describe what the screenshot shows
+                      <span className="ml-1 text-gray-400 font-normal">(optional if uploading a doc)</span>
+                    </p>
+                    <textarea
+                      placeholder={`e.g. "Active placements by employment type for Q1 2024. Only open job orders."`}
+                      value={userContext}
+                      onChange={e => setUserContext(e.target.value)}
+                      rows={3}
+                      disabled={uploading}
+                      className="w-full text-xs border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-blue-400 resize-none disabled:opacity-50 placeholder-gray-300"
+                    />
+                    {userContext.trim().length > 0 && (
+                      <p className="text-xs text-blue-500">
+                        ✓ {userContext.trim().length} chars — AI will parse filters, date ranges, and aggregation hints
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Context document upload */}
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-semibold text-gray-600">
+                      Or upload a context document
+                      <span className="ml-1 font-normal text-gray-400">(PDF, DOCX, PPTX, TXT — up to 3 files)</span>
+                    </p>
+                    <label className={`flex items-center justify-center gap-2 border-2 border-dashed rounded-xl py-3 px-3 cursor-pointer transition-colors ${uploading ? 'opacity-50 cursor-not-allowed' : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50/30'}`}>
+                      <FileText size={14} className="text-gray-400 shrink-0" />
+                      <span className="text-xs text-gray-500">
+                        {contextFiles.length > 0
+                          ? `${contextFiles.length} file${contextFiles.length !== 1 ? 's' : ''} selected — click to add more`
+                          : 'Click or drag PDF / DOCX / PPTX / TXT here'}
+                      </span>
+                      <input
+                        type="file"
+                        accept=".pdf,.docx,.doc,.pptx,.ppt,.txt"
+                        multiple
+                        disabled={uploading}
+                        className="hidden"
+                        onChange={e => {
+                          const chosen = Array.from(e.target.files || [])
+                          setContextFiles(prev => {
+                            const existing = new Set(prev.map(f => f.name + f.size))
+                            const fresh = chosen.filter(f => !existing.has(f.name + f.size))
+                            return [...prev, ...fresh].slice(0, 3)
+                          })
+                          e.target.value = ''
+                        }}
+                      />
+                    </label>
+                    {contextFiles.length > 0 && (
+                      <div className="flex flex-wrap gap-1 pt-0.5">
+                        {contextFiles.map((f, i) => (
+                          <span
+                            key={f.name + i}
+                            className="flex items-center gap-1 px-2 py-0.5 bg-indigo-50 text-indigo-700 text-xs rounded-full max-w-[180px]"
+                          >
+                            <FileText size={9} className="shrink-0" />
+                            <span className="truncate">{f.name}</span>
+                            <button
+                              onClick={() => setContextFiles(prev => prev.filter((_, idx) => idx !== i))}
+                              className="hover:text-indigo-500 ml-0.5 shrink-0"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Optional table picker */}
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-semibold text-gray-600">
+                      Tables to use <span className="font-normal text-gray-400">(optional)</span>
+                    </p>
+                    {loadingTables ? (
+                      <div className="flex items-center gap-2 text-xs text-gray-400">
+                        <Loader2 size={12} className="animate-spin" /> Loading schema…
+                      </div>
+                    ) : allTables.length === 0 ? (
+                      <p className="text-xs text-amber-500">
+                        No schema found — crawl the schema first from the project Schema page.
+                      </p>
+                    ) : (
+                      <>
+                        <input
+                          type="text"
+                          placeholder="Search tables…"
+                          value={tableSearch}
+                          onChange={e => setTableSearch(e.target.value)}
+                          className="w-full text-xs border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-blue-400"
+                        />
+                        <div className="max-h-28 overflow-y-auto space-y-0.5 pr-1">
+                          {allTables
+                            .filter(t => t.qualified.toLowerCase().includes(tableSearch.toLowerCase()))
+                            .slice(0, 50)
+                            .map(t => (
+                              <label
+                                key={t.qualified}
+                                className="flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-gray-50 cursor-pointer"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={tableHints.includes(t.qualified)}
+                                  onChange={e => {
+                                    if (e.target.checked) {
+                                      setTableHints(prev => [...prev, t.qualified])
+                                    } else {
+                                      setTableHints(prev => prev.filter(x => x !== t.qualified))
+                                    }
+                                  }}
+                                  className="accent-brand"
+                                />
+                                <span className="font-mono text-xs text-gray-700 truncate">{t.qualified}</span>
+                              </label>
+                            ))}
+                        </div>
+                        {tableHints.length > 0 && (
+                          <div className="flex flex-wrap gap-1 pt-0.5">
+                            {tableHints.map(t => (
+                              <span
+                                key={t}
+                                className="flex items-center gap-1 px-2 py-0.5 bg-blue-50 text-blue-700 text-xs rounded-full"
+                              >
+                                <Database size={9} />
+                                <span className="max-w-[120px] truncate">{t.split('.').pop()}</span>
+                                <button
+                                  onClick={() => setTableHints(prev => prev.filter(x => x !== t))}
+                                  className="hover:text-blue-500 ml-0.5"
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* PBIT mode — Power BI Template + table/column selector */}
+              {uiMode === 'pbit' && (
+                <div className="border border-purple-200 rounded-xl p-3 space-y-3">
+
+                  {/* PBIT file upload */}
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-semibold text-gray-600">
+                      Upload Power BI Template
+                      <span className="ml-1 font-normal text-gray-400">(.pbit file)</span>
+                    </p>
+                    <label className={`flex items-center justify-center gap-2 border-2 border-dashed rounded-xl py-3 px-3 cursor-pointer transition-colors ${uploading ? 'opacity-50 cursor-not-allowed' : pbitFile ? 'border-purple-400 bg-purple-50/40' : 'border-gray-200 hover:border-purple-400 hover:bg-purple-50/30'}`}>
+                      <Upload size={14} className={pbitFile ? 'text-purple-500' : 'text-gray-400'} />
+                      <span className="text-xs text-gray-500">
+                        {pbitFile ? pbitFile.name : 'Click or drag .pbit file here'}
+                      </span>
+                      <input
+                        type="file"
+                        accept=".pbit"
+                        disabled={uploading}
+                        className="hidden"
+                        onChange={e => {
+                          const f = e.target.files?.[0]
+                          if (f) setPbitFile(f)
+                          e.target.value = ''
+                        }}
+                      />
+                    </label>
+                    {pbitFile && (
+                      <div className="flex items-center gap-2 px-2 py-1 bg-purple-50 rounded-lg">
+                        <span className="text-xs text-purple-700 flex-1 truncate">{pbitFile.name}</span>
+                        <span className="text-xs text-purple-400">{(pbitFile.size / 1024 / 1024).toFixed(1)} MB</span>
+                        <button onClick={() => setPbitFile(null)} className="text-purple-300 hover:text-purple-500 text-sm leading-none">×</button>
+                      </div>
+                    )}
+                    <p className="text-xs text-gray-400">The PBIT file provides exact columns, DAX measures, and table relationships — highest accuracy mode.</p>
+                  </div>
+
+                  {/* Table picker with per-table column selection */}
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-semibold text-gray-600">
+                      Select tables &amp; specify columns
+                      <span className="ml-1 font-normal text-gray-400">(optional — AI will infer if not set)</span>
+                    </p>
+                    {loadingTables ? (
+                      <div className="flex items-center gap-2 text-xs text-gray-400">
+                        <Loader2 size={12} className="animate-spin" /> Loading schema…
+                      </div>
+                    ) : allTables.length === 0 ? (
+                      <p className="text-xs text-amber-500">No schema found — crawl the schema first.</p>
+                    ) : (
+                      <>
+                        <input
+                          type="text"
+                          placeholder="Search tables…"
+                          value={tableSearch}
+                          onChange={e => setTableSearch(e.target.value)}
+                          className="w-full text-xs border border-gray-200 rounded-lg px-3 py-1.5 outline-none focus:border-purple-400"
+                        />
+                        <div className="max-h-64 overflow-y-auto space-y-1 pr-1">
+                          {allTables
+                            .filter(t => t.qualified.toLowerCase().includes(tableSearch.toLowerCase()))
+                            .slice(0, 50)
+                            .map(t => {
+                              const isChecked = tableHints.includes(t.qualified)
+                              const isExpanded = expandedTables.has(t.qualified)
+                              const cols = t.columns || []
+                              const hint = columnHints[t.qualified] || { dimension: '', metric: '', date: '', group_by: '' }
+                              return (
+                                <div key={t.qualified} className={`rounded-lg border transition-colors ${isChecked ? 'border-purple-200 bg-purple-50/30' : 'border-transparent'}`}>
+                                  <label className="flex items-center gap-2 px-2 py-1.5 cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked}
+                                      onChange={e => {
+                                        if (e.target.checked) {
+                                          setTableHints(prev => [...prev, t.qualified])
+                                          setExpandedTables(prev => new Set(Array.from(prev).concat(t.qualified)))
+                                        } else {
+                                          setTableHints(prev => prev.filter(x => x !== t.qualified))
+                                          setExpandedTables(prev => { const s = new Set(prev); s.delete(t.qualified); return s })
+                                        }
+                                      }}
+                                      className="accent-purple-600 shrink-0"
+                                    />
+                                    <Database size={10} className="text-gray-400 shrink-0" />
+                                    <span className="font-mono text-xs text-gray-700 truncate flex-1">{t.qualified}</span>
+                                    {isChecked && cols.length > 0 && (
+                                      <button
+                                        type="button"
+                                        onClick={e => { e.preventDefault(); setExpandedTables(prev => { const s = new Set(prev); isExpanded ? s.delete(t.qualified) : s.add(t.qualified); return s }) }}
+                                        className="text-gray-400 hover:text-purple-600 shrink-0"
+                                      >
+                                        {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                      </button>
+                                    )}
+                                  </label>
+
+                                  {/* Column selectors — shown when table is checked and expanded */}
+                                  {isChecked && isExpanded && cols.length > 0 && (
+                                    <div className="px-6 pb-2 grid grid-cols-2 gap-x-3 gap-y-1.5">
+                                      {(
+                                        [
+                                          { key: 'dimension' as const, label: 'Dimension', placeholder: 'Group-by column (e.g. employment_type)' },
+                                          { key: 'metric'    as const, label: 'Metric',    placeholder: 'Count/sum column (e.g. id)' },
+                                          { key: 'date'      as const, label: 'Date',       placeholder: 'Date column (e.g. date_added)' },
+                                          { key: 'group_by'  as const, label: 'Series',     placeholder: 'Legend/series column (optional)' },
+                                        ]
+                                      ).map(f => (
+                                        <div key={f.key} className="space-y-0.5">
+                                          <p className="text-xs text-gray-500">{f.label}</p>
+                                          <select
+                                            value={hint[f.key]}
+                                            onChange={e => setColumnHints(prev => ({
+                                              ...prev,
+                                              [t.qualified]: { ...hint, [f.key]: e.target.value }
+                                            }))}
+                                            className="w-full text-xs border border-gray-200 rounded-lg px-2 py-1 outline-none focus:border-purple-400 bg-white"
+                                          >
+                                            <option value="">— not set —</option>
+                                            {cols.map(c => (
+                                              <option key={c} value={c}>{c}</option>
+                                            ))}
+                                          </select>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })}
+                        </div>
+                        {tableHints.length > 0 && (
+                          <div className="flex flex-wrap gap-1 pt-1">
+                            {tableHints.map(t => {
+                              const h = columnHints[t]
+                              const setCols = [h?.dimension, h?.metric, h?.date, h?.group_by].filter(Boolean)
+                              return (
+                                <span key={t} className="flex items-center gap-1 px-2 py-0.5 bg-purple-50 text-purple-700 text-xs rounded-full">
+                                  <Database size={9} />
+                                  <span className="max-w-[100px] truncate">{t.split('.').pop()}</span>
+                                  {setCols.length > 0 && <span className="text-purple-400">·{setCols.length}col</span>}
+                                  <button onClick={() => { setTableHints(prev => prev.filter(x => x !== t)); setExpandedTables(prev => { const s = new Set(prev); s.delete(t); return s }) }} className="hover:text-purple-500 ml-0.5">×</button>
+                                </span>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* CSV Upload mode — separate CSV dropzone */}
+              {uiMode === 'csv' && (
+                <div className="border border-gray-200 rounded-xl p-3 space-y-2">
+                  <p className="text-xs font-semibold text-gray-600">Upload CSV data files</p>
+                  <label className="flex items-center justify-center gap-2 border-2 border-dashed border-gray-200 rounded-xl py-4 px-3 cursor-pointer hover:border-blue-400 hover:bg-blue-50/30 transition-colors">
+                    <FileText size={16} className="text-gray-400" />
+                    <span className="text-xs text-gray-500">
+                      {csvFiles.length > 0
+                        ? `${csvFiles.length} file${csvFiles.length !== 1 ? 's' : ''} selected — click to add more`
+                        : 'Click or drag CSV files here'}
+                    </span>
+                    <input
+                      type="file"
+                      accept=".csv,text/csv"
+                      multiple
+                      className="hidden"
+                      onChange={e => {
+                        const chosen = Array.from(e.target.files || [])
+                        setCsvFiles(prev => {
+                          const existing = new Set(prev.map(f => f.name))
+                          return [...prev, ...chosen.filter(f => !existing.has(f.name))]
+                        })
+                        e.target.value = ''
+                      }}
+                    />
+                  </label>
+                  {csvFiles.length > 0 && (
+                    <div className="space-y-0.5">
+                      {csvFiles.map((f, i) => (
+                        <div key={i} className="flex items-center justify-between px-2 py-1 bg-gray-50 rounded-lg">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <FileText size={11} className="text-gray-400 shrink-0" />
+                            <span className="text-xs font-mono text-gray-700 truncate">{f.name}</span>
+                            <span className="text-xs text-gray-400 shrink-0">
+                              ({(f.size / 1024 / 1024).toFixed(1)} MB)
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => setCsvFiles(prev => prev.filter((_, idx) => idx !== i))}
+                            className="text-gray-300 hover:text-red-400 ml-2 shrink-0 text-sm leading-none"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400">Max 50 MB each · up to 10 files · table names = filenames without extension</p>
+                </div>
+              )}
+
               {error && (
                 <div className="flex items-center gap-2 text-sm text-red-600 bg-red-50 px-3 py-2 rounded-xl">
                   <AlertCircle size={14} /> {error}
                 </div>
               )}
               <div className="flex justify-between items-center">
-                <p className="text-xs text-gray-400">PNG / JPEG / WebP · max 20 MB · up to 5 files</p>
+                <p className="text-xs text-gray-400">
+                  {uiMode === 'csv'
+                    ? `${files.length || 'No'} screenshot${files.length !== 1 ? 's' : ''} · ${csvFiles.length || 'no'} CSV file${csvFiles.length !== 1 ? 's' : ''}`
+                    : 'PNG / JPEG / WebP · max 20 MB · up to 5 files'
+                  }
+                </p>
                 <button
                   onClick={handleUpload}
-                  disabled={!files.length || uploading}
+                  disabled={!files.length || uploading || (uiMode === 'csv' && csvFiles.length === 0) || (uiMode === 'context' && !userContext.trim() && contextFiles.length === 0)}
                   className="btn-primary flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {uploading
@@ -649,6 +1226,65 @@ export default function ScreenshotPage() {
                 </div>
               )}
 
+              {/* Date filter — visible when the new dashboard has date-range charts */}
+              {resultDateFilters.length > 0 && resultDashboardId && (
+                <div className="border border-blue-100 rounded-xl p-3 bg-blue-50/40 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Calendar size={13} className="text-blue-600" />
+                    <p className="text-xs font-semibold text-blue-700">Date filter</p>
+                    <span className="text-xs text-blue-400">— adjust the date range and apply to all charts</span>
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    {resultDateFilters.map(fc => (
+                      <div key={fc.column} className="flex items-center gap-1.5">
+                        <span className="text-xs font-medium text-gray-600">{fc.display_name}</span>
+                        <input
+                          type="date"
+                          value={resultDateRange[fc.column]?.start || ''}
+                          onChange={e =>
+                            setResultDateRange(prev => ({
+                              ...prev,
+                              [fc.column]: { end: prev[fc.column]?.end || '', ...prev[fc.column], start: e.target.value },
+                            }))
+                          }
+                          className="text-xs border border-blue-200 rounded px-2 py-0.5 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                        <span className="text-xs text-gray-400">→</span>
+                        <input
+                          type="date"
+                          value={resultDateRange[fc.column]?.end || ''}
+                          onChange={e =>
+                            setResultDateRange(prev => ({
+                              ...prev,
+                              [fc.column]: { start: prev[fc.column]?.start || '', ...prev[fc.column], end: e.target.value },
+                            }))
+                          }
+                          className="text-xs border border-blue-200 rounded px-2 py-0.5 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    onClick={async () => {
+                      const active = Object.fromEntries(
+                        Object.entries(resultDateRange).filter(([, v]) => v.start && v.end)
+                      )
+                      if (!Object.keys(active).length || !resultDashboardId) return
+                      setApplyingDate(true)
+                      try {
+                        await canvasApi.requery(resultDashboardId, active)
+                      } catch {}
+                      setApplyingDate(false)
+                    }}
+                    disabled={applyingDate}
+                    className="flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                  >
+                    {applyingDate && <Loader2 size={11} className="animate-spin" />}
+                    Apply to all charts
+                  </button>
+                </div>
+              )}
+
               {/* Token usage summary */}
               {tokenUsage && Object.keys(tokenUsage).length > 0 && (
                 <div className="border border-gray-100 rounded-lg p-3 bg-gray-50">
@@ -678,7 +1314,7 @@ export default function ScreenshotPage() {
 
               <div className="flex justify-end gap-3 flex-wrap">
                 <button
-                  onClick={() => { processedEventCount.current = 0; setPhase('idle'); setFiles([]); setChartStates([]); setJobId(null); setLog([]); setNameSaved(false); setTokenUsage(null); setSteps({ upload: 'idle', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' }) }}
+                  onClick={() => { processedEventCount.current = 0; setPhase('idle'); setFiles([]); setCsvFiles([]); setTableHints([]); setChartStates([]); setJobId(null); setLog([]); setNameSaved(false); setTokenUsage(null); setSteps({ upload: 'idle', vision: 'idle', sql: 'idle', execute: 'idle', validate: 'idle', verify: 'idle', assemble: 'idle' }) }}
                   className="btn-secondary text-sm flex items-center gap-1.5"
                 >
                   <RefreshCw size={13} /> Upload another

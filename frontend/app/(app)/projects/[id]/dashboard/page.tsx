@@ -479,7 +479,7 @@ export default function DashboardPage() {
                     </div>
 
                     {/* Chart body */}
-                    <div className="p-3" style={{ height: `${chartHeight}px` }}>
+                    <div className="p-3 overflow-hidden" style={{ height: `${chartHeight}px` }}>
                       {cd ? (
                         <ChartRenderer
                           result={{

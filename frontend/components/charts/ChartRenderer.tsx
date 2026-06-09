@@ -331,23 +331,32 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       pieData = [...top, { name: `Other (${rawPie.length - MAX_SLICES + 1})`, value: otherSum }]
     }
     const manySlices = pieData.length > 7
-    const showLegend = height > 200
+    const showLegend = height > 160
+    // Only show inline labels when the card is tall enough to give the labels room.
+    // Below 300px rely on the legend + tooltip — labels overflow card edges at smaller heights.
+    const showInlineLabels = !manySlices && height >= 300
+    // Truncate long names so labels never overflow the SVG viewport horizontally
+    const truncName = (s: string) => s.length > 9 ? s.slice(0, 8) + '…' : s
+    // Shrink the pie when inline labels are shown to keep them inside the SVG bounds.
+    const outerRad = showInlineLabels ? '40%' : (manySlices ? '60%' : '55%')
     return (
-      <ResponsiveContainer width="100%" height={height}>
-        <PieChart style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
-          <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
-            innerRadius={ct === 'donut' ? '45%' : 0}
-            outerRadius={showLegend && !manySlices ? '60%' : '72%'}
-            label={!manySlices && showLegend ? ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)` : undefined}
-            labelLine={!manySlices && showLegend}
-            onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data.name) : undefined}
-          >
-            {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-          </Pie>
-          <Tooltip formatter={(v: number) => v.toLocaleString()} />
-          {showLegend && <Legend wrapperStyle={{ fontSize: 11, maxHeight: 80, overflowY: 'auto' }} />}
-        </PieChart>
-      </ResponsiveContainer>
+      <div style={{ overflow: 'hidden', height }}>
+        <ResponsiveContainer width="100%" height={height}>
+          <PieChart style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
+            <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
+              innerRadius={ct === 'donut' ? '45%' : 0}
+              outerRadius={outerRad}
+              label={showInlineLabels ? ({ name, percent }) => `${truncName(name)} (${(percent * 100).toFixed(0)}%)` : undefined}
+              labelLine={showInlineLabels}
+              onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data.name) : undefined}
+            >
+              {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+            </Pie>
+            <Tooltip formatter={(v: number) => v.toLocaleString()} />
+            {showLegend && <Legend wrapperStyle={{ fontSize: 11, maxHeight: 60, overflowY: 'auto' }} />}
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
     )
   }
 
@@ -783,17 +792,26 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       const nx = Number(x), ny = Number(y), nw = Number(width), nh = Number(h)
       const idx = tmData.findIndex(d => d.name === name)
       const fill = COLORS[Math.max(0, idx) % COLORS.length]
+      // Unique clip-path id per cell so text never overflows into neighbouring cells
+      const clipId = `tm-clip-${Math.round(nx * 10)}-${Math.round(ny * 10)}`
       if (nw < 20 || nh < 20) return <g><rect x={nx} y={ny} width={nw} height={nh} fill={fill} stroke="white" strokeWidth={2} /></g>
       return (
         <g>
+          <defs>
+            <clipPath id={clipId}>
+              <rect x={nx + 2} y={ny + 2} width={Math.max(0, nw - 4)} height={Math.max(0, nh - 4)} />
+            </clipPath>
+          </defs>
           <rect x={nx} y={ny} width={nw} height={nh} fill={fill} stroke="white" strokeWidth={2} rx={4} />
           {nw > 50 && nh > 30 && (
-            <text x={nx + nw / 2} y={ny + nh / 2 - (nh > 50 ? 8 : 0)} textAnchor="middle" fill="white" fontSize={Math.min(13, nw / 6)} fontWeight={600}>
+            <text x={nx + nw / 2} y={ny + nh / 2 - (nh > 50 ? 8 : 0)} textAnchor="middle" fill="white"
+              fontSize={Math.min(13, nw / 6)} fontWeight={600} clipPath={`url(#${clipId})`}>
               {String(name)}
             </text>
           )}
           {nw > 50 && nh > 50 && (
-            <text x={nx + nw / 2} y={ny + nh / 2 + 12} textAnchor="middle" fill="rgba(255,255,255,0.8)" fontSize={11}>
+            <text x={nx + nw / 2} y={ny + nh / 2 + 12} textAnchor="middle" fill="rgba(255,255,255,0.8)"
+              fontSize={11} clipPath={`url(#${clipId})`}>
               {typeof value === 'number' ? value.toLocaleString() : String(value)}
             </text>
           )}
@@ -801,10 +819,12 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       )
     }
     return (
-      <ResponsiveContainer width="100%" height={height}>
-        <Treemap data={tmData} dataKey="size" aspectRatio={4 / 3} stroke="white"
-          content={<CustomTile />} />
-      </ResponsiveContainer>
+      <div style={{ overflow: 'hidden', height }}>
+        <ResponsiveContainer width="100%" height={height}>
+          <Treemap data={tmData} dataKey="size" aspectRatio={4 / 3} stroke="white"
+            content={<CustomTile />} />
+        </ResponsiveContainer>
+      </div>
     )
   }
 

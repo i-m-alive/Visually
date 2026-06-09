@@ -7,7 +7,8 @@ import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
-  Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil
+  Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
+  RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
 } from 'lucide-react'
 import { canvasApi, widgetApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -17,21 +18,17 @@ import { VisuallReport } from '@/components/canvas/VisuallReport'
 
 const ResponsiveGrid = WidthProvider(Responsive)
 
-// LayoutItem is imported from react-grid-layout/legacy
 type GridItem = LayoutItem
 
-// ── Smart auto-arrange: size by chart type, pack left→right then wrap ─────────
+// ── Smart auto-arrange ─────────────────────────────────────────────────────────
 const CHART_SIZES: Record<string, { w: number; h: number }> = {
-  // KPI variants — small
   kpi:                    { w: 3, h: 4 },
   kpi_card:               { w: 3, h: 4 },
   gauge:                  { w: 3, h: 5 },
   multi_row_card:         { w: 4, h: 6 },
-  // Round charts
   pie:                    { w: 4, h: 6 },
   donut:                  { w: 4, h: 6 },
   sunburst:               { w: 5, h: 6 },
-  // Standard charts
   line:                   { w: 6, h: 6 },
   area:                   { w: 6, h: 6 },
   bar_vertical:           { w: 6, h: 6 },
@@ -43,51 +40,36 @@ const CHART_SIZES: Record<string, { w: number; h: number }> = {
   funnel:                 { w: 5, h: 7 },
   treemap:                { w: 6, h: 6 },
   combo:                  { w: 7, h: 6 },
-  // Multi-series — need more width
   stacked_bar:            { w: 7, h: 6 },
   stacked_bar_100:        { w: 7, h: 6 },
   grouped_bar:            { w: 7, h: 6 },
   stacked_area:           { w: 7, h: 6 },
-  // Horizontal bars — widest
   bar_horizontal:         { w: 7, h: 6 },
   stacked_bar_horizontal: { w: 8, h: 6 },
-  // Heatmap — large grid
   heatmap:                { w: 8, h: 7 },
-  // Tables — full width
   table:                  { w: 8, h: 7 },
   data_table:             { w: 8, h: 7 },
   pivot_table:            { w: 9, h: 7 },
-  // ── New chart types ──────────────────────────────────────────────────────────
-  // Statistical
   box_plot:               { w: 7, h: 6 },
-  // Comparison
   bullet:                 { w: 7, h: 6 },
   scorecard:              { w: 5, h: 7 },
   dot_plot:               { w: 5, h: 7 },
   radar:                  { w: 6, h: 6 },
-  // Trend / rank
   ribbon:                 { w: 7, h: 6 },
-  // Flow / relational
   sankey:                 { w: 8, h: 7 },
   chord:                  { w: 6, h: 6 },
   network:                { w: 7, h: 7 },
-  // Time-based
   gantt:                  { w: 10, h: 7 },
   timeline:               { w: 10, h: 5 },
   calendar_heatmap:       { w: 10, h: 5 },
-  // Text
   word_cloud:             { w: 6, h: 6 },
-  // Hierarchical
   org_chart:              { w: 8, h: 7 },
-  // Part-to-whole (advanced)
   marimekko:              { w: 8, h: 7 },
-  // Geographic
   choropleth:             { w: 7, h: 8 },
 }
 const DEFAULT_SIZE = { w: 6, h: 6 }
 const COLS = 12
 
-// Priority groups: KPIs together, then compact charts, then wide charts
 const TYPE_GROUP: Record<string, number> = {
   kpi: 0, kpi_card: 0, gauge: 0, multi_row_card: 0,
   bullet: 0, scorecard: 0,
@@ -106,15 +88,10 @@ function autoArrange(widgets: CanvasWidgetData[]): GridItem[] {
   const sorted = [...widgets].sort((a, b) =>
     (TYPE_GROUP[a.chart_type] ?? 2) - (TYPE_GROUP[b.chart_type] ?? 2)
   )
-
   let x = 0, y = 0, rowHeight = 0
   return sorted.map(w => {
     const size = CHART_SIZES[w.chart_type] || DEFAULT_SIZE
-    if (x + size.w > COLS) {
-      x = 0
-      y += rowHeight
-      rowHeight = 0
-    }
+    if (x + size.w > COLS) { x = 0; y += rowHeight; rowHeight = 0 }
     const item: GridItem = { i: w.id, x, y, w: size.w, h: size.h, minW: 1, minH: 1 }
     x += size.w
     rowHeight = Math.max(rowHeight, size.h)
@@ -143,6 +120,7 @@ interface CanvasDetail {
   name: string
   theme: string
   project_id: string
+  description?: string
   filter_config?: FilterConfig[]
   widgets: WidgetWithPosition[]
 }
@@ -151,21 +129,41 @@ export default function CanvasEditorPage() {
   const { id: projectId, canvasId } = useParams<{ id: string; canvasId: string }>()
   const router = useRouter()
 
-  const [canvas, setCanvas] = useState<CanvasDetail | null>(null)
-  const [widgets, setWidgets] = useState<WidgetWithPosition[]>([])
-  const [layout, setLayout] = useState<GridItem[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
-  const [savedOk, setSavedOk] = useState(false)
-  const [showChat, setShowChat]     = useState(false)
-  const [showReport, setShowReport] = useState(false)
-  const [zoomTarget, setZoomTarget] = useState<{ widget: CanvasWidgetData; colors: string[] } | null>(null)
-  const [isDirty, setIsDirty]       = useState(false)
+  const [canvas, setCanvas]           = useState<CanvasDetail | null>(null)
+  const [widgets, setWidgets]         = useState<WidgetWithPosition[]>([])
+  const [layout, setLayout]           = useState<GridItem[]>([])
+  const [loading, setLoading]         = useState(true)
+  const [error, setError]             = useState<string | null>(null)
+  const [saving, setSaving]           = useState(false)
+  const [savedOk, setSavedOk]         = useState(false)
+  const [showChat, setShowChat]       = useState(false)
+  const [showReport, setShowReport]   = useState(false)
+  const [zoomTarget, setZoomTarget]   = useState<{ widget: CanvasWidgetData; colors: string[] } | null>(null)
+  const [isDirty, setIsDirty]         = useState(false)
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleValue, setTitleValue]     = useState('')
+  const [activeDateRange, setActiveDateRange] = useState<Record<string, { start: string; end: string }>>({})
+  const [isRequeryingDate, setIsRequeryingDate] = useState(false)
+
+  // New state
+  const [lockedWidgets, setLockedWidgets]   = useState<Set<string>>(new Set())
+  const [refreshingId, setRefreshingId]     = useState<string | null>(null)
+  const [gridZoom, setGridZoom]             = useState(1)
+  const [isViewOnly, setIsViewOnly]         = useState(false)
+  const [toastMsg, setToastMsg]             = useState<string | null>(null)
+  const [canUndo, setCanUndo]               = useState(false)
+  const [canRedo, setCanRedo]               = useState(false)
 
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const undoStackRef   = useRef<GridItem[][]>([])
+  const redoStackRef   = useRef<GridItem[][]>([])
+  const toastTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  function showToast(msg: string) {
+    setToastMsg(msg)
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => setToastMsg(null), 2500)
+  }
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -176,7 +174,17 @@ export default function CanvasEditorPage() {
       setCanvas(data)
       const ws: WidgetWithPosition[] = (data.widgets || []) as WidgetWithPosition[]
       setWidgets(ws)
-      // If every widget sits at (0,0) the canvas is fresh — auto-arrange smartly
+      const seedDates: Record<string, { start: string; end: string }> = {}
+      for (const w of ws) {
+        const df = (w as WidgetWithPosition & { config?: Record<string, unknown> }).config?.date_filter as
+          | { column: string; start: string; end: string | null } | undefined
+        if (df?.column && df.start) {
+          if (!seedDates[df.column]) {
+            seedDates[df.column] = { start: df.start, end: df.end ?? df.start }
+          }
+        }
+      }
+      if (Object.keys(seedDates).length) setActiveDateRange(seedDates)
       const allZero = ws.every(w => (w.position_x ?? 0) === 0 && (w.position_y ?? 0) === 0)
       const computed: GridItem[] = allZero
         ? autoArrange(ws)
@@ -190,7 +198,6 @@ export default function CanvasEditorPage() {
             minH: 3,
           }))
       setLayout(computed)
-      // Persist auto-arrangement so future loads preserve positions
       if (allZero && ws.length > 0) {
         void canvasApi.updateLayout(canvasId, computed.map(l => ({
           widget_id: l.i, x: l.x, y: l.y, w: l.w, h: l.h,
@@ -205,32 +212,106 @@ export default function CanvasEditorPage() {
 
   useEffect(() => { load() }, [load])
 
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Ignore when typing in inputs
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as Element)?.tagName)) return
+      // N → open chat (add chart)
+      if (e.key === 'n' && !e.ctrlKey && !e.metaKey) {
+        setShowChat(true)
+        return
+      }
+      // Ctrl+Z → undo
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        handleUndo()
+        return
+      }
+      // Ctrl+Y or Ctrl+Shift+Z → redo
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault()
+        handleRedo()
+        return
+      }
+      // Ctrl+S → manual save
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault()
+        handleManualSave()
+        return
+      }
+      // + / - for zoom
+      if (e.key === '=' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); setGridZoom(z => Math.min(1.5, z + 0.1)) }
+      if (e.key === '-' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); setGridZoom(z => Math.max(0.5, z - 0.1)) }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canUndo, canRedo])
+
   const persistLayout = useCallback(async (items: LayoutItem[]) => {
     setSaving(true)
     try {
       await canvasApi.updateLayout(canvasId, items.map(l => ({
-        widget_id: l.i,
-        x: l.x,
-        y: l.y,
-        w: l.w,
-        h: l.h,
+        widget_id: l.i, x: l.x, y: l.y, w: l.w, h: l.h,
       })))
       setSavedOk(true)
       setIsDirty(false)
       setTimeout(() => setSavedOk(false), 2000)
-    } catch {
-      // silently ignore
-    } finally {
-      setSaving(false)
-    }
+    } catch { /* silently ignore */ }
+    finally { setSaving(false) }
   }, [canvasId])
+
+  const pushUndo = useCallback((snap: GridItem[]) => {
+    undoStackRef.current.push(snap)
+    if (undoStackRef.current.length > 30) undoStackRef.current.shift()
+    redoStackRef.current = []
+    setCanUndo(true)
+    setCanRedo(false)
+  }, [])
+
+  const handleUndo = useCallback(() => {
+    const stack = undoStackRef.current
+    if (!stack.length) return
+    const prev = stack.pop()!
+    redoStackRef.current.push([...layout])
+    setLayout(prev)
+    setCanUndo(stack.length > 0)
+    setCanRedo(true)
+    void persistLayout(prev)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout, persistLayout])
+
+  const handleRedo = useCallback(() => {
+    const stack = redoStackRef.current
+    if (!stack.length) return
+    const next = stack.pop()!
+    undoStackRef.current.push([...layout])
+    setLayout(next)
+    setCanUndo(true)
+    setCanRedo(stack.length > 0)
+    void persistLayout(next)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout, persistLayout])
 
   const handleLayoutChange = useCallback((newLayout: Layout, _allLayouts: Partial<Record<string, Layout>>) => {
     setLayout([...newLayout])
     setIsDirty(true)
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
-    saveTimeoutRef.current = setTimeout(() => persistLayout([...newLayout]), 1200)
+    saveTimeoutRef.current = setTimeout(() => persistLayout([...newLayout]), 3000)
   }, [persistLayout])
+
+  const handleDragStop = useCallback((newLayout: Layout) => {
+    pushUndo([...layout])
+    setLayout([...newLayout])
+    void persistLayout([...newLayout])
+  }, [layout, persistLayout, pushUndo])
+
+  const handleResizeStop = useCallback((newLayout: Layout) => {
+    pushUndo([...layout])
+    setLayout([...newLayout])
+    void persistLayout([...newLayout])
+  }, [layout, persistLayout, pushUndo])
 
   const handleDeleteWidget = useCallback(async (widgetId: string) => {
     try {
@@ -258,6 +339,72 @@ export default function CanvasEditorPage() {
     } catch { /* ignore */ }
   }, [])
 
+  const handleDuplicate = useCallback(async (widget: CanvasWidgetData) => {
+    try {
+      const existing = layout.find(l => l.i === widget.id)
+      const newWidget = await canvasApi.addWidget(canvasId, {
+        title: `${widget.title} (copy)`,
+        chart_type: widget.chart_type,
+        chart_data: widget.chart_data as Record<string, unknown>,
+        config: widget.config,
+        sql_query: widget.sql_query,
+        width: existing?.w ?? 6,
+        height: existing?.h ?? 6,
+        position_x: (existing?.x ?? 0) + 1,
+        position_y: (existing?.y ?? 0) + 1,
+      })
+      await load()
+      showToast(`Duplicated "${widget.title}"`)
+      return newWidget
+    } catch { /* ignore */ }
+  }, [canvasId, layout, load])
+
+  const handleToggleLock = useCallback((widgetId: string) => {
+    setLockedWidgets(prev => {
+      const next = new Set(prev)
+      if (next.has(widgetId)) next.delete(widgetId)
+      else next.add(widgetId)
+      showToast(next.has(widgetId) ? 'Widget locked' : 'Widget unlocked')
+      return next
+    })
+    setLayout(prev => prev.map(l =>
+      l.i === widgetId ? { ...l, static: !lockedWidgets.has(widgetId) } : l
+    ))
+  }, [lockedWidgets])
+
+  const handleRefreshWidget = useCallback(async (widgetId: string) => {
+    setRefreshingId(widgetId)
+    await load()
+    setRefreshingId(null)
+    showToast('Widget data refreshed')
+  }, [load])
+
+  const handleRefreshAll = useCallback(async () => {
+    setRefreshingId('all')
+    await load()
+    setRefreshingId(null)
+    showToast('All widgets refreshed')
+  }, [load])
+
+  const handleApplyDateFilter = async () => {
+    const active = Object.fromEntries(
+      Object.entries(activeDateRange).filter(([, v]) => v.start && v.end)
+    )
+    if (!Object.keys(active).length) return
+    setIsRequeryingDate(true)
+    try {
+      const resp = await canvasApi.requery(canvasId, active)
+      const updatedWidgets: WidgetWithPosition[] = (resp.data.widgets || []) as WidgetWithPosition[]
+      setWidgets(prev =>
+        prev.map(w => {
+          const upd = updatedWidgets.find(u => u.id === w.id)
+          return upd ? { ...w, chart_data: upd.chart_data } : w
+        })
+      )
+    } catch { /* ignore */ }
+    setIsRequeryingDate(false)
+  }
+
   const handleManualSave = () => {
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
     persistLayout(layout)
@@ -274,16 +421,43 @@ export default function CanvasEditorPage() {
   }
 
   const handleAutoArrange = useCallback(() => {
+    pushUndo([...layout])
     const arranged = autoArrange(widgets)
     setLayout(arranged)
     setIsDirty(false)
     persistLayout(arranged)
-  }, [widgets, persistLayout])
+  }, [widgets, persistLayout, layout, pushUndo])
+
+  const handleCopyLink = () => {
+    try {
+      navigator.clipboard.writeText(window.location.href)
+      showToast('Canvas link copied!')
+    } catch { showToast('Could not copy link') }
+  }
+
+  const handleExportJSON = () => {
+    const data = {
+      canvas: { id: canvas?.id, name: canvas?.name },
+      widgets: widgets.map(w => ({
+        id: w.id, title: w.title, chart_type: w.chart_type,
+        sql_query: w.sql_query, config: w.config,
+      })),
+      layout,
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${canvas?.name ?? 'canvas'}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    showToast('JSON exported')
+  }
 
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center">
-        <Loader2 className="w-8 h-8 text-brand animate-spin" />
+        <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
       </div>
     )
   }
@@ -293,15 +467,22 @@ export default function CanvasEditorPage() {
       <div className="flex-1 flex flex-col items-center justify-center gap-3 text-gray-500">
         <AlertCircle className="w-10 h-10 text-red-400" />
         <p className="text-sm">{error}</p>
-        <button onClick={() => router.back()} className="text-sm text-brand hover:underline">Go back</button>
+        <button onClick={() => router.back()} className="text-sm text-blue-600 hover:underline">Go back</button>
       </div>
     )
   }
 
   return (
     <div className="flex flex-col h-full min-h-0 bg-gray-50">
+      {/* Toast */}
+      {toastMsg && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-gray-900 text-white text-sm rounded-xl shadow-lg pointer-events-none select-none">
+          {toastMsg}
+        </div>
+      )}
+
       {/* Top bar */}
-      <div className="flex items-center gap-3 px-4 py-2.5 bg-white border-b border-gray-100 flex-shrink-0">
+      <div className="flex items-center gap-2 px-4 py-2.5 bg-white border-b border-gray-100 flex-shrink-0 flex-wrap">
         <button
           onClick={() => router.push(`/projects/${projectId}/canvas`)}
           className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
@@ -310,7 +491,7 @@ export default function CanvasEditorPage() {
         </button>
 
         <div className="flex items-center gap-2 flex-1 min-w-0">
-          <Layers size={16} className="text-brand flex-shrink-0" />
+          <Layers size={16} className="text-blue-600 flex-shrink-0" />
           {editingTitle ? (
             <input
               autoFocus
@@ -321,16 +502,16 @@ export default function CanvasEditorPage() {
                 if (e.key === 'Enter') handleTitleSave()
                 if (e.key === 'Escape') { setTitleValue(canvas?.name ?? ''); setEditingTitle(false) }
               }}
-              className="text-sm font-semibold text-gray-900 bg-transparent border-b-2 border-brand outline-none min-w-0 w-48"
+              className="text-sm font-semibold text-gray-900 bg-transparent border-b-2 border-blue-500 outline-none min-w-0 w-48"
             />
           ) : (
             <button
               onClick={() => { setTitleValue(canvas?.name ?? ''); setEditingTitle(true) }}
-              className="group/title flex items-center gap-1.5 text-sm font-semibold text-gray-900 hover:text-brand transition-colors min-w-0"
+              className="group/title flex items-center gap-1.5 text-sm font-semibold text-gray-900 hover:text-blue-600 transition-colors min-w-0"
               title="Click to rename"
             >
               <span className="truncate">{canvas?.name}</span>
-              <Pencil size={12} className="text-gray-300 group-hover/title:text-brand shrink-0 transition-colors" />
+              <Pencil size={12} className="text-gray-300 group-hover/title:text-blue-500 shrink-0 transition-colors" />
             </button>
           )}
         </div>
@@ -350,12 +531,88 @@ export default function CanvasEditorPage() {
           {isDirty && !saving && !savedOk && (
             <button
               onClick={handleManualSave}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-brand rounded-lg hover:bg-brand/90 transition-colors"
+              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
             >
               <Save size={12} /> Save
             </button>
           )}
         </div>
+
+        {/* Undo / Redo */}
+        <button
+          onClick={handleUndo}
+          disabled={!canUndo}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-30"
+          title="Undo (Ctrl+Z)"
+        >
+          <RotateCcw size={14} />
+        </button>
+        <button
+          onClick={handleRedo}
+          disabled={!canRedo}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-30 scale-x-[-1]"
+          title="Redo (Ctrl+Y)"
+        >
+          <RotateCcw size={14} />
+        </button>
+
+        {/* Zoom controls */}
+        <button
+          onClick={() => setGridZoom(z => Math.max(0.5, z - 0.1))}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
+          title="Zoom out"
+        >
+          <ZoomOut size={14} />
+        </button>
+        <span className="text-xs text-gray-400 min-w-[2.5rem] text-center select-none">
+          {Math.round(gridZoom * 100)}%
+        </span>
+        <button
+          onClick={() => setGridZoom(z => Math.min(1.5, z + 0.1))}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
+          title="Zoom in"
+        >
+          <ZoomIn size={14} />
+        </button>
+
+        {/* View-only toggle */}
+        <button
+          onClick={() => { setIsViewOnly(v => !v); showToast(!isViewOnly ? 'View-only mode on' : 'Edit mode') }}
+          className={`p-1.5 rounded-lg transition-colors ${
+            isViewOnly ? 'bg-amber-100 text-amber-600' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-100'
+          }`}
+          title={isViewOnly ? 'Exit view-only mode' : 'Enter view-only mode'}
+        >
+          {isViewOnly ? <EyeOff size={14} /> : <Eye size={14} />}
+        </button>
+
+        {/* Refresh all */}
+        <button
+          onClick={handleRefreshAll}
+          disabled={refreshingId === 'all'}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-50"
+          title="Refresh all widgets"
+        >
+          <RefreshCw size={14} className={refreshingId === 'all' ? 'animate-spin' : ''} />
+        </button>
+
+        {/* Copy link */}
+        <button
+          onClick={handleCopyLink}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
+          title="Copy canvas link"
+        >
+          <Link2 size={14} />
+        </button>
+
+        {/* JSON export */}
+        <button
+          onClick={handleExportJSON}
+          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
+          title="Export as JSON"
+        >
+          <FileJson size={14} />
+        </button>
 
         {/* Auto-arrange */}
         {widgets.length > 0 && (
@@ -364,29 +621,32 @@ export default function CanvasEditorPage() {
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
             title="Auto-arrange all charts by type"
           >
-            <LayoutGrid size={13} /> Auto-arrange
+            <LayoutGrid size={13} /> Auto
           </button>
         )}
 
-        {/* Add chart via AI */}
-        <button
-          onClick={() => setShowChat(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-        >
-          <Plus size={13} /> Add chart
-        </button>
+        {/* Add chart */}
+        {!isViewOnly && (
+          <button
+            onClick={() => setShowChat(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+            title="Add chart (N)"
+          >
+            <Plus size={13} /> Add chart
+          </button>
+        )}
 
-        {/* Chat toggle */}
+        {/* AI Chat toggle */}
         <button
           onClick={() => setShowChat(v => !v)}
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
-            showChat ? 'bg-brand text-white' : 'text-gray-600 bg-gray-100 hover:bg-gray-200'
+            showChat ? 'bg-blue-600 text-white' : 'text-gray-600 bg-gray-100 hover:bg-gray-200'
           }`}
         >
           <MessageSquare size={13} /> AI Chat
         </button>
 
-        {/* Visually report mode */}
+        {/* Visually report */}
         <button
           onClick={() => setShowReport(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-lg transition-all hover:opacity-90"
@@ -397,50 +657,129 @@ export default function CanvasEditorPage() {
         </button>
       </div>
 
-      {/* Body: canvas + optional chat panel */}
+      {/* Date filter bar */}
+      {(canvas?.filter_config?.filter(f => f.filter_type === 'date_range') ?? []).length > 0 && (
+        <div className="flex items-center gap-3 px-4 py-2 bg-blue-50 border-b border-blue-100 flex-shrink-0 flex-wrap">
+          <Calendar size={14} className="text-blue-600 flex-shrink-0" />
+          <span className="text-xs font-semibold text-blue-700">Date filter</span>
+          {canvas!.filter_config!.filter(f => f.filter_type === 'date_range').map(fc => (
+            <div key={fc.column} className="flex items-center gap-1.5">
+              <span className="text-xs text-blue-600 font-medium">{fc.display_name}</span>
+              <input
+                type="date"
+                value={activeDateRange[fc.column]?.start || ''}
+                onChange={e =>
+                  setActiveDateRange(prev => ({
+                    ...prev,
+                    [fc.column]: { ...prev[fc.column], start: e.target.value },
+                  }))
+                }
+                className="text-xs border border-blue-200 rounded px-2 py-0.5 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              />
+              <span className="text-xs text-gray-400">→</span>
+              <input
+                type="date"
+                value={activeDateRange[fc.column]?.end || ''}
+                onChange={e =>
+                  setActiveDateRange(prev => ({
+                    ...prev,
+                    [fc.column]: { ...prev[fc.column], end: e.target.value },
+                  }))
+                }
+                className="text-xs border border-blue-200 rounded px-2 py-0.5 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              />
+            </div>
+          ))}
+          <button
+            onClick={handleApplyDateFilter}
+            disabled={isRequeryingDate}
+            className="flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors"
+          >
+            {isRequeryingDate && <Loader2 size={11} className="animate-spin" />}
+            Apply to all charts
+          </button>
+        </div>
+      )}
+
+      {/* Body */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Canvas grid */}
-        <div className="flex-1 overflow-auto p-4 min-w-0">
+        <div className="flex-1 overflow-auto p-4 min-w-0" style={{
+          backgroundColor: '#f1f5f9',
+          backgroundImage: 'radial-gradient(circle, #cbd5e1 1px, transparent 1px)',
+          backgroundSize: '24px 24px',
+        }}>
           {widgets.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-64 text-gray-400 gap-4">
-              <Layers className="w-12 h-12 text-gray-200" />
+            // Enhanced 3-step empty state
+            <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400 gap-6 py-12">
+              <div className="flex gap-2 opacity-30">
+                {[40, 60, 40, 80].map((h, i) => (
+                  <div key={i} className="w-8 rounded-t-sm bg-blue-400" style={{ height: h }} />
+                ))}
+              </div>
               <div className="text-center">
-                <p className="font-medium text-gray-600">Canvas is empty</p>
-                <p className="text-sm mt-1">Use AI Chat to add charts, or run a screenshot pipeline to populate this canvas.</p>
+                <p className="font-semibold text-gray-600 text-base">Your canvas is empty</p>
+                <p className="text-sm mt-1 text-gray-400 max-w-sm">
+                  Build your first visualization in 3 steps
+                </p>
+              </div>
+              <div className="flex gap-4 flex-wrap justify-center">
+                {[
+                  { step: '1', label: 'Connect data', desc: 'Add a database or CSV in project settings' },
+                  { step: '2', label: 'Ask the AI', desc: 'Describe a chart in natural language' },
+                  { step: '3', label: 'Arrange & share', desc: 'Drag, resize, then open Visually' },
+                ].map(s => (
+                  <div key={s.step} className="flex flex-col items-center gap-1.5 w-36 text-center">
+                    <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-600 font-bold text-sm flex items-center justify-center">
+                      {s.step}
+                    </div>
+                    <span className="text-xs font-semibold text-gray-600">{s.label}</span>
+                    <span className="text-xs text-gray-400">{s.desc}</span>
+                  </div>
+                ))}
               </div>
               <button
                 onClick={() => setShowChat(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-brand text-white text-sm rounded-lg hover:bg-brand/90"
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors"
               >
                 <MessageSquare size={14} /> Open AI Chat
               </button>
             </div>
           ) : (
-            <ResponsiveGrid
-              className="layout"
-              layouts={{ lg: layout, md: layout, sm: layout }}
-              breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
-              cols={{ lg: 12, md: 12, sm: 6, xs: 4, xxs: 2 }}
-              rowHeight={70}
-              onLayoutChange={handleLayoutChange}
-              draggableHandle=".drag-handle"
-              isDraggable
-              isResizable
-              margin={[12, 12]}
-              containerPadding={[4, 4]}
-              resizeHandles={['se', 'e', 's']}
-            >
-              {widgets.map(widget => (
-                <div key={widget.id} className="overflow-hidden rounded-xl">
-                  <CanvasWidget
-                    widget={widget}
-                    onDelete={handleDeleteWidget}
-                    onUpdate={handleUpdateWidget}
-                    onZoom={(w, cols) => setZoomTarget({ widget: w, colors: cols })}
-                  />
-                </div>
-              ))}
-            </ResponsiveGrid>
+            <div style={{ transform: `scale(${gridZoom})`, transformOrigin: 'top left', transition: 'transform 0.15s ease' }}>
+              <ResponsiveGrid
+                className="layout"
+                layouts={{ lg: layout, md: layout, sm: layout }}
+                breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
+                cols={{ lg: 12, md: 12, sm: 6, xs: 4, xxs: 2 }}
+                rowHeight={70}
+                onLayoutChange={handleLayoutChange}
+                onDragStop={(newLayout) => handleDragStop(newLayout)}
+                onResizeStop={(newLayout) => handleResizeStop(newLayout)}
+                draggableHandle=".drag-handle"
+                isDraggable={!isViewOnly}
+                isResizable={!isViewOnly}
+                margin={[12, 12]}
+                containerPadding={[4, 4]}
+                resizeHandles={['se', 'e', 's']}
+              >
+                {widgets.map(widget => (
+                  <div key={widget.id} className="overflow-hidden rounded-xl">
+                    <CanvasWidget
+                      widget={widget}
+                      onDelete={handleDeleteWidget}
+                      onUpdate={handleUpdateWidget}
+                      onZoom={(w, cols) => setZoomTarget({ widget: w, colors: cols })}
+                      onDuplicate={handleDuplicate}
+                      onRefresh={handleRefreshWidget}
+                      onToggleLock={handleToggleLock}
+                      isLocked={lockedWidgets.has(widget.id)}
+                      isRefreshing={refreshingId === widget.id}
+                    />
+                  </div>
+                ))}
+              </ResponsiveGrid>
+            </div>
           )}
         </div>
 

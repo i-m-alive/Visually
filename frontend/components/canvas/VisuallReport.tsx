@@ -3,11 +3,12 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import {
   X, Send, Loader2, Plus, BarChart2, Table2, Sparkles,
   LayoutGrid, MessageSquare, ChevronRight, TrendingUp, TrendingDown,
-  CheckCircle2, Copy, List, Sun, Moon, Zap, Info, ChevronDown, ChevronUp,
-  Maximize2, Star, Printer, ChevronLeft, Play, Pause, Download, Calendar,
+  CheckCircle2, Copy, List, Info, ChevronDown, ChevronUp,
+  Maximize2, Printer, ChevronLeft, Play, Pause, Download, Calendar,
+  Share2, HelpCircle,
 } from 'lucide-react'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
-import { chatApi, canvasApi, type WidgetCreate } from '@/lib/api'
+import { chatApi, canvasApi, exportApi, type WidgetCreate } from '@/lib/api'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 
@@ -207,13 +208,17 @@ function Sparkline({ data, color, width = 64, height = 28 }: { data: number[]; c
   )
 }
 
-function TypewriterText({ text, active, speed = 10 }: { text: string; active: boolean; speed?: number }) {
+function TypewriterText({ text, active, speed = 10, onComplete }: { text: string; active: boolean; speed?: number; onComplete?: () => void }) {
   const [shown, setShown] = useState(active ? '' : text)
   useEffect(() => {
     if (!active) { setShown(text); return }
     setShown('')
     let i = 0
-    const id = setInterval(() => { i++; setShown(text.slice(0, i)); if (i >= text.length) clearInterval(id) }, speed)
+    const id = setInterval(() => {
+      i++
+      setShown(text.slice(0, i))
+      if (i >= text.length) { clearInterval(id); onComplete?.() }
+    }, speed)
     return () => clearInterval(id)
   }, [text, active, speed])
   return <>{shown}</>
@@ -373,19 +378,44 @@ function toChartResult(w: CanvasWidgetData): ChartResult {
 }
 
 function getKpiMeta(w: CanvasWidgetData): { num: number; spark: number[]; delta: { pct: number; up: boolean } | null } {
-  const vs = ((w.chart_data?.values as (number | null)[]) ?? []).filter((v): v is number => v !== null)
-  const num  = vs[vs.length - 1] ?? 0
-  const prev = vs.length >= 2 ? vs[vs.length - 2] : null
+  const rawValues = (w.chart_data?.values as (number | null)[]) ?? []
+  const rows = (w.chart_data?.rows as Record<string, unknown>[]) ?? []
+  const cols = (w.chart_data?.columns as string[]) ?? []
+
+  // When values array is empty (e.g. single-column KPI SQL), extract from rows.
+  // Single column → that column is the value; multi-column → use second column.
+  let effective = rawValues.filter((v): v is number => v !== null)
+  if (effective.length === 0 && rows.length > 0 && cols.length > 0) {
+    const valueCol = cols.length === 1 ? cols[0] : cols[1]
+    effective = rows.map(r => {
+      const v = r[valueCol]
+      if (typeof v === 'number') return v
+      const n = parseFloat(String(v ?? ''))
+      return isNaN(n) ? null : n
+    }).filter((v): v is number => v !== null)
+  }
+
+  const num  = effective[effective.length - 1] ?? 0
+  const prev = effective.length >= 2 ? effective[effective.length - 2] : null
   const delta = prev !== null && prev !== 0
     ? { pct: Math.abs(((num - prev) / prev) * 100), up: num >= prev }
     : null
-  return { num, spark: vs.slice(-7), delta }
+  return { num, spark: effective.slice(-7), delta }
 }
 
 function fmtNum(n: number) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return n.toLocaleString()
+}
+
+function getChartHeight(chartType: string, layoutMode: LayoutMode): number {
+  if (layoutMode === 'list') return 300
+  const ct = chartType.toLowerCase()
+  if (['treemap'].includes(ct)) return 320
+  if (['pie', 'donut'].includes(ct)) return 270
+  if (['scatter'].includes(ct)) return 260
+  return 260
 }
 
 function generateFollowUps(text: string, widgets: CanvasWidgetData[]): string[] {
@@ -541,6 +571,10 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const [input, setInput]       = useState('')
   const [sending, setSending]   = useState(false)
   const [sessionId]             = useState(() => `visually-${canvas.id}-${Date.now()}`)
+  // Reset textarea height when input is cleared (e.g. after sending)
+  useEffect(() => {
+    if (!input && chatInputRef.current) chatInputRef.current.style.height = 'auto'
+  }, [input])
   const [toast, setToast]       = useState<string | null>(null)
   const [execSummary, setExecSummary]   = useState('')
   const [summaryLoading, setSummaryLoading] = useState(false)
@@ -568,17 +602,35 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   const [filteredWidgets, setFilteredWidgets] = useState<CanvasWidgetData[] | null>(null)
   const [filterLoading, setFilterLoading] = useState(false)
   const filterConfigs: FilterConfig[] = canvas.filter_config ?? []
-  const endRef    = useRef<HTMLDivElement>(null)
-  const toastRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Global date range (date_range filter_config entries)
+  const dateFCs = filterConfigs.filter(f => f.filter_type === 'date_range')
+  const catFCs  = filterConfigs.filter(f => f.filter_type !== 'date_range')
+  const [globalDateDraft, setGlobalDateDraft] = useState<Record<string, { start: string; end: string }>>({})
+  const [appliedDateRange, setAppliedDateRange] = useState<Record<string, { start: string; end: string }>>({})
+  const [dateRangeApplying, setDateRangeApplying] = useState(false)
+  const [crossFilter, setCrossFilter] = useState<{ column: string; value: string } | null>(null)
+  const [scrollProgress, setScrollProgress] = useState(0)
+  const [showShortcutSheet, setShowShortcutSheet] = useState(false)
+  const [shareModal, setShareModal] = useState<{ open: boolean; loading: boolean; url: string | null; error: string | null }>({ open: false, loading: false, url: null, error: null })
+  const endRef         = useRef<HTMLDivElement>(null)
+  const toastRef       = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const chatInputRef   = useRef<HTMLTextAreaElement>(null)
+  const scrollAreaRef  = useRef<HTMLDivElement>(null)
 
   const connectionId   = widgets.find(w => w.connection_id)?.connection_id
   // Use filtered widget data when filters are active, original widgets otherwise
   const displayWidgets = filteredWidgets ?? widgets
-  const kpis           = displayWidgets.filter(w => ['kpi', 'kpi_card'].includes(w.chart_type))
-  const visualCharts   = displayWidgets.filter(w => ['bar', 'line', 'scatter', 'pie', 'donut', 'bar_horizontal'].includes(w.chart_type))
-  const tables         = displayWidgets.filter(w => ['table', 'data_table', 'pivot_table'].includes(w.chart_type))
+
+  const KPI_TYPES   = new Set(['kpi', 'kpi_card'])
+  const TABLE_TYPES = new Set(['table', 'data_table', 'pivot_table'])
+
+  const kpis         = displayWidgets.filter(w => KPI_TYPES.has(w.chart_type))
+  const tables       = displayWidgets.filter(w => TABLE_TYPES.has(w.chart_type))
+  // Any widget that is not a KPI and not a table is a visual chart — catches all current
+  // and future chart types without needing an exhaustive allow-list.
+  const visualCharts = displayWidgets.filter(w => !KPI_TYPES.has(w.chart_type) && !TABLE_TYPES.has(w.chart_type))
   const recommended    = useMemo(() => getRecommendedQuestions(widgets), [widgets])
-  const hasActiveFilters = Object.values(activeFilters).some(v => v.length > 0)
+  const hasActiveFilters = Object.values(activeFilters).some(v => v.length > 0) || Object.keys(appliedDateRange).length > 0
 
   // Anomaly callout data — across all displayed widgets
   const globalAnomalies = useMemo(() => {
@@ -630,10 +682,19 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
       .vis-focus-container .vis-card:hover { opacity: 1 !important; }
       .vis-ticker-inner { display:flex; gap:48px; white-space:nowrap; animation: vis-ticker-scroll 38s linear infinite; width:max-content; }
       .vis-no-print {}
-      @media print { .vis-no-print{display:none!important} }
       .vis-hide-scroll { scrollbar-width:none; -ms-overflow-style:none; }
       .vis-hide-scroll::-webkit-scrollbar { display:none; }
       .vis-nav { transition: width 0.22s cubic-bezier(.4,0,.2,1), opacity 0.2s ease; }
+      .vis-scroll-progress { transition: width 0.12s linear; }
+      @media print {
+        .vis-no-print { display:none!important; }
+        nav { display:none!important; }
+        aside { display:none!important; }
+        body { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+        .vis-card { break-inside:avoid; box-shadow:none!important; border:1px solid #ccc!important; }
+        svg { overflow:visible!important; }
+        * { animation:none!important; transition:none!important; }
+      }
     `
     document.head.appendChild(s)
     return () => { document.getElementById(id)?.remove() }
@@ -668,12 +729,16 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     const h = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (e.key === 'Escape') {
+        if (showShortcutSheet) { setShowShortcutSheet(false); return }
+        if (shareModal.open) { setShareModal(s => ({ ...s, open: false })); return }
         if (showThemePicker) { setShowThemePicker(false); return }
         if (slideMode) { setSlideMode(false); setSlidePlaying(false); return }
         if (fullscreenId) { setFullscreenId(null); return }
+        if (crossFilter) { setCrossFilter(null); return }
         if (infoWidgetId) { setInfoWidgetId(null); return }
         onClose()
       }
+      if (e.key === '?') { setShowShortcutSheet(v => !v); return }
       if (slideMode) {
         if (e.key === 'ArrowRight') setSlideIdx(v => Math.min(v + 1, slideDeck.length - 1))
         if (e.key === 'ArrowLeft')  setSlideIdx(v => Math.max(v - 1, 0))
@@ -694,7 +759,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose, visualCharts, tables.length, infoWidgetId, slideMode, fullscreenId, slideDeck.length])
+  }, [onClose, visualCharts, tables.length, infoWidgetId, slideMode, fullscreenId, slideDeck.length, showShortcutSheet, shareModal.open, crossFilter])
 
   // ── Auto-generate executive summary ─────────────────────────────────────
   useEffect(() => {
@@ -720,15 +785,68 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     toastRef.current = setTimeout(() => setToast(null), 3000)
   }, [])
 
+  // ── Scroll progress ───────────────────────────────────────────────────────
+  useEffect(() => {
+    const el = scrollAreaRef.current
+    if (!el) return
+    const onScroll = () => {
+      const max = el.scrollHeight - el.clientHeight
+      setScrollProgress(max > 0 ? el.scrollTop / max : 0)
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // ── Cross-filter toggle ───────────────────────────────────────────────────
+  const handleCrossFilter = useCallback((column: string, value: unknown) => {
+    const v = String(value)
+    setCrossFilter(prev => prev?.column === column && prev?.value === v ? null : { column, value: v })
+  }, [])
+
+  // ── Share handler — generates an HTML export as the shareable link ────────
+  const handleShare = useCallback(async () => {
+    setShareModal({ open: true, loading: true, url: null, error: null })
+    try {
+      const triggerResp = await exportApi.trigger({
+        dashboard_id: canvas.id,
+        project_id: projectId,
+        export_type: 'html',
+        theme: theme.id,
+        include_chat: false,
+        token_expiry_days: 7,
+      })
+      const jobId = triggerResp.data?.job_id
+      if (!jobId) throw new Error('No job ID returned')
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await new Promise(r => setTimeout(r, 1500))
+        const statusResp = await exportApi.getJob(jobId)
+        if (statusResp.data?.status === 'done') {
+          setShareModal({ open: true, loading: false, url: exportApi.downloadUrl(jobId), error: null })
+          return
+        }
+        if (statusResp.data?.status === 'failed') throw new Error('Export job failed')
+      }
+      throw new Error('Export timed out')
+    } catch (err: unknown) {
+      setShareModal({ open: true, loading: false, url: null, error: err instanceof Error ? err.message : 'Share failed' })
+    }
+  }, [canvas.id, projectId, theme.id])
+
   // ── Filter requery — re-execute all widget SQL when active filters change ────
   useEffect(() => {
-    if (!hasActiveFilters) {
+    const catActive = Object.values(activeFilters).some(v => v.length > 0)
+    const dateActive = Object.keys(appliedDateRange).length > 0
+    if (!catActive && !dateActive) {
       setFilteredWidgets(null)
       return
     }
+    const combined: Record<string, string[] | { start: string; end: string }> = {
+      ...activeFilters,
+      ...appliedDateRange,
+    }
     let cancelled = false
     setFilterLoading(true)
-    canvasApi.requery(canvas.id, activeFilters)
+    canvasApi.requery(canvas.id, combined)
       .then(r => {
         if (cancelled) return
         const updatedMap: Record<string, { rows: Record<string, unknown>[]; columns: string[] }> = {}
@@ -745,7 +863,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
       .catch(() => { if (!cancelled) showToast('Filter query failed') })
       .finally(() => { if (!cancelled) setFilterLoading(false) })
     return () => { cancelled = true }
-  }, [activeFilters, hasActiveFilters]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeFilters, appliedDateRange]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleFilter = useCallback((column: string, value: string) => {
     setActiveFilters(prev => {
@@ -757,6 +875,8 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
 
   const clearAllFilters = useCallback(() => {
     setActiveFilters({})
+    setAppliedDateRange({})
+    setGlobalDateDraft({})
     setFilteredWidgets(null)
   }, [])
 
@@ -1051,6 +1171,9 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     textTransform: 'uppercase', letterSpacing: '0.07em', margin: '0 0 12px',
   }
 
+  // Chart cards use tighter padding so the chart area gets more vertical space
+  const chartCardBase: React.CSSProperties = { ...cardBase, padding: '12px 14px' }
+
   // ── KPI card renderer ────────────────────────────────────────────────────
   const renderKpi = (w: CanvasWidgetData, idx: number) => {
     const { num, spark, delta } = getKpiMeta(w)
@@ -1076,11 +1199,11 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           <Info size={11} />
         </button>
 
-        <p style={{ fontSize: Math.max(9, theme.fontSizeBase - 4), fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 0 6px', padding: '0 26px 0 20px' }}>{w.title}</p>
+        <p style={{ fontSize: Math.max(9, theme.fontSizeBase - 4), fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 0 6px', padding: '0 26px 0 20px', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', lineHeight: 1.3, maxHeight: '2.6em' }}>{w.title}</p>
         {hasValues ? (
           <>
             <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 8 }}>
-              <p style={{ fontSize: theme.kpiFontSize, fontWeight: 800, color: theme.text, margin: 0, fontVariantNumeric: 'tabular-nums', lineHeight: 1, fontFamily: theme.id === 'digitalnative' ? theme.fontFamily : '"SF Mono","JetBrains Mono",monospace' }}>
+              <p style={{ fontSize: Math.min(theme.kpiFontSize, 36), fontWeight: 800, color: theme.text, margin: 0, fontVariantNumeric: 'tabular-nums', lineHeight: 1, fontFamily: theme.id === 'digitalnative' ? theme.fontFamily : '"SF Mono","JetBrains Mono",monospace' }}>
                 <AnimatedCounter value={Math.round(num * (1 + whatIf/100))} />
               </p>
               {spark.length >= 2 && <Sparkline data={spark} color={borderColor} />}
@@ -1172,9 +1295,27 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
       labels: filteredLabels,
       values: filteredValues,
     }
+
+    // Apply active cross-filter to this chart's data (must be computed before baseResult)
+    const xfRows = crossFilter
+      ? (() => {
+          const matched = filteredRows.filter(r => String(r[crossFilter.column] ?? '') === crossFilter.value)
+          return matched.length > 0 ? matched : filteredRows
+        })()
+      : filteredRows
+    const xfLabels = crossFilter && xfRows !== filteredRows
+      ? filteredLabels.filter((_, i) => filteredRows.indexOf(xfRows[i]) !== -1)
+      : filteredLabels
+    const xfValues = crossFilter && xfRows !== filteredRows
+      ? filteredValues.filter((_, i) => filteredRows.indexOf(xfRows[i]) !== -1)
+      : filteredValues
+    const activeChartData = crossFilter
+      ? { ...filteredChartData, rows: xfRows, labels: xfLabels, values: xfValues }
+      : filteredChartData
+
     const baseResult = comparisonMode && filteredRows.length >= 4
       ? makeComparisonResult({ ...w, chart_data: { ...w.chart_data, rows: filteredRows } as typeof w.chart_data })
-      : { ...toChartResult(w), chart_type: activeType, chart_data: filteredChartData }
+      : { ...toChartResult(w), chart_type: activeType, chart_data: activeChartData }
     const chartResult = baseResult
     const anomalyIdxs = detectAnomalyIndices(filteredValues.length ? filteredValues : (w.chart_data?.values as (number|null)[]) ?? [])
 
@@ -1184,7 +1325,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     return (
       <div key={w.id} id={`vr-chart-${w.id}`} className="vis-card"
         onContextMenu={e => { e.preventDefault(); copyAsPng(`vr-chart-${w.id}`) }}
-        style={{ ...cardBase, animationDelay: `${idx * 60}ms` }}
+        style={{ ...chartCardBase, animationDelay: `${idx * 60}ms` }}
       >
         {/* Header row */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, gap: 8 }}>
@@ -1272,19 +1413,19 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
         {/* Chart content — normal or split view */}
         {w.chart_data ? (
           splitViewId === w.id ? (
-            <div style={{ display: 'flex', gap: 8 }}>
-              <div style={{ flex: 1 }}>
+            <div style={{ display: 'flex', gap: 8, overflow: 'hidden' }}>
+              <div style={{ flex: 1, overflow: 'hidden' }}>
                 <p style={{ fontSize: 9, color: theme.muted, margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Current</p>
                 <ChartRenderer result={chartResult} height={Math.round(h * 0.85)} showAnomalies anomalyIndices={anomalyIdxs} />
               </div>
-              <div style={{ flex: 1, borderLeft: `1px solid ${theme.border}`, paddingLeft: 8 }}>
+              <div style={{ flex: 1, borderLeft: `1px solid ${theme.border}`, paddingLeft: 8, overflow: 'hidden' }}>
                 <p style={{ fontSize: 9, color: theme.muted, margin: '0 0 4px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Alternative</p>
                 <ChartRenderer result={{ ...toChartResult(w), chart_type: altType ?? 'bar' }} height={Math.round(h * 0.85)} />
               </div>
             </div>
           ) : (
-            <div style={themeTableVars(theme)}>
-              <ChartRenderer result={chartResult} height={h} showAnomalies anomalyIndices={anomalyIdxs} />
+            <div style={{ ...themeTableVars(theme), overflow: 'hidden' }}>
+              <ChartRenderer result={chartResult} height={h} showAnomalies anomalyIndices={anomalyIdxs} onDataPointClick={handleCrossFilter} />
             </div>
           )
         ) : (
@@ -1405,7 +1546,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                 {(() => { const trend = computeTrendBadge(featured); return trend ? <TrendBadge trend={trend} small /> : null })()}
               </div>
               <h3 style={{ fontSize: 16, fontWeight: 800, color: theme.text, margin: '0 0 12px', letterSpacing: '-0.3px' }}>{featured.title}</h3>
-              {featured.chart_data && <div style={themeTableVars(theme)}><ChartRenderer result={{ ...toChartResult(featured), chart_type: chartTypeOverrides[featured.id] ?? featured.chart_type }} height={280} /></div>}
+              {featured.chart_data && <div style={{ ...themeTableVars(theme), overflow: 'hidden' }}><ChartRenderer result={{ ...toChartResult(featured), chart_type: chartTypeOverrides[featured.id] ?? featured.chart_type }} height={280} /></div>}
               {(() => { const c = computeCaption(featured); return c ? <p style={{ fontSize: 11, color: theme.muted, margin: '10px 0 0', fontStyle: 'italic', lineHeight: 1.5 }}>{c}</p> : null })()}
               {(() => { const kd = computeKeyDriver(featured); return kd ? <KeyDriverCallout text={kd} theme={theme} /> : null })()}
             </div>
@@ -1572,12 +1713,26 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     // Newspaper layout has its own full renderer
     if (layoutMode === 'newspaper') return renderNewspaper()
     if (widgets.length === 0) return (
-      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 320, gap: 14 }}>
-        <div style={{ width: 64, height: 64, borderRadius: 20, background: theme.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <Sparkles size={28} color={theme.accent} />
-        </div>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 380, gap: 14 }}>
+        {/* Dashboard wireframe illustration */}
+        <svg width="100" height="80" viewBox="0 0 100 80" fill="none">
+          <rect x="4" y="4" width="92" height="14" rx="4" fill={theme.accentBg} stroke={theme.accent} strokeWidth="1.5"/>
+          <rect x="8" y="8" width="24" height="6" rx="2" fill={theme.accent} opacity="0.4"/>
+          <rect x="4" y="24" width="28" height="52" rx="4" fill={theme.accentBg} stroke={theme.accent} strokeWidth="1.5"/>
+          <rect x="9" y="54" width="7" height="16" rx="2" fill={theme.accent} opacity="0.5"/>
+          <rect x="19" y="44" width="7" height="26" rx="2" fill={theme.accent} opacity="0.7"/>
+          <rect x="36" y="24" width="60" height="24" rx="4" fill={theme.accentBg} stroke={theme.accent} strokeWidth="1.5"/>
+          <circle cx="54" cy="36" r="8" stroke={theme.accent} strokeWidth="1.5" fill="none"/>
+          <path d="M54 28 A8 8 0 0 1 62 36" stroke={theme.accent} strokeWidth="3" strokeLinecap="round"/>
+          <rect x="36" y="52" width="28" height="24" rx="4" fill={theme.accentBg} stroke={theme.accent} strokeWidth="1.5"/>
+          <rect x="68" y="52" width="28" height="24" rx="4" fill={theme.accentBg} stroke={theme.accent} strokeWidth="1.5"/>
+          <rect x="40" y="57" width="20" height="3" rx="1.5" fill={theme.accent} opacity="0.4"/>
+          <rect x="40" y="63" width="14" height="3" rx="1.5" fill={theme.accent} opacity="0.3"/>
+          <rect x="72" y="57" width="20" height="3" rx="1.5" fill={theme.accent} opacity="0.4"/>
+          <rect x="72" y="63" width="14" height="3" rx="1.5" fill={theme.accent} opacity="0.3"/>
+        </svg>
         <p style={{ fontSize: 15, fontWeight: 700, color: theme.text, margin: 0 }}>No charts yet</p>
-        <p style={{ fontSize: 13, color: theme.muted, margin: 0 }}>Ask the AI Copilot to create visualizations</p>
+        <p style={{ fontSize: 13, color: theme.muted, margin: 0, textAlign: 'center', maxWidth: 260, lineHeight: 1.5 }}>Ask the AI Copilot to generate visualizations, or add widgets from the canvas editor</p>
         <button onClick={() => setShowChat(true)} style={{
           padding: '10px 22px', background: theme.accent, border: 'none', borderRadius: 10,
           fontSize: 13, fontWeight: 600, color: 'white', cursor: 'pointer',
@@ -1586,7 +1741,6 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
     )
 
     const cols = layoutMode === 'list' ? '1fr' : 'repeat(auto-fill, minmax(340px, 1fr))'
-    const chartH = layoutMode === 'list' ? 280 : 220
 
     return (
       <div style={{ padding: '20px 28px 32px' }}>
@@ -1634,7 +1788,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
         {activeSection === 'overview' && kpis.length > 0 && (
           <div style={{ marginBottom: 28, borderLeft: `3px solid #2563EB`, paddingLeft: 12 }}>
             <p style={secLabel}>Key Metrics</p>
-            <div className={focusMode ? 'vis-focus-container' : undefined} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14 }}>
+            <div className={focusMode ? 'vis-focus-container' : undefined} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, 200px)', gap: 14, justifyContent: 'start' }}>
               {kpis.map((w, i) => renderKpi(w, i))}
             </div>
           </div>
@@ -1644,8 +1798,8 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
         {(activeSection === 'overview' || activeSection === 'charts') && visualCharts.length > 0 && (
           <div style={{ marginBottom: 28, borderLeft: `3px solid #7C3AED`, paddingLeft: 12 }}>
             {activeSection === 'overview' && <p style={secLabel}>Charts</p>}
-            <div className={focusMode ? 'vis-focus-container' : undefined} style={{ display: 'grid', gridTemplateColumns: cols, gap: 14 }}>
-              {visualCharts.map((w, i) => renderChart(w, i, chartH))}
+            <div className={focusMode ? 'vis-focus-container' : undefined} style={{ display: 'grid', gridTemplateColumns: cols, gap: 14, alignItems: 'start' }}>
+              {visualCharts.map((w, i) => renderChart(w, i, getChartHeight(w.chart_type, layoutMode)))}
             </div>
           </div>
         )}
@@ -1858,10 +2012,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'flex', fontFamily: theme.fontFamily, background: theme.bg, fontSize: theme.fontSizeBase }}>
 
-      {/* Background pattern overlay */}
-      {bgPattern !== 'none' && (
-        <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 0, ...getPatternStyle(bgPattern, theme) }} />
-      )}
+      {/* Background pattern is applied directly on the scrollable charts area so it shows through */}
 
       {/* ── Left Rail ──────────────────────────────────────────────────────── */}
       <nav className="vis-nav" style={{ width: navCollapsed ? 0 : 74, opacity: navCollapsed ? 0 : 1, overflow: navCollapsed ? 'hidden' : 'visible', background: theme.rail, display: 'flex', flexDirection: 'column', alignItems: 'center', padding: navCollapsed ? 0 : '14px 0', flexShrink: 0, gap: 2, boxShadow: navCollapsed ? 'none' : '2px 0 12px rgba(0,0,0,0.15)', position: 'relative', zIndex: 50 }}>
@@ -2172,6 +2323,14 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               style={{ padding: '1px 7px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer' }}>
               ✉ Email
             </button>
+            <button onClick={handleShare}
+              style={{ padding: '1px 7px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
+              <Share2 size={9} /> Share
+            </button>
+            <button onClick={() => setShowShortcutSheet(true)} title="Keyboard shortcuts (?)"
+              style={{ padding: '1px 5px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+              <HelpCircle size={10} />
+            </button>
           </div>
         </div>
 
@@ -2187,7 +2346,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                   <span style={{ fontSize: 11, fontWeight: 700, color: theme.text, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Filters</span>
                   {hasActiveFilters && (
                     <span style={{ padding: '1px 6px', background: theme.accent, borderRadius: 8, fontSize: 9, fontWeight: 700, color: 'white' }}>
-                      {Object.values(activeFilters).flat().length}
+                      {Object.values(activeFilters).flat().length + Object.keys(appliedDateRange).length}
                     </span>
                   )}
                 </div>
@@ -2210,7 +2369,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               )}
 
               {/* No filters state */}
-              {filterConfigs.length === 0 && (
+              {catFCs.length === 0 && dateFCs.length === 0 && (
                 <div style={{ padding: '24px 16px', textAlign: 'center' }}>
                   <div style={{ width: 40, height: 40, borderRadius: 12, background: theme.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px' }}>
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={theme.accent} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
@@ -2222,8 +2381,58 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                 </div>
               )}
 
-              {/* Filter groups */}
-              {filterConfigs.map(f => {
+              {/* Date range filter groups */}
+              {dateFCs.map(f => {
+                const draft   = globalDateDraft[f.column]   ?? { start: '', end: '' }
+                const applied = appliedDateRange[f.column]
+                const hasApplied = !!(applied?.start || applied?.end)
+                const draftChanged = draft.start !== (applied?.start ?? '') || draft.end !== (applied?.end ?? '')
+                return (
+                  <div key={f.id} style={{ padding: '10px 14px', borderBottom: `1px solid ${theme.border}` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 7 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <Calendar size={10} color={theme.accent} />
+                        <p style={{ fontSize: 10, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.06em', margin: 0 }}>{f.display_name}</p>
+                        {hasApplied && <span style={{ padding: '1px 5px', background: theme.accent, borderRadius: 8, fontSize: 8, fontWeight: 700, color: 'white' }}>active</span>}
+                      </div>
+                      {hasApplied && (
+                        <button onClick={() => {
+                          setAppliedDateRange(prev => { const n = { ...prev }; delete n[f.column]; return n })
+                          setGlobalDateDraft(prev => { const n = { ...prev }; delete n[f.column]; return n })
+                        }}
+                          style={{ fontSize: 9, color: theme.accent, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>✕ clear</button>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <input type="date" value={draft.start}
+                          onChange={e => setGlobalDateDraft(prev => ({ ...prev, [f.column]: { ...draft, start: e.target.value } }))}
+                          style={{ flex: 1, fontSize: 10, padding: '3px 6px', borderRadius: 5, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, outline: 'none' }} />
+                        <span style={{ fontSize: 9, color: theme.muted, flexShrink: 0 }}>→</span>
+                        <input type="date" value={draft.end}
+                          onChange={e => setGlobalDateDraft(prev => ({ ...prev, [f.column]: { ...draft, end: e.target.value } }))}
+                          style={{ flex: 1, fontSize: 10, padding: '3px 6px', borderRadius: 5, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, outline: 'none' }} />
+                      </div>
+                      {draftChanged && draft.start && draft.end && (
+                        <button
+                          disabled={dateRangeApplying}
+                          onClick={async () => {
+                            setDateRangeApplying(true)
+                            setAppliedDateRange(prev => ({ ...prev, [f.column]: { start: draft.start, end: draft.end } }))
+                            setDateRangeApplying(false)
+                          }}
+                          style={{ fontSize: 10, padding: '4px 10px', borderRadius: 6, border: 'none', background: theme.accent, color: 'white', cursor: 'pointer', fontWeight: 600, width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                          {dateRangeApplying && <Loader2 size={10} style={{ animation: 'visually-spin 1s linear infinite' }} />}
+                          Apply to all charts
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+
+              {/* Categorical filter groups */}
+              {catFCs.map(f => {
                 const selected = activeFilters[f.column] ?? []
                 return (
                   <div key={f.id} style={{ padding: '10px 14px', borderBottom: `1px solid ${theme.border}` }}>
@@ -2255,8 +2464,23 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
             </aside>
           )}
 
-          {/* Charts area */}
-          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', background: theme.bg }}>
+          {/* Charts area — backgroundColor is the base; backgroundImage from getPatternStyle overlays the pattern */}
+          <div ref={scrollAreaRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', backgroundColor: theme.bg, ...getPatternStyle(bgPattern, theme), position: 'relative' }}>
+            {/* Scroll progress bar */}
+            {scrollProgress > 0.01 && (
+              <div className="vis-scroll-progress vis-no-print" style={{ position: 'sticky', top: 0, left: 0, height: 3, background: theme.accent, width: `${scrollProgress * 100}%`, zIndex: 10, borderRadius: '0 2px 2px 0', opacity: 0.8 }} />
+            )}
+            {/* Cross-filter active banner */}
+            {crossFilter && (
+              <div className="vis-no-print" style={{ padding: '5px 20px', background: `${theme.accent}12`, borderBottom: `1px solid ${theme.accent}30`, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                <span style={{ fontSize: 9, fontWeight: 700, color: theme.accent, textTransform: 'uppercase', letterSpacing: '0.07em' }}>Cross-filter</span>
+                <span style={{ padding: '2px 9px', background: theme.accentBg, border: `1px solid ${theme.accent}44`, borderRadius: 10, fontSize: 11, fontWeight: 600, color: theme.accent, display: 'flex', alignItems: 'center', gap: 5 }}>
+                  {crossFilter.column}: {crossFilter.value}
+                  <button onClick={() => setCrossFilter(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: theme.accent, padding: 0, lineHeight: 1, fontSize: 12 }}>×</button>
+                </span>
+                <span style={{ fontSize: 10, color: theme.muted }}>All charts filtered — click again or press Esc to clear</span>
+              </div>
+            )}
             {/* ── Anomaly callout strip ── */}
             {globalAnomalies.length > 0 && (
               <div style={{ padding: '6px 20px', background: 'rgba(239,68,68,0.07)', borderBottom: `1px solid rgba(239,68,68,0.18)`, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
@@ -2285,7 +2509,7 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
               </div>
             )}
             {renderContent()}
-          </div>
+          </div>{/* end scrollable charts area */}
         </div>
       </main>
 
@@ -2433,7 +2657,12 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
                 <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 8 }}>
                   <div style={{ maxWidth: '90%', padding: '9px 13px', borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '4px 16px 16px 16px', background: bubbleBg, color: bubbleText, fontSize: 13, lineHeight: 1.55 }}>
                     {isLatestAI
-                      ? <TypewriterText text={msg.content} active speed={10} />
+                      ? <TypewriterText
+                          text={msg.content}
+                          active
+                          speed={10}
+                          onComplete={() => setMessages(prev => prev.map((m, mi) => mi === i ? { ...m, typing: false } : m))}
+                        />
                       : msg.role === 'assistant'
                         ? <MarkdownText text={msg.content} color={bubbleText} fontSize={13} />
                         : msg.content
@@ -2491,19 +2720,24 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           <div style={{ padding: '12px 16px', borderTop: `1px solid ${theme.border}`, flexShrink: 0 }}>
             <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, background: theme.bg, border: `1px solid ${theme.border}`, borderRadius: 12, padding: '8px 10px 8px 14px' }}>
               <textarea
+                ref={chatInputRef}
                 value={input}
-                onChange={e => setInput(e.target.value)}
+                onChange={e => {
+                  setInput(e.target.value)
+                  e.target.style.height = 'auto'
+                  e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'
+                }}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
                 placeholder="Ask about your data or request a chart…"
                 rows={1}
-                style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: 13, color: theme.text, resize: 'none', maxHeight: 80, lineHeight: 1.5, fontFamily: 'inherit' }}
+                style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: 13, color: theme.text, resize: 'none', minHeight: '24px', maxHeight: '120px', overflowY: 'auto', lineHeight: 1.5, fontFamily: 'inherit' }}
               />
               <button onClick={() => send()} disabled={!input.trim() || sending} style={{ width: 34, height: 34, borderRadius: 9, flexShrink: 0, background: 'linear-gradient(135deg,#2563EB,#7C3AED)', border: 'none', cursor: input.trim() && !sending ? 'pointer' : 'not-allowed', opacity: !input.trim() || sending ? 0.45 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 <Send size={13} color="white" />
               </button>
             </div>
             <p style={{ fontSize: 10, color: theme.muted, marginTop: 6, textAlign: 'center' }}>
-              1/2/3 sections · C copilot · T theme · Esc back
+              1/2/3 sections · C copilot · T theme · ? shortcuts
             </p>
           </div>
         </>}
@@ -2600,6 +2834,93 @@ export function VisuallReport({ canvas, widgets, projectId, onClose, onWidgetAdd
           </div>
         )
       })()}
+
+      {/* ── Keyboard Shortcut Cheat-Sheet ────────────────────────────────── */}
+      {showShortcutSheet && (
+        <div onClick={() => setShowShortcutSheet(false)}
+          style={{ position: 'fixed', inset: 0, zIndex: 500, background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32, animation: 'visually-fadeIn 0.15s ease both' }}>
+          <div onClick={e => e.stopPropagation()} style={{ ...cardBase, width: 380, padding: 24 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <HelpCircle size={16} color={theme.accent} />
+                <p style={{ fontSize: 14, fontWeight: 800, color: theme.text, margin: 0 }}>Keyboard Shortcuts</p>
+              </div>
+              <button onClick={() => setShowShortcutSheet(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: theme.muted, padding: 2 }}><X size={14} /></button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+              {([
+                ['1', 'Overview section'],
+                ['2', 'Charts section'],
+                ['3', 'Data tables section'],
+                ['C', 'Toggle AI Copilot panel'],
+                ['T', 'Cycle through themes'],
+                ['F', 'Fullscreen first chart'],
+                ['S', 'Toggle presentation / slide mode'],
+                ['P', 'Cycle background pattern'],
+                ['?', 'Show this cheat-sheet'],
+                ['Esc', 'Close panel / go back to canvas'],
+              ] as [string, string][]).map(([key, desc]) => (
+                <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 0', borderBottom: `1px solid ${theme.border}` }}>
+                  <span style={{ fontSize: 12, color: theme.text }}>{desc}</span>
+                  <kbd style={{ padding: '2px 8px', background: theme.bg, border: `1px solid ${theme.border}`, borderRadius: 5, fontSize: 11, fontFamily: '"SF Mono","JetBrains Mono",monospace', fontWeight: 700, color: theme.accent, flexShrink: 0 }}>{key}</kbd>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Share Modal ───────────────────────────────────────────────────── */}
+      {shareModal.open && (
+        <div onClick={() => setShareModal(s => ({ ...s, open: false }))}
+          style={{ position: 'fixed', inset: 0, zIndex: 500, background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32, animation: 'visually-fadeIn 0.15s ease both' }}>
+          <div onClick={e => e.stopPropagation()} style={{ ...cardBase, width: 460, padding: 28 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ width: 38, height: 38, borderRadius: 11, background: theme.accentBg, display: 'flex', alignItems: 'center', justifyContent: 'center', border: `1px solid ${theme.accent}44` }}>
+                  <Share2 size={17} color={theme.accent} />
+                </div>
+                <div>
+                  <p style={{ fontSize: 14, fontWeight: 700, color: theme.text, margin: 0 }}>Share Report</p>
+                  <p style={{ fontSize: 10, color: theme.muted, margin: 0 }}>Read-only HTML export · expires in 7 days</p>
+                </div>
+              </div>
+              <button onClick={() => setShareModal(s => ({ ...s, open: false }))} style={{ background: 'none', border: 'none', cursor: 'pointer', color: theme.muted, padding: 2 }}><X size={14} /></button>
+            </div>
+            {shareModal.loading && (
+              <div style={{ textAlign: 'center', padding: '32px 0' }}>
+                <Loader2 size={26} style={{ color: theme.accent, animation: 'visually-spin 1s linear infinite', display: 'block', margin: '0 auto 14px' }} />
+                <p style={{ fontSize: 13, color: theme.muted, margin: 0 }}>Generating your shareable report…</p>
+                <p style={{ fontSize: 11, color: theme.muted, margin: '5px 0 0' }}>This may take up to 30 seconds</p>
+              </div>
+            )}
+            {!shareModal.loading && shareModal.url && (
+              <div>
+                <p style={{ fontSize: 12, color: theme.muted, margin: '0 0 10px' }}>Shareable download link (anyone can open this):</p>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input readOnly value={shareModal.url}
+                    style={{ flex: 1, fontSize: 11, padding: '8px 10px', border: `1px solid ${theme.border}`, borderRadius: 8, background: theme.bg, color: theme.text, outline: 'none' }} />
+                  <button onClick={() => { navigator.clipboard.writeText(shareModal.url!); showToast('Link copied!') }}
+                    style={{ padding: '8px 16px', background: theme.accent, border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, color: 'white', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+                    <Copy size={12} /> Copy
+                  </button>
+                </div>
+                <p style={{ fontSize: 11, color: theme.muted, marginTop: 10, lineHeight: 1.5 }}>
+                  Recipients can view the report without logging in. The link downloads a self-contained HTML file.
+                </p>
+              </div>
+            )}
+            {!shareModal.loading && shareModal.error && (
+              <div style={{ padding: '14px 16px', background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 8 }}>
+                <p style={{ fontSize: 12, color: '#DC2626', margin: 0 }}>⚠ {shareModal.error}</p>
+                <button onClick={handleShare} style={{ marginTop: 10, fontSize: 11, color: '#DC2626', background: 'none', border: '1px solid #FECACA', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>
+                  Try again
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── Toast ─────────────────────────────────────────────────────────── */}
       {toast && (
