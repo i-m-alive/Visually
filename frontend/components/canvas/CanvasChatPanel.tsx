@@ -18,10 +18,18 @@ interface ChatMsg {
   }
 }
 
+interface CanvasPage {
+  id: string
+  name: string
+  order: number
+}
+
 interface Props {
   projectId: string
   canvasId: string
-  widgets: CanvasWidgetData[]
+  widgets: CanvasWidgetData[]          // ALL widgets across all pages
+  pages?: CanvasPage[]
+  activePageId?: string
   onClose: () => void
   onWidgetAdded: () => void
 }
@@ -69,10 +77,10 @@ function MarkdownText({ text }: { text: string }) {
   return <div>{elements}</div>
 }
 
-function buildRecommendations(widgets: CanvasWidgetData[]): string[] {
+function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]): string[] {
   const qs: string[] = []
   const kpis   = widgets.filter(w => ['kpi', 'kpi_card'].includes(w.chart_type))
-  const charts  = widgets.filter(w => ['bar', 'line'].includes(w.chart_type))
+  const charts  = widgets.filter(w => ['bar_vertical', 'bar', 'line', 'area'].includes(w.chart_type))
   const pies    = widgets.filter(w => ['pie', 'donut'].includes(w.chart_type))
   const tables  = widgets.filter(w => ['table', 'data_table'].includes(w.chart_type))
 
@@ -81,16 +89,17 @@ function buildRecommendations(widgets: CanvasWidgetData[]): string[] {
   if (charts[0]) qs.push(`Summarize trends in "${charts[0].title}"`)
   if (pies[0])   qs.push(`Which segment is highest in "${pies[0].title}"?`)
   if (tables[0]) qs.push(`Top 5 rows in "${tables[0].title}"`)
-  qs.push('Summarize this dashboard in 3 bullet points')
+  if (pages.length > 1) qs.push(`Summarize all ${pages.length} pages of this report`)
   qs.push('Which metrics need the most attention?')
+  qs.push('Create a chart showing overall performance')
 
   return Array.from(new Set(qs)).slice(0, 5)
 }
 
-export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidgetAdded }: Props) {
+export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([{
     role: 'assistant',
-    content: 'Hi! Ask me to explore data, explain trends, or generate new charts for this canvas.',
+    content: 'Hi! I have full access to your canvas report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
   }])
   const [input, setInput]     = useState('')
   const [sending, setSending]   = useState(false)
@@ -101,7 +110,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidge
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
-  const recommended  = buildRecommendations(widgets)
+  const recommended  = buildRecommendations(widgets, pages)
 
   const send = useCallback(async (quickText?: string) => {
     const text = (quickText ?? input).trim()
@@ -112,21 +121,14 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidge
 
     setMessages(prev => [...prev, { role: 'user', content: text }])
 
-    const widgetContext = widgets.map(w =>
-      `- "${w.title}" (${w.chart_type})${w.sql_query ? `\n  SQL: ${w.sql_query}` : ''}`
-    ).join('\n')
-
-    const contextMsg = widgets.length > 0
-      ? `Canvas widgets:\n${widgetContext}\n\nUser: ${text}`
-      : text
-
     try {
       const resp = await chatApi.send({
         session_id:    sessionId,
-        message:       contextMsg,
+        message:       text,
         project_id:    projectId,
         dashboard_id:  canvasId,
         connection_id: connectionId,
+        active_page_id: activePageId || undefined,
       })
 
       const data         = resp.data
@@ -179,7 +181,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidge
     } finally {
       setSending(false)
     }
-  }, [input, sending, sessionId, projectId, canvasId, connectionId, widgets])
+  }, [input, sending, sessionId, projectId, canvasId, connectionId, activePageId])
 
   const handleAddWidget = useCallback(async (src: ChartResult | ChatMsg['newWidget']) => {
     if (!src) return
@@ -188,18 +190,21 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidge
       chart_type:    src.chart_type,
       sql_query:     src.sql,
       chart_data:    (src.chart_data as Record<string, unknown>) ?? undefined,
+      config:        activePageId ? { page_id: activePageId } : undefined,
       width:         6,
       height:        5,
       connection_id: connectionId,
     }
+    const activePage = pages.find(p => p.id === activePageId)
+    const pageLabel  = activePage ? ` on "${activePage.name}"` : ''
     try {
       await canvasApi.addWidget(canvasId, widgetData)
       onWidgetAdded()
-      setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added "${src.title}" to your canvas!` }])
+      setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added "${src.title}"${pageLabel} to your canvas!` }])
     } catch {
       setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to add the chart. Please try again.' }])
     }
-  }, [canvasId, connectionId, onWidgetAdded])
+  }, [canvasId, connectionId, onWidgetAdded, activePageId, pages])
 
   return (
     <div className="w-80 bg-white border-l border-gray-100 flex flex-col h-full">
@@ -317,7 +322,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, onClose, onWidge
             <Send size={12} />
           </button>
         </div>
-        <p className="text-xs text-gray-400 mt-1.5 text-center">Real-time data · Enter to send</p>
+        <p className="text-xs text-gray-400 mt-1.5 text-center">Full DB access · All pages · Enter to send</p>
       </div>
     </div>
   )

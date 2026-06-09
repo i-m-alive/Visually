@@ -15,6 +15,7 @@ import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasW
 import { ZoomModal } from '@/components/canvas/ZoomModal'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
 import { VisuallReport } from '@/components/canvas/VisuallReport'
+import { CanvasPageTabs, type CanvasPage } from '@/components/canvas/CanvasPageTabs'
 
 const ResponsiveGrid = WidthProvider(Responsive)
 
@@ -123,6 +124,8 @@ interface CanvasDetail {
   description?: string
   filter_config?: FilterConfig[]
   widgets: WidgetWithPosition[]
+  pages?: CanvasPage[]
+  layout_config?: Record<string, unknown>
 }
 
 export default function CanvasEditorPage() {
@@ -145,6 +148,10 @@ export default function CanvasEditorPage() {
   const [activeDateRange, setActiveDateRange] = useState<Record<string, { start: string; end: string }>>({})
   const [isRequeryingDate, setIsRequeryingDate] = useState(false)
 
+  // Pages state
+  const [pages, setPages]               = useState<CanvasPage[]>([])
+  const [activePageId, setActivePageId] = useState<string>('')
+
   // New state
   const [lockedWidgets, setLockedWidgets]   = useState<Set<string>>(new Set())
   const [refreshingId, setRefreshingId]     = useState<string | null>(null)
@@ -165,6 +172,10 @@ export default function CanvasEditorPage() {
     toastTimerRef.current = setTimeout(() => setToastMsg(null), 2500)
   }
 
+  const savePagesConfig = useCallback(async (newPages: CanvasPage[]) => {
+    try { await canvasApi.updateLayoutConfig(canvasId, { pages: newPages }) } catch { /* ignore */ }
+  }, [canvasId])
+
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -174,6 +185,21 @@ export default function CanvasEditorPage() {
       setCanvas(data)
       const ws: WidgetWithPosition[] = (data.widgets || []) as WidgetWithPosition[]
       setWidgets(ws)
+
+      // Initialize pages — create default "Page 1" for canvases without pages yet
+      const loadedPages: CanvasPage[] = data.pages || []
+      if (loadedPages.length === 0) {
+        const defaultPage: CanvasPage = { id: crypto.randomUUID(), name: 'Page 1', order: 0 }
+        setPages([defaultPage])
+        setActivePageId(defaultPage.id)
+        void canvasApi.updateLayoutConfig(canvasId, { pages: [defaultPage] })
+      } else {
+        setPages(loadedPages)
+        setActivePageId(prev => {
+          const still = loadedPages.find(p => p.id === prev)
+          return still ? prev : loadedPages[0].id
+        })
+      }
       const seedDates: Record<string, { start: string; end: string }> = {}
       for (const w of ws) {
         const df = (w as WidgetWithPosition & { config?: Record<string, unknown> }).config?.date_filter as
@@ -342,11 +368,11 @@ export default function CanvasEditorPage() {
   const handleDuplicate = useCallback(async (widget: CanvasWidgetData) => {
     try {
       const existing = layout.find(l => l.i === widget.id)
-      const newWidget = await canvasApi.addWidget(canvasId, {
+      await canvasApi.addWidget(canvasId, {
         title: `${widget.title} (copy)`,
         chart_type: widget.chart_type,
         chart_data: widget.chart_data as Record<string, unknown>,
-        config: widget.config,
+        config: { ...(widget.config || {}), page_id: activePageId },
         sql_query: widget.sql_query,
         width: existing?.w ?? 6,
         height: existing?.h ?? 6,
@@ -355,9 +381,8 @@ export default function CanvasEditorPage() {
       })
       await load()
       showToast(`Duplicated "${widget.title}"`)
-      return newWidget
     } catch { /* ignore */ }
-  }, [canvasId, layout, load])
+  }, [canvasId, layout, load, activePageId])
 
   const handleToggleLock = useCallback((widgetId: string) => {
     setLockedWidgets(prev => {
@@ -409,6 +434,72 @@ export default function CanvasEditorPage() {
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
     persistLayout(layout)
   }
+
+  // ── Page management ────────────────────────────────────────────────────────
+  const handleAddPage = useCallback(async () => {
+    const newPage: CanvasPage = {
+      id: crypto.randomUUID(),
+      name: `Page ${pages.length + 1}`,
+      order: pages.length,
+    }
+    const newPages = [...pages, newPage]
+    setPages(newPages)
+    setActivePageId(newPage.id)
+    await savePagesConfig(newPages)
+  }, [pages, savePagesConfig])
+
+  const handleRenamePage = useCallback(async (pageId: string, newName: string) => {
+    const newPages = pages.map(p => p.id === pageId ? { ...p, name: newName } : p)
+    setPages(newPages)
+    await savePagesConfig(newPages)
+  }, [pages, savePagesConfig])
+
+  const handleDeletePage = useCallback(async (pageId: string) => {
+    if (pages.length <= 1) return
+    const defaultPageId = pages[0].id
+    const pageWidgets = widgets.filter(w => {
+      const wPid = (w.config?.page_id as string) || ''
+      return wPid ? wPid === pageId : pageId === defaultPageId
+    })
+    await Promise.all(pageWidgets.map(w => widgetApi.delete(w.id)))
+    const newPages = pages.filter(p => p.id !== pageId).map((p, i) => ({ ...p, order: i }))
+    setPages(newPages)
+    if (activePageId === pageId) setActivePageId(newPages[0].id)
+    await savePagesConfig(newPages)
+    await load()
+    showToast('Page deleted')
+  }, [pages, widgets, activePageId, savePagesConfig, load])
+
+  const handleDuplicatePage = useCallback(async (pageId: string) => {
+    const sourcePage = pages.find(p => p.id === pageId)
+    if (!sourcePage) return
+    const newPageId = crypto.randomUUID()
+    const defaultPageId = pages[0]?.id ?? ''
+    const pageWidgets = widgets.filter(w => {
+      const wPid = (w.config?.page_id as string) || ''
+      return wPid ? wPid === pageId : pageId === defaultPageId
+    })
+    await Promise.all(pageWidgets.map(w => {
+      const existing = layout.find(l => l.i === w.id)
+      return canvasApi.addWidget(canvasId, {
+        title: w.title,
+        chart_type: w.chart_type,
+        sql_query: w.sql_query,
+        chart_data: w.chart_data as Record<string, unknown>,
+        config: { ...(w.config || {}), page_id: newPageId },
+        width: existing?.w ?? 6,
+        height: existing?.h ?? 6,
+        connection_id: w.connection_id,
+      })
+    }))
+    const newPage: CanvasPage = { id: newPageId, name: `${sourcePage.name} (copy)`, order: pages.length }
+    const newPages = [...pages, newPage]
+    setPages(newPages)
+    setActivePageId(newPageId)
+    await savePagesConfig(newPages)
+    await load()
+    showToast(`Duplicated "${sourcePage.name}"`)
+  }, [pages, widgets, layout, canvasId, savePagesConfig, load])
 
   const handleTitleSave = async () => {
     setEditingTitle(false)
@@ -703,13 +794,21 @@ export default function CanvasEditorPage() {
 
       {/* Body */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
-        {/* Canvas grid */}
+        {/* Canvas grid + page tabs */}
+        <div className="flex flex-col flex-1 min-w-0 min-h-0">
         <div className="flex-1 overflow-auto p-4 min-w-0" style={{
           backgroundColor: '#f1f5f9',
           backgroundImage: 'radial-gradient(circle, #cbd5e1 1px, transparent 1px)',
           backgroundSize: '24px 24px',
         }}>
-          {widgets.length === 0 ? (
+          {(() => {
+            const defaultPageId = pages[0]?.id ?? ''
+            const activePageWidgets = widgets.filter(w => {
+              const wPageId = (w.config?.page_id as string) || ''
+              return wPageId ? wPageId === activePageId : activePageId === defaultPageId
+            })
+            const activePageLayout = layout.filter(l => activePageWidgets.some(w => w.id === l.i))
+            return activePageWidgets.length === 0 ? (
             // Enhanced 3-step empty state
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400 gap-6 py-12">
               <div className="flex gap-2 opacity-30">
@@ -745,42 +844,57 @@ export default function CanvasEditorPage() {
                 <MessageSquare size={14} /> Open AI Chat
               </button>
             </div>
-          ) : (
-            <div style={{ transform: `scale(${gridZoom})`, transformOrigin: 'top left', transition: 'transform 0.15s ease' }}>
-              <ResponsiveGrid
-                className="layout"
-                layouts={{ lg: layout, md: layout, sm: layout }}
-                breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
-                cols={{ lg: 12, md: 12, sm: 6, xs: 4, xxs: 2 }}
-                rowHeight={70}
-                onLayoutChange={handleLayoutChange}
-                onDragStop={(newLayout) => handleDragStop(newLayout)}
-                onResizeStop={(newLayout) => handleResizeStop(newLayout)}
-                draggableHandle=".drag-handle"
-                isDraggable={!isViewOnly}
-                isResizable={!isViewOnly}
-                margin={[12, 12]}
-                containerPadding={[4, 4]}
-                resizeHandles={['se', 'e', 's']}
-              >
-                {widgets.map(widget => (
-                  <div key={widget.id} className="overflow-hidden rounded-xl">
-                    <CanvasWidget
-                      widget={widget}
-                      onDelete={handleDeleteWidget}
-                      onUpdate={handleUpdateWidget}
-                      onZoom={(w, cols) => setZoomTarget({ widget: w, colors: cols })}
-                      onDuplicate={handleDuplicate}
-                      onRefresh={handleRefreshWidget}
-                      onToggleLock={handleToggleLock}
-                      isLocked={lockedWidgets.has(widget.id)}
-                      isRefreshing={refreshingId === widget.id}
-                    />
-                  </div>
-                ))}
-              </ResponsiveGrid>
-            </div>
-          )}
+            ) : (
+              <div style={{ transform: `scale(${gridZoom})`, transformOrigin: 'top left', transition: 'transform 0.15s ease' }}>
+                <ResponsiveGrid
+                  className="layout"
+                  layouts={{ lg: activePageLayout, md: activePageLayout, sm: activePageLayout }}
+                  breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
+                  cols={{ lg: 12, md: 12, sm: 6, xs: 4, xxs: 2 }}
+                  rowHeight={70}
+                  onLayoutChange={handleLayoutChange}
+                  onDragStop={(newLayout) => handleDragStop(newLayout)}
+                  onResizeStop={(newLayout) => handleResizeStop(newLayout)}
+                  draggableHandle=".drag-handle"
+                  isDraggable={!isViewOnly}
+                  isResizable={!isViewOnly}
+                  margin={[12, 12]}
+                  containerPadding={[4, 4]}
+                  resizeHandles={['se', 'e', 's']}
+                >
+                  {activePageWidgets.map(widget => (
+                    <div key={widget.id} className="overflow-hidden rounded-xl">
+                      <CanvasWidget
+                        widget={widget}
+                        onDelete={handleDeleteWidget}
+                        onUpdate={handleUpdateWidget}
+                        onZoom={(w, cols) => setZoomTarget({ widget: w, colors: cols })}
+                        onDuplicate={handleDuplicate}
+                        onRefresh={handleRefreshWidget}
+                        onToggleLock={handleToggleLock}
+                        isLocked={lockedWidgets.has(widget.id)}
+                        isRefreshing={refreshingId === widget.id}
+                      />
+                    </div>
+                  ))}
+                </ResponsiveGrid>
+              </div>
+            )
+          })()}
+        </div>
+
+        {/* Page tabs */}
+        {pages.length > 0 && (
+          <CanvasPageTabs
+            pages={pages}
+            activePageId={activePageId}
+            onSwitch={setActivePageId}
+            onAdd={handleAddPage}
+            onRename={handleRenamePage}
+            onDelete={handleDeletePage}
+            onDuplicate={handleDuplicatePage}
+          />
+        )}
         </div>
 
         {/* Chat panel */}
@@ -789,6 +903,8 @@ export default function CanvasEditorPage() {
             projectId={projectId}
             canvasId={canvasId}
             widgets={widgets}
+            pages={pages}
+            activePageId={activePageId}
             onClose={() => setShowChat(false)}
             onWidgetAdded={load}
           />
@@ -809,9 +925,18 @@ export default function CanvasEditorPage() {
         <VisuallReport
           canvas={{ id: canvas.id, name: canvas.name, project_id: canvas.project_id, filter_config: canvas.filter_config }}
           widgets={widgets}
+          pages={pages}
+          initialPageId={activePageId}
           projectId={projectId}
           onClose={() => setShowReport(false)}
           onWidgetAdded={load}
+          onPageRename={handleRenamePage}
+          onPageDelete={handleDeletePage}
+          onPageDuplicate={handleDuplicatePage}
+          onPageReorder={async (newPages) => {
+            setPages(newPages)
+            await canvasApi.updateLayoutConfig(canvasId, { pages: newPages })
+          }}
         />
       )}
     </div>

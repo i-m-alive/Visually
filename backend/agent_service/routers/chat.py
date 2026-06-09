@@ -1,5 +1,6 @@
 import uuid
 import json
+import re
 import os
 from typing import Optional
 import httpx
@@ -31,6 +32,7 @@ class ChatRequest(BaseModel):
     dashboard_id: Optional[str] = None
     session_id: Optional[str] = None
     connection_id: Optional[str] = None
+    active_page_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -72,17 +74,25 @@ async def chat(
         except Exception as _e:
             print(f"[chat] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
 
-    # Load dashboard widgets if dashboard_id provided
-    dashboard_widgets = []
+    # Load all widgets + page structure from dashboard
+    dashboard_widgets: list[dict] = []
+    dashboard_pages: list[dict] = []
     if req.dashboard_id:
-        dashboard_widgets = await _get_dashboard_widgets(req.dashboard_id, db)
+        dashboard_widgets, dashboard_pages = await _get_dashboard_widgets_and_pages(
+            req.dashboard_id, db
+        )
 
-    # Call Chat Agent — pass enriched schema when available
+    priority_tables = _extract_priority_tables(dashboard_widgets)
+
+    # Call Chat Agent — pass enriched schema, pages, and priority tables
     result = await _agent.respond(
         message=req.message,
         conversation_history=history,
         schema_doc=schema_doc,
         dashboard_widgets=dashboard_widgets,
+        dashboard_pages=dashboard_pages,
+        active_page_id=req.active_page_id,
+        priority_tables=priority_tables,
         enriched_schema=enriched,
     )
 
@@ -237,21 +247,45 @@ async def _get_schema_context(
     return schema_doc, connection_id_str, db_type
 
 
-async def _get_dashboard_widgets(dashboard_id: str, db: AsyncSession) -> list[dict]:
+async def _get_dashboard_widgets_and_pages(
+    dashboard_id: str, db: AsyncSession
+) -> tuple[list[dict], list[dict]]:
+    """Return (widgets_with_page_id, pages_array) for the full canvas."""
+    dash_result = await db.execute(
+        select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
+    )
+    dash = dash_result.scalar_one_or_none()
+    pages: list[dict] = (dash.layout_config or {}).get("pages", []) if dash else []
+
     result = await db.execute(
         select(Widget).where(Widget.dashboard_id == uuid.UUID(dashboard_id))
     )
     widgets = result.scalars().all()
-    return [
+    widget_list = [
         {
             "id": str(w.id),
             "title": w.title,
             "chart_type": w.chart_type,
             "sql_query": w.sql_query,
             "chart_data": w.chart_data,
+            "page_id": (w.config or {}).get("page_id"),
         }
         for w in widgets
     ]
+    return widget_list, pages
+
+
+def _extract_priority_tables(widgets: list[dict]) -> set[str]:
+    """Extract table names referenced in existing widget SQL queries."""
+    tables: set[str] = set()
+    for w in widgets:
+        sql = w.get("sql_query") or ""
+        if not sql:
+            continue
+        from_tables = re.findall(r"\bFROM\s+([\w.]+)", sql, re.IGNORECASE)
+        join_tables = re.findall(r"\bJOIN\s+([\w.]+)", sql, re.IGNORECASE)
+        tables.update(t.lower() for t in from_tables + join_tables)
+    return tables
 
 
 async def _get_primary_connection(project_id: str, db: AsyncSession):

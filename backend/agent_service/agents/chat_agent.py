@@ -13,22 +13,27 @@ CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 _memory_history: dict[str, list[dict]] = {}
 
 _SYSTEM_PROMPT_TEMPLATE = """You are a conversational data analyst embedded in a BI platform called Visually.
-You have access to a live database and the user's current dashboard.
+You have full access to the user's live database and their complete multi-page canvas report.
 
 {schema_section}
 
-CURRENT DASHBOARD WIDGETS:
+CANVAS REPORT STRUCTURE:
 {dashboard_context}
 
 CAPABILITIES:
-1. Answer questions about data visible in the current dashboard charts.
-2. Answer questions about any data in the connected database (you can write SQL).
+1. Answer questions about any chart or data across all canvas pages.
+2. Query any table in the connected database — write and execute SQL on demand.
 3. Generate new chart visualizations inline in this conversation.
 4. Explain trends, anomalies, and patterns in plain English.
-5. Modify the dashboard: filter charts, suggest follow-up queries.
+5. Add charts to the current active page or suggest placements across pages.
+
+CHART CREATION GUIDELINES:
+- Prefer tables already in use on the canvas (listed as PRIORITY TABLES) — they are pre-verified and relevant.
+- You may query any other table in the schema when the user's request requires it.
+- When creating a chart for a specific page, mention the page name in your response.
 
 WHEN TO GENERATE SQL:
-If the user asks a question that requires data not already in the dashboard context, generate SQL.
+If the user asks a question that requires data not already in the canvas context, generate SQL.
 Return SQL inside a special JSON block so the system can execute it.
 
 RESPONSE FORMAT:
@@ -47,10 +52,6 @@ TONE: Be concise, helpful, and data-focused. Reference actual values from the da
 
 
 def _tfidf_score(message: str, table: dict) -> float:
-    """
-    Simple word-overlap score between the user message and a compact_table entry.
-    Mirrors the logic in schema_matcher._tfidf_prefilter — no extra import needed.
-    """
     query_words: set[str] = set()
     for w in re.sub(r"[^a-z0-9_]", " ", message.lower()).split():
         if len(w) > 2:
@@ -78,17 +79,21 @@ def _tfidf_score(message: str, table: dict) -> float:
 
 class ChatAgent:
     def _build_schema_section_enriched(
-        self, message: str, enriched: "EnrichedSchema"
+        self,
+        message: str,
+        enriched: "EnrichedSchema",
+        priority_tables: Optional[set[str]] = None,
     ) -> str:
-        """Build a rich schema section from the EnrichedSchema (cache hit path)."""
+        """Build a rich schema section. Priority tables get a +5 boost in TF-IDF ranking."""
         compact = enriched.compact_tables or []
         total_tables = len(compact)
+        priority_tables = priority_tables or set()
 
-        # Rank tables by TF-IDF relevance to the current message, keep top 18.
         if total_tables > 18:
             scored = sorted(
                 compact,
-                key=lambda t: _tfidf_score(message, t),
+                key=lambda t: _tfidf_score(message, t)
+                + (5.0 if t.get("name", "").lower() in priority_tables else 0.0),
                 reverse=True,
             )
             top_tables = scored[:18]
@@ -99,17 +104,22 @@ class ChatAgent:
             f"DATABASE SCHEMA ({total_tables} tables total"
             f" — showing {len(top_tables)} most relevant to your question):"
         ]
+        if priority_tables:
+            lines.append(
+                f"PRIORITY TABLES (already used in this canvas — prefer these): "
+                f"{', '.join(sorted(priority_tables))}"
+            )
 
         for t in top_tables:
             tname = t.get("name", "")
             desc = t.get("description") or ""
             row_count = t.get("row_count")
             row_hint = f"  ~{row_count:,} rows" if row_count else ""
-            lines.append(f"\n[{tname}]{row_hint}")
+            in_use = " ★" if tname.lower() in priority_tables else ""
+            lines.append(f"\n[{tname}]{in_use}{row_hint}")
             if desc:
                 lines.append(f"  {desc}")
 
-            # Semantics from DB metadata (use_for / never_use_for / grain)
             sem = enriched.table_semantics.get(tname, {})
             grain = sem.get("grain") or ""
             use_for = sem.get("use_for") or []
@@ -121,7 +131,6 @@ class ChatAgent:
             if never_use:
                 lines.append(f"  Never use for: {', '.join(never_use)}")
 
-            # Columns — include all, flag filter-eligible ones with sample values
             cols = t.get("columns") or []
             col_parts = []
             sample_parts = []
@@ -133,7 +142,6 @@ class ChatAgent:
                 tag = f"[{sem_type}]" if sem_type else ""
                 col_parts.append(f"{cname}{tag} ({ctype}){': ' + cdesc if cdesc else ''}")
 
-                # Show example values for filter-eligible columns
                 stats = c.get("stats") or {}
                 top_vals = stats.get("top_values") or []
                 if top_vals:
@@ -153,7 +161,6 @@ class ChatAgent:
             if sample_parts:
                 lines.append(f"  Sample values: {' | '.join(sample_parts)}")
 
-        # JOIN hints from relationship_graph for the visible tables
         top_names = {t.get("name") for t in top_tables}
         join_hints = []
         seen_edges: set[frozenset] = set()
@@ -169,7 +176,6 @@ class ChatAgent:
             lines.append("\nJOIN CONDITIONS:")
             lines.extend(join_hints[:20])
 
-        # Disambiguation (ambiguous column names)
         disambig = enriched.get_disambiguation_text()
         if disambig and disambig != "COLUMN DISAMBIGUATION (same column name, different meanings per table):":
             lines.append(f"\n{disambig}")
@@ -177,7 +183,6 @@ class ChatAgent:
         return "\n".join(lines)
 
     def _build_schema_section_raw(self, schema_doc: dict) -> str:
-        """Fallback: build a minimal schema section from the raw schema_doc dict."""
         schema_parts = []
         for table in schema_doc.get("tables", [])[:12]:
             col_names = [c["name"] for c in table.get("columns", [])[:20]]
@@ -189,31 +194,100 @@ class ChatAgent:
             "\n".join(schema_parts) if schema_parts else "Schema not available."
         )
 
+    def _build_dashboard_context(
+        self,
+        dashboard_widgets: list[dict],
+        dashboard_pages: list[dict],
+        active_page_id: Optional[str],
+        priority_tables: Optional[set[str]] = None,
+    ) -> str:
+        if not dashboard_widgets:
+            return "Canvas is empty — no charts yet."
+
+        priority_tables = priority_tables or set()
+
+        # Build page name map
+        pages_map: dict[str, str] = {p["id"]: p["name"] for p in dashboard_pages if "id" in p}
+
+        # Group widgets by page_id
+        by_page: dict[str, list[dict]] = {}
+        unassigned: list[dict] = []
+        for w in dashboard_widgets:
+            pid = w.get("page_id")
+            if pid:
+                by_page.setdefault(pid, []).append(w)
+            else:
+                unassigned.append(w)
+
+        parts: list[str] = []
+
+        # Page summary header
+        if dashboard_pages:
+            page_summary = []
+            for p in sorted(dashboard_pages, key=lambda x: x.get("order", 0)):
+                count = len(by_page.get(p["id"], []))
+                marker = " [ACTIVE]" if p["id"] == active_page_id else ""
+                page_summary.append(f"{p['name']} ({count} chart{'s' if count != 1 else ''}){marker}")
+            total = len(dashboard_widgets)
+            parts.append(
+                f"CANVAS PAGES ({len(dashboard_pages)} pages, {total} total charts): "
+                + " | ".join(page_summary)
+            )
+
+        # Per-page widget detail
+        ordered_pages = sorted(dashboard_pages, key=lambda x: x.get("order", 0))
+        for p in ordered_pages:
+            pid = p["id"]
+            page_widgets = by_page.get(pid, [])
+            if not page_widgets:
+                parts.append(f"\nPage '{p['name']}' — empty")
+                continue
+            active_marker = " (ACTIVE — new charts go here)" if pid == active_page_id else ""
+            parts.append(f"\nPage '{p['name']}'{active_marker}:")
+            for w in page_widgets:
+                sql_preview = (w.get("sql_query") or "")[:180]
+                rows = (w.get("chart_data") or {}).get("rows", [])
+                sample = f" | Sample data: {rows[:1]}" if rows else ""
+                parts.append(
+                    f"  • {w['title']} [{w['chart_type']}]"
+                    + (f" | SQL: {sql_preview}" if sql_preview else "")
+                    + sample
+                )
+
+        # Widgets not yet assigned to a page (legacy / just added)
+        if unassigned:
+            parts.append(f"\nUnassigned widgets ({len(unassigned)}):")
+            for w in unassigned:
+                parts.append(f"  • {w['title']} [{w['chart_type']}]")
+
+        # Priority tables extracted from existing SQL
+        if priority_tables:
+            parts.append(
+                f"\nPRIORITY TABLES (used by existing charts — prefer these when building new ones): "
+                f"{', '.join(sorted(priority_tables))}"
+            )
+
+        return "\n".join(parts)
+
     def _build_system_prompt(
         self,
         message: str,
         schema_doc: dict,
         dashboard_widgets: list,
+        dashboard_pages: list,
+        active_page_id: Optional[str],
+        priority_tables: Optional[set[str]],
         enriched: Optional["EnrichedSchema"] = None,
     ) -> str:
         if enriched and enriched.compact_tables:
-            schema_section = self._build_schema_section_enriched(message, enriched)
+            schema_section = self._build_schema_section_enriched(
+                message, enriched, priority_tables
+            )
         else:
             schema_section = self._build_schema_section_raw(schema_doc)
 
-        dashboard_parts = []
-        for w in dashboard_widgets:
-            data_preview = ""
-            if w.get("chart_data") and isinstance(w["chart_data"], dict):
-                rows = w["chart_data"].get("rows", [])
-                if rows:
-                    data_preview = f" | Sample: {rows[:2]}"
-            dashboard_parts.append(
-                f"Widget: {w.get('title', 'Untitled')} | Type: {w.get('chart_type', 'unknown')}"
-                f" | SQL: {(w.get('sql_query') or '')[:200]}{data_preview}"
-            )
-        dashboard_context = (
-            "\n".join(dashboard_parts) if dashboard_parts else "No widgets on dashboard yet."
+        dashboard_context = self._build_dashboard_context(
+            dashboard_widgets, dashboard_pages, active_page_id, priority_tables
         )
 
         return _SYSTEM_PROMPT_TEMPLATE.format(
@@ -227,10 +301,19 @@ class ChatAgent:
         conversation_history: list[dict],
         schema_doc: dict,
         dashboard_widgets: list,
+        dashboard_pages: Optional[list] = None,
+        active_page_id: Optional[str] = None,
+        priority_tables: Optional[set[str]] = None,
         enriched_schema: Optional["EnrichedSchema"] = None,
     ) -> dict:
         system_prompt = self._build_system_prompt(
-            message, schema_doc, dashboard_widgets, enriched_schema
+            message=message,
+            schema_doc=schema_doc,
+            dashboard_widgets=dashboard_widgets,
+            dashboard_pages=dashboard_pages or [],
+            active_page_id=active_page_id,
+            priority_tables=priority_tables,
+            enriched=enriched_schema,
         )
         messages = conversation_history[-20:] + [{"role": "user", "content": message}]
 

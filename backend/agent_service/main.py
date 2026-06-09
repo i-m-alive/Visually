@@ -633,6 +633,7 @@ class DashboardPatch(_BM):
     theme: str | None = None
     name: str | None = None
     description: str | None = None
+    layout_config: dict | None = None
 
 
 @app.get("/dashboards")
@@ -692,6 +693,8 @@ async def get_dashboard(
         "report_title": layout_cfg.get("report_title"),
         "page_tabs": layout_cfg.get("page_tabs", []),
         "colour_theme": layout_cfg.get("colour_theme"),
+        "pages": layout_cfg.get("pages", []),
+        "layout_config": layout_cfg,
         "widgets": [
             {
                 "id": str(w.id),
@@ -733,6 +736,10 @@ async def update_dashboard(
         dashboard.name = patch.name
     if patch.description is not None:
         dashboard.description = patch.description
+    if patch.layout_config is not None:
+        existing = dict(dashboard.layout_config or {})
+        existing.update(patch.layout_config)
+        dashboard.layout_config = existing
     dashboard.updated_at = datetime.utcnow()
     await db.commit()
     return {"id": str(dashboard.id), "name": dashboard.name, "theme": dashboard.theme}

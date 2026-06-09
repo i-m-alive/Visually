@@ -62,6 +62,7 @@ export const chatApi = {
     project_id: string
     dashboard_id?: string
     connection_id?: string
+    active_page_id?: string
   }) => api.post('/agent/chat', data),
   clear: (sessionId: string) =>
     api.delete(`/agent/chat/${sessionId}`),
@@ -184,6 +185,8 @@ export const canvasApi = {
     api.patch(`/dashboards/${canvasId}`, { theme }),
   updateLayout: (canvasId: string, items: LayoutItem[]) =>
     api.patch(`/dashboards/${canvasId}/layout`, { items }),
+  updateLayoutConfig: (canvasId: string, layoutConfig: Record<string, unknown>) =>
+    api.patch(`/dashboards/${canvasId}`, { layout_config: layoutConfig }),
   addWidget: (canvasId: string, widget: WidgetCreate) =>
     api.post(`/dashboards/${canvasId}/widgets`, widget),
   requery: (
