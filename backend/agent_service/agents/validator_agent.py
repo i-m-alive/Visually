@@ -24,7 +24,9 @@ _CHART_TYPE_CANONICAL: dict[str, str] = {
     "column": "bar_vertical", "column_chart": "bar_vertical",
     "stacked_bar": "bar_vertical", "stacked_bar_100": "bar_vertical",
     "stacked_column": "bar_vertical", "grouped_bar": "bar_vertical",
-    "waterfall": "bar_vertical", "histogram": "bar_vertical",
+    "histogram": "bar_vertical",
+    # waterfall — own canonical family (same data shape as bar but distinct render)
+    "waterfall": "waterfall",
     # bar_horizontal family
     "bar_horizontal": "bar_horizontal", "horizontal_bar": "bar_horizontal",
     "stacked_bar_horizontal": "bar_horizontal",
@@ -44,6 +46,8 @@ _CHART_TYPE_CANONICAL: dict[str, str] = {
     # other
     "treemap": "treemap", "funnel": "funnel",
     "heatmap": "heatmap", "calendar_heatmap": "heatmap",
+    # slicer — filter control widget, not a chart
+    "slicer": "slicer", "filter": "slicer", "dropdown": "slicer",
 }
 
 # Synonym map for axis label comparison — collapses semantically equivalent words

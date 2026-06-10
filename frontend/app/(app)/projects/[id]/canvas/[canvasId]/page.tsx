@@ -957,7 +957,7 @@ export default function CanvasEditorPage() {
         {showChat && (
           <div style={{
             position: 'absolute', right: 0, top: 0, bottom: 0, zIndex: 40,
-            width: 320, display: 'flex', flexDirection: 'column',
+            display: 'flex', flexDirection: 'column',
             boxShadow: '-4px 0 24px rgba(0,0,0,0.10)',
           }}>
             <CanvasChatPanel

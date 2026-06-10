@@ -788,9 +788,9 @@ function ListRow({ dash, idx, aiSummaries, onOpen, onExport, onShare, onDelete, 
   )
 }
 
-// ─── Flip Card ────────────────────────────────────────────────────────────────
+// ─── Dashboard Card ───────────────────────────────────────────────────────────
 function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, onOpen, onExport, onShare, onTogglePin, onDelete, onDuplicate, onCancelDel, onStartRename, onRename, onRenameChange, onRefreshAi, onEditFolder, onSaveFolder, onFolderDraftChange, onOpenShareModal }: any) {
-  const [flipped,  setFlipped]  = useState(false)
+  const [hovered, setHovered] = useState(false)
   const renameRef = useRef<HTMLInputElement>(null)
   const g         = getGrad(dash.theme)
   const stale     = isStale(dash.updated_at)
@@ -807,194 +807,139 @@ function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId,
   return (
     <div
       style={{
-        perspective: '1200px',
         height: 260,
         animation: `slideUp .42s ${idx * 50}ms cubic-bezier(.21,1.02,.73,1) both`,
+        borderRadius: 16,
+        overflow: 'hidden',
+        background: 'white',
+        border: `1px solid ${hovered ? '#c7d2fe' : '#f1f5f9'}`,
+        boxShadow: hovered
+          ? '0 8px 28px rgba(99,102,241,0.13), 0 2px 8px rgba(0,0,0,0.06)'
+          : '0 1px 4px rgba(0,0,0,0.06)',
+        transform: hovered ? 'translateY(-3px)' : 'translateY(0)',
+        transition: 'box-shadow .22s ease, border-color .22s ease, transform .22s ease',
+        display: 'flex',
+        flexDirection: 'column',
       }}
-      onMouseEnter={() => setFlipped(true)}
-      onMouseLeave={() => setFlipped(false)}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
     >
-      <div style={{
-        position: 'relative', width: '100%', height: '100%',
-        transformStyle: 'preserve-3d',
-        transform: flipped ? 'rotateY(180deg)' : 'rotateY(0deg)',
-        transition: 'transform .55s cubic-bezier(.4,0,.2,1)',
-      }}>
+      {/* Gradient header — click to open report */}
+      <div
+        className="relative px-4 pt-3.5 pb-3 flex-shrink-0 cursor-pointer"
+        style={{ background: `linear-gradient(135deg, ${g.from}, ${g.to})`, minHeight: 88 }}
+        onClick={() => onOpen(dash.id)}
+      >
+        {isRenaming ? (
+          <input
+            ref={renameRef}
+            value={renameDraft}
+            onChange={e => onRenameChange(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') onRename(dash.id)
+              if (e.key === 'Escape') onStartRename(null, '')
+            }}
+            onBlur={() => onRename(dash.id)}
+            onClick={e => e.stopPropagation()}
+            className="w-full bg-white/20 text-white font-bold text-sm rounded-lg px-2 py-0.5 outline-none border border-white/50 pr-16"
+          />
+        ) : (
+          <h3
+            onDoubleClick={e => { e.stopPropagation(); onStartRename(dash.id, dash.name) }}
+            onClick={e => e.stopPropagation()}
+            className="text-[15px] font-bold text-white leading-snug pr-16 cursor-text select-none"
+            style={{ textShadow: '0 1px 4px rgba(0,0,0,0.28)' }}
+            title="Double-click to rename"
+          >
+            {dash.name}
+          </h3>
+        )}
 
-        {/* ── FRONT ── */}
-        <div style={{
-          position: 'absolute', inset: 0,
-          backfaceVisibility: 'hidden',
-          WebkitBackfaceVisibility: 'hidden',
-          borderRadius: 16,
-          overflow: 'hidden',
-          background: 'white',
-          border: '1px solid #f1f5f9',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
-          display: 'flex', flexDirection: 'column',
-        }}>
-          {/* Gradient header */}
-          <div className="relative px-4 pt-3.5 pb-3 flex-shrink-0" style={{ background: `linear-gradient(135deg, ${g.from}, ${g.to})`, minHeight: 88 }}>
-            {isRenaming ? (
-              <input
-                ref={renameRef}
-                value={renameDraft}
-                onChange={e => onRenameChange(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') onRename(dash.id)
-                  if (e.key === 'Escape') onStartRename(null, '')
-                }}
-                onBlur={() => onRename(dash.id)}
-                onClick={e => e.stopPropagation()}
-                className="w-full bg-white/20 text-white font-bold text-sm rounded-lg px-2 py-0.5 outline-none border border-white/50 pr-16"
-              />
-            ) : (
-              <h3
-                onDoubleClick={e => { e.stopPropagation(); onStartRename(dash.id, dash.name) }}
-                className="text-[15px] font-bold text-white leading-snug pr-16 cursor-text select-none"
-                style={{ textShadow: '0 1px 4px rgba(0,0,0,0.28)' }}
-                title="Double-click to rename"
-              >
-                {dash.name}
-              </h3>
-            )}
+        <div className="flex items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()}>
+          <span className="text-[10px] text-white/65 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
+          <span className="text-[10px] text-white/65 flex items-center gap-0.5"><Clock size={9} /> {relativeDate(dash.updated_at)}</span>
+          {stale && <span className="text-[10px] font-medium text-amber-300 bg-amber-400/20 px-1.5 py-0.5 rounded-full flex items-center gap-0.5"><AlertTriangle size={8} /> Stale</span>}
+          {dash.has_schedule && <span className="text-[10px] text-white/70 bg-white/15 px-1.5 py-0.5 rounded-full">⏰ Auto</span>}
+          {folder && <span className="text-[10px] text-white/80 bg-white/15 px-1.5 py-0.5 rounded-full flex items-center gap-0.5"><Folder size={8} /> {folder}</span>}
+        </div>
 
-            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-              <span className="text-[10px] text-white/65 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
-              <span className="text-[10px] text-white/65 flex items-center gap-0.5"><Clock size={9} /> {relativeDate(dash.updated_at)}</span>
-              {stale && <span className="text-[10px] font-medium text-amber-300 bg-amber-400/20 px-1.5 py-0.5 rounded-full flex items-center gap-0.5"><AlertTriangle size={8} /> Stale</span>}
-              {dash.has_schedule && <span className="text-[10px] text-white/70 bg-white/15 px-1.5 py-0.5 rounded-full">⏰ Auto</span>}
-              {folder && <span className="text-[10px] text-white/80 bg-white/15 px-1.5 py-0.5 rounded-full flex items-center gap-0.5"><Folder size={8} /> {folder}</span>}
-            </div>
-
-            {/* Top-right action cluster */}
-            <div className="absolute top-2.5 right-2.5 flex items-center gap-1" onClick={e => e.stopPropagation()}>
-              {renaming && isRenaming && <Loader2 size={10} className="animate-spin text-white/70" />}
-              <button
-                onClick={() => onTogglePin(dash.id)}
-                className="p-1.5 rounded-lg transition-all"
-                style={{ background: 'rgba(0,0,0,0.22)', color: pinned.includes(dash.id) ? '#fcd34d' : 'rgba(255,255,255,0.55)' }}
-                title={pinned.includes(dash.id) ? 'Unpin' : 'Pin'}
-              >
-                {pinned.includes(dash.id) ? <Pin size={10} fill="currentColor" /> : <PinOff size={10} />}
+        {/* Top-right action cluster */}
+        <div className="absolute top-2.5 right-2.5 flex items-center gap-1" onClick={e => e.stopPropagation()}>
+          {renaming && isRenaming && <Loader2 size={10} className="animate-spin text-white/70" />}
+          <button
+            onClick={() => onTogglePin(dash.id)}
+            className="p-1.5 rounded-lg transition-all"
+            style={{ background: 'rgba(0,0,0,0.22)', color: pinned.includes(dash.id) ? '#fcd34d' : 'rgba(255,255,255,0.55)' }}
+            title={pinned.includes(dash.id) ? 'Unpin' : 'Pin'}
+          >
+            {pinned.includes(dash.id) ? <Pin size={10} fill="currentColor" /> : <PinOff size={10} />}
+          </button>
+          {isConfirm ? (
+            <div className="flex items-center gap-1" style={{ animation: 'popSpring .2s ease both' }}>
+              <button onClick={() => onDelete(dash.id)} disabled={isDeleting} className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-red-500 text-white hover:bg-red-600 flex items-center gap-0.5">
+                {isDeleting ? <Loader2 size={9} className="animate-spin" /> : 'Confirm?'}
               </button>
-              {isConfirm ? (
-                <div className="flex items-center gap-1" style={{ animation: 'popSpring .2s ease both' }}>
-                  <button onClick={() => onDelete(dash.id)} disabled={isDeleting} className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-red-500 text-white hover:bg-red-600 flex items-center gap-0.5">
-                    {isDeleting ? <Loader2 size={9} className="animate-spin" /> : 'Confirm?'}
-                  </button>
-                  <button onClick={() => onCancelDel()} className="px-1.5 py-0.5 rounded-lg text-[10px] font-medium bg-white/20 text-white hover:bg-white/30">No</button>
-                </div>
-              ) : (
-                <button onClick={() => onDelete(dash.id)} className="p-1.5 rounded-lg" style={{ background: 'rgba(0,0,0,0.22)', color: 'rgba(255,255,255,0.5)' }} title="Delete">
-                  <Trash2 size={10} />
-                </button>
+              <button onClick={() => onCancelDel()} className="px-1.5 py-0.5 rounded-lg text-[10px] font-medium bg-white/20 text-white hover:bg-white/30">No</button>
+            </div>
+          ) : (
+            <button onClick={() => onDelete(dash.id)} className="p-1.5 rounded-lg" style={{ background: 'rgba(0,0,0,0.22)', color: 'rgba(255,255,255,0.5)' }} title="Delete">
+              <Trash2 size={10} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Body — click to open report */}
+      <div
+        className="flex-1 px-4 pt-3 pb-3 flex flex-col gap-2"
+        style={{ cursor: 'pointer' }}
+        onClick={() => onOpen(dash.id)}
+      >
+        {/* AI snippet */}
+        <div className="flex-1">
+          {loading ? (
+            <div className="space-y-2 pt-1">
+              <div className="shimmer-line h-2.5 w-full" /><div className="shimmer-line h-2.5 w-3/4" />
+            </div>
+          ) : summary ? (
+            <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-3">{summary}</p>
+          ) : (
+            <p className="text-[11px] text-gray-400 italic">{dash.description || 'Click to open report'}</p>
+          )}
+        </div>
+
+        {/* Folder + actions */}
+        {showFolderEdit === dash.id ? (
+          <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+            <input
+              autoFocus value={folderDraft} onChange={e => onFolderDraftChange(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') onSaveFolder(dash.id, folderDraft); if (e.key === 'Escape') onEditFolder(null, '') }}
+              placeholder="Folder name…"
+              className="flex-1 text-xs px-2 py-1 border border-indigo-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-400"
+            />
+            <button onClick={() => onSaveFolder(dash.id, folderDraft)} className="text-[10px] px-2 py-1 bg-indigo-600 text-white rounded-lg">Save</button>
+            <button onClick={() => onSaveFolder(dash.id, '')} className="text-[10px] px-1.5 py-1 text-gray-500 border border-gray-200 rounded-lg">Clear</button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between" onClick={e => e.stopPropagation()}>
+            <button onClick={() => onEditFolder(dash.id, folder)} className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-indigo-600 transition-colors">
+              <Tag size={9} /> {folder || 'Add to folder'}
+            </button>
+            <div className="flex items-center gap-1">
+              <SmallBtn onClick={() => onOpenShareModal(dash.id)} title="Share with analyst"><Users size={12} /></SmallBtn>
+              <SmallBtn onClick={() => onShare(dash.id)} title="Copy share link"><Share2 size={12} /></SmallBtn>
+              <SmallBtn onClick={() => onExport(dash.id)} title="Export"><Download size={12} /></SmallBtn>
+              <SmallBtn onClick={() => onDuplicate(dash.id)} title="Duplicate" disabled={isDupl}>
+                {isDupl ? <Loader2 size={12} className="animate-spin" /> : <Copy size={12} />}
+              </SmallBtn>
+              {!summary && (
+                <SmallBtn onClick={() => onRefreshAi(dash.id)} title="Generate AI summary">
+                  <Sparkles size={12} />
+                </SmallBtn>
               )}
             </div>
           </div>
-
-          {/* Body */}
-          <div className="flex-1 px-4 pt-3 pb-3 flex flex-col gap-2">
-            {/* AI snippet */}
-            <div className="flex-1">
-              {loading ? (
-                <div className="space-y-2 pt-1">
-                  <div className="shimmer-line h-2.5 w-full" /><div className="shimmer-line h-2.5 w-3/4" />
-                </div>
-              ) : summary ? (
-                <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{summary}</p>
-              ) : (
-                <p className="text-[11px] text-gray-400 italic">{dash.description || 'Hover to see AI description'}</p>
-              )}
-            </div>
-
-            {/* Folder + actions */}
-            {showFolderEdit === dash.id ? (
-              <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
-                <input
-                  autoFocus value={folderDraft} onChange={e => onFolderDraftChange(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') onSaveFolder(dash.id, folderDraft); if (e.key === 'Escape') onEditFolder(null, '') }}
-                  placeholder="Folder name…"
-                  className="flex-1 text-xs px-2 py-1 border border-indigo-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-400"
-                />
-                <button onClick={() => onSaveFolder(dash.id, folderDraft)} className="text-[10px] px-2 py-1 bg-indigo-600 text-white rounded-lg">Save</button>
-                <button onClick={() => onSaveFolder(dash.id, '')} className="text-[10px] px-1.5 py-1 text-gray-500 border border-gray-200 rounded-lg">Clear</button>
-              </div>
-            ) : (
-              <div className="flex items-center justify-between" onClick={e => e.stopPropagation()}>
-                <button onClick={() => onEditFolder(dash.id, folder)} className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-indigo-600 transition-colors">
-                  <Tag size={9} /> {folder || 'Add to folder'}
-                </button>
-                <div className="flex items-center gap-1">
-                  <SmallBtn onClick={() => onOpenShareModal(dash.id)} title="Share with analyst"><Users size={12} /></SmallBtn>
-                  <SmallBtn onClick={() => onShare(dash.id)} title="Copy share link"><Share2 size={12} /></SmallBtn>
-                  <SmallBtn onClick={() => onExport(dash.id)} title="Export"><Download size={12} /></SmallBtn>
-                  <SmallBtn onClick={() => onDuplicate(dash.id)} title="Duplicate" disabled={isDupl}>
-                    {isDupl ? <Loader2 size={12} className="animate-spin" /> : <Copy size={12} />}
-                  </SmallBtn>
-                  {!summary && (
-                    <SmallBtn onClick={() => onRefreshAi(dash.id)} title="Generate AI summary">
-                      <Sparkles size={12} />
-                    </SmallBtn>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* ── BACK ── click anywhere to open */}
-        <div
-          onClick={() => onOpen(dash.id)}
-          style={{
-            position: 'absolute', inset: 0,
-            backfaceVisibility: 'hidden',
-            WebkitBackfaceVisibility: 'hidden',
-            transform: 'rotateY(180deg)',
-            borderRadius: 16,
-            overflow: 'hidden',
-            background: `linear-gradient(160deg, ${g.from} 0%, ${g.to} 100%)`,
-            cursor: 'pointer',
-            display: 'flex', flexDirection: 'column',
-          }}
-        >
-          {/* Top strip with name */}
-          <div className="px-4 pt-4 pb-2 flex-shrink-0 border-b border-white/10">
-            <p className="text-[11px] font-semibold text-white/60 uppercase tracking-widest">AI Summary</p>
-            <h3 className="text-[15px] font-bold text-white leading-tight mt-0.5" style={{ textShadow: '0 1px 4px rgba(0,0,0,0.3)' }}>{dash.name}</h3>
-          </div>
-
-          {/* Full AI description */}
-          <div className="flex-1 px-4 py-3 overflow-hidden">
-            {loading ? (
-              <div className="space-y-2.5 pt-1">
-                {[1, 0.8, 0.9, 0.7].map((w, i) => (
-                  <div key={i} className="h-2.5 rounded-full" style={{ width: `${w * 100}%`, background: 'rgba(255,255,255,0.2)', animation: `shimmer 1.5s ${i * 200}ms ease-in-out infinite`, backgroundSize: '200px 100%' }} />
-                ))}
-              </div>
-            ) : summary ? (
-              <p className="text-[12px] text-white/90 leading-relaxed">{summary}</p>
-            ) : (
-              <div className="flex flex-col items-center justify-center h-full gap-2 opacity-70">
-                <Sparkles size={20} className="text-white/60" />
-                <p className="text-[11px] text-white/60 text-center">No AI summary yet.<br/>Generating soon…</p>
-              </div>
-            )}
-          </div>
-
-          {/* Meta + click hint */}
-          <div className="px-4 pb-4 flex-shrink-0 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <span className="text-[10px] text-white/60 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
-              <span className="text-[10px] text-white/60 flex items-center gap-0.5"><Clock size={9} /> {relativeDate(dash.updated_at)}</span>
-              {stale && <span className="text-[10px] text-amber-300 bg-amber-400/20 px-1.5 py-0.5 rounded-full flex items-center gap-0.5"><AlertTriangle size={8} /> Stale</span>}
-            </div>
-            <div className="flip-hint flex items-center gap-1 text-[11px] font-semibold text-white/80">
-              Open <ArrowRight size={11} />
-            </div>
-          </div>
-        </div>
-
+        )}
       </div>
     </div>
   )

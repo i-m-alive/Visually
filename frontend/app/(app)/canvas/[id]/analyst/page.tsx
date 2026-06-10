@@ -1,16 +1,16 @@
 'use client'
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useParams } from 'next/navigation'
+import { useParams, useRouter } from 'next/navigation'
 import { Responsive, WidthProvider } from 'react-grid-layout/legacy'
 import type { LayoutItem } from 'react-grid-layout/legacy'
 import 'react-grid-layout/css/styles.css'
 import 'react-resizable/css/styles.css'
 import {
-  RefreshCw, Loader2, AlertCircle, Sparkles, ChevronLeft, ChevronRight,
+  RefreshCw, Loader2, AlertCircle, Sparkles, ArrowLeft,
   Download, Bookmark, Calendar, Terminal, MessageSquare, Database,
-  FileDown, MoreHorizontal, CheckCircle2,
+  FileDown,
 } from 'lucide-react'
-import { publicCanvasApi, analystApi } from '@/lib/api'
+import { api, publicCanvasApi, analystApi } from '@/lib/api'
 import type { FilterItem, AnnotationData } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
@@ -25,8 +25,6 @@ import { ScheduleModal } from '@/components/analyst/ScheduleModal'
 import { AnnotationLayer } from '@/components/analyst/AnnotationLayer'
 
 const ResponsiveGrid = WidthProvider(Responsive)
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface WidgetData {
   id: string
@@ -59,8 +57,6 @@ interface DrilldownState {
   xValue: string
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function widgetToResult(w: WidgetData, override?: { rows: unknown[]; columns: string[] }): ChartResult {
   const cd = override ?? (w.chart_data || { rows: [], columns: [] })
   const rows = (cd.rows as Record<string, unknown>[]) || []
@@ -80,10 +76,13 @@ function widgetToResult(w: WidgetData, override?: { rows: unknown[]; columns: st
   }
 }
 
-// ── Main Component ────────────────────────────────────────────────────────────
+export default function AuthedAnalystPage() {
+  const { id } = useParams<{ id: string }>()
+  const router = useRouter()
 
-export default function AnalystCanvasPage() {
-  const { token } = useParams<{ token: string }>()
+  // Token state (obtained by exchanging dashboard access for a live analyst token)
+  const [analystToken, setAnalystToken] = useState<string | null>(null)
+  const [tokenError, setTokenError] = useState<string | null>(null)
 
   // Canvas state
   const [canvas, setCanvas] = useState<CanvasData | null>(null)
@@ -118,37 +117,44 @@ export default function AnalystCanvasPage() {
   const [exportMenu, setExportMenu] = useState(false)
   const exportMenuRef = useRef<HTMLDivElement>(null)
 
-  // ── Load canvas ─────────────────────────────────────────────────────────────
+  // ── Bootstrap: get analyst token then load canvas ────────────────────────────
 
-  const load = useCallback(async () => {
-    try {
-      const resp = await publicCanvasApi.get(token)
-      const data: CanvasData = resp.data
-      setCanvas(data)
-      if (data.pages.length > 0 && !activePageId) {
-        setActivePageId(data.pages[0].id)
-      }
-    } catch {
-      setError('This share link is invalid, expired, or has been revoked.')
-    } finally {
-      setLoading(false)
-    }
-  }, [token, activePageId])
-
-  useEffect(() => { load() }, [load])
-
-  // Load annotations on mount
   useEffect(() => {
-    if (!token) return
-    analystApi.listAnnotations(token).then(r => setAnnotations(r.data.annotations)).catch(() => {})
-  }, [token])
+    if (!id) return
+    setLoading(true)
+    setTokenError(null)
+
+    api.post(`/dashboards/${id}/analyst-token`)
+      .then(r => {
+        const token: string = r.data.token
+        setAnalystToken(token)
+        return publicCanvasApi.get(token)
+      })
+      .then(r => {
+        const data: CanvasData = r.data
+        setCanvas(data)
+        if (data.pages.length > 0) setActivePageId(data.pages[0].id)
+      })
+      .catch(err => {
+        const msg = err?.response?.status === 403
+          ? 'You do not have access to this report.'
+          : 'Failed to load report.'
+        setError(msg)
+      })
+      .finally(() => setLoading(false))
+  }, [id])
+
+  // Load annotations after token is ready
+  useEffect(() => {
+    if (!analystToken) return
+    analystApi.listAnnotations(analystToken).then(r => setAnnotations(r.data.annotations)).catch(() => {})
+  }, [analystToken])
 
   // Close export menu on outside click
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node))
         setExportMenu(false)
-      }
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
@@ -157,10 +163,10 @@ export default function AnalystCanvasPage() {
   // ── Live refresh ─────────────────────────────────────────────────────────────
 
   const handleRefresh = async () => {
-    if (!canvas || canvas.share_mode !== 'live' || refreshing) return
+    if (!canvas || !analystToken || refreshing) return
     setRefreshing(true)
     try {
-      const resp = await publicCanvasApi.refresh(token)
+      const resp = await publicCanvasApi.refresh(analystToken)
       const freshWidgets: { widget_id: string; chart_data: WidgetData['chart_data'] }[] = resp.data.widgets
       setCanvas(prev => {
         if (!prev) return prev
@@ -175,7 +181,7 @@ export default function AnalystCanvasPage() {
   // ── Filter application ────────────────────────────────────────────────────────
 
   const applyFilters = useCallback(async (filters: FilterItem[]) => {
-    if (!canvas || filters.length === 0) {
+    if (!canvas || !analystToken || filters.length === 0) {
       setWidgetLiveData({})
       return
     }
@@ -186,14 +192,14 @@ export default function AnalystCanvasPage() {
         .filter(w => w.chart_type !== 'slicer')
         .map(async w => {
           try {
-            const r = await analystApi.getWidgetData(token, w.id, filters)
+            const r = await analystApi.getWidgetData(analystToken, w.id, filters)
             updates[w.id] = { rows: r.data.rows, columns: r.data.columns }
           } catch { /* keep cached */ }
         })
     )
     setWidgetLiveData(updates)
     setApplyingFilters(false)
-  }, [canvas, token])
+  }, [canvas, analystToken])
 
   const handleFiltersChange = (filters: FilterItem[]) => {
     setActiveFilters(filters)
@@ -220,32 +226,37 @@ export default function AnalystCanvasPage() {
   // ── Annotations ──────────────────────────────────────────────────────────────
 
   const handleAddAnnotation = async (widgetId: string, content: string, authorName: string, x: number, y: number) => {
-    const r = await analystApi.createAnnotation(token, { widget_id: widgetId, content, author_name: authorName, x_percent: x, y_percent: y })
+    if (!analystToken) return
+    const r = await analystApi.createAnnotation(analystToken, { widget_id: widgetId, content, author_name: authorName, x_percent: x, y_percent: y })
     setAnnotations(prev => [r.data, ...prev])
   }
 
-  const handleDeleteAnnotation = async (id: string) => {
-    await analystApi.deleteAnnotation(token, id)
-    setAnnotations(prev => prev.filter(a => a.id !== id))
+  const handleDeleteAnnotation = async (annotId: string) => {
+    if (!analystToken) return
+    await analystApi.deleteAnnotation(analystToken, annotId)
+    setAnnotations(prev => prev.filter(a => a.id !== annotId))
   }
 
-  const handleResolveAnnotation = async (id: string) => {
-    await analystApi.resolveAnnotation(token, id)
-    setAnnotations(prev => prev.filter(a => a.id !== id))
+  const handleResolveAnnotation = async (annotId: string) => {
+    if (!analystToken) return
+    await analystApi.resolveAnnotation(analystToken, annotId)
+    setAnnotations(prev => prev.filter(a => a.id !== annotId))
   }
 
   // ── Export ────────────────────────────────────────────────────────────────────
 
   const handleExportPdf = async () => {
     setExportMenu(false)
+    if (!analystToken) return
     try {
-      await analystApi.exportPdf(token)
+      await analystApi.exportPdf(analystToken)
       alert('PDF export queued. You will receive it via email or download when ready.')
     } catch { /* ignore */ }
   }
 
   const handleExportWidgetCsv = (widgetId: string) => {
-    window.open(analystApi.csvExportUrl(token, widgetId), '_blank')
+    if (!analystToken) return
+    window.open(analystApi.csvExportUrl(analystToken, widgetId), '_blank')
   }
 
   // ── Bookmark load ─────────────────────────────────────────────────────────────
@@ -253,33 +264,36 @@ export default function AnalystCanvasPage() {
   const handleLoadBookmark = (filters: FilterItem[], pageIndex: number) => {
     setActiveFilters(filters)
     applyFilters(filters)
-    if (canvas && canvas.pages[pageIndex]) {
-      setActivePageId(canvas.pages[pageIndex].id)
-    }
+    if (canvas && canvas.pages[pageIndex]) setActivePageId(canvas.pages[pageIndex].id)
   }
 
   // ── Loading / Error states ────────────────────────────────────────────────────
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="h-full flex items-center justify-center bg-gray-50">
         <div className="flex flex-col items-center gap-3">
           <Loader2 size={28} className="animate-spin text-blue-500" />
-          <p className="text-sm text-gray-500">Loading canvas…</p>
+          <p className="text-sm text-gray-500">Loading report…</p>
         </div>
       </div>
     )
   }
 
-  if (error || !canvas) {
+  if (error || !canvas || !analystToken) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="flex flex-col items-center gap-3 max-w-sm text-center px-4">
+      <div className="h-full flex items-center justify-center bg-gray-50">
+        <div className="flex flex-col items-center gap-4 max-w-sm text-center px-4">
           <div className="w-12 h-12 rounded-full bg-red-50 flex items-center justify-center">
             <AlertCircle size={20} className="text-red-400" />
           </div>
-          <p className="text-sm font-medium text-gray-700">Share link unavailable</p>
-          <p className="text-xs text-gray-500">{error}</p>
+          <p className="text-sm font-medium text-gray-700">{error ?? 'Report unavailable'}</p>
+          <button
+            onClick={() => router.push('/end-user/dashboard')}
+            className="flex items-center gap-2 px-4 py-2 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+          >
+            <ArrowLeft size={14} /> My Reports
+          </button>
         </div>
       </div>
     )
@@ -306,11 +320,20 @@ export default function AnalystCanvasPage() {
   const annotationCount = annotations.filter(a => !a.is_resolved).length
 
   return (
-    <div className="min-h-screen flex flex-col" style={{ background: '#F8FAFC' }}>
+    <div className="h-full flex flex-col" style={{ background: '#F8FAFC' }}>
 
       {/* ── Header ───────────────────────────────────────────────────────────── */}
       <header className="flex items-center justify-between px-4 py-3 bg-white border-b border-gray-100 flex-shrink-0 shadow-sm z-20">
         <div className="flex items-center gap-3">
+          {/* Back to reports */}
+          <button
+            onClick={() => router.push('/end-user/dashboard')}
+            className="p-1.5 rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-all"
+            title="Back to My Reports"
+          >
+            <ArrowLeft size={15} />
+          </button>
+
           {/* Schema toggle */}
           <button
             onClick={() => setLeftOpen(v => !v)}
@@ -327,25 +350,23 @@ export default function AnalystCanvasPage() {
           <div>
             <h1 className="text-sm font-semibold text-gray-900 leading-tight">{canvas.name}</h1>
             <p className="text-xs text-gray-400 flex items-center gap-1">
-              <span className={`w-1.5 h-1.5 rounded-full inline-block ${canvas.share_mode === 'live' ? 'bg-green-400' : 'bg-gray-400'}`} />
-              {canvas.share_mode === 'live' ? 'Live data' : 'Snapshot'}
+              <span className="w-1.5 h-1.5 rounded-full inline-block bg-green-400" />
+              Live data
               {lastRefresh.current && ` · ${lastRefresh.current.toLocaleTimeString()}`}
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-1.5">
-          {/* Refresh (live mode) */}
-          {canvas.share_mode === 'live' && (
-            <button
-              onClick={handleRefresh}
-              disabled={refreshing || applyingFilters}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors disabled:opacity-50"
-            >
-              <RefreshCw size={11} className={(refreshing || applyingFilters) ? 'animate-spin' : ''} />
-              {refreshing ? 'Refreshing…' : applyingFilters ? 'Filtering…' : 'Refresh'}
-            </button>
-          )}
+          {/* Refresh */}
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing || applyingFilters}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={11} className={(refreshing || applyingFilters) ? 'animate-spin' : ''} />
+            {refreshing ? 'Refreshing…' : applyingFilters ? 'Filtering…' : 'Refresh'}
+          </button>
 
           {/* SQL Sandbox */}
           <button
@@ -402,7 +423,7 @@ export default function AnalystCanvasPage() {
             )}
           </div>
 
-          {/* Annotations badge */}
+          {/* AI Chat toggle + annotation badge */}
           <button
             onClick={() => setRightOpen(v => !v)}
             className={`relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-gray-200 transition-colors ${rightOpen ? 'bg-purple-100 border-purple-200 text-purple-600' : 'text-gray-600 hover:bg-gray-50'}`}
@@ -452,7 +473,7 @@ export default function AnalystCanvasPage() {
         {leftOpen && (
           <div className="w-72 flex-shrink-0 bg-white border-r border-gray-100 flex flex-col overflow-hidden shadow-sm z-10">
             <SchemaSidebar
-              token={token}
+              token={analystToken}
               onQueryOpen={sql => setQueryModal({ open: true, sql })}
             />
           </div>
@@ -480,7 +501,7 @@ export default function AnalystCanvasPage() {
                   return (
                     <div key={w.id} className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden flex flex-col" style={{ borderLeft: '3px solid #6366F1' }}>
                       <SlicerWidget
-                        token={token}
+                        token={analystToken!}
                         widgetId={w.id}
                         title={w.title}
                         slicerColumn={(w.config?.slicer_column as string) || ''}
@@ -498,7 +519,6 @@ export default function AnalystCanvasPage() {
 
                 return (
                   <div key={w.id} className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden flex flex-col group relative">
-                    {/* Widget header */}
                     <div className="px-3 pt-3 pb-1 flex items-center gap-2 flex-shrink-0">
                       <h3 className="text-xs font-semibold text-gray-700 truncate flex-1">{w.title}</h3>
                       {liveData && (
@@ -512,7 +532,6 @@ export default function AnalystCanvasPage() {
                       )}
                     </div>
 
-                    {/* Chart */}
                     <div className="flex-1 px-2 pb-2 min-h-0">
                       <ChartRenderer
                         result={result}
@@ -521,7 +540,6 @@ export default function AnalystCanvasPage() {
                       />
                     </div>
 
-                    {/* Annotation layer — pointer-events controlled internally */}
                     <div className="absolute inset-0">
                       <AnnotationLayer
                         widgetId={w.id}
@@ -565,7 +583,7 @@ export default function AnalystCanvasPage() {
             >
               <div className="w-0.5 h-8 rounded-full bg-gray-300 group-hover:bg-indigo-400 transition-colors" />
             </div>
-            <ChatSidebar token={token} dashboardName={canvas.name} />
+            <ChatSidebar token={analystToken} dashboardName={canvas.name} />
           </div>
         )}
       </div>
@@ -574,7 +592,7 @@ export default function AnalystCanvasPage() {
 
       {drilldown && (
         <DrilldownModal
-          token={token}
+          token={analystToken}
           widgetId={drilldown.widgetId}
           widgetTitle={drilldown.widgetTitle}
           xColumn={drilldown.xColumn}
@@ -586,7 +604,7 @@ export default function AnalystCanvasPage() {
 
       {queryModal.open && (
         <QueryModal
-          token={token}
+          token={analystToken}
           initialSql={queryModal.sql}
           onClose={() => setQueryModal({ open: false, sql: '' })}
         />
@@ -594,7 +612,7 @@ export default function AnalystCanvasPage() {
 
       {bookmarkModal && (
         <BookmarkModal
-          token={token}
+          token={analystToken}
           currentFilters={activeFilters}
           currentPageIndex={pageIndex >= 0 ? pageIndex : 0}
           onLoad={handleLoadBookmark}
@@ -604,7 +622,7 @@ export default function AnalystCanvasPage() {
 
       {scheduleModal && (
         <ScheduleModal
-          token={token}
+          token={analystToken}
           dashboardName={canvas.name}
           onClose={() => setScheduleModal(false)}
         />

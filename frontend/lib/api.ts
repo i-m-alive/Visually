@@ -375,3 +375,139 @@ export const rlsRequeryApi = {
     filters: Record<string, string[] | { start: string; end: string }>,
   ) => api.post(`/dashboards/${canvasId}/requery-rls`, { filters }),
 }
+
+// ─── Analyst (public canvas analyst features) ─────────────────────────────────
+// All analyst endpoints use the share token as auth — no Bearer needed.
+
+export interface FilterItem {
+  column: string
+  operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'like' | 'in' | 'between'
+  value: string | number | string[]
+}
+
+export interface AnnotationData {
+  id: string
+  widget_id: string | null
+  content: string
+  author_name: string
+  color: string
+  x_percent: number | null
+  y_percent: number | null
+  is_resolved: boolean
+  created_at: string
+}
+
+export interface BookmarkData {
+  id: string
+  name: string
+  description: string | null
+  filter_state: Record<string, unknown>
+  page_index: number
+  created_at: string
+}
+
+export interface ScheduleData {
+  id: string
+  email: string
+  frequency: 'daily' | 'weekly' | 'monthly'
+  day_of_week: number | null
+  hour_utc: number
+  timezone: string
+  include_ai_summary: boolean
+  is_active: boolean
+  last_sent_at: string | null
+  next_send_at: string | null
+  created_at: string
+}
+
+export interface TableInfo {
+  name: string
+  columns: { name: string; type: string; nullable: boolean; sample_values: unknown[] }[]
+  column_count: number
+}
+
+export const analystApi = {
+  // Live widget data with filters applied server-side
+  getWidgetData: (token: string, widgetId: string, filters: FilterItem[] = []) =>
+    publicApi.post(`/analyst/canvas/${token}/widgets/${widgetId}/data`, { filters }),
+
+  // Distinct values for slicer widgets (dropdown / checkbox)
+  getSlicerValues: (token: string, widgetId: string) =>
+    publicApi.get<{ values: string[] }>(`/analyst/canvas/${token}/widgets/${widgetId}/slicer-values`),
+
+  // Scoped AI chat — only tables in this canvas are accessible
+  chat: (token: string, data: { message: string; session_id?: string }) =>
+    publicApi.post<{
+      session_id: string
+      text: string
+      inline_chart: unknown
+      turn_count: number
+      schema_source: 'live' | 'recent' | 'cached' | 'embedded' | 'none'
+      schema_age_minutes: number | null
+    }>(`/analyst/canvas/${token}/chat`, data),
+
+  // Schema browser — tables used by canvas widgets
+  getSchema: (token: string) =>
+    publicApi.get<{ tables: TableInfo[]; total: number }>(`/analyst/canvas/${token}/schema`),
+
+  // Table data preview (max 500 rows)
+  previewTable: (token: string, tableName: string, limit = 100) =>
+    publicApi.get(`/analyst/canvas/${token}/schema/${encodeURIComponent(tableName)}/preview?limit=${limit}`),
+
+  // Ad-hoc sandboxed query — SELECT only, restricted to canvas tables
+  query: (token: string, sql: string) =>
+    publicApi.post(`/analyst/canvas/${token}/query`, { sql }),
+
+  // Drill-down: raw rows for a specific data point
+  drilldown: (token: string, widgetId: string, data: { x_column: string; x_value: string; filters?: FilterItem[] }) =>
+    publicApi.post(`/analyst/canvas/${token}/widgets/${widgetId}/drilldown`, data),
+
+  // CSV export — returns download URL (open in new tab or fetch as blob)
+  csvExportUrl: (token: string, widgetId: string) =>
+    `${API_URL}/analyst/canvas/${token}/widgets/${widgetId}/export/csv`,
+
+  // PDF export of full dashboard
+  exportPdf: (token: string) =>
+    publicApi.post(`/analyst/canvas/${token}/export/pdf`),
+
+  // Annotations
+  createAnnotation: (token: string, data: {
+    widget_id?: string; content: string; author_name?: string;
+    x_percent?: number; y_percent?: number; color?: string
+  }) => publicApi.post<AnnotationData>(`/analyst/canvas/${token}/annotations`, data),
+
+  listAnnotations: (token: string, widgetId?: string) =>
+    publicApi.get<{ annotations: AnnotationData[] }>(
+      `/analyst/canvas/${token}/annotations${widgetId ? `?widget_id=${widgetId}` : ''}`
+    ),
+
+  resolveAnnotation: (token: string, annotationId: string) =>
+    publicApi.patch(`/analyst/canvas/${token}/annotations/${annotationId}/resolve`),
+
+  deleteAnnotation: (token: string, annotationId: string) =>
+    publicApi.delete(`/analyst/canvas/${token}/annotations/${annotationId}`),
+
+  // Bookmarks — save filter state + page as named views
+  createBookmark: (token: string, data: {
+    name: string; description?: string;
+    filter_state?: Record<string, unknown>; page_index?: number
+  }) => publicApi.post<BookmarkData>(`/analyst/canvas/${token}/bookmarks`, data),
+
+  listBookmarks: (token: string) =>
+    publicApi.get<{ bookmarks: BookmarkData[] }>(`/analyst/canvas/${token}/bookmarks`),
+
+  deleteBookmark: (token: string, bookmarkId: string) =>
+    publicApi.delete(`/analyst/canvas/${token}/bookmarks/${bookmarkId}`),
+
+  // Scheduled email snapshots
+  createSchedule: (token: string, data: {
+    email: string; frequency?: 'daily' | 'weekly' | 'monthly';
+    day_of_week?: number; hour_utc?: number; timezone?: string; include_ai_summary?: boolean
+  }) => publicApi.post<ScheduleData>(`/analyst/canvas/${token}/schedules`, data),
+
+  listSchedules: (token: string) =>
+    publicApi.get<{ schedules: ScheduleData[] }>(`/analyst/canvas/${token}/schedules`),
+
+  deleteSchedule: (token: string, scheduleId: string) =>
+    publicApi.delete(`/analyst/canvas/${token}/schedules/${scheduleId}`),
+}

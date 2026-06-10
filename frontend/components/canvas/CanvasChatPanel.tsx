@@ -6,16 +6,26 @@ import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 
+type InlineChart = ChartResult & { selected: boolean }
+
 interface ChatMsg {
   role: 'user' | 'assistant'
   content: string
-  inlineChart?: ChartResult
+  inlineCharts?: InlineChart[]
   newWidget?: {
     title: string
     chart_type: string
     sql: string
     chart_data?: Record<string, unknown>
   }
+  triggerMsg?: string  // the user message that produced this response (for retry)
+}
+
+const CHART_CREATION_WORDS = /\b(create|make|build|generate|add|show|give|draw|produce)\b/i
+const CHART_SUBJECT_WORDS  = /\b(chart|graph|pie|bar|kpi|table|visual|visualization|plot|donut|scatter|waterfall)\b/i
+
+function isChartCreationRequest(text: string) {
+  return CHART_CREATION_WORDS.test(text) && CHART_SUBJECT_WORDS.test(text)
 }
 
 interface CanvasPage {
@@ -107,11 +117,34 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   const [showSuggestions, setShowSuggestions] = useState(true)
   const endRef                  = useRef<HTMLDivElement>(null)
   const textareaRef             = useRef<HTMLTextAreaElement>(null)
+  const [panelWidth, setPanelWidth] = useState(320)
+  const resizingRef  = useRef(false)
+  const resizeStartX = useRef(0)
+  const resizeStartW = useRef(320)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
   const recommended  = buildRecommendations(widgets, pages)
+
+  const startResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    resizingRef.current  = true
+    resizeStartX.current = e.clientX
+    resizeStartW.current = panelWidth
+    const onMove = (ev: MouseEvent) => {
+      if (!resizingRef.current) return
+      const delta = resizeStartX.current - ev.clientX
+      setPanelWidth(Math.min(640, Math.max(260, resizeStartW.current + delta)))
+    }
+    const onUp = () => {
+      resizingRef.current = false
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [panelWidth])
 
   const send = useCallback(async (quickText?: string) => {
     const text = (quickText ?? input).trim()
@@ -135,26 +168,37 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       const data         = resp.data
       const responseText = data?.text || 'I could not generate a response.'
 
-      // Use inline_chart returned by the backend (already executed SQL + data)
-      let inlineChart: ChartResult | undefined
-      if (data?.inline_chart) {
-        const ic = data.inline_chart
-        inlineChart = {
-          chart_type:     ic.chart_type,
-          title:          ic.title,
-          sql:            ic.sql ?? '',
+      // Build inlineCharts array from backend response
+      const toInlineChart = (ic: Record<string, unknown>): InlineChart => {
+        const extra: Record<string, unknown> = {}
+        if (ic.slicer_type)   extra.slicer_type   = ic.slicer_type
+        if (ic.slicer_column) extra.slicer_column = ic.slicer_column
+        return {
+          chart_type:     ic.chart_type as string,
+          title:          ic.title as string,
+          sql:            (ic.sql as string) ?? '',
           score:          1,
           low_confidence: false,
-          x_axis_label:   ic.x_axis_label ?? 'x',
-          y_axis_label:   ic.y_axis_label ?? 'y',
+          x_axis_label:   (ic.x_axis_label as string) ?? 'x',
+          y_axis_label:   (ic.y_axis_label as string) ?? 'y',
           table_used:     '',
-          chart_data:     ic.chart_data ?? { rows: [], columns: [], labels: [], values: [] },
+          chart_data:     (ic.chart_data as ChartResult['chart_data']) ?? { rows: [], columns: [], labels: [], values: [] },
+          extra_config:   Object.keys(extra).length ? extra : undefined,
+          selected:       true,
         }
+      }
+
+      let inlineCharts: InlineChart[] | undefined
+      const rawCharts: Record<string, unknown>[] = data?.inline_charts ?? []
+      if (rawCharts.length > 0) {
+        inlineCharts = rawCharts.map(toInlineChart)
+      } else if (data?.inline_chart) {
+        inlineCharts = [toInlineChart(data.inline_chart)]
       }
 
       // Fallback: detect JSON chart spec in text
       let newWidget: ChatMsg['newWidget'] | undefined
-      if (!inlineChart) {
+      if (!inlineCharts) {
         const jsonMatch = responseText.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/)
         if (jsonMatch) {
           try {
@@ -174,8 +218,9 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: responseText,
-        inlineChart,
-        newWidget: inlineChart ? undefined : newWidget,
+        inlineCharts,
+        newWidget: inlineCharts ? undefined : newWidget,
+        triggerMsg: text,
       }])
     } catch {
       setMessages(prev => [...prev, { role: 'assistant', content: 'Sorry, something went wrong. Please try again.' }])
@@ -184,31 +229,60 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
     }
   }, [input, sending, sessionId, projectId, canvasId, connectionId, activePageId])
 
-  const handleAddWidget = useCallback(async (src: ChartResult | ChatMsg['newWidget']) => {
-    if (!src) return
-    const widgetData: WidgetCreate = {
-      title:         src.title,
-      chart_type:    src.chart_type,
-      sql_query:     src.sql,
-      chart_data:    (src.chart_data as Record<string, unknown>) ?? undefined,
-      config:        activePageId ? { page_id: activePageId } : undefined,
-      width:         6,
-      height:        5,
-      connection_id: connectionId,
-    }
+  const handleAddWidgets = useCallback(async (srcs: Array<ChartResult | ChatMsg['newWidget']>) => {
+    if (!srcs.length) return
     const activePage = pages.find(p => p.id === activePageId)
     const pageLabel  = activePage ? ` on "${activePage.name}"` : ''
     try {
-      await canvasApi.addWidget(canvasId, widgetData)
+      await Promise.all(srcs.map(src => {
+        if (!src) return Promise.resolve()
+        const extraCfg = (src as ChartResult).extra_config ?? {}
+        const widgetData: WidgetCreate = {
+          title:         src.title,
+          chart_type:    src.chart_type,
+          sql_query:     src.sql,
+          chart_data:    (src.chart_data as Record<string, unknown>) ?? undefined,
+          config:        { ...(activePageId ? { page_id: activePageId } : {}), ...extraCfg },
+          width:         src.chart_type === 'slicer' ? 3 : 6,
+          height:        src.chart_type === 'slicer' ? 2 : 5,
+          connection_id: connectionId,
+        }
+        return canvasApi.addWidget(canvasId, widgetData)
+      }))
       onWidgetAdded()
-      setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added "${src.title}"${pageLabel} to your canvas!` }])
+      const names = srcs.filter(Boolean).map(s => `"${s!.title}"`).join(', ')
+      setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added ${names}${pageLabel} to your canvas!` }])
     } catch {
-      setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to add the chart. Please try again.' }])
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to add charts. Please try again.' }])
     }
   }, [canvasId, connectionId, onWidgetAdded, activePageId, pages])
 
+  const toggleChart = useCallback((msgIdx: number, chartIdx: number) => {
+    setMessages(prev => prev.map((m, mi) => mi !== msgIdx ? m : {
+      ...m,
+      inlineCharts: m.inlineCharts?.map((c, ci) => ci !== chartIdx ? c : { ...c, selected: !c.selected }),
+    }))
+  }, [])
+
+  const toggleAllCharts = useCallback((msgIdx: number, val: boolean) => {
+    setMessages(prev => prev.map((m, mi) => mi !== msgIdx ? m : {
+      ...m,
+      inlineCharts: m.inlineCharts?.map(c => ({ ...c, selected: val })),
+    }))
+  }, [])
+
   return (
-    <div className="w-80 bg-white border-l border-gray-100 flex flex-col h-full">
+    <div
+      className="relative bg-white border-l border-gray-100 flex flex-col h-full"
+      style={{ width: panelWidth, flexShrink: 0 }}
+    >
+      {/* Resize handle — drag left edge to widen */}
+      <div
+        onMouseDown={startResize}
+        className="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize z-20 flex items-center justify-center group hover:bg-indigo-50/80 transition-colors"
+      >
+        <div className="w-0.5 h-8 rounded-full bg-gray-300 group-hover:bg-indigo-400 transition-colors" />
+      </div>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0">
         <div className="flex items-center gap-2">
@@ -234,8 +308,8 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
             >
               {msg.role === 'user' ? <Bot size={11} /> : <Sparkles size={10} />}
             </div>
-            <div className="flex flex-col gap-2 max-w-[85%]">
-              <div className={`px-3 py-2 rounded-2xl text-xs leading-relaxed ${
+            <div className="flex flex-col gap-2 max-w-[85%] min-w-0">
+              <div className={`px-3 py-2 rounded-2xl text-xs leading-relaxed break-words min-w-0 ${
                 msg.role === 'user'
                   ? 'bg-brand text-white rounded-tr-sm'
                   : 'bg-gray-100 text-gray-800 rounded-tl-sm'
@@ -245,28 +319,84 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                   : msg.content}
               </div>
 
-              {/* Inline chart preview */}
-              {msg.inlineChart && (
-                <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
-                  <p className="text-xs font-semibold text-gray-700 mb-2">{msg.inlineChart.title}</p>
-                  <ChartRenderer result={msg.inlineChart} height={150} />
-                  <button
-                    onClick={() => handleAddWidget(msg.inlineChart!)}
-                    className="mt-2.5 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
-                    style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
-                  >
-                    <Plus size={11} /> Add to Canvas
-                  </button>
-                </div>
+              {/* Inline chart previews */}
+              {msg.inlineCharts && msg.inlineCharts.length > 0 && (
+                msg.inlineCharts.length === 1 ? (
+                  // Single chart — compact preview
+                  <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
+                    <p className="text-xs font-semibold text-gray-700 mb-2">{msg.inlineCharts[0].title}</p>
+                    <ChartRenderer result={msg.inlineCharts[0]} height={150} />
+                    <button
+                      onClick={() => handleAddWidgets([msg.inlineCharts![0]])}
+                      className="mt-2.5 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
+                      style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
+                    >
+                      <Plus size={11} /> Add to Canvas
+                    </button>
+                  </div>
+                ) : (
+                  // Multiple charts — selectable list
+                  <div className="bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
+                    <div className="px-3 py-2 border-b border-gray-100 flex items-center justify-between">
+                      <span className="text-xs font-semibold text-gray-600">{msg.inlineCharts.length} charts generated</span>
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => toggleAllCharts(i, true)} className="text-[10px] text-indigo-500 hover:text-indigo-700">All</button>
+                        <span className="text-gray-300 text-[10px]">·</span>
+                        <button onClick={() => toggleAllCharts(i, false)} className="text-[10px] text-gray-400 hover:text-gray-600">None</button>
+                      </div>
+                    </div>
+                    {msg.inlineCharts.map((chart, ci) => (
+                      <div key={ci} className={`p-3 border-b border-gray-100 last:border-0 transition-opacity ${chart.selected ? '' : 'opacity-50'}`}>
+                        <label className="flex items-center gap-2 mb-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={chart.selected}
+                            onChange={() => toggleChart(i, ci)}
+                            className="w-3.5 h-3.5 rounded accent-indigo-600 cursor-pointer"
+                          />
+                          <span className="text-xs font-semibold text-gray-700 truncate flex-1">{chart.title}</span>
+                          <span className="text-[10px] text-gray-400 shrink-0 bg-gray-100 px-1.5 py-0.5 rounded">{chart.chart_type}</span>
+                        </label>
+                        <ChartRenderer result={chart} height={110} />
+                      </div>
+                    ))}
+                    <div className="px-3 py-2.5 flex gap-2 bg-white">
+                      <button
+                        onClick={() => handleAddWidgets(msg.inlineCharts!.filter(c => c.selected))}
+                        disabled={!msg.inlineCharts.some(c => c.selected)}
+                        className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-white rounded-lg disabled:opacity-40 transition-opacity"
+                        style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
+                      >
+                        <Plus size={10} /> Add selected ({msg.inlineCharts.filter(c => c.selected).length})
+                      </button>
+                      <button
+                        onClick={() => handleAddWidgets(msg.inlineCharts!)}
+                        className="flex items-center justify-center gap-1 px-3 py-1.5 text-xs font-medium text-gray-600 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+                      >
+                        All ({msg.inlineCharts.length})
+                      </button>
+                    </div>
+                  </div>
+                )
               )}
 
               {/* JSON widget add button */}
               {msg.newWidget && (
                 <button
-                  onClick={() => handleAddWidget(msg.newWidget!)}
+                  onClick={() => handleAddWidgets([msg.newWidget!])}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-brand bg-brand/10 rounded-lg hover:bg-brand/20 transition-colors self-start"
                 >
                   <Plus size={12} /> Add to canvas
+                </button>
+              )}
+
+              {/* Retry button — shown when AI described a chart but didn't generate it */}
+              {msg.role === 'assistant' && !msg.inlineCharts && !msg.newWidget && msg.triggerMsg && isChartCreationRequest(msg.triggerMsg) && (
+                <button
+                  onClick={() => send(`GENERATE NOW as sql_execute block only, no description: ${msg.triggerMsg}`)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 transition-colors self-start"
+                >
+                  <Sparkles size={11} className="text-amber-500" /> Generate chart
                 </button>
               )}
             </div>

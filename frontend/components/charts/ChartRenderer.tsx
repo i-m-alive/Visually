@@ -33,15 +33,19 @@ interface Props {
 export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
 
-  // Table sort state — must be declared before any early return (React rules of hooks)
+  // Table sort + search state — must be declared before any early return (React rules of hooks)
   const [sortCol, setSortCol] = React.useState<string | null>(null)
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
+  const [tableSearch, setTableSearch] = React.useState('')
 
-  // sortedRows must live at the top level — moving it inside the if(ct==='table') block
-  // would violate the Rules of Hooks (hook count changes between renders).
+  // sortedRows must live at the top level — Rules of Hooks.
   const _rawRows = result?.chart_data?.rows as Record<string, unknown>[] | undefined
   const sortedRows = React.useMemo(() => {
-    const rows = _rawRows ?? []
+    let rows = _rawRows ?? []
+    if (tableSearch.trim()) {
+      const q = tableSearch.trim().toLowerCase()
+      rows = rows.filter(r => Object.values(r).some(v => String(v ?? '').toLowerCase().includes(q)))
+    }
     if (!sortCol) return rows
     return [...rows].sort((a, b) => {
       const av = a[sortCol], bv = b[sortCol]
@@ -53,7 +57,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
         ? String(av ?? '').localeCompare(String(bv ?? ''))
         : String(bv ?? '').localeCompare(String(av ?? ''))
     })
-  }, [_rawRows, sortCol, sortDir])
+  }, [_rawRows, sortCol, sortDir, tableSearch])
 
   if (!result) return null
   const { chart_type, title, x_axis_label, y_axis_label, chart_data } = result
@@ -134,17 +138,17 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     const kpis = rows.length > 0
       ? rows.map(r => ({ name: String(r[columns[0]] ?? ''), val: r[columns[1]] }))
       : labels.map((l, i) => ({ name: l, val: values[i] }))
+    const fmtVal = (v: unknown) =>
+      typeof v === 'number'
+        ? (Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : v.toLocaleString(undefined, { maximumFractionDigits: 2 }))
+        : String(v ?? '—')
     return (
       <div className="w-full overflow-auto" style={{ height }}>
-        <div className="grid grid-cols-2 gap-3 p-1">
+        <div className="flex flex-col divide-y divide-gray-100">
           {kpis.map((k, i) => (
-            <div key={i} className="flex flex-col items-center justify-center rounded-xl bg-blue-50 border border-blue-100 p-3">
-              <p className="text-xs text-gray-500 text-center leading-tight mb-1">{k.name}</p>
-              <p className="text-lg font-bold text-blue-700">
-                {typeof k.val === 'number'
-                  ? k.val.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                  : String(k.val ?? '—')}
-              </p>
+            <div key={i} className="flex items-center justify-between px-3 py-2 hover:bg-gray-50 transition-colors">
+              <span className="text-xs font-medium text-gray-500 truncate max-w-[55%]">{k.name}</span>
+              <span className="text-sm font-bold text-blue-700 tabular-nums">{fmtVal(k.val)}</span>
             </div>
           ))}
         </div>
@@ -187,71 +191,114 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       color: 'var(--dash-text-muted, #6B7280)',
       borderColor: 'var(--dash-table-border, #E5E7EB)',
     }
+    const barColWidth = primaryNumCol ? 64 : 0
     return (
-      <div className="overflow-auto w-full" style={{ height }}>
-        <table className="w-full text-xs border-collapse">
-          <thead className="sticky top-0 z-10">
-            <tr>
-              {cols.map(c => (
-                <th
-                  key={c}
-                  className="px-3 py-2 text-left font-semibold border-b whitespace-nowrap select-none cursor-pointer hover:opacity-80"
-                  style={thStyle}
-                  onClick={() => {
-                    if (sortCol === c) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-                    else { setSortCol(c); setSortDir('asc') }
-                  }}
-                >
-                  {c}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                </th>
-              ))}
-              {primaryNumCol && (
-                <th className="px-2 py-2 border-b" style={{ ...thStyle, width: 68, minWidth: 68 }} title="Value bar" />
-              )}
-            </tr>
-          </thead>
-          <tbody>
-            {sortedRows.map((row, i) => {
-              const rowBg = i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)'
-              const barVal = primaryNumCol ? (typeof row[primaryNumCol] === 'number' ? row[primaryNumCol] as number : parseFloat(String(row[primaryNumCol] ?? 0))) : 0
-              const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, (barVal as number) / primaryMax)) : 0
-              return (
-                <tr
-                  key={i}
-                  className={onDataPointClick ? 'cursor-pointer hover:opacity-80' : ''}
-                  style={{ background: rowBg }}
-                  onClick={() => onDataPointClick && cols[0] && onDataPointClick(cols[0], row[cols[0]])}
-                >
-                  {cols.map(c => {
-                    const heat = heatmapBg(c, row[c])
-                    return (
-                      <td
-                        key={c}
-                        className="px-3 py-1.5 border-b whitespace-nowrap"
-                        style={{
-                          color: 'var(--dash-row-text, #374151)',
-                          borderColor: 'var(--dash-table-border, #E5E7EB)',
-                          background: heat ?? undefined,
-                          fontWeight: colStats[c]?.isNum ? 500 : undefined,
-                        }}
-                      >
-                        {String(row[c] ?? '')}
-                      </td>
-                    )
-                  })}
-                  {primaryNumCol && (
-                    <td className="px-2 py-1.5 border-b" style={{ borderColor: 'var(--dash-table-border, #E5E7EB)', background: rowBg }}>
-                      <svg width={60} height={10}>
-                        <rect x={0} y={1} width={60} height={8} rx={3} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
-                        <rect x={0} y={1} width={Math.max(3, barPct * 60)} height={8} rx={3} fill={COLORS[0]} opacity={0.75} />
-                      </svg>
-                    </td>
-                  )}
+      <div className="flex flex-col w-full min-h-0" style={{ height: height ?? '100%' }}>
+        {/* Search bar */}
+        <div className="flex items-center gap-1.5 px-2 py-1.5 border-b border-gray-100 bg-white flex-shrink-0">
+          <svg className="w-3 h-3 text-gray-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" />
+          </svg>
+          <input
+            value={tableSearch}
+            onChange={e => setTableSearch(e.target.value)}
+            placeholder="Search…"
+            className="flex-1 text-xs outline-none placeholder-gray-400 bg-transparent"
+          />
+          {tableSearch && (
+            <button onClick={() => setTableSearch('')} className="text-gray-300 hover:text-gray-500 text-xs leading-none">✕</button>
+          )}
+        </div>
+
+        {/* Table — table-layout:fixed keeps columns within container width */}
+        <div className="overflow-auto flex-1 min-h-0">
+          <table className="w-full text-xs border-collapse" style={{ tableLayout: 'fixed' }}>
+            <colgroup>
+              {cols.map(c => <col key={c} style={{ width: `${(100 - (barColWidth / 6)) / cols.length}%` }} />)}
+              {primaryNumCol && <col style={{ width: barColWidth }} />}
+            </colgroup>
+            <thead className="sticky top-0 z-10">
+              <tr>
+                {cols.map(c => (
+                  <th
+                    key={c}
+                    className="px-2 py-2 text-left font-semibold border-b select-none cursor-pointer hover:opacity-80"
+                    style={{ ...thStyle, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                    title={c}
+                    onClick={() => {
+                      if (sortCol === c) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                      else { setSortCol(c); setSortDir('asc') }
+                    }}
+                  >
+                    <span className="block truncate">{c}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}</span>
+                  </th>
+                ))}
+                {primaryNumCol && (
+                  <th className="px-2 py-2 border-b" style={{ ...thStyle, width: barColWidth }} />
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {sortedRows.length === 0 ? (
+                <tr>
+                  <td colSpan={cols.length + (primaryNumCol ? 1 : 0)} className="px-3 py-4 text-center text-gray-400 text-xs">
+                    No results
+                  </td>
                 </tr>
-              )
-            })}
-          </tbody>
-        </table>
+              ) : sortedRows.map((row, i) => {
+                const rowBg = i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)'
+                const barVal = primaryNumCol ? (typeof row[primaryNumCol] === 'number' ? row[primaryNumCol] as number : parseFloat(String(row[primaryNumCol] ?? 0))) : 0
+                const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, (barVal as number) / primaryMax)) : 0
+                return (
+                  <tr
+                    key={i}
+                    className={onDataPointClick ? 'cursor-pointer hover:opacity-80' : ''}
+                    style={{ background: rowBg }}
+                    onClick={() => onDataPointClick && cols[0] && onDataPointClick(cols[0], row[cols[0]])}
+                  >
+                    {cols.map(c => {
+                      const heat = heatmapBg(c, row[c])
+                      return (
+                        <td
+                          key={c}
+                          className="px-2 py-1.5 border-b"
+                          title={String(row[c] ?? '')}
+                          style={{
+                            color: 'var(--dash-row-text, #374151)',
+                            borderColor: 'var(--dash-table-border, #E5E7EB)',
+                            background: heat ?? undefined,
+                            fontWeight: colStats[c]?.isNum ? 500 : undefined,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                            maxWidth: 0,
+                          }}
+                        >
+                          {String(row[c] ?? '')}
+                        </td>
+                      )
+                    })}
+                    {primaryNumCol && (
+                      <td className="px-2 py-1.5 border-b" style={{ borderColor: 'var(--dash-table-border, #E5E7EB)', background: rowBg, width: barColWidth }}>
+                        <svg width={52} height={10}>
+                          <rect x={0} y={1} width={52} height={8} rx={3} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
+                          <rect x={0} y={1} width={Math.max(3, barPct * 52)} height={8} rx={3} fill={COLORS[0]} opacity={0.75} />
+                        </svg>
+                      </td>
+                    )}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Row count footer */}
+        {sortedRows.length > 0 && tableSearch && (
+          <div className="px-2 py-1 text-[10px] text-gray-400 border-t border-gray-100 flex-shrink-0">
+            {sortedRows.length} of {(_rawRows ?? []).length} rows
+          </div>
+        )}
       </div>
     )
   }

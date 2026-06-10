@@ -19,6 +19,8 @@ export interface ChartResult {
   y_axis_label: string
   table_used: string
   validation_details?: Record<string, unknown>
+  // Extra metadata passed through for slicer widgets
+  extra_config?: Record<string, unknown>
 }
 
 interface PipelineSteps {

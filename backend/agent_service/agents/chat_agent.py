@@ -34,14 +34,109 @@ CHART CREATION GUIDELINES:
 
 WHEN TO GENERATE SQL:
 If the user asks a question that requires data not already in the canvas context, generate SQL.
-Return SQL inside a special JSON block so the system can execute it.
+
+══════════════════════════════════════════════════════════════════════
+CHART CREATION — MANDATORY EXECUTION PROTOCOL
+══════════════════════════════════════════════════════════════════════
+When the user asks to CREATE / BUILD / GENERATE / SHOW / MAKE / ADD
+a chart, table, graph, visualization, or KPI:
+
+  STEP 1 — Write one short sentence (max 10 words): "Here's the X:"
+  STEP 2 — IMMEDIATELY output the sql_execute block below it.
+  STEP 3 — STOP. Do NOT describe the chart. Do NOT explain what the SQL does.
+
+❌ ABSOLUTELY FORBIDDEN — these responses will FAIL the user:
+   "This pie chart shows the distribution of..."
+   "I'll create a bar chart that visualizes..."
+   "The chart displays data from the table..."
+   Any response that describes a chart WITHOUT a sql_execute block.
+
+✅ CORRECT — this is the ONLY acceptable pattern:
+   "Here's the Current Status pie chart:"
+   ```sql_execute
+   {{"sql": "...", "chart_type": "pie", ...}}
+   ```
+
+BEFORE you write your response, ask yourself:
+  - Does it contain a sql_execute block? If NO → you are WRONG. Add one.
+  - Does it describe what the chart shows? If YES → delete that description.
+
+If the user provides DAX/Power BI-style formulas (SUMX, HASONEFILTER, DISTINCTCOUNT, etc.),
+translate them to SQL equivalents:
+  DISTINCTCOUNT(table[col]) → COUNT(DISTINCT col)
+  SUMX(table, expr)          → SUM(expr) or GROUP BY computation
+  HASONEFILTER(table[col])   → omit — just write the aggregate directly
+  [Measure] * [Other]        → col * other_col
+If the user specifies column aliases like "Name : name", use AS "Name" in SELECT.
+For multi-table requests: use JOIN. Match columns to their tables by name.
+══════════════════════════════════════════════════════════════════════
+
+MULTI-CHART RESPONSES:
+If the user asks for MULTIPLE charts/KPIs in one message (e.g. "create 3 KPIs", "show a bar and a pie", "give me a dashboard with sales, revenue, and status"), output MULTIPLE sql_execute blocks — one per chart. Each block must be complete and independently valid.
+
+Example — two charts at once:
+User: "Create a bar chart for monthly placements and a KPI for total count"
+Response: "Here are 2 charts:"
+```sql_execute
+{{"sql": "SELECT DATE_TRUNC('month', start_date) AS \"Month\", COUNT(*) AS \"Placements\" FROM bullhorn_core_placement GROUP BY 1 ORDER BY 1", "chart_type": "bar_vertical", "title": "Monthly Placements", "x_label": "Month", "y_label": "Placements"}}
+```
+```sql_execute
+{{"sql": "SELECT COUNT(*) AS \"Total Placements\" FROM bullhorn_core_placement", "chart_type": "kpi", "title": "Total Placements", "x_label": "", "y_label": ""}}
+```
 
 RESPONSE FORMAT:
-For text answers: respond in plain conversational English.
-For SQL queries you want executed, include this anywhere in your response:
+For plain questions / data questions: respond in conversational English (no sql_execute needed).
+For chart/table/KPI creation: one sentence + sql_execute block(s) (see above).
+
 ```sql_execute
-{{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|scatter|table", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
+{{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
 ```
+
+CHART TYPE SELECTION RULES:
+- Use "pie" for proportional distributions (status breakdown, category share, etc.)
+- Use "kpi" ONLY for a single aggregate number (one row, one value): SELECT COUNT(*) AS value FROM table
+- Use "multi_row_card" when the user wants a KPI broken down by a dimension — multiple label/value pairs:
+    SQL pattern: SELECT dim AS label, COUNT(*)/SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 20
+- Use "table" for detailed row-level data with many columns
+- Use "bar_vertical" when the user wants to compare values visually
+
+CHART CREATION EXAMPLES — copy these patterns exactly:
+
+Example 1 — pie chart by specific columns (user names table + columns):
+User: "Create a PieChart for current status. Table: bullhorn_core_placement. Columns: placementID, status."
+Response: "Here's the Current Status pie chart:"
+```sql_execute
+{{"sql": "SELECT status AS \"Status\", COUNT(DISTINCT \"placementID\") AS \"Count\" FROM bullhorn_core_placement GROUP BY status ORDER BY 2 DESC LIMIT 20", "chart_type": "pie", "title": "Current Status", "x_label": "Status", "y_label": "Count"}}
+```
+
+Example 2 — table chart:
+User: "Create a table chart showing employee name and salary"
+Response: "Here's the table:"
+```sql_execute
+{{"sql": "SELECT name AS \"Name\", salary AS \"Salary\" FROM employees ORDER BY salary DESC LIMIT 1000", "chart_type": "table", "title": "Employee Salaries", "x_label": "", "y_label": ""}}
+```
+
+Example 3 — grouped KPI (multi_row_card):
+User: "Show job count broken down by source type" or "KPI showing jobs per category"
+Response: "Here's the Job Count by Source:"
+```sql_execute
+{{"sql": "SELECT source AS \"Source\", COUNT(*) AS \"Count\" FROM jobs GROUP BY source ORDER BY 2 DESC LIMIT 20", "chart_type": "multi_row_card", "title": "Job Count by Source", "x_label": "Source", "y_label": "Count"}}
+```
+
+Example 4 — slicer / filter widget:
+User: "Add a filter for status" / "Create a dropdown to filter by region" / "Add a checkbox slicer for category"
+Response: "Here's a Status slicer:"
+```sql_execute
+{{"sql": "SELECT DISTINCT status FROM jobs WHERE status IS NOT NULL ORDER BY 1 LIMIT 300", "chart_type": "slicer", "title": "Status Filter", "slicer_type": "dropdown", "slicer_column": "status", "x_label": "", "y_label": ""}}
+```
+NOTE for slicers:
+- chart_type must be "slicer"
+- slicer_type: "dropdown" (single value), "checkbox" (multi-select), or "date_range" (date picker)
+- slicer_column: the exact column name being filtered (must match column in other widgets' queries)
+- sql must be SELECT DISTINCT <column> ... so the slicer can populate its option list
+- The slicer will automatically filter all other charts on the page when the user selects a value
+- Use "checkbox" when the user says "multi-select", "multiple", or "checkboxes"
+- Use "date_range" when filtering by a date/timestamp column
 
 For dashboard modifications, include:
 ```dashboard_action
@@ -75,6 +170,23 @@ def _tfidf_score(message: str, table: dict) -> float:
 
     overlap = len(query_words & target_words)
     return overlap / len(query_words) if query_words else 0.0
+
+
+_CHART_CREATION_KEYWORDS = {
+    "create", "make", "build", "generate", "add", "show", "give",
+    "chart", "graph", "pie", "bar", "line", "kpi", "table", "visual",
+    "plot", "donut", "scatter", "funnel", "treemap", "waterfall",
+}
+
+def _is_chart_creation_request(message: str) -> bool:
+    """Return True when the message is asking for chart/viz creation."""
+    words = set(re.sub(r"[^a-z0-9 ]", " ", message.lower()).split())
+    action_words  = {"create", "make", "build", "generate", "add", "give", "draw", "produce"}
+    subject_words = {"chart", "graph", "pie", "bar", "kpi", "table", "visual",
+                     "visualization", "plot", "donut", "scatter", "funnel", "treemap", "waterfall"}
+    has_action  = bool(words & action_words)
+    has_subject = bool(words & subject_words)
+    return has_action and has_subject
 
 
 class ChatAgent:
@@ -325,18 +437,21 @@ class ChatAgent:
             temperature=0.3,
         )
 
-        sql_to_execute = None
+        sqls_to_execute: list[dict] = []
         dashboard_action = None
         text = raw
 
         if "```sql_execute" in raw:
-            match = re.search(r"```sql_execute\n(.*?)\n```", raw, re.DOTALL)
-            if match:
+            all_blocks = re.findall(r"```sql_execute\n(.*?)\n```", raw, re.DOTALL)
+            for block in all_blocks:
                 try:
-                    sql_to_execute = json.loads(match.group(1).strip())
+                    spec = json.loads(block.strip())
+                    sqls_to_execute.append(spec)
                 except json.JSONDecodeError:
                     pass
             text = re.sub(r"```sql_execute\n.*?\n```", "", text, flags=re.DOTALL).strip()
+
+        sql_to_execute = sqls_to_execute[0] if sqls_to_execute else None
 
         if "```dashboard_action" in raw:
             match = re.search(r"```dashboard_action\n(.*?)\n```", raw, re.DOTALL)
@@ -359,9 +474,39 @@ class ChatAgent:
                     pass
             text = re.sub(r"<action>.*?</action>", "", text, flags=re.DOTALL).strip()
 
+        # ── Auto-retry when model narrated instead of executing ───────────────
+        # If the user asked to create/show a chart but we got no sql_execute,
+        # send one silent retry with an ultra-strict prompt.
+        if not sqls_to_execute and _is_chart_creation_request(message):
+            retry_msg = (
+                "EXECUTE ONLY — output NOTHING except a single sql_execute block.\n"
+                "Do NOT write any description or explanation.\n"
+                f"Original request: {message}"
+            )
+            retry_messages = conversation_history[-20:] + [{"role": "user", "content": retry_msg}]
+            try:
+                raw2 = await bedrock_invoke_with_history(
+                    model_id=CHAT_MODEL,
+                    system_prompt=system_prompt,
+                    messages=retry_messages,
+                    max_tokens=1024,
+                    temperature=0.0,
+                )
+                if "```sql_execute" in raw2:
+                    retry_blocks = re.findall(r"```sql_execute\n(.*?)\n```", raw2, re.DOTALL)
+                    for block in retry_blocks:
+                        try:
+                            sqls_to_execute.append(json.loads(block.strip()))
+                        except json.JSONDecodeError:
+                            pass
+                    sql_to_execute = sqls_to_execute[0] if sqls_to_execute else None
+            except Exception:
+                pass  # retry failed — return original narration, frontend shows retry button
+
         return {
             "text": text,
             "sql_to_execute": sql_to_execute,
+            "sqls_to_execute": sqls_to_execute,
             "dashboard_action": dashboard_action,
         }
 

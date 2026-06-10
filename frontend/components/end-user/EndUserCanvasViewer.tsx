@@ -330,7 +330,12 @@ export function EndUserCanvasViewer({ dashboardId, onClose }: Props) {
 
                     {/* Chart body */}
                     <div className="p-3 overflow-hidden" style={{ height: `${chartHeight}px` }}>
-                      {cd ? (
+                      {widget.chart_type === 'slicer' ? (
+                        <div className="h-full flex flex-col items-center justify-center gap-1 text-gray-400">
+                          <span className="text-xs font-medium">{(widget.config?.slicer_type as string) || 'dropdown'} slicer</span>
+                          <span className="text-[11px]">{(widget.config?.slicer_column as string) || ''}</span>
+                        </div>
+                      ) : cd ? (
                         <ChartRenderer
                           result={{
                             chart_type: widget.chart_type,
@@ -363,7 +368,7 @@ export function EndUserCanvasViewer({ dashboardId, onClose }: Props) {
         {showChat && (
           <div style={{
             position: 'absolute', right: 0, top: 0, bottom: 0, zIndex: 40,
-            width: 320, display: 'flex', flexDirection: 'column',
+            display: 'flex', flexDirection: 'column',
             boxShadow: '-4px 0 24px rgba(0,0,0,0.10)',
           }}>
             <CanvasChatPanel

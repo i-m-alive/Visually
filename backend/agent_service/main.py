@@ -46,6 +46,8 @@ from agent_service.routers import share as share_module
 from agent_service.routers import public_canvas as public_canvas_module
 from agent_service.routers import tier5 as tier5_module
 from agent_service.routers import ai_insights as ai_insights_module
+from agent_service.routers import analyst as analyst_module
+from agent_service.routers import end_user as end_user_module
 
 from contextlib import asynccontextmanager
 
@@ -130,6 +132,8 @@ app.include_router(share_module.router)
 app.include_router(public_canvas_module.router)
 app.include_router(tier5_module.router)
 app.include_router(ai_insights_module.router)
+app.include_router(analyst_module.router)
+app.include_router(end_user_module.router)
 
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
@@ -894,6 +898,66 @@ async def list_shared_with_me(
             for d, project_name in rows
         ]
     }
+
+
+@app.post("/dashboards/{dashboard_id}/analyst-token")
+async def get_analyst_token(
+    dashboard_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Issue a short-lived live analyst token for a dashboard the user has access to.
+    The caller can then use all /analyst/canvas/{token}/... endpoints without re-auth."""
+    import secrets
+    import hashlib as _hl
+    from datetime import timedelta as _td
+    from shared.models.sharing import CanvasCollaborator, CanvasShareToken
+    from sqlalchemy import or_ as _or
+
+    dash_id = uuid.UUID(dashboard_id)
+
+    # Access check: CanvasCollaborator OR project member/owner
+    collab_result = await db.execute(
+        select(CanvasCollaborator)
+        .where(CanvasCollaborator.dashboard_id == dash_id)
+        .where(CanvasCollaborator.user_id == current_user.id)
+    )
+    has_access = collab_result.scalar_one_or_none() is not None
+
+    if not has_access:
+        dash_result = await db.execute(select(Dashboard).where(Dashboard.id == dash_id))
+        dashboard = dash_result.scalar_one_or_none()
+        if not dashboard:
+            raise HTTPException(status_code=404, detail="Dashboard not found")
+        proj_result = await db.execute(
+            select(Project)
+            .outerjoin(ProjectMember,
+                       (ProjectMember.project_id == Project.id) &
+                       (ProjectMember.user_id == current_user.id))
+            .where(Project.id == dashboard.project_id)
+            .where(_or(Project.owner_id == current_user.id, ProjectMember.user_id == current_user.id))
+        )
+        if not proj_result.scalar_one_or_none():
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    raw = secrets.token_urlsafe(32)
+    token_hash = _hl.sha256(raw.encode()).hexdigest()
+    expires = datetime.utcnow() + _td(hours=24)
+
+    new_token = CanvasShareToken(
+        id=uuid.uuid4(),
+        dashboard_id=dash_id,
+        token_hash=token_hash,
+        mode="live",
+        label="analyst-session",
+        expires_at=expires,
+        is_revoked=False,
+        created_by=current_user.id,
+    )
+    db.add(new_token)
+    await db.commit()
+
+    return {"token": raw, "expires_at": expires.isoformat()}
 
 
 @app.get("/dashboards/{dashboard_id}")

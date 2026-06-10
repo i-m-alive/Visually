@@ -41,7 +41,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 DEV_MODE    = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
 
-VLY_VERSION = "1.0"
+VLY_VERSION = "2.0"
 
 
 # ── auth helper ───────────────────────────────────────────────────────────────
@@ -218,10 +218,75 @@ async def export_vly(
         for w in widgets
     }
 
-    # ── schema.json ───────────────────────────────────────────────────────────
+    # ── schema.json (basic hints) ─────────────────────────────────────────────
+    schema_hints = _build_schema_hints(widgets)
     schema_doc = {
-        "tables": _build_schema_hints(widgets),
+        "tables": schema_hints,
         "filter_config": dashboard.filter_config or [],
+    }
+
+    # ── schema_enriched.json — full snapshot scoped to report tables ──────────
+    # Pull the latest SchemaSnapshot for the connection and filter to used tables.
+    # This gives the AI instant, accurate schema context without a DB roundtrip.
+    schema_enriched_doc: dict = {}
+    used_tables_lower: set[str] = set()
+    for hint in schema_hints:
+        t = hint.get("table", "")
+        if t:
+            used_tables_lower.add(t.lower())
+            used_tables_lower.add(t.split(".")[-1].lower())
+
+    if sample_conn_id and used_tables_lower:
+        from shared.models.schema_snapshots import SchemaSnapshot
+        snap_result = await db.execute(
+            select(SchemaSnapshot)
+            .where(SchemaSnapshot.connection_id == sample_conn_id)
+            .order_by(SchemaSnapshot.version.desc())
+            .limit(1)
+        )
+        snap = snap_result.scalar_one_or_none()
+        if snap and snap.schema_document:
+            full_schema = snap.schema_document
+            all_tables: dict = full_schema.get("tables", {}) if isinstance(full_schema, dict) else {}
+            filtered_tables = {
+                tbl: info for tbl, info in all_tables.items()
+                if tbl.lower() in used_tables_lower or tbl.split(".")[-1].lower() in used_tables_lower
+            }
+            schema_enriched_doc = {
+                "db_type": conn_hint.get("db_type", ""),
+                "snapshot_version": snap.version,
+                "snapshot_captured_at": snap.created_at.isoformat() if snap.created_at else None,
+                "tables": filtered_tables,
+                "prioritized": {
+                    "tables": sorted(used_tables_lower),
+                    "columns_by_widget": {
+                        str(w.id): _extract_table_names(w.sql_query or w.base_sql or "")
+                        for w in widgets
+                    }
+                }
+            }
+
+    # ── ai_context.json — report-level AI hints for fast AI warm-start ────────
+    ai_context_doc = {
+        "report_name": dashboard.name,
+        "report_description": dashboard.description or "",
+        "db_type": conn_hint.get("db_type", "unknown"),
+        "host": conn_hint.get("host", ""),
+        "database": conn_hint.get("database_name", ""),
+        "used_tables": sorted(used_tables_lower),
+        "widgets": [
+            {
+                "id": str(w.id),
+                "title": w.title,
+                "chart_type": w.chart_type,
+                "tables_used": _extract_table_names(w.sql_query or w.base_sql or ""),
+                "columns_selected": schema_hints[i]["columns"] if i < len(schema_hints) else [],
+            }
+            for i, w in enumerate(widgets)
+        ],
+        "filter_columns": [
+            f.get("column") for f in (dashboard.filter_config or []) if isinstance(f, dict) and f.get("column")
+        ],
     }
 
     # ── data/<widget_id>.json per widget ─────────────────────────────────────
@@ -246,6 +311,9 @@ async def export_vly(
         zf.writestr("meta.json",   json.dumps(meta_doc,   ensure_ascii=False, indent=2, default=str))
         zf.writestr("queries.json", json.dumps(queries_doc, ensure_ascii=False, indent=2, default=str))
         zf.writestr("schema.json", json.dumps(schema_doc, ensure_ascii=False, indent=2, default=str))
+        zf.writestr("ai_context.json", json.dumps(ai_context_doc, ensure_ascii=False, indent=2, default=str))
+        if schema_enriched_doc:
+            zf.writestr("schema_enriched.json", json.dumps(schema_enriched_doc, ensure_ascii=False, indent=2, default=str))
         for path, content in data_files:
             zf.writestr(path, content)
 

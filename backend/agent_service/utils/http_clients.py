@@ -2,8 +2,9 @@
 import os
 import httpx
 
-QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
-RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://localhost:3001")
+QUERY_EXECUTOR_URL  = os.getenv("QUERY_EXECUTOR_URL",  "http://localhost:8002")
+RENDER_SERVICE_URL  = os.getenv("RENDER_SERVICE_URL",  "http://localhost:3001")
+SCHEMA_CRAWLER_URL  = os.getenv("SCHEMA_CRAWLER_URL",  "http://localhost:8003")
 
 # connection_id prefix that routes to the in-process DuckDB executor instead of
 # the live database executor service.  Set by orchestrator.py in CSV mode.
@@ -35,6 +36,18 @@ async def call_query_executor(
             return {"rows": [], "row_count": 0, "columns": [], "error": f"Executor {resp.status_code}: {resp.text[:200]}"}
     except Exception as e:
         return {"rows": [], "row_count": 0, "columns": [], "error": str(e)}
+
+
+async def call_schema_crawler(connection_id: str, project_id: str) -> None:
+    """Fire-and-forget: ask the schema crawler to refresh a connection. Never raises."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{SCHEMA_CRAWLER_URL}/crawl",
+                json={"connection_id": connection_id, "project_id": project_id},
+            )
+    except Exception:
+        pass
 
 
 async def call_render_service(query_plan: dict, rows: list) -> dict:

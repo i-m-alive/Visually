@@ -18,7 +18,9 @@ ENTITY TYPES to extract:
 - metrics: numeric measure words (revenue, sales, count, orders, churn, rate, total, average)
 - dimensions: grouping/category words (region, product, category, country, status, month, year, user)
 - time_range: date references ("last quarter", "this year", "2024", "past 30 days") -> normalize to {type: "relative"|"absolute", value: str}
-- chart_type: explicit chart requests (bar, line, pie, donut, scatter, kpi, table, area, funnel, gauge, treemap) -> null if not specified
+- chart_type: explicit chart requests (bar, line, pie, donut, scatter, kpi, multi_row_card, table, area, funnel, gauge, treemap, waterfall, slicer) -> null if not specified
+  NOTE: use "multi_row_card" when the user wants a KPI card with MULTIPLE values broken down by a category (e.g. "count by region", "jobs per type"). Use "kpi" only for a single aggregate number.
+  NOTE: use "slicer" when the user wants a filter control, dropdown slicer, or checkbox filter that will filter other charts on the page.
 - filters: explicit filter conditions [{column, op, value}]
 
 VAGUENESS SCORE (0.0 to 1.0):

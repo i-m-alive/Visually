@@ -1,12 +1,12 @@
 'use client'
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { dashboardApi, shareApi, aiInsightsApi } from '@/lib/api'
+import { useRouter } from 'next/navigation'
+import { api, dashboardApi, shareApi, aiInsightsApi } from '@/lib/api'
 import {
-  LayoutDashboard, Loader2, AlertCircle, Search, X,
+  Loader2, AlertCircle, Search, X,
   BarChart2, Clock, RefreshCw, Share2, Heart, TrendingUp, Zap,
-  ChevronRight, Download, Sparkles, UserCircle2,
+  ChevronRight, Sparkles, UserCircle2, Link2, Upload, FileArchive,
 } from 'lucide-react'
-import { VisuallReportLoader } from '@/components/canvas/VisuallReportLoader'
 
 interface DashCard {
   id: string
@@ -38,16 +38,37 @@ function computeHealthScore(widgetCount: number): number {
   return 95
 }
 
+// Extract share token from a /share/canvas/{token} URL
+function extractToken(input: string): string | null {
+  const cleaned = input.trim()
+  const m = cleaned.match(/\/share\/canvas\/([A-Za-z0-9_-]+)/)
+  if (m) return m[1]
+  // raw token (no slashes)
+  if (/^[A-Za-z0-9_-]{20,}$/.test(cleaned)) return cleaned
+  return null
+}
+
 export default function EndUserDashboardPage() {
+  const router = useRouter()
+  const fileRef = useRef<HTMLInputElement>(null)
+
   const [dashboards, setDashboards] = useState<DashCard[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
-  const [viewingId, setViewingId] = useState<string | null>(null)
   const [aiSummaries, setAiSummaries] = useState<Record<string, string>>({})
   const [aiLoading, setAiLoading] = useState<Record<string, boolean>>({})
   const [shareToast, setShareToast] = useState<string | null>(null)
   const loadedSummaries = useRef(new Set<string>())
+
+  // Paste link modal
+  const [linkModal, setLinkModal] = useState(false)
+  const [linkInput, setLinkInput] = useState('')
+  const [linkError, setLinkError] = useState('')
+
+  // .vly import
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -88,7 +109,48 @@ export default function EndUserDashboardPage() {
       await navigator.clipboard.writeText(url)
       setShareToast('Share link copied!')
       setTimeout(() => setShareToast(null), 2500)
-    } catch { setShareToast('Failed to create share link'); setTimeout(() => setShareToast(null), 2500) }
+    } catch {
+      setShareToast('Failed to create share link')
+      setTimeout(() => setShareToast(null), 2500)
+    }
+  }
+
+  // Open via pasted share link
+  const handleOpenLink = () => {
+    setLinkError('')
+    const token = extractToken(linkInput)
+    if (!token) {
+      setLinkError('Paste a share link like: …/share/canvas/TOKEN')
+      return
+    }
+    setLinkModal(false)
+    setLinkInput('')
+    router.push(`/share/canvas/${token}`)
+  }
+
+  // Import .vly file
+  const handleVlyFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+
+    setImporting(true)
+    setImportError(null)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const resp = await api.post('/end-user/import-vly', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      const { token } = resp.data
+      router.push(`/share/canvas/${token}`)
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        ?? 'Failed to import file. Make sure it is a valid .vly file.'
+      setImportError(msg)
+    } finally {
+      setImporting(false)
+    }
   }
 
   const filtered = dashboards.filter(d => {
@@ -96,16 +158,6 @@ export default function EndUserDashboardPage() {
     const q = search.toLowerCase()
     return d.name.toLowerCase().includes(q) || d.project_name.toLowerCase().includes(q)
   })
-
-  if (viewingId) {
-    return (
-      <VisuallReportLoader
-        dashboardId={viewingId}
-        canEdit={false}
-        onClose={() => setViewingId(null)}
-      />
-    )
-  }
 
   return (
     <div className="flex flex-col h-full" style={{ background: '#F8FAFC' }}>
@@ -117,6 +169,50 @@ export default function EndUserDashboardPage() {
         </div>
       )}
 
+      {/* Paste link modal */}
+      {linkModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm px-4">
+          <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+            <div className="flex items-center gap-2 mb-4">
+              <div className="w-8 h-8 rounded-xl flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
+                <Link2 size={14} className="text-white" />
+              </div>
+              <h2 className="text-base font-bold text-gray-900">Open via Share Link</h2>
+              <button onClick={() => { setLinkModal(false); setLinkInput(''); setLinkError('') }}
+                className="ml-auto text-gray-400 hover:text-gray-600">
+                <X size={16} />
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">
+              Paste a share link you received from your team (e.g. <span className="font-mono text-gray-700">…/share/canvas/TOKEN</span>)
+            </p>
+            <input
+              autoFocus
+              value={linkInput}
+              onChange={e => { setLinkInput(e.target.value); setLinkError('') }}
+              onKeyDown={e => e.key === 'Enter' && handleOpenLink()}
+              placeholder="https://app.visually.io/share/canvas/…"
+              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-xl bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400"
+            />
+            {linkError && <p className="text-xs text-red-500 mt-1.5">{linkError}</p>}
+            <div className="flex gap-2 mt-4">
+              <button onClick={handleOpenLink}
+                className="flex-1 py-2 text-sm font-semibold text-white rounded-xl"
+                style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
+                Open Report
+              </button>
+              <button onClick={() => { setLinkModal(false); setLinkInput(''); setLinkError('') }}
+                className="px-4 py-2 text-sm text-gray-500 border border-gray-200 rounded-xl hover:bg-gray-50">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden file input for .vly */}
+      <input ref={fileRef} type="file" accept=".vly" className="hidden" onChange={handleVlyFile} />
+
       {/* Header */}
       <div className="px-6 py-4 bg-white border-b border-gray-100 flex-shrink-0">
         <div className="flex items-center justify-between">
@@ -124,11 +220,7 @@ export default function EndUserDashboardPage() {
             <h1 className="text-lg font-bold font-display text-gray-900">My Reports</h1>
             <p className="text-sm text-gray-500 mt-0.5">Reports shared with you by your team</p>
           </div>
-          <button
-            onClick={load}
-            className="p-2 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
-            title="Refresh"
-          >
+          <button onClick={load} className="p-2 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-50 transition-colors" title="Refresh">
             <RefreshCw size={16} />
           </button>
         </div>
@@ -148,6 +240,38 @@ export default function EndUserDashboardPage() {
             </button>
           )}
         </div>
+
+        {/* Access methods */}
+        <div className="flex items-center gap-2 mt-3 flex-wrap">
+          <span className="text-xs text-gray-400 font-medium mr-1">Get access:</span>
+
+          <button
+            onClick={() => setLinkModal(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-blue-200 text-blue-600 bg-blue-50 hover:bg-blue-100 transition-colors"
+          >
+            <Link2 size={12} /> Paste share link
+          </button>
+
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={importing}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-purple-200 text-purple-600 bg-purple-50 hover:bg-purple-100 transition-colors disabled:opacity-50"
+          >
+            {importing
+              ? <><Loader2 size={12} className="animate-spin" /> Importing…</>
+              : <><Upload size={12} /> Import .vly file</>
+            }
+          </button>
+        </div>
+
+        {/* Import error */}
+        {importError && (
+          <div className="mt-2 flex items-center gap-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            <AlertCircle size={12} />
+            <span>{importError}</span>
+            <button onClick={() => setImportError(null)} className="ml-auto"><X size={11} /></button>
+          </div>
+        )}
       </div>
 
       {/* Content */}
@@ -176,9 +300,14 @@ export default function EndUserDashboardPage() {
                 {search ? 'No reports match your search.' : 'No reports shared with you yet.'}
               </p>
               {!search && (
-                <p className="text-sm mt-1 text-gray-400">
-                  Ask your builder to share a report with your email address.
-                </p>
+                <div className="mt-2 space-y-1 text-sm text-gray-400">
+                  <p>Ask your builder to share a report, or:</p>
+                  <p>
+                    <button onClick={() => setLinkModal(true)} className="text-blue-500 hover:underline font-medium">Paste a share link</button>
+                    {' · '}
+                    <button onClick={() => fileRef.current?.click()} className="text-purple-500 hover:underline font-medium">Import a .vly file</button>
+                  </p>
+                </div>
               )}
             </div>
           </div>
@@ -203,7 +332,6 @@ export default function EndUserDashboardPage() {
                     key={dash.id}
                     className="group relative rounded-2xl border border-gray-100 overflow-hidden bg-white hover:shadow-xl hover:-translate-y-1 transition-all duration-200"
                   >
-                    {/* Gradient header */}
                     <div className="h-20 relative flex items-end px-4 pb-3" style={{ background: `linear-gradient(135deg, ${colors.border}, ${colors.accent})` }}>
                       <div className="flex items-center gap-1.5 opacity-60">
                         <BarChart2 size={14} className="text-white" />
@@ -256,7 +384,7 @@ export default function EndUserDashboardPage() {
                       {/* Actions */}
                       <div className="flex items-center gap-2 mt-4 pt-3 border-t border-gray-50">
                         <button
-                          onClick={() => setViewingId(dash.id)}
+                          onClick={() => router.push(`/canvas/${dash.id}/analyst`)}
                           className="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-white rounded-xl transition-colors"
                           style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
                         >

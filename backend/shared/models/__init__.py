@@ -14,6 +14,9 @@ from .phase4 import ExportJob, ExportToken, ExportChatSession
 from .schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
 from .sharing import CanvasShareToken, CanvasCollaborator
 from .tier5 import RLSPolicy
+from .annotations import DashboardAnnotation
+from .bookmarks import DashboardBookmark
+from .snapshot_schedules import SnapshotSchedule
 
 __all__ = [
     "User", "Project", "ProjectMember", "DatabaseConnection",
@@ -25,4 +28,5 @@ __all__ = [
     "SchemaTableMetadata", "SchemaColumnMetadata",
     "CanvasShareToken", "CanvasCollaborator",
     "RLSPolicy",
+    "DashboardAnnotation", "DashboardBookmark", "SnapshotSchedule",
 ]
