@@ -25,19 +25,56 @@ def _crawl_sync(
     host: str, port: int, database: str, user: str, password: str,
     ssl: bool, connection_id: str, iam_role_arn: str | None,
 ) -> dict:
+    is_serverless = "redshift-serverless" in (host or "")
+    # Serverless workgroups auto-pause; allow more time for cold-start wake-up
+    _timeout = 180 if is_serverless else 120
+
     conn_kwargs: dict[str, Any] = {
         "host": host, "port": port, "database": database,
-        "ssl": ssl, "timeout": 120,
+        "ssl": ssl, "timeout": _timeout,
     }
+
+    if is_serverless:
+        conn_kwargs["is_serverless"] = True
+        # Host format: <workgroup>.<account>.<region>.redshift-serverless.amazonaws.com
+        _parts = (host or "").split(".")
+        if len(_parts) >= 3:
+            conn_kwargs["region"] = _parts[2]
+        if _parts:
+            conn_kwargs["serverless_work_group"] = _parts[0]
 
     # IAM auth when password is blank — use AWS credential env vars
     if not password:
+        _ak = os.getenv("AWS_ACCESS_KEY_ID", "")
+        _sk = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        _tok = os.getenv("AWS_SESSION_TOKEN", "")
+        _region = conn_kwargs.get("region", "us-east-1")
+
+        # Pre-validate AWS credentials before handing them to redshift_connector.
+        # Expired STS tokens cause redshift_connector to silently fall back to
+        # password auth (empty password), which produces a confusing error.
+        try:
+            import boto3
+            sts = boto3.client(
+                "sts",
+                aws_access_key_id=_ak,
+                aws_secret_access_key=_sk,
+                aws_session_token=_tok or None,
+                region_name=_region,
+            )
+            sts.get_caller_identity()
+        except Exception as cred_err:
+            raise Exception(
+                f"AWS credentials are invalid or expired: {cred_err}\n"
+                "Run: aws sts get-session-token  — then update AWS_ACCESS_KEY_ID, "
+                "AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN in .env and restart the backend."
+            )
+
         conn_kwargs["iam"] = True
-        conn_kwargs["aws_access_key_id"] = os.getenv("AWS_ACCESS_KEY_ID", "")
-        conn_kwargs["aws_secret_access_key"] = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        aws_session_token = os.getenv("AWS_SESSION_TOKEN", "")
-        if aws_session_token:
-            conn_kwargs["aws_session_token"] = aws_session_token
+        conn_kwargs["aws_access_key_id"] = _ak
+        conn_kwargs["aws_secret_access_key"] = _sk
+        if _tok:
+            conn_kwargs["aws_session_token"] = _tok
         conn_kwargs["database_user"] = user if user else "awsuser"
     else:
         conn_kwargs["user"] = user

@@ -5,6 +5,7 @@ interface AuthUser {
   id: string
   email: string
   full_name: string
+  role: 'builder' | 'end_user'
 }
 
 interface AuthState {
@@ -13,6 +14,7 @@ interface AuthState {
   refreshToken: string | null
   _hasHydrated: boolean
   setAuth: (user: AuthUser, accessToken: string, refreshToken: string) => void
+  updateUser: (partial: Partial<AuthUser>) => void
   clearAuth: () => void
   setHasHydrated: (v: boolean) => void
 }
@@ -25,6 +27,7 @@ export const useAuthStore = create<AuthState>()(
       refreshToken: null,
       _hasHydrated: false,
       setAuth: (user, accessToken, refreshToken) => set({ user, accessToken, refreshToken }),
+      updateUser: (partial) => set((s) => ({ user: s.user ? { ...s.user, ...partial } : s.user })),
       clearAuth: () => set({ user: null, accessToken: null, refreshToken: null }),
       setHasHydrated: (v) => set({ _hasHydrated: v }),
     }),

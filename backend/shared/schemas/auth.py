@@ -5,6 +5,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     full_name: str
+    role: str = "builder"
 
 
 class LoginRequest(BaseModel):
@@ -19,6 +20,7 @@ class TokenResponse(BaseModel):
     user_id: str
     email: str
     full_name: str
+    role: str = "builder"
 
 
 class RefreshRequest(BaseModel):
@@ -30,3 +32,4 @@ class UserResponse(BaseModel):
     email: str
     full_name: str
     is_active: bool
+    role: str = "builder"

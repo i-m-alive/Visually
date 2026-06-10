@@ -22,10 +22,11 @@ interface Props {
   onRename: (id: string, name: string) => void
   onDelete: (id: string) => void
   onDuplicate: (id: string) => void
+  onReorder?: (newPages: CanvasPage[]) => void
 }
 
 export function CanvasPageTabs({
-  pages, activePageId, onSwitch, onAdd, onRename, onDelete, onDuplicate,
+  pages, activePageId, onSwitch, onAdd, onRename, onDelete, onDuplicate, onReorder,
 }: Props) {
   const [editingId, setEditingId]     = useState<string | null>(null)
   const [editDraft, setEditDraft]     = useState('')
@@ -190,6 +191,44 @@ export function CanvasPageTabs({
           >
             <Copy size={12} className="text-gray-400" /> Duplicate page
           </button>
+          {(() => {
+            if (!onReorder) return null
+            const idx = sortedPages.findIndex(p => p.id === contextMenu.pageId)
+            return (
+              <>
+                {idx > 0 && (
+                  <button
+                    onClick={() => {
+                      const arr = sortedPages.map((p, i) => ({ ...p }))
+                      const tmp = arr[idx].order
+                      arr[idx].order = arr[idx - 1].order
+                      arr[idx - 1].order = tmp
+                      onReorder(arr)
+                      setContextMenu(null)
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+                  >
+                    <ChevronLeft size={12} className="text-gray-400" /> Move left
+                  </button>
+                )}
+                {idx < sortedPages.length - 1 && (
+                  <button
+                    onClick={() => {
+                      const arr = sortedPages.map((p, i) => ({ ...p }))
+                      const tmp = arr[idx].order
+                      arr[idx].order = arr[idx + 1].order
+                      arr[idx + 1].order = tmp
+                      onReorder(arr)
+                      setContextMenu(null)
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+                  >
+                    <ChevronRight size={12} className="text-gray-400" /> Move right
+                  </button>
+                )}
+              </>
+            )
+          })()}
           {pages.length > 1 && (
             <>
               <div className="my-1 border-t border-gray-100" />

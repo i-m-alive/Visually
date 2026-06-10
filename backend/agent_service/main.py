@@ -41,8 +41,51 @@ from agent_service.agents.intent_classifier import IntentClassifier as QuickClas
 from agent_service.routers import chat as chat_module
 from agent_service.routers import screenshots as screenshots_module
 from agent_service.routers import exports as exports_module
+from agent_service.routers import vly as vly_module
+from agent_service.routers import share as share_module
+from agent_service.routers import public_canvas as public_canvas_module
+from agent_service.routers import tier5 as tier5_module
+from agent_service.routers import ai_insights as ai_insights_module
 
-app = FastAPI(title="Visually Agent Service", version="2.0.0")
+from contextlib import asynccontextmanager
+
+async def _backfill_project_members():
+    """Ensure every project has a ProjectMember row for its owner.
+    Runs once at startup to fix projects created before this constraint was enforced."""
+    from shared.database import AsyncSessionLocal
+    from shared.models.projects import Project
+    from shared.models.project_members import ProjectMember, MemberRole
+    async with AsyncSessionLocal() as db:
+        try:
+            projects = (await db.execute(select(Project))).scalars().all()
+            for project in projects:
+                existing = (await db.execute(
+                    select(ProjectMember)
+                    .where(ProjectMember.project_id == project.id)
+                    .where(ProjectMember.user_id == project.owner_id)
+                )).scalar_one_or_none()
+                if not existing:
+                    db.add(ProjectMember(
+                        id=uuid.uuid4(),
+                        project_id=project.id,
+                        user_id=project.owner_id,
+                        role=MemberRole.owner,
+                        joined_at=project.created_at or datetime.utcnow(),
+                    ))
+            await db.commit()
+        except Exception as e:
+            print(f"[startup] ProjectMember backfill warning: {e}")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    from agent_service.scheduler import start_scheduler, stop_scheduler
+    await _backfill_project_members()
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+app = FastAPI(title="Visually Agent Service", version="2.0.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,6 +125,11 @@ bearer_scheme = HTTPBearer(auto_error=False)
 app.include_router(chat_module.router)
 app.include_router(screenshots_module.router)
 app.include_router(exports_module.router)
+app.include_router(vly_module.router)
+app.include_router(share_module.router)
+app.include_router(public_canvas_module.router)
+app.include_router(tier5_module.router)
+app.include_router(ai_insights_module.router)
 
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
@@ -117,7 +165,10 @@ async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    if DEV_MODE:
+    # DEV_MODE: only use the dev user when no JWT is present (direct API testing).
+    # When a real JWT is provided (browser sessions), always validate it so each
+    # registered user gets their own isolated data.
+    if DEV_MODE and credentials is None:
         return await _get_or_create_dev_user(db)
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
@@ -142,17 +193,19 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == req.email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already registered")
+    role = getattr(req, "role", "builder") or "builder"
     user = User(
         id=uuid.uuid4(), email=req.email,
         hashed_password=hash_password(req.password),
         full_name=req.full_name,
+        role=role,
         created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
     )
     db.add(user)
     await db.commit()
     await db.refresh(user)
-    access_token = create_access_token({"sub": str(user.id)})
-    refresh_token = create_refresh_token({"sub": str(user.id)})
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token = create_refresh_token({"sub": str(user.id), "role": user.role})
     db.add(RefreshToken(
         id=uuid.uuid4(), user_id=user.id, token_hash=_hash_rt(refresh_token),
         expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
@@ -160,7 +213,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     ))
     await db.commit()
     return TokenResponse(access_token=access_token, refresh_token=refresh_token,
-                        user_id=str(user.id), email=user.email, full_name=user.full_name)
+                        user_id=str(user.id), email=user.email, full_name=user.full_name, role=user.role)
 
 
 @app.post("/auth/login", response_model=TokenResponse)
@@ -171,8 +224,8 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive")
-    access_token = create_access_token({"sub": str(user.id)})
-    refresh_token = create_refresh_token({"sub": str(user.id)})
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token = create_refresh_token({"sub": str(user.id), "role": user.role})
     db.add(RefreshToken(
         id=uuid.uuid4(), user_id=user.id, token_hash=_hash_rt(refresh_token),
         expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
@@ -180,7 +233,7 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     ))
     await db.commit()
     return TokenResponse(access_token=access_token, refresh_token=refresh_token,
-                        user_id=str(user.id), email=user.email, full_name=user.full_name)
+                        user_id=str(user.id), email=user.email, full_name=user.full_name, role=user.role)
 
 
 @app.post("/auth/refresh", response_model=TokenResponse)
@@ -202,8 +255,8 @@ async def refresh_token_endpoint(req: RefreshRequest, db: AsyncSession = Depends
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    new_access = create_access_token({"sub": str(user.id)})
-    new_refresh = create_refresh_token({"sub": str(user.id)})
+    new_access = create_access_token({"sub": str(user.id), "role": user.role})
+    new_refresh = create_refresh_token({"sub": str(user.id), "role": user.role})
     db.add(RefreshToken(
         id=uuid.uuid4(), user_id=user.id, token_hash=_hash_rt(new_refresh),
         expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
@@ -211,13 +264,37 @@ async def refresh_token_endpoint(req: RefreshRequest, db: AsyncSession = Depends
     ))
     await db.commit()
     return TokenResponse(access_token=new_access, refresh_token=new_refresh,
-                        user_id=str(user.id), email=user.email, full_name=user.full_name)
+                        user_id=str(user.id), email=user.email, full_name=user.full_name, role=user.role)
 
 
 @app.get("/auth/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return UserResponse(id=str(current_user.id), email=current_user.email,
-                       full_name=current_user.full_name, is_active=current_user.is_active)
+                       full_name=current_user.full_name, is_active=current_user.is_active,
+                       role=current_user.role)
+
+
+class UpdateMeRequest(BaseModel):
+    full_name: str | None = None
+    role: str | None = None
+
+
+@app.patch("/auth/me", response_model=UserResponse)
+async def update_me(
+    req: UpdateMeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if req.full_name is not None:
+        current_user.full_name = req.full_name.strip() or current_user.full_name
+    if req.role is not None and req.role in ("builder", "end_user"):
+        current_user.role = req.role
+    current_user.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(current_user)
+    return UserResponse(id=str(current_user.id), email=current_user.email,
+                       full_name=current_user.full_name, is_active=current_user.is_active,
+                       role=current_user.role)
 
 
 # ─── PROJECT ROUTES ──────────────────────────────────────────────────────────
@@ -250,7 +327,19 @@ async def create_project(req: ProjectCreate, current_user: User = Depends(get_cu
 
 @app.get("/projects", response_model=list[ProjectResponse])
 async def list_projects(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Project).where(Project.owner_id == current_user.id).order_by(Project.created_at.desc()))
+    from sqlalchemy import or_
+    result = await db.execute(
+        select(Project)
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(
+            or_(Project.owner_id == current_user.id,
+                ProjectMember.user_id == current_user.id)
+        )
+        .distinct()
+        .order_by(Project.created_at.desc())
+    )
     return [ProjectResponse(id=str(p.id), name=p.name, description=p.description,
                            owner_id=str(p.owner_id), created_at=p.created_at.isoformat())
             for p in result.scalars().all()]
@@ -262,6 +351,18 @@ async def get_project(project_id: str, current_user: User = Depends(get_current_
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    from sqlalchemy import or_
+    access = await db.execute(
+        select(Project)
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(Project.id == project.id)
+        .where(or_(Project.owner_id == current_user.id,
+                   ProjectMember.user_id == current_user.id))
+    )
+    if not access.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
     return ProjectResponse(id=str(project.id), name=project.name, description=project.description,
                           owner_id=str(project.owner_id), created_at=project.created_at.isoformat())
 
@@ -361,13 +462,15 @@ async def test_connection(project_id: str, conn_id: str, current_user: User = De
     start = time.monotonic()
     try:
         if conn.db_type.value == "redshift":
-            import redshift_connector
+            import redshift_connector, os as _os
+            _is_serverless = "redshift-serverless" in (conn.host or "")
             conn_kwargs: dict = {
                 "host": conn.host, "port": conn.port or 5439,
                 "database": conn.database_name or "", "ssl": True, "timeout": 15,
             }
+            if _is_serverless:
+                conn_kwargs["is_serverless"] = True
             if not password:
-                import os as _os
                 conn_kwargs["iam"] = True
                 conn_kwargs["aws_access_key_id"] = _os.getenv("AWS_ACCESS_KEY_ID", "")
                 conn_kwargs["aws_secret_access_key"] = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -621,7 +724,7 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
 
 # ─── DASHBOARD ROUTES ────────────────────────────────────────────────────────
 
-from sqlalchemy import update as sa_update
+from sqlalchemy import update as sa_update, func
 from shared.models.dashboards import Dashboard
 from shared.models.widgets import Widget as WidgetModel
 from shared.models.chat_sessions import ChatSession
@@ -642,23 +745,153 @@ async def list_dashboards(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Verify the calling user has access to this project
+    from sqlalchemy import or_
+    proj_check = await db.execute(
+        select(Project)
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(Project.id == uuid.UUID(project_id))
+        .where(or_(Project.owner_id == current_user.id,
+                   ProjectMember.user_id == current_user.id))
+    )
+    if not proj_check.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
+
     result = await db.execute(
         select(Dashboard)
         .where(Dashboard.project_id == uuid.UUID(project_id))
         .where(Dashboard.is_archived == False)
-        .order_by(Dashboard.created_at.desc())
+        .order_by(Dashboard.updated_at.desc())
     )
     dashboards = result.scalars().all()
+    if not dashboards:
+        return {"dashboards": []}
+
+    dash_ids = [d.id for d in dashboards]
+    wc_result = await db.execute(
+        select(WidgetModel.dashboard_id, func.count(WidgetModel.id).label("cnt"))
+        .where(WidgetModel.dashboard_id.in_(dash_ids))
+        .group_by(WidgetModel.dashboard_id)
+    )
+    widget_counts = {str(row.dashboard_id): row.cnt for row in wc_result.all()}
+
     return {
         "dashboards": [
             {
                 "id": str(d.id),
                 "name": d.name,
                 "description": d.description,
-                "theme": d.theme,
+                "theme": d.theme or "frost",
+                "project_id": str(d.project_id),
                 "created_at": d.created_at.isoformat(),
+                "updated_at": (d.updated_at or d.created_at).isoformat(),
+                "widget_count": widget_counts.get(str(d.id), 0),
+                "has_schedule": bool(d.layout_config and d.layout_config.get("schedule_enabled")),
             }
             for d in dashboards
+        ]
+    }
+
+
+@app.get("/dashboards/all")
+async def list_all_dashboards(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return non-archived dashboards scoped to projects the current user owns or is a member of."""
+    from shared.models.projects import Project
+    from sqlalchemy import or_
+    result = await db.execute(
+        select(Dashboard, Project.name.label("project_name"))
+        .join(Project, Dashboard.project_id == Project.id)
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(or_(Project.owner_id == current_user.id,
+                   ProjectMember.user_id == current_user.id))
+        .where(Dashboard.is_archived == False)
+        .distinct()
+        .order_by(Dashboard.updated_at.desc())
+    )
+    rows = result.all()
+    if not rows:
+        return {"dashboards": []}
+
+    dash_ids = [d.id for d, _ in rows]
+    wc_result = await db.execute(
+        select(WidgetModel.dashboard_id, func.count(WidgetModel.id).label("cnt"))
+        .where(WidgetModel.dashboard_id.in_(dash_ids))
+        .group_by(WidgetModel.dashboard_id)
+    )
+    widget_counts = {str(row.dashboard_id): row.cnt for row in wc_result.all()}
+
+    return {
+        "dashboards": [
+            {
+                "id": str(d.id),
+                "name": d.name,
+                "description": d.description,
+                "theme": d.theme or "frost",
+                "project_name": project_name,
+                "project_id": str(d.project_id),
+                "created_at": d.created_at.isoformat(),
+                "updated_at": (d.updated_at or d.created_at).isoformat(),
+                "widget_count": widget_counts.get(str(d.id), 0),
+                "has_schedule": bool(d.layout_config and d.layout_config.get("schedule_enabled")),
+            }
+            for d, project_name in rows
+        ]
+    }
+
+
+@app.get("/dashboards/shared-with-me")
+async def list_shared_with_me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return dashboards explicitly shared with the current user via CanvasCollaborator."""
+    from shared.models.sharing import CanvasCollaborator
+    from shared.models.projects import Project
+
+    result = await db.execute(
+        select(Dashboard, Project.name.label("project_name"))
+        .join(CanvasCollaborator, CanvasCollaborator.dashboard_id == Dashboard.id)
+        .join(Project, Dashboard.project_id == Project.id)
+        .where(CanvasCollaborator.user_id == current_user.id)
+        .where(Dashboard.is_archived == False)
+        .distinct()
+        .order_by(Dashboard.updated_at.desc())
+    )
+    rows = result.all()
+
+    if not rows:
+        return {"dashboards": []}
+
+    dash_ids = [d.id for d, _ in rows]
+    wc_result = await db.execute(
+        select(WidgetModel.dashboard_id, func.count(WidgetModel.id).label("cnt"))
+        .where(WidgetModel.dashboard_id.in_(dash_ids))
+        .group_by(WidgetModel.dashboard_id)
+    )
+    widget_counts = {str(row.dashboard_id): row.cnt for row in wc_result.all()}
+
+    return {
+        "dashboards": [
+            {
+                "id": str(d.id),
+                "name": d.name,
+                "description": d.description,
+                "theme": d.theme or "frost",
+                "project_name": project_name,
+                "project_id": str(d.project_id),
+                "created_at": d.created_at.isoformat(),
+                "updated_at": (d.updated_at or d.created_at).isoformat(),
+                "widget_count": widget_counts.get(str(d.id), 0),
+                "has_schedule": bool(d.layout_config and d.layout_config.get("schedule_enabled")),
+            }
+            for d, project_name in rows
         ]
     }
 
@@ -675,6 +908,19 @@ async def get_dashboard(
     dashboard = dash_result.scalar_one_or_none()
     if not dashboard:
         raise HTTPException(status_code=404, detail="Dashboard not found")
+
+    from sqlalchemy import or_
+    proj_access = await db.execute(
+        select(Project)
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(Project.id == dashboard.project_id)
+        .where(or_(Project.owner_id == current_user.id,
+                   ProjectMember.user_id == current_user.id))
+    )
+    if not proj_access.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
 
     widgets_result = await db.execute(
         select(WidgetModel).where(WidgetModel.dashboard_id == uuid.UUID(dashboard_id))
@@ -715,6 +961,51 @@ async def get_dashboard(
             for w in widgets
         ],
     }
+
+
+@app.post("/dashboards/{dashboard_id}/duplicate")
+async def duplicate_dashboard(
+    dashboard_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clone a canvas — copies dashboard metadata and all widgets."""
+    src_res = await db.execute(select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id)))
+    src = src_res.scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
+    new_dash = Dashboard(
+        name=f"{src.name} (Copy)",
+        description=src.description,
+        theme=src.theme,
+        project_id=src.project_id,
+        layout_config=src.layout_config,
+        filter_config=src.filter_config,
+    )
+    db.add(new_dash)
+    await db.flush()
+
+    widgets_res = await db.execute(select(WidgetModel).where(WidgetModel.dashboard_id == src.id))
+    for w in widgets_res.scalars().all():
+        new_w = WidgetModel(
+            dashboard_id=new_dash.id,
+            title=w.title,
+            chart_type=w.chart_type,
+            sql_query=w.sql_query,
+            base_sql=w.base_sql,
+            chart_data=w.chart_data,
+            config=w.config,
+            width=w.width,
+            height=w.height,
+            position_x=w.position_x,
+            position_y=w.position_y,
+            connection_id=w.connection_id,
+        )
+        db.add(new_w)
+
+    await db.commit()
+    return {"id": str(new_dash.id), "name": new_dash.name}
 
 
 @app.patch("/dashboards/{dashboard_id}")

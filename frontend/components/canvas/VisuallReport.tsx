@@ -5,12 +5,21 @@ import {
   LayoutGrid, MessageSquare, ChevronRight, TrendingUp, TrendingDown,
   CheckCircle2, Copy, List, Info, ChevronDown, ChevronUp,
   Maximize2, Printer, ChevronLeft, Play, Pause, Download, Calendar,
-  Share2, HelpCircle,
+  Share2, HelpCircle, FileArchive, Users, Upload,
+  FunctionSquare, Clock, Shield, RefreshCw, ZoomIn, Pencil,
 } from 'lucide-react'
+import { useRouter } from 'next/navigation'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
-import { chatApi, canvasApi, exportApi, type WidgetCreate } from '@/lib/api'
+import { chatApi, canvasApi, exportApi, vlyApi, scheduleApi, type WidgetCreate } from '@/lib/api'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
+import { ShareModal } from '@/components/canvas/ShareModal'
+import { VlyImportModal } from '@/components/canvas/VlyImportModal'
+import { DrillDownModal } from '@/components/canvas/DrillDownModal'
+import { MeasuresPanel } from '@/components/canvas/MeasuresPanel'
+import { ScheduleRefreshModal } from '@/components/canvas/ScheduleRefreshModal'
+import { RLSModal } from '@/components/canvas/RLSModal'
+import { DateRangeSlicer } from '@/components/canvas/DateRangeSlicer'
 
 // ─── Theme System ──────────────────────────────────────────────────────────────
 
@@ -342,7 +351,8 @@ interface Props {
   initialPageId?: string
   projectId: string
   onClose: () => void
-  onWidgetAdded: () => void
+  onWidgetAdded?: () => void
+  canEdit?: boolean
   onCanvasRename?: (newName: string) => void
   onPageRename?: (id: string, name: string) => void
   onPageDelete?: (id: string) => void
@@ -565,7 +575,8 @@ function detectAnomalyIndices(values: (number|null)[]): number[] {
 
 // ─── Main Component ────────────────────────────────────────────────────────────
 
-export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '', projectId, onClose, onWidgetAdded, onCanvasRename, onPageRename, onPageDelete, onPageDuplicate, onPageReorder }: Props) {
+export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '', projectId, onClose, onWidgetAdded, canEdit = false, onCanvasRename, onPageRename, onPageDelete, onPageDuplicate, onPageReorder }: Props) {
+  const router = useRouter()
   const [themeIdx, setThemeIdx] = useState(() => {
     try { return parseInt(localStorage.getItem(`visually-theme-${canvas.id}`) ?? '0', 10) || 0 } catch { return 0 }
   })
@@ -667,6 +678,15 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
   const [scrollProgress, setScrollProgress] = useState(0)
   const [showShortcutSheet, setShowShortcutSheet] = useState(false)
   const [shareModal, setShareModal] = useState<{ open: boolean; loading: boolean; url: string | null; error: string | null }>({ open: false, loading: false, url: null, error: null })
+  const [showNewShareModal, setShowNewShareModal] = useState(false)
+  const [showVlyImport, setShowVlyImport] = useState(false)
+  // Tier 5 modals
+  const [showMeasures, setShowMeasures] = useState(false)
+  const [showSchedule, setShowSchedule] = useState(false)
+  const [showRLS, setShowRLS] = useState(false)
+  const [drilldown, setDrilldown] = useState<{ widgetId: string; widgetTitle: string; column: string; value: string } | null>(null)
+  const [crossFilteredWidgets, setCrossFilteredWidgets] = useState<CanvasWidgetData[] | null>(null)
+  const [crossFilterLoading, setCrossFilterLoading] = useState(false)
   const endRef         = useRef<HTMLDivElement>(null)
   const toastRef       = useRef<ReturnType<typeof setTimeout> | null>(null)
   const chatInputRef   = useRef<HTMLTextAreaElement>(null)
@@ -684,7 +704,12 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
     })
   }
   const pageWidgets    = filterByPage(widgets)
-  const displayWidgets = filteredWidgets ? filterByPage(filteredWidgets) : pageWidgets
+  // Priority: explicit filter > cross-filter server results > plain page widgets
+  const displayWidgets = filteredWidgets
+    ? filterByPage(filteredWidgets)
+    : crossFilteredWidgets
+      ? filterByPage(crossFilteredWidgets)
+      : pageWidgets
 
   const KPI_TYPES   = new Set(['kpi', 'kpi_card'])
   const TABLE_TYPES = new Set(['table', 'data_table', 'pivot_table'])
@@ -822,6 +847,12 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (e.key === 'Escape') {
         if (showShortcutSheet) { setShowShortcutSheet(false); return }
+        if (showNewShareModal) { setShowNewShareModal(false); return }
+        if (showVlyImport) { setShowVlyImport(false); return }
+        if (showMeasures) { setShowMeasures(false); return }
+        if (showSchedule) { setShowSchedule(false); return }
+        if (showRLS) { setShowRLS(false); return }
+        if (drilldown) { setDrilldown(null); return }
         if (shareModal.open) { setShareModal(s => ({ ...s, open: false })); return }
         if (showThemePicker) { setShowThemePicker(false); return }
         if (showBgPicker) { setShowBgPicker(false); return }
@@ -892,11 +923,38 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
     return () => el.removeEventListener('scroll', onScroll)
   }, [])
 
-  // ── Cross-filter toggle ───────────────────────────────────────────────────
+  // ── Cross-filter toggle + server-side requery ─────────────────────────────
   const handleCrossFilter = useCallback((column: string, value: unknown) => {
     const v = String(value)
     setCrossFilter(prev => prev?.column === column && prev?.value === v ? null : { column, value: v })
   }, [])
+
+  // Requery all other widgets server-side when crossFilter changes
+  useEffect(() => {
+    if (!crossFilter) {
+      setCrossFilteredWidgets(null)
+      return
+    }
+    let cancelled = false
+    setCrossFilterLoading(true)
+    canvasApi.requery(canvas.id, { [crossFilter.column]: [crossFilter.value] })
+      .then(r => {
+        if (cancelled) return
+        const updatedMap: Record<string, { rows: Record<string, unknown>[]; columns: string[] }> = {}
+        r.data.widgets?.forEach((w: { widget_id: string; chart_data: { rows: Record<string, unknown>[]; columns: string[] } }) => {
+          updatedMap[w.widget_id] = w.chart_data
+        })
+        setCrossFilteredWidgets(
+          widgets.map(w => updatedMap[w.id]
+            ? { ...w, chart_data: { ...w.chart_data, rows: updatedMap[w.id].rows, columns: updatedMap[w.id].columns } }
+            : w
+          )
+        )
+      })
+      .catch(() => { if (!cancelled) showToast('Cross-filter query failed') })
+      .finally(() => { if (!cancelled) setCrossFilterLoading(false) })
+    return () => { cancelled = true }
+  }, [crossFilter]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Share handler — generates an HTML export as the shareable link ────────
   const handleShare = useCallback(async () => {
@@ -1113,7 +1171,7 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
     }
     try {
       await canvasApi.addWidget(canvas.id, w)
-      onWidgetAdded()
+      onWidgetAdded?.()
       showToast(`✓ "${src.title}" added to canvas`)
       setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added "${src.title}" to your canvas!` }])
     } catch {
@@ -1269,6 +1327,16 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
   // Chart cards use tighter padding so the chart area gets more vertical space
   const chartCardBase: React.CSSProperties = { ...cardBase, padding: '12px 14px' }
 
+  const ribbonBtn = (active: boolean): React.CSSProperties => ({
+    display: 'flex', alignItems: 'center', gap: 4,
+    padding: '5px 10px', fontSize: 10, fontWeight: active ? 700 : 500,
+    border: `1px solid ${active ? theme.accent : 'transparent'}`,
+    borderRadius: 6, cursor: 'pointer', whiteSpace: 'nowrap' as const,
+    background: active ? theme.accentBg : 'transparent',
+    color: active ? theme.accent : theme.muted,
+    transition: 'all 0.12s', flexShrink: 0,
+  })
+
   // ── KPI card renderer ────────────────────────────────────────────────────
   const renderKpi = (w: CanvasWidgetData, idx: number) => {
     const { num, spark, delta } = getKpiMeta(w)
@@ -1380,6 +1448,33 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
 
   // ── Chart card renderer ──────────────────────────────────────────────────
   const renderChart = (w: CanvasWidgetData, idx: number, h = 220) => {
+    // Slicer widget — renders as a DateRangeSlicer that broadcasts to all charts
+    if (w.chart_type === 'slicer' || (w.config?.widget_type as string) === 'slicer') {
+      const slicerCol = (w.config?.slicer_column as string) || w.title
+      const currentRange = appliedDateRange[slicerCol] ?? null
+      return (
+        <div key={w.id} style={{ gridColumn: 'span 2' }}>
+          <DateRangeSlicer
+            title={w.title}
+            columnName={slicerCol}
+            value={currentRange}
+            onChange={(col, range) => {
+              if (range) {
+                setAppliedDateRange(prev => ({ ...prev, [col]: range }))
+              } else {
+                setAppliedDateRange(prev => { const r = { ...prev }; delete r[col]; return r })
+              }
+            }}
+            theme={{
+              surface: theme.surface, border: theme.border, text: theme.text,
+              muted: theme.muted, accent: theme.accent, accentBg: theme.accentBg,
+              bg: theme.bg, cardRadius: theme.cardRadius,
+            }}
+          />
+        </div>
+      )
+    }
+
     const isInfoOpen = infoWidgetId === w.id
     const isStarred = bookmarked.has(w.id)
     const activeType = chartTypeOverrides[w.id] ?? w.chart_type
@@ -1582,12 +1677,20 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
         )}
 
         {crossFilter && (
-          <div style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 5 }}>
-            <span style={{ fontSize: 9, fontWeight: 700, color: theme.accent }}>⬡ Drill-down:</span>
+          <div style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: theme.accent }}>
+              {crossFilterLoading ? '⏳' : '⬡'} Cross-filter:
+            </span>
             <span style={{ padding: '1px 7px', background: theme.accentBg, border: `1px solid ${theme.accent}44`, borderRadius: 8, fontSize: 9, fontWeight: 600, color: theme.accent }}>
               {crossFilter.column}: {crossFilter.value}
             </span>
-            <button onClick={() => setCrossFilter(null)} style={{ fontSize: 9, color: theme.muted, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>✕ clear</button>
+            <button
+              onClick={() => setDrilldown({ widgetId: w.id, widgetTitle: w.title, column: crossFilter.column, value: crossFilter.value })}
+              style={{ fontSize: 9, color: theme.accent, background: 'none', border: `1px solid ${theme.accent}44`, borderRadius: 4, cursor: 'pointer', padding: '1px 6px', display: 'flex', alignItems: 'center', gap: 2 }}
+            >
+              <ZoomIn size={8} /> Drill down
+            </button>
+            <button onClick={() => { setCrossFilter(null); setCrossFilteredWidgets(null) }} style={{ fontSize: 9, color: theme.muted, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>✕ clear</button>
           </div>
         )}
 
@@ -2309,10 +2412,22 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
           <span style={{ fontSize: 9, fontWeight: 500 }}>AI</span>
         </button>
 
+        {/* Edit in Canvas (builder only) */}
+        {canEdit && (
+          <button
+            onClick={() => router.push(`/projects/${projectId}/canvas/${canvas.id}`)}
+            title="Edit in Canvas Builder"
+            style={{ width: 52, minHeight: 48, borderRadius: 12, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 3, background: 'rgba(37,99,235,0.18)', color: '#93C5FD', border: 'none', cursor: 'pointer' }}
+          >
+            <Pencil size={16} />
+            <span style={{ fontSize: 9, fontWeight: 500 }}>Edit</span>
+          </button>
+        )}
+
         {/* Back */}
-        <button onClick={onClose} title="Back to Canvas (Esc)" style={{ width: 52, minHeight: 48, borderRadius: 12, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 3, background: 'transparent', color: theme.railText, border: 'none', cursor: 'pointer' }}>
+        <button onClick={onClose} title="Back" style={{ width: 52, minHeight: 48, borderRadius: 12, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 3, background: 'transparent', color: theme.railText, border: 'none', cursor: 'pointer' }}>
           <X size={16} />
-          <span style={{ fontSize: 9, fontWeight: 500 }}>Canvas</span>
+          <span style={{ fontSize: 9, fontWeight: 500 }}>Back</span>
         </button>
       </nav>
 
@@ -2503,41 +2618,99 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
               </button>
             ))}
           </div>
-          {/* Right: action buttons */}
-          <div className="vis-no-print" style={{ display: 'flex', alignItems: 'center', gap: 3, paddingLeft: 10, borderLeft: `1px solid ${theme.border}`, marginLeft: 6 }}>
-            <button onClick={() => setFocusMode(v => !v)}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${focusMode ? theme.accent : theme.border}`, background: focusMode ? theme.accentBg : 'none', color: focusMode ? theme.accent : theme.muted, cursor: 'pointer' }}>
-              {focusMode ? '◎ Focus' : '○ Focus'}
+        </div>
+
+        {/* ── Developer / Power Tools Ribbon ──────────────────────────────── */}
+        <div className="vis-no-print" style={{
+          display: 'flex', alignItems: 'stretch', flexShrink: 0,
+          background: ['midnight','digitalnative'].includes(theme.id) ? 'rgba(255,255,255,0.04)' : '#F8FAFC',
+          borderBottom: `1px solid ${theme.border}`,
+          overflowX: 'auto', minHeight: 42,
+        }}>
+          {/* Group: View */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px 4px 16px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
+            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>View</span>
+            <button onClick={() => setFocusMode(v => !v)} style={ribbonBtn(focusMode)} title="Dim unfocused cards on hover">
+              <ZoomIn size={11} /> Focus
             </button>
-            <button onClick={() => { const next = !comparisonMode; setComparisonMode(next); if (next) setComparedCharts(new Set(visualCharts.map(w => w.id))); else setComparedCharts(new Set()) }}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${comparisonMode ? theme.accent : theme.border}`, background: comparisonMode ? theme.accentBg : 'none', color: comparisonMode ? theme.accent : theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
-              ⇆ Compare all
-            </button>
-            <button onClick={() => { setSlideMode(true); setSlideIdx(0) }}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
-              <Play size={9} /> Present
-            </button>
-            <button onClick={handlePrint}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
-              <Printer size={9} /> Print
-            </button>
-            <button onClick={handleExportJSON}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
-              <Download size={9} /> Export
-            </button>
-            <button onClick={handleEmailCopy}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer' }}>
-              ✉ Email
-            </button>
-            <button onClick={handleShare}
-              style={{ padding: '2px 8px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
-              <Share2 size={9} /> Share
-            </button>
-            <button onClick={() => setShowShortcutSheet(true)} title="Keyboard shortcuts (?)"
-              style={{ padding: '2px 6px', fontSize: 9, borderRadius: 4, border: `1px solid ${theme.border}`, background: 'none', color: theme.muted, cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
-              <HelpCircle size={10} />
+            <button
+              onClick={() => { const next = !comparisonMode; setComparisonMode(next); if (next) setComparedCharts(new Set(visualCharts.map(w => w.id))); else setComparedCharts(new Set()) }}
+              style={ribbonBtn(comparisonMode)} title="Compare current vs prior period on all charts"
+            >⇆ Compare</button>
+            <button onClick={() => { setSlideMode(true); setSlideIdx(0) }} style={ribbonBtn(false)} title="Enter presentation / slide mode (S)">
+              <Play size={11} /> Present
             </button>
           </div>
+
+          {/* Group: Analytics */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
+            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Analytics</span>
+            <button
+              onClick={() => setShowMeasures(true)}
+              style={ribbonBtn(showMeasures)}
+              title="Calculated Measures — define SQL expressions as reusable metrics with AI generation"
+            ><FunctionSquare size={11} /> Measures</button>
+            <button
+              onClick={() => {
+                if (crossFilter && visualCharts[0]) {
+                  setDrilldown({ widgetId: visualCharts[0].id, widgetTitle: visualCharts[0].title, column: crossFilter.column, value: crossFilter.value })
+                }
+              }}
+              style={{ ...ribbonBtn(!!drilldown), opacity: crossFilter ? 1 : 0.38, cursor: crossFilter ? 'pointer' : 'default' }}
+              title={crossFilter ? `Drill into "${crossFilter.value}" — explore child data` : 'Click a chart bar or point to activate cross-filter, then use Drilldown'}
+            ><ZoomIn size={11} /> Drilldown</button>
+          </div>
+
+          {/* Group: Security */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
+            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Security</span>
+            <button
+              onClick={() => setShowRLS(true)}
+              style={ribbonBtn(showRLS)}
+              title="Row-Level Security — SQL WHERE clause policies injected per user at query time"
+            ><Shield size={11} /> Row-Level Security</button>
+          </div>
+
+          {/* Group: Automation */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
+            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Automation</span>
+            <button
+              onClick={() => setShowSchedule(true)}
+              style={ribbonBtn(showSchedule)}
+              title="Scheduled Refresh — cron-based auto-refresh of all widget queries"
+            ><Clock size={11} /> Schedule Refresh</button>
+            <button
+              onClick={async () => {
+                try {
+                  await scheduleApi.refreshNow(canvas.id)
+                  onWidgetAdded?.()
+                  showToast('✓ Dashboard refreshed')
+                } catch {
+                  showToast('Refresh failed')
+                }
+              }}
+              style={ribbonBtn(false)}
+              title="Immediately re-run all widget SQL queries"
+            ><RefreshCw size={11} /> Refresh Now</button>
+          </div>
+
+          {/* Group: Export */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
+            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Export</span>
+            <button onClick={handlePrint} style={ribbonBtn(false)}><Printer size={11} /> Print</button>
+            <button onClick={handleExportJSON} style={ribbonBtn(false)}><Download size={11} /> Export</button>
+            <button onClick={handleEmailCopy} style={ribbonBtn(false)}>✉ Email</button>
+            <button onClick={() => setShowNewShareModal(true)} style={ribbonBtn(false)}><Users size={11} /> Share</button>
+            <button onClick={() => vlyApi.exportVly(canvas.id)} title="Download as .vly canvas bundle" style={ribbonBtn(false)}><FileArchive size={11} /> .vly</button>
+            <button onClick={() => setShowVlyImport(true)} title="Import a .vly canvas file" style={ribbonBtn(false)}><Upload size={11} /> Import</button>
+          </div>
+
+          <div style={{ flex: 1 }} />
+          <button
+            onClick={() => setShowShortcutSheet(true)}
+            style={{ ...ribbonBtn(false), padding: '4px 14px', borderLeft: `1px solid ${theme.border}`, borderRadius: 0 }}
+            title="Keyboard shortcuts (?)"
+          ><HelpCircle size={11} /> Shortcuts</button>
         </div>
 
         {/* Page switcher strip — MOVED TO HERO — this placeholder kept for context menu portal */}
@@ -2793,8 +2966,8 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
             </aside>
           )}
 
-          {/* Charts area — backgroundColor is the base; backgroundImage from getPatternStyle overlays the pattern */}
-          <div ref={scrollAreaRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', backgroundColor: theme.bg, ...getPatternStyle(bgPattern, theme), position: 'relative' }}>
+          {/* Charts area — Power BI-style: patterned workspace with centered white sheet */}
+          <div ref={scrollAreaRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'auto', backgroundColor: theme.bg, ...getPatternStyle(bgPattern, theme), position: 'relative' }}>
             {/* Scroll progress bar */}
             {scrollProgress > 0.01 && (
               <div className="vis-scroll-progress vis-no-print" style={{ position: 'sticky', top: 0, left: 0, height: 3, background: theme.accent, width: `${scrollProgress * 100}%`, zIndex: 10, borderRadius: '0 2px 2px 0', opacity: 0.8 }} />
@@ -2824,8 +2997,22 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
                 )}
               </div>
             )}
-            <div key={`${activeSection}::${reportPageId}`} style={{ animation: 'vis-page-enter 0.22s cubic-bezier(0.4,0,0.2,1) both' }}>
-              {renderContent()}
+            {/* ── Centered page sheet (Power BI canvas style) ──────────── */}
+            <div style={{ padding: '24px 40px 56px', display: 'flex', justifyContent: 'center', minHeight: '100%' }}>
+              <div style={{
+                width: '100%', maxWidth: 1440,
+                background: theme.surface,
+                borderRadius: 6,
+                boxShadow: ['midnight','digitalnative'].includes(theme.id)
+                  ? '0 6px 40px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.08)'
+                  : '0 2px 8px rgba(0,0,0,0.06), 0 8px 32px rgba(0,0,0,0.08), 0 0 0 1px rgba(0,0,0,0.04)',
+                minHeight: '70vh',
+                overflow: 'hidden',
+              }}>
+                <div key={`${activeSection}::${reportPageId}`} style={{ animation: 'vis-page-enter 0.22s cubic-bezier(0.4,0,0.2,1) both' }}>
+                  {renderContent()}
+                </div>
+              </div>
             </div>
           </div>{/* end scrollable charts area */}
         </div>
@@ -3188,7 +3375,62 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
         </div>
       )}
 
-      {/* ── Share Modal ───────────────────────────────────────────────────── */}
+      {/* ── New Share Modal (links + collaborators) ───────────────────────── */}
+      {showNewShareModal && (
+        <ShareModal
+          canvasId={canvas.id}
+          canvasName={canvas.name}
+          onClose={() => setShowNewShareModal(false)}
+        />
+      )}
+
+      {/* ── .vly Import Modal ─────────────────────────────────────────────── */}
+      {showVlyImport && (
+        <VlyImportModal
+          projectId={projectId}
+          onClose={() => setShowVlyImport(false)}
+        />
+      )}
+
+      {/* ── Tier 5: Measures Panel ────────────────────────────────────────── */}
+      {showMeasures && (
+        <MeasuresPanel
+          canvasId={canvas.id}
+          onClose={() => setShowMeasures(false)}
+        />
+      )}
+
+      {/* ── Tier 5: Schedule Refresh Modal ───────────────────────────────── */}
+      {showSchedule && (
+        <ScheduleRefreshModal
+          canvasId={canvas.id}
+          onClose={() => setShowSchedule(false)}
+          onRefreshedNow={onWidgetAdded ?? (() => {})}
+        />
+      )}
+
+      {/* ── Tier 5: RLS Modal ─────────────────────────────────────────────── */}
+      {showRLS && (
+        <RLSModal
+          canvasId={canvas.id}
+          onClose={() => setShowRLS(false)}
+        />
+      )}
+
+      {/* ── Tier 5: Drill-Down Modal ──────────────────────────────────────── */}
+      {drilldown && (
+        <DrillDownModal
+          canvasId={canvas.id}
+          widgetId={drilldown.widgetId}
+          widgetTitle={drilldown.widgetTitle}
+          drillColumn={drilldown.column}
+          drillValue={drilldown.value}
+          connectionId={connectionId}
+          onClose={() => setDrilldown(null)}
+        />
+      )}
+
+      {/* ── Legacy HTML Share Modal ───────────────────────────────────────── */}
       {shareModal.open && (
         <div onClick={() => setShareModal(s => ({ ...s, open: false }))}
           style={{ position: 'fixed', inset: 0, zIndex: 500, background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32, animation: 'visually-fadeIn 0.15s ease both' }}>

@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { projectApi } from '@/lib/api'
 import { CheckCircle, XCircle, Loader2 } from 'lucide-react'
@@ -39,6 +39,22 @@ export default function NewProjectPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
+  // Poll crawl job status via useEffect so HMR doesn't break the interval
+  useEffect(() => {
+    if (!crawlJobId || !projectId) return
+    const poll = setInterval(async () => {
+      try {
+        const s = await projectApi.getCrawlStatus(projectId, crawlJobId)
+        if (s.data.status === 'completed' || s.data.status === 'failed') {
+          clearInterval(poll)
+          router.push(`/projects/${projectId}/query`)
+        }
+      } catch { /* keep waiting */ }
+    }, 3000)
+    const timeout = setTimeout(() => { clearInterval(poll); router.push(`/projects/${projectId}/query`) }, 600_000)
+    return () => { clearInterval(poll); clearTimeout(timeout) }
+  }, [crawlJobId, projectId])
+
   const handleDbTypeChange = (value: DbType) => {
     setDbType(value)
     const opt = DB_OPTIONS.find(o => o.value === value)
@@ -62,14 +78,22 @@ export default function NewProjectPage() {
   }
 
   const handleTestConnection = async () => {
-    if (!connId) {
-      await handleSaveConnection(true)
-      return
-    }
     setTesting(true)
     setTestResult(null)
     try {
-      const resp = await projectApi.testConnection(projectId, connId)
+      let targetConnId = connId
+      if (!targetConnId) {
+        // Create connection first if not yet saved
+        const connectionOptions = dbType === 'redshift' && iamRoleArn ? { iam_role_arn: iamRoleArn } : undefined
+        const resp = await projectApi.addConnection(projectId, {
+          name: connName, db_type: dbType, host, port: parseInt(port),
+          database_name: dbName, username, password,
+          ssl_enabled: dbType === 'redshift', connection_options: connectionOptions,
+        })
+        targetConnId = resp.data.id
+        setConnId(targetConnId)
+      }
+      const resp = await projectApi.testConnection(projectId, targetConnId)
       setTestResult(resp.data)
     } catch {
       setTestResult({ success: false, message: 'Connection test failed' })
@@ -78,51 +102,44 @@ export default function NewProjectPage() {
     }
   }
 
-  const handleSaveConnection = async (testOnly = false) => {
+  const handleSaveConnection = async () => {
     setError('')
     setSaving(true)
     try {
       const connectionOptions = dbType === 'redshift' && iamRoleArn
         ? { iam_role_arn: iamRoleArn }
         : undefined
-
-      const resp = await projectApi.addConnection(projectId, {
-        name: connName,
-        db_type: dbType,
-        host,
-        port: parseInt(port),
-        database_name: dbName,
-        username,
-        password,
-        ssl_enabled: dbType === 'redshift',
-        connection_options: connectionOptions,
-      })
-      setConnId(resp.data.id)
-
-      if (testOnly) {
-        const testResp = await projectApi.testConnection(projectId, resp.data.id)
-        setTestResult(testResp.data)
-      } else {
-        setStep('crawling')
-        const crawlResp = await projectApi.triggerCrawl(projectId)
-        setCrawlJobId(crawlResp.data.job_id)
-
-        const poll = setInterval(async () => {
-          try {
-            await projectApi.getSchema(projectId)
-            clearInterval(poll)
-            router.push(`/projects/${projectId}/query`)
-          } catch {}
-        }, 2000)
-
-        setTimeout(() => {
-          clearInterval(poll)
-          router.push(`/projects/${projectId}/query`)
-        }, 120000)
+      const connData = {
+        name: connName, db_type: dbType, host, port: parseInt(port),
+        database_name: dbName, username, password,
+        ssl_enabled: dbType === 'redshift', connection_options: connectionOptions,
       }
+
+      let savedConnId = connId
+      if (!savedConnId) {
+        // No connection yet — create one
+        const resp = await projectApi.addConnection(projectId, connData)
+        savedConnId = resp.data.id
+        setConnId(savedConnId)
+      } else {
+        // Already tested — update in place, don't create a duplicate
+        await projectApi.updateConnection(projectId, savedConnId, connData)
+      }
+
+      // Trigger crawl — if schema crawler isn't running this returns 502
+      let crawlResp
+      try {
+        crawlResp = await projectApi.triggerCrawl(projectId)
+      } catch (crawlErr: unknown) {
+        const ce = crawlErr as { response?: { data?: { detail?: string } } }
+        throw new Error(ce.response?.data?.detail ?? 'Schema crawler is not running. Start it on port 8003.')
+      }
+      setStep('crawling')
+      setCrawlJobId(crawlResp.data.job_id)
     } catch (err: unknown) {
-      const e = err as { response?: { data?: { detail?: string } } }
-      setError(e.response?.data?.detail || 'Failed to save connection')
+      setStep('connection')
+      const e = err as { message?: string; response?: { data?: { detail?: string } } }
+      setError(e.message ?? e.response?.data?.detail ?? 'Failed to save connection')
     } finally {
       setSaving(false)
     }
@@ -247,7 +264,7 @@ export default function NewProjectPage() {
               <button onClick={handleTestConnection} disabled={testing || saving} className="btn-secondary flex-1">
                 {testing ? 'Testing...' : 'Test connection'}
               </button>
-              <button onClick={() => handleSaveConnection(false)} disabled={saving || testing} className="btn-primary flex-1">
+              <button onClick={() => handleSaveConnection()} disabled={saving || testing} className="btn-primary flex-1">
                 {saving ? 'Saving...' : 'Save & crawl →'}
               </button>
             </div>

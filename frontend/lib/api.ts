@@ -19,13 +19,15 @@ api.interceptors.request.use((config) => {
 })
 
 export const authApi = {
-  register: (data: { email: string; password: string; full_name: string }) =>
+  register: (data: { email: string; password: string; full_name: string; role?: string }) =>
     api.post('/auth/register', data),
   login: (data: { email: string; password: string }) =>
     api.post('/auth/login', data),
   refresh: (data: { refresh_token: string }) =>
     api.post('/auth/refresh', data),
   me: () => api.get('/auth/me'),
+  updateMe: (data: { full_name?: string; role?: string }) =>
+    api.patch('/auth/me', data),
 }
 
 export const projectApi = {
@@ -34,8 +36,12 @@ export const projectApi = {
   list: () => api.get('/projects'),
   get: (id: string) => api.get(`/projects/${id}`),
   delete: (id: string) => api.delete(`/projects/${id}`),
+  listConnections: (projectId: string) =>
+    api.get(`/projects/${projectId}/connections`),
   addConnection: (projectId: string, data: Record<string, unknown>) =>
     api.post(`/projects/${projectId}/connections`, data),
+  updateConnection: (projectId: string, connId: string, data: Record<string, unknown>) =>
+    api.patch(`/projects/${projectId}/connections/${connId}`, data),
   testConnection: (projectId: string, connId: string) =>
     api.post(`/projects/${projectId}/connections/${connId}/test`),
   triggerCrawl: (projectId: string) =>
@@ -131,6 +137,8 @@ export const exportApi = {
 }
 
 export const dashboardApi = {
+  listAll: () => api.get('/dashboards/all'),
+  sharedWithMe: () => api.get('/dashboards/shared-with-me'),
   list: (projectId: string) => api.get(`/dashboards?project_id=${projectId}`),
   get: (dashboardId: string) => api.get(`/dashboards/${dashboardId}`),
   updateTheme: (dashboardId: string, theme: string) =>
@@ -138,6 +146,7 @@ export const dashboardApi = {
   rename: (dashboardId: string, name: string) =>
     api.patch(`/dashboards/${dashboardId}`, { name }),
   delete: (dashboardId: string) => api.delete(`/dashboards/${dashboardId}`),
+  duplicate: (dashboardId: string) => api.post(`/dashboards/${dashboardId}/duplicate`),
   requery: (
     dashboardId: string,
     filters: Record<string, string[] | { start: string; end: string }>,
@@ -200,4 +209,169 @@ export const widgetApi = {
     api.patch(`/widgets/${widgetId}`, data),
   delete: (widgetId: string) =>
     api.delete(`/widgets/${widgetId}`),
+}
+
+// ─── AI Insights (end-user) ───────────────────────────────────────────────────
+
+export const aiInsightsApi = {
+  summary:   (dashboardId: string) =>
+    api.post<{ summary: string }>(`/dashboards/${dashboardId}/ai-summary`),
+  insight:   (dashboardId: string, widgetId: string) =>
+    api.post<{ insight: string; widget_id: string }>(`/dashboards/${dashboardId}/ai-insight`, { widget_id: widgetId }),
+  anomalies: (dashboardId: string) =>
+    api.post<{ anomalies: { widget_id: string; severity: string; message: string }[] }>(`/dashboards/${dashboardId}/ai-anomalies`),
+}
+
+// ─── .vly export / import ─────────────────────────────────────────────────────
+
+export const vlyApi = {
+  /** Triggers a browser download of the .vly archive for a canvas. */
+  exportVly: (canvasId: string): void => {
+    const stored = typeof window !== 'undefined' ? localStorage.getItem('visually-auth') : null
+    let token = ''
+    if (stored) {
+      try { token = JSON.parse(stored)?.state?.accessToken ?? '' } catch { /* ignore */ }
+    }
+    const url = `${API_URL}/dashboards/${canvasId}/export-vly`
+    const a = document.createElement('a')
+    a.href = url
+    if (token) a.href = url  // auth header not possible via <a>, use fetch below
+    // Use fetch to carry the Bearer token, then trigger download
+    fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      .then(r => r.blob())
+      .then(blob => {
+        const blobUrl = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = blobUrl
+        link.download = `canvas-${canvasId.slice(0, 8)}.vly`
+        link.click()
+        URL.revokeObjectURL(blobUrl)
+      })
+  },
+
+  /** Import a .vly file into a project. */
+  importVly: (file: File, projectId: string, connectionId?: string) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('project_id', projectId)
+    if (connectionId) form.append('connection_id', connectionId)
+    return api.post('/dashboards/import-vly', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+  },
+}
+
+// ─── Share links ──────────────────────────────────────────────────────────────
+
+export const shareApi = {
+  create: (canvasId: string, data: { mode?: string; label?: string; expires_days?: number | null }) =>
+    api.post(`/dashboards/${canvasId}/shares`, data),
+  list: (canvasId: string) =>
+    api.get(`/dashboards/${canvasId}/shares`),
+  revoke: (canvasId: string, tokenId: string) =>
+    api.delete(`/dashboards/${canvasId}/shares/${tokenId}`),
+  addCollaborator: (canvasId: string, data: { email: string; role: string }) =>
+    api.post(`/dashboards/${canvasId}/collaborators`, data),
+  listCollaborators: (canvasId: string) =>
+    api.get(`/dashboards/${canvasId}/collaborators`),
+  removeCollaborator: (canvasId: string, userId: string) =>
+    api.delete(`/dashboards/${canvasId}/collaborators/${userId}`),
+}
+
+// ─── Public canvas (no-auth) ──────────────────────────────────────────────────
+
+const publicApi = axios.create({ baseURL: API_URL })
+
+export const publicCanvasApi = {
+  get: (token: string) =>
+    publicApi.get(`/public/canvas/${token}`),
+  refresh: (token: string) =>
+    publicApi.post(`/public/canvas/${token}/refresh`),
+}
+
+// ─── Tier 5: Row-Level Security ───────────────────────────────────────────────
+
+export interface RLSPolicy {
+  id: string
+  dashboard_id: string
+  user_id: string | null
+  name: string
+  clause: string
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export const rlsApi = {
+  list: (canvasId: string) =>
+    api.get<{ policies: RLSPolicy[] }>(`/dashboards/${canvasId}/rls-policies`),
+  create: (canvasId: string, data: { name: string; clause: string; user_id?: string | null; is_active?: boolean }) =>
+    api.post<RLSPolicy>(`/dashboards/${canvasId}/rls-policies`, data),
+  update: (canvasId: string, policyId: string, data: Partial<{ name: string; clause: string; user_id: string | null; is_active: boolean }>) =>
+    api.put<RLSPolicy>(`/dashboards/${canvasId}/rls-policies/${policyId}`, data),
+  delete: (canvasId: string, policyId: string) =>
+    api.delete(`/dashboards/${canvasId}/rls-policies/${policyId}`),
+}
+
+// ─── Tier 5: Scheduled Refresh ────────────────────────────────────────────────
+
+export interface RefreshSchedule {
+  enabled: boolean
+  cron: string | null
+  timezone: string
+}
+
+export const scheduleApi = {
+  get: (canvasId: string) =>
+    api.get<{ schedule: RefreshSchedule }>(`/dashboards/${canvasId}/refresh-schedule`),
+  set: (canvasId: string, data: { cron?: string | null; enabled: boolean; timezone?: string }) =>
+    api.patch<{ schedule: RefreshSchedule }>(`/dashboards/${canvasId}/refresh-schedule`, data),
+  refreshNow: (canvasId: string) =>
+    api.post(`/dashboards/${canvasId}/refresh-now`),
+}
+
+// ─── Tier 5: Calculated Measures ─────────────────────────────────────────────
+
+export interface Measure {
+  name: string
+  label: string
+  expression: string
+  format: string
+}
+
+export const measuresApi = {
+  list: (canvasId: string) =>
+    api.get<{ measures: Measure[] }>(`/dashboards/${canvasId}/measures`),
+  create: (canvasId: string, data: Omit<Measure, 'format'> & { format?: string }) =>
+    api.post<{ measures: Measure[] }>(`/dashboards/${canvasId}/measures`, data),
+  delete: (canvasId: string, measureName: string) =>
+    api.delete<{ measures: Measure[] }>(`/dashboards/${canvasId}/measures/${measureName}`),
+  generate: (canvasId: string, description: string) =>
+    api.post<Measure>(`/dashboards/${canvasId}/measures/generate`, { description }),
+}
+
+// ─── Tier 5: Drilldown ────────────────────────────────────────────────────────
+
+export interface DrilldownResult {
+  widget_id: string
+  drill_column: string
+  drill_value: string
+  child_sql: string
+  chart_data: { rows: Record<string, unknown>[]; columns: string[] }
+}
+
+export const drilldownApi = {
+  generate: (
+    canvasId: string,
+    data: { widget_id: string; drill_column: string; drill_value: string; connection_id?: string },
+  ) => api.post<DrilldownResult>(`/dashboards/${canvasId}/drilldown`, data),
+}
+
+// ─── Tier 5: RLS-aware requery ────────────────────────────────────────────────
+
+export const rlsRequeryApi = {
+  requery: (
+    canvasId: string,
+    filters: Record<string, string[] | { start: string; end: string }>,
+  ) => api.post(`/dashboards/${canvasId}/requery-rls`, { filters }),
 }

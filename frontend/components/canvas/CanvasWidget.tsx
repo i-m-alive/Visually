@@ -6,6 +6,7 @@ import {
   RefreshCw, StickyNote, Lock, Unlock, Copy, RotateCcw
 } from 'lucide-react'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
+import { DateRangeSlicer } from '@/components/canvas/DateRangeSlicer'
 import type { ChartResult } from '@/stores/pipelineStore'
 
 const CHART_TYPES = [
@@ -523,7 +524,14 @@ export function CanvasWidget({
         ref={chartAreaRef}
         className="flex-1 overflow-hidden min-h-0 p-2 relative"
       >
-        {widget.chart_data ? (
+        {widget.chart_type === 'slicer' ? (
+          <DateRangeSlicer
+            title=""
+            columnName={(widget.config?.slicer_column as string) || widget.title}
+            value={null}
+            onChange={() => {}}
+          />
+        ) : widget.chart_data ? (
           <ChartRenderer
             result={result}
             colors={colors}

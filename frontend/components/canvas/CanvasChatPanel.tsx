@@ -106,6 +106,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   const [sessionId]             = useState(() => `canvas-${canvasId}-${Date.now()}`)
   const [showSuggestions, setShowSuggestions] = useState(true)
   const endRef                  = useRef<HTMLDivElement>(null)
+  const textareaRef             = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
@@ -305,13 +306,18 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       <div className="px-3 py-3 border-t border-gray-100 flex-shrink-0">
         <div className="flex items-end gap-2 bg-gray-50 rounded-xl px-3 py-2">
           <textarea
+            ref={textareaRef}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={e => {
+              setInput(e.target.value)
+              e.target.style.height = 'auto'
+              e.target.style.height = Math.min(e.target.scrollHeight, 80) + 'px'
+            }}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
             placeholder="Ask about your data or create a chart…"
             rows={1}
             className="flex-1 bg-transparent text-xs text-gray-800 placeholder-gray-400 outline-none resize-none leading-relaxed"
-            style={{ maxHeight: 80 }}
+            style={{ maxHeight: 80, overflowY: 'auto' }}
           />
           <button
             onClick={() => send()}

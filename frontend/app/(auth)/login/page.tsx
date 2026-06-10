@@ -20,12 +20,20 @@ export default function LoginPage() {
     try {
       const resp = await authApi.login({ email, password })
       const data = resp.data
+      const role: 'builder' | 'end_user' = data.role === 'end_user' ? 'end_user' : 'builder'
       setAuth(
-        { id: data.user_id, email: data.email, full_name: data.full_name },
+        { id: data.user_id, email: data.email, full_name: data.full_name, role },
         data.access_token,
         data.refresh_token,
       )
-      router.push('/projects')
+      document.cookie = `visually-role=${role}; path=/; SameSite=Lax`
+      // First-time login → show role onboarding
+      const onboarded = localStorage.getItem(`visually-onboarded-${data.user_id}`)
+      if (!onboarded) {
+        router.push('/onboarding')
+      } else {
+        router.push(role === 'end_user' ? '/end-user/dashboard' : '/projects')
+      }
     } catch (err: unknown) {
       const e = err as { response?: { data?: { detail?: unknown } } }
       const detail = e.response?.data?.detail

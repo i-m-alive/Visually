@@ -9,13 +9,17 @@ import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
   Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
+  FunctionSquare, Clock, Shield, FileDown,
 } from 'lucide-react'
-import { canvasApi, widgetApi } from '@/lib/api'
+import { canvasApi, widgetApi, vlyApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import { ZoomModal } from '@/components/canvas/ZoomModal'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
 import { VisuallReport } from '@/components/canvas/VisuallReport'
 import { CanvasPageTabs, type CanvasPage } from '@/components/canvas/CanvasPageTabs'
+import { MeasuresPanel } from '@/components/canvas/MeasuresPanel'
+import { ScheduleRefreshModal } from '@/components/canvas/ScheduleRefreshModal'
+import { RLSModal } from '@/components/canvas/RLSModal'
 
 const ResponsiveGrid = WidthProvider(Responsive)
 
@@ -157,6 +161,9 @@ export default function CanvasEditorPage() {
   const [refreshingId, setRefreshingId]     = useState<string | null>(null)
   const [gridZoom, setGridZoom]             = useState(1)
   const [isViewOnly, setIsViewOnly]         = useState(false)
+  const [showMeasures, setShowMeasures]     = useState(false)
+  const [showSchedule, setShowSchedule]     = useState(false)
+  const [showRLS, setShowRLS]               = useState(false)
   const [toastMsg, setToastMsg]             = useState<string | null>(null)
   const [canUndo, setCanUndo]               = useState(false)
   const [canRedo, setCanRedo]               = useState(false)
@@ -746,6 +753,40 @@ export default function CanvasEditorPage() {
         >
           <Sparkles size={13} /> Visually
         </button>
+
+        {/* Tier 5 feature buttons */}
+        <div className="w-px h-4 bg-gray-200 mx-1 flex-shrink-0" />
+        <button
+          onClick={() => setShowMeasures(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-purple-50 hover:text-purple-700 transition-colors"
+          title="Calculated Measures"
+        >
+          <FunctionSquare size={13} /> Measures
+        </button>
+        <button
+          onClick={() => setShowSchedule(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-green-50 hover:text-green-700 transition-colors"
+          title="Schedule Refresh"
+        >
+          <Clock size={13} /> Schedule
+        </button>
+        <button
+          onClick={() => setShowRLS(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-orange-50 hover:text-orange-700 transition-colors"
+          title="Row-Level Security"
+        >
+          <Shield size={13} /> RLS
+        </button>
+
+        {/* .vly export */}
+        <div className="w-px h-4 bg-gray-200 mx-1 flex-shrink-0" />
+        <button
+          onClick={() => vlyApi.exportVly(canvasId)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-teal-50 hover:text-teal-700 transition-colors"
+          title="Export as .vly portable file"
+        >
+          <FileDown size={13} /> Export .vly
+        </button>
       </div>
 
       {/* Date filter bar */}
@@ -793,14 +834,23 @@ export default function CanvasEditorPage() {
       )}
 
       {/* Body */}
-      <div className="flex flex-1 min-h-0 overflow-hidden">
-        {/* Canvas grid + page tabs */}
+      <div className="flex flex-1 min-h-0 overflow-hidden relative">
+        {/* Canvas grid + page tabs — always full width, chat overlays on top */}
         <div className="flex flex-col flex-1 min-w-0 min-h-0">
-        <div className="flex-1 overflow-auto p-4 min-w-0" style={{
+        <div className="flex-1 overflow-auto min-w-0" style={{
           backgroundColor: '#f1f5f9',
           backgroundImage: 'radial-gradient(circle, #cbd5e1 1px, transparent 1px)',
           backgroundSize: '24px 24px',
+          padding: '20px',
         }}>
+          {/* Power BI–style white page sheet */}
+          <div style={{
+            background: 'white',
+            border: '2px dashed #CBD5E1',
+            borderRadius: 4,
+            minHeight: '70vh',
+            overflow: 'hidden',
+          }}>
           {(() => {
             const defaultPageId = pages[0]?.id ?? ''
             const activePageWidgets = widgets.filter(w => {
@@ -881,6 +931,7 @@ export default function CanvasEditorPage() {
               </div>
             )
           })()}
+          </div>{/* /page sheet */}
         </div>
 
         {/* Page tabs */}
@@ -893,21 +944,32 @@ export default function CanvasEditorPage() {
             onRename={handleRenamePage}
             onDelete={handleDeletePage}
             onDuplicate={handleDuplicatePage}
+            onReorder={async (newPages) => {
+              setPages(newPages)
+              await savePagesConfig(newPages)
+              showToast('Pages reordered')
+            }}
           />
         )}
         </div>
 
-        {/* Chat panel */}
+        {/* Chat panel — absolute overlay so grid width is never affected */}
         {showChat && (
-          <CanvasChatPanel
-            projectId={projectId}
-            canvasId={canvasId}
-            widgets={widgets}
-            pages={pages}
-            activePageId={activePageId}
-            onClose={() => setShowChat(false)}
-            onWidgetAdded={load}
-          />
+          <div style={{
+            position: 'absolute', right: 0, top: 0, bottom: 0, zIndex: 40,
+            width: 320, display: 'flex', flexDirection: 'column',
+            boxShadow: '-4px 0 24px rgba(0,0,0,0.10)',
+          }}>
+            <CanvasChatPanel
+              projectId={projectId}
+              canvasId={canvasId}
+              widgets={widgets}
+              pages={pages}
+              activePageId={activePageId}
+              onClose={() => setShowChat(false)}
+              onWidgetAdded={load}
+            />
+          </div>
         )}
       </div>
 
@@ -937,6 +999,31 @@ export default function CanvasEditorPage() {
             setPages(newPages)
             await canvasApi.updateLayoutConfig(canvasId, { pages: newPages })
           }}
+        />
+      )}
+
+      {/* Tier 5: Calculated Measures */}
+      {showMeasures && (
+        <MeasuresPanel
+          canvasId={canvasId}
+          onClose={() => setShowMeasures(false)}
+        />
+      )}
+
+      {/* Tier 5: Schedule Refresh */}
+      {showSchedule && (
+        <ScheduleRefreshModal
+          canvasId={canvasId}
+          onClose={() => setShowSchedule(false)}
+          onRefreshedNow={load}
+        />
+      )}
+
+      {/* Tier 5: Row-Level Security */}
+      {showRLS && (
+        <RLSModal
+          canvasId={canvasId}
+          onClose={() => setShowRLS(false)}
         />
       )}
     </div>
