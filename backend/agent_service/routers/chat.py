@@ -33,6 +33,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     connection_id: Optional[str] = None
     active_page_id: Optional[str] = None
+    model_preference: Optional[str] = None  # 'opus' for deeper analysis
 
 
 class ChatResponse(BaseModel):
@@ -50,6 +51,14 @@ async def chat(
     redis=Depends(get_redis),
 ):
     session_id = req.session_id or str(uuid.uuid4())
+
+    print(
+        f"[chat] session={session_id[:8]}  project={req.project_id[:8]}  "
+        f"dashboard={'yes' if req.dashboard_id else 'no'}  "
+        f"model_pref={req.model_preference or 'default'}  "
+        f"msg_len={len(req.message)}",
+        flush=True,
+    )
 
     # Load conversation history from Redis
     history = await ChatAgent.load_history(session_id, redis)
@@ -81,8 +90,22 @@ async def chat(
         dashboard_widgets, dashboard_pages = await _get_dashboard_widgets_and_pages(
             req.dashboard_id, db
         )
+        sql_widget_count = sum(1 for w in dashboard_widgets if w.get("sql_query"))
+        print(
+            f"[chat] dashboard loaded  widgets={len(dashboard_widgets)}  "
+            f"with_sql={sql_widget_count}  pages={len(dashboard_pages)}",
+            flush=True,
+        )
 
     priority_tables = _extract_priority_tables(dashboard_widgets)
+
+    # Auto-upgrade to Opus for intelligence-scale prompts (large msg = intelligence agent)
+    effective_model_pref = req.model_preference
+    if not effective_model_pref and len(req.message) > 8000:
+        effective_model_pref = "opus"
+        print(f"[chat] auto-upgraded to opus (msg_len={len(req.message)} > 8000)", flush=True)
+    elif effective_model_pref:
+        print(f"[chat] using requested model_pref={effective_model_pref}", flush=True)
 
     # Call Chat Agent — pass enriched schema, pages, and priority tables
     result = await _agent.respond(
@@ -94,9 +117,17 @@ async def chat(
         active_page_id=req.active_page_id,
         priority_tables=priority_tables,
         enriched_schema=enriched,
+        model_override=effective_model_pref,
     )
 
     # Execute inline SQL if agent returned one
+    print(
+        f"[chat] agent done  text_len={len(result.get('text', ''))}  "
+        f"sql_returned={'yes' if result.get('sql_to_execute') else 'no'}  "
+        f"action={'yes' if result.get('dashboard_action') else 'no'}",
+        flush=True,
+    )
+
     inline_chart = None
     if result["sql_to_execute"]:
         sql_spec = result["sql_to_execute"]

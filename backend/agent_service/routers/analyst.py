@@ -191,6 +191,28 @@ def _get_allowed_tables(widgets: list) -> set:
     return tables
 
 
+def _extract_schema_names(raw_schema: dict) -> set:
+    """Extract all table/view names from schema_doc — handles both list and dict formats."""
+    names: set = set()
+    if not isinstance(raw_schema, dict):
+        return names
+    tables = raw_schema.get("tables", [])
+    if isinstance(tables, list):
+        for entry in tables:
+            if isinstance(entry, dict):
+                name = (entry.get("name") or "").lower()
+                schema = (entry.get("schema") or "").lower()
+                if name:
+                    names.add(name)
+                    if schema:
+                        names.add(f"{schema}.{name}")
+    elif isinstance(tables, dict):
+        for k in tables:
+            names.add(k.lower())
+            names.add(k.split(".")[-1].lower())
+    return names
+
+
 class FilterItem(BaseModel):
     column: str
     operator: str = "="
@@ -353,14 +375,12 @@ async def analyst_chat(
     raw_schema, schema_source, snapshot_age_min, conn_id_str, db_type = \
         await _get_schema_context(dashboard, widgets, db, background_tasks)
 
-    # Scope schema to tables actually used by this canvas
-    schema_doc: dict = {}
-    if isinstance(raw_schema, dict) and "tables" in raw_schema:
-        scoped = {k: v for k, v in raw_schema["tables"].items()
-                  if k.lower() in allowed_tables or k.split(".")[-1].lower() in allowed_tables}
-        schema_doc = {**raw_schema, "tables": scoped} if scoped else raw_schema
-    else:
-        schema_doc = raw_schema
+    # Expand allowed_tables: any table/view in the crawled schema is accessible —
+    # not just tables that appear in existing widget SQL. This lets the AI query
+    # views like customer_billable_hours_yoy_view even if no widget uses them yet.
+    allowed_tables = allowed_tables | _extract_schema_names(raw_schema)
+
+    schema_doc = raw_schema if isinstance(raw_schema, dict) else {}
 
     enriched = None
     if schema_doc and conn_id_str:
@@ -441,7 +461,6 @@ async def analyst_chat(
 @router.get("/analyst/canvas/{raw_token}/schema")
 async def get_canvas_schema(raw_token: str, db: AsyncSession = Depends(get_db)):
     dashboard, token_obj, widgets = await _get_canvas_and_token(raw_token, db)
-    allowed_tables = _get_allowed_tables(widgets)
     conn = await _get_connection_for_dashboard(dashboard, db)
     schema_doc: dict = {}
     if conn:
@@ -454,23 +473,35 @@ async def get_canvas_schema(raw_token: str, db: AsyncSession = Depends(get_db)):
             schema_doc = snap.schema_document or {}
 
     tables = []
-    raw_tables = schema_doc.get("tables", {}) if isinstance(schema_doc, dict) else {}
-    for table_name, table_info in raw_tables.items():
-        if table_name.lower() not in allowed_tables and table_name.split(".")[-1].lower() not in allowed_tables:
-            continue
-        columns = []
-        if isinstance(table_info, dict):
-            for col_name, col_info in table_info.get("columns", {}).items():
-                columns.append({
-                    "name": col_name,
-                    "type": col_info.get("type", "unknown") if isinstance(col_info, dict) else str(col_info),
-                    "nullable": col_info.get("nullable", True) if isinstance(col_info, dict) else True,
-                    "sample_values": col_info.get("sample_values", []) if isinstance(col_info, dict) else [],
-                })
-        tables.append({"name": table_name, "columns": columns, "column_count": len(columns)})
-
-    if not tables and allowed_tables:
-        tables = [{"name": t, "columns": [], "column_count": 0} for t in sorted(allowed_tables) if t]
+    raw_tables = schema_doc.get("tables", []) if isinstance(schema_doc, dict) else []
+    if isinstance(raw_tables, list):
+        for entry in raw_tables:
+            if not isinstance(entry, dict):
+                continue
+            tname = entry.get("name", "")
+            columns = [
+                {
+                    "name": c.get("name", ""),
+                    "type": c.get("type", "unknown"),
+                    "nullable": c.get("is_nullable", True),
+                    "sample_values": [],
+                }
+                for c in entry.get("columns", [])
+                if isinstance(c, dict)
+            ]
+            tables.append({"name": tname, "columns": columns, "column_count": len(columns)})
+    elif isinstance(raw_tables, dict):
+        for table_name, table_info in raw_tables.items():
+            columns = []
+            if isinstance(table_info, dict):
+                for col_name, col_info in table_info.get("columns", {}).items():
+                    columns.append({
+                        "name": col_name,
+                        "type": col_info.get("type", "unknown") if isinstance(col_info, dict) else str(col_info),
+                        "nullable": col_info.get("nullable", True) if isinstance(col_info, dict) else True,
+                        "sample_values": col_info.get("sample_values", []) if isinstance(col_info, dict) else [],
+                    })
+            tables.append({"name": table_name, "columns": columns, "column_count": len(columns)})
 
     return {"tables": tables, "total": len(tables)}
 
@@ -482,9 +513,6 @@ async def preview_table(
     raw_token: str, table_name: str, limit: int = Query(default=100, le=500), db: AsyncSession = Depends(get_db),
 ):
     dashboard, token_obj, widgets = await _get_canvas_and_token(raw_token, db)
-    allowed_tables = _get_allowed_tables(widgets)
-    if allowed_tables and table_name.lower() not in allowed_tables and table_name.split(".")[-1].lower() not in allowed_tables:
-        raise HTTPException(status_code=403, detail=f"Table '{table_name}' is not accessible in this canvas")
     if not re.match(r'^[\w.]+$', table_name):
         raise HTTPException(status_code=400, detail="Invalid table name")
     conn = await _get_connection_for_dashboard(dashboard, db)
@@ -501,7 +529,16 @@ async def preview_table(
 @router.post("/analyst/canvas/{raw_token}/query")
 async def sandbox_query(raw_token: str, req: AdHocQueryRequest, db: AsyncSession = Depends(get_db)):
     dashboard, token_obj, widgets = await _get_canvas_and_token(raw_token, db)
+    conn = await _get_connection_for_dashboard(dashboard, db)
     allowed_tables = _get_allowed_tables(widgets)
+    if conn:
+        snap_result = await db.execute(
+            select(SchemaSnapshot).where(SchemaSnapshot.connection_id == conn.id)
+            .order_by(SchemaSnapshot.version.desc()).limit(1)
+        )
+        snap = snap_result.scalar_one_or_none()
+        if snap and snap.schema_document:
+            allowed_tables = allowed_tables | _extract_schema_names(snap.schema_document)
     stripped = req.sql.strip().upper().lstrip("(")
     if not stripped.startswith("SELECT") and not stripped.startswith("WITH"):
         raise HTTPException(status_code=400, detail="Only SELECT / WITH queries are allowed")
@@ -510,7 +547,6 @@ async def sandbox_query(raw_token: str, req: AdHocQueryRequest, db: AsyncSession
         disallowed = used - allowed_tables
         if disallowed:
             raise HTTPException(status_code=403, detail=f"Query references tables not in this canvas: {', '.join(sorted(disallowed))}")
-    conn = await _get_connection_for_dashboard(dashboard, db)
     if not conn:
         raise HTTPException(status_code=400, detail="No database connection configured")
     result = await call_query_executor(str(conn.id), req.sql, row_limit=5000)

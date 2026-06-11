@@ -63,8 +63,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                   <NavLink href={`/projects/${projectId}/connection`}  icon={<Link2 size={16} />}           label="Connection"   current={pathname} />
                 </>
               )}
-              <NavLink href="/projects"  icon={<BarChart2 size={16} />}  label="Projects"  current={pathname} />
-              <NavLink href="/settings"  icon={<Settings size={16} />}   label="Settings"  current={pathname} />
+              <NavLink href="/projects"    icon={<BarChart2 size={16} />} label="Projects"     current={pathname} />
+              <NavLink href="/settings"    icon={<Settings size={16} />}  label="Settings"     current={pathname} />
             </>
           ) : (
             // ── End-user nav ─────────────────────────────────────────

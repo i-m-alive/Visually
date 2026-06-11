@@ -1,7 +1,7 @@
 import json
 import re
 from typing import Optional, TYPE_CHECKING
-from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL
+from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL, BEDROCK_OPUS_MODEL
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
@@ -417,6 +417,7 @@ class ChatAgent:
         active_page_id: Optional[str] = None,
         priority_tables: Optional[set[str]] = None,
         enriched_schema: Optional["EnrichedSchema"] = None,
+        model_override: Optional[str] = None,
     ) -> dict:
         system_prompt = self._build_system_prompt(
             message=message,
@@ -428,13 +429,32 @@ class ChatAgent:
             enriched=enriched_schema,
         )
         messages = conversation_history[-20:] + [{"role": "user", "content": message}]
+        effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else CHAT_MODEL
+        # Opus needs more tokens for deep analysis prompts
+        effective_max_tokens = 8192 if model_override == "opus" else 2048
+
+        print(
+            f"[chat_agent] model={effective_model.split('/')[-1]}  "
+            f"max_tokens={effective_max_tokens}  "
+            f"history_turns={len(conversation_history) // 2}  "
+            f"msg_len={len(message)}  "
+            f"prompt_len={len(system_prompt)}",
+            flush=True,
+        )
 
         raw = await bedrock_invoke_with_history(
-            model_id=CHAT_MODEL,
+            model_id=effective_model,
             system_prompt=system_prompt,
             messages=messages,
-            max_tokens=2048,
+            max_tokens=effective_max_tokens,
             temperature=0.3,
+        )
+
+        print(
+            f"[chat_agent] response_len={len(raw)}  "
+            f"has_sql={'yes' if '```sql_execute' in raw else 'no'}  "
+            f"has_action={'yes' if '```dashboard_action' in raw else 'no'}",
+            flush=True,
         )
 
         sqls_to_execute: list[dict] = []

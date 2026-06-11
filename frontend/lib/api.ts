@@ -69,9 +69,29 @@ export const chatApi = {
     dashboard_id?: string
     connection_id?: string
     active_page_id?: string
+    model_preference?: 'opus' | 'sonnet'
   }) => api.post('/agent/chat', data),
   clear: (sessionId: string) =>
     api.delete(`/agent/chat/${sessionId}`),
+}
+
+export const intelligenceApi = {
+  /**
+   * Execute every widget's sql_query in parallel on the backend and return
+   * fresh rows + columns so the AI agent has real data instead of stale cache.
+   */
+  fetchWidgetData: (dashboardId: string) =>
+    api.post<{
+      widget_data: Array<{
+        widget_id: string
+        ok: boolean
+        rows?: Record<string, unknown>[]
+        columns?: string[]
+        labels?: string[]
+        values?: unknown[]
+        error?: string
+      }>
+    }>(`/dashboards/${dashboardId}/intelligence-data`),
 }
 
 export const screenshotApi = {
@@ -441,6 +461,7 @@ export const analystApi = {
       session_id: string
       text: string
       inline_chart: unknown
+      inline_charts: unknown[]
       turn_count: number
       schema_source: 'live' | 'recent' | 'cached' | 'embedded' | 'none'
       schema_age_minutes: number | null

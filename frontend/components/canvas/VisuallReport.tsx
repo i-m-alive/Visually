@@ -1337,6 +1337,17 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
     transition: 'all 0.12s', flexShrink: 0,
   })
 
+  // Compact button style for the tools section inside the sidebar
+  const sideBtn = (active: boolean): React.CSSProperties => ({
+    display: 'inline-flex', alignItems: 'center', gap: 3,
+    padding: '3px 7px', fontSize: 10, fontWeight: active ? 600 : 400,
+    border: `1px solid ${active ? theme.accent : theme.border}`,
+    borderRadius: 5, cursor: 'pointer', whiteSpace: 'nowrap' as const,
+    background: active ? theme.accentBg : 'transparent',
+    color: active ? theme.accent : theme.muted,
+    transition: 'all 0.1s',
+  })
+
   // ── KPI card renderer ────────────────────────────────────────────────────
   const renderKpi = (w: CanvasWidgetData, idx: number) => {
     const { num, spark, delta } = getKpiMeta(w)
@@ -2620,98 +2631,6 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
           </div>
         </div>
 
-        {/* ── Developer / Power Tools Ribbon ──────────────────────────────── */}
-        <div className="vis-no-print" style={{
-          display: 'flex', alignItems: 'stretch', flexShrink: 0,
-          background: ['midnight','digitalnative'].includes(theme.id) ? 'rgba(255,255,255,0.04)' : '#F8FAFC',
-          borderBottom: `1px solid ${theme.border}`,
-          overflowX: 'auto', minHeight: 42,
-        }}>
-          {/* Group: View */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px 4px 16px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
-            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>View</span>
-            <button onClick={() => setFocusMode(v => !v)} style={ribbonBtn(focusMode)} title="Dim unfocused cards on hover">
-              <ZoomIn size={11} /> Focus
-            </button>
-            <button
-              onClick={() => { const next = !comparisonMode; setComparisonMode(next); if (next) setComparedCharts(new Set(visualCharts.map(w => w.id))); else setComparedCharts(new Set()) }}
-              style={ribbonBtn(comparisonMode)} title="Compare current vs prior period on all charts"
-            >⇆ Compare</button>
-            <button onClick={() => { setSlideMode(true); setSlideIdx(0) }} style={ribbonBtn(false)} title="Enter presentation / slide mode (S)">
-              <Play size={11} /> Present
-            </button>
-          </div>
-
-          {/* Group: Analytics */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
-            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Analytics</span>
-            <button
-              onClick={() => setShowMeasures(true)}
-              style={ribbonBtn(showMeasures)}
-              title="Calculated Measures — define SQL expressions as reusable metrics with AI generation"
-            ><FunctionSquare size={11} /> Measures</button>
-            <button
-              onClick={() => {
-                if (crossFilter && visualCharts[0]) {
-                  setDrilldown({ widgetId: visualCharts[0].id, widgetTitle: visualCharts[0].title, column: crossFilter.column, value: crossFilter.value })
-                }
-              }}
-              style={{ ...ribbonBtn(!!drilldown), opacity: crossFilter ? 1 : 0.38, cursor: crossFilter ? 'pointer' : 'default' }}
-              title={crossFilter ? `Drill into "${crossFilter.value}" — explore child data` : 'Click a chart bar or point to activate cross-filter, then use Drilldown'}
-            ><ZoomIn size={11} /> Drilldown</button>
-          </div>
-
-          {/* Group: Security */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
-            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Security</span>
-            <button
-              onClick={() => setShowRLS(true)}
-              style={ribbonBtn(showRLS)}
-              title="Row-Level Security — SQL WHERE clause policies injected per user at query time"
-            ><Shield size={11} /> Row-Level Security</button>
-          </div>
-
-          {/* Group: Automation */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
-            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Automation</span>
-            <button
-              onClick={() => setShowSchedule(true)}
-              style={ribbonBtn(showSchedule)}
-              title="Scheduled Refresh — cron-based auto-refresh of all widget queries"
-            ><Clock size={11} /> Schedule Refresh</button>
-            <button
-              onClick={async () => {
-                try {
-                  await scheduleApi.refreshNow(canvas.id)
-                  onWidgetAdded?.()
-                  showToast('✓ Dashboard refreshed')
-                } catch {
-                  showToast('Refresh failed')
-                }
-              }}
-              style={ribbonBtn(false)}
-              title="Immediately re-run all widget SQL queries"
-            ><RefreshCw size={11} /> Refresh Now</button>
-          </div>
-
-          {/* Group: Export */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 1, padding: '4px 6px', borderRight: `1px solid ${theme.border}`, flexShrink: 0 }}>
-            <span style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginRight: 5, flexShrink: 0 }}>Export</span>
-            <button onClick={handlePrint} style={ribbonBtn(false)}><Printer size={11} /> Print</button>
-            <button onClick={handleExportJSON} style={ribbonBtn(false)}><Download size={11} /> Export</button>
-            <button onClick={handleEmailCopy} style={ribbonBtn(false)}>✉ Email</button>
-            <button onClick={() => setShowNewShareModal(true)} style={ribbonBtn(false)}><Users size={11} /> Share</button>
-            <button onClick={() => vlyApi.exportVly(canvas.id)} title="Download as .vly canvas bundle" style={ribbonBtn(false)}><FileArchive size={11} /> .vly</button>
-            <button onClick={() => setShowVlyImport(true)} title="Import a .vly canvas file" style={ribbonBtn(false)}><Upload size={11} /> Import</button>
-          </div>
-
-          <div style={{ flex: 1 }} />
-          <button
-            onClick={() => setShowShortcutSheet(true)}
-            style={{ ...ribbonBtn(false), padding: '4px 14px', borderLeft: `1px solid ${theme.border}`, borderRadius: 0 }}
-            title="Keyboard shortcuts (?)"
-          ><HelpCircle size={11} /> Shortcuts</button>
-        </div>
 
         {/* Page switcher strip — MOVED TO HERO — this placeholder kept for context menu portal */}
         {pages.length > 1 && (
@@ -2841,7 +2760,59 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
           {/* Filter panel sidebar */}
           {filterPanelOpen && (
             <aside style={{ width: 248, flexShrink: 0, background: theme.surface, borderRight: `1px solid ${theme.border}`, display: 'flex', flexDirection: 'column', overflowY: 'auto', animation: 'visually-slideUp 0.18s ease both' }}>
-              {/* Header */}
+
+              {/* ── Tools section ─────────────────────────────────────────────── */}
+              <div style={{ padding: '10px 12px 8px', borderBottom: `1px solid ${theme.border}`, flexShrink: 0 }}>
+
+                {/* View */}
+                <p style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 4px' }}>View</p>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  <button onClick={() => setFocusMode(v => !v)} style={sideBtn(focusMode)} title="Dim unfocused cards on hover"><ZoomIn size={9} /> Focus</button>
+                  <button onClick={() => { const next = !comparisonMode; setComparisonMode(next); if (next) setComparedCharts(new Set(visualCharts.map(w => w.id))); else setComparedCharts(new Set()) }} style={sideBtn(comparisonMode)} title="Compare current vs prior period">⇆ Compare</button>
+                  <button onClick={() => { setSlideMode(true); setSlideIdx(0) }} style={sideBtn(false)} title="Presentation / slide mode"><Play size={9} /> Present</button>
+                </div>
+
+                {/* Analytics */}
+                <p style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 4px' }}>Analytics</p>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  <button onClick={() => setShowMeasures(true)} style={sideBtn(showMeasures)} title="Calculated Measures"><FunctionSquare size={9} /> Measures</button>
+                  <button
+                    onClick={() => { if (crossFilter && visualCharts[0]) setDrilldown({ widgetId: visualCharts[0].id, widgetTitle: visualCharts[0].title, column: crossFilter.column, value: crossFilter.value }) }}
+                    style={{ ...sideBtn(!!drilldown), opacity: crossFilter ? 1 : 0.38, cursor: crossFilter ? 'pointer' : 'default' }}
+                    title={crossFilter ? `Drill into "${crossFilter.value}"` : 'Click a chart bar first'}
+                  ><ZoomIn size={9} /> Drilldown</button>
+                </div>
+
+                {/* Security */}
+                <p style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 4px' }}>Security</p>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  <button onClick={() => setShowRLS(true)} style={sideBtn(showRLS)} title="Row-Level Security"><Shield size={9} /> Row-Level Security</button>
+                </div>
+
+                {/* Automation */}
+                <p style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 4px' }}>Automation</p>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  <button onClick={() => setShowSchedule(true)} style={sideBtn(showSchedule)} title="Scheduled Refresh"><Clock size={9} /> Schedule Refresh</button>
+                  <button
+                    onClick={async () => { try { await scheduleApi.refreshNow(canvas.id); onWidgetAdded?.(); showToast('✓ Dashboard refreshed') } catch { showToast('Refresh failed') } }}
+                    style={sideBtn(false)} title="Re-run all widget queries"
+                  ><RefreshCw size={9} /> Refresh Now</button>
+                </div>
+
+                {/* Export */}
+                <p style={{ fontSize: 8, fontWeight: 700, color: theme.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 4px' }}>Export</p>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  <button onClick={handlePrint} style={sideBtn(false)}><Printer size={9} /> Print</button>
+                  <button onClick={handleExportJSON} style={sideBtn(false)}><Download size={9} /> Export</button>
+                  <button onClick={handleEmailCopy} style={sideBtn(false)}>✉ Email</button>
+                  <button onClick={() => setShowNewShareModal(true)} style={sideBtn(false)}><Users size={9} /> Share</button>
+                  <button onClick={() => vlyApi.exportVly(canvas.id)} title="Download .vly bundle" style={sideBtn(false)}><FileArchive size={9} /> .vly</button>
+                  <button onClick={() => setShowVlyImport(true)} title="Import .vly file" style={sideBtn(false)}><Upload size={9} /> Import</button>
+                  <button onClick={() => setShowShortcutSheet(true)} style={sideBtn(false)} title="Keyboard shortcuts"><HelpCircle size={9} /> Shortcuts</button>
+                </div>
+              </div>
+
+              {/* Filter header */}
               <div style={{ padding: '12px 14px 10px', borderBottom: `1px solid ${theme.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={theme.accent} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>

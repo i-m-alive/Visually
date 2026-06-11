@@ -191,8 +191,8 @@ export default function SchemaPage() {
         } catch { /* keep waiting */ }
       }, 3000)
       setTimeout(() => {
-        if (pollRef.current) { stopPoll(); setCrawling(false); setCrawlStatus(''); setCrawlError('Crawl timed out after 10 min') }
-      }, 600_000)
+        if (pollRef.current) { stopPoll(); setCrawling(false); setCrawlStatus(''); setCrawlError('Crawl timed out after 20 min') }
+      }, 1_200_000)
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } } }
       setCrawlError(err.response?.data?.detail || 'Failed to start crawl')

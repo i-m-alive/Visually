@@ -9,7 +9,7 @@ import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
   Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
-  FunctionSquare, Clock, Shield, FileDown,
+  FunctionSquare, Clock, Shield, FileDown, Zap,
 } from 'lucide-react'
 import { canvasApi, widgetApi, vlyApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -752,6 +752,16 @@ export default function CanvasEditorPage() {
           title="View as rich report"
         >
           <Sparkles size={13} /> Visually
+        </button>
+
+        {/* Intelligence */}
+        <button
+          onClick={() => router.push(`/intelligence/${canvasId}`)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-lg transition-all hover:opacity-90"
+          style={{ background: 'linear-gradient(135deg, #00a9d4, #16c0e8)' }}
+          title="Open Executive Intelligence"
+        >
+          <Zap size={13} /> Intelligence
         </button>
 
         {/* Tier 5 feature buttons */}

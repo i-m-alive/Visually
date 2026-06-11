@@ -7,7 +7,7 @@ import {
   Pin, PinOff, LayoutDashboard, Plus,
   Trash2, RotateCcw, CheckCircle2, Copy, List,
   LayoutGrid, SlidersHorizontal, ChevronDown, Tag,
-  AlertTriangle, Command, ArrowRight, Folder, Users,
+  AlertTriangle, Command, ArrowRight, Folder, Users, Zap,
 } from 'lucide-react'
 import { dashboardApi, canvasApi, vlyApi, shareApi, aiInsightsApi } from '@/lib/api'
 import { VlyImportZone } from '@/components/end-user/VlyImportZone'
@@ -542,7 +542,7 @@ export default function DashboardPage() {
               {pinnedCards.length > 0 && (
                 <section style={{ animation: 'fadeIn .35s ease both' }}>
                   <SH icon={<Pin size={13} className="text-amber-500" />} label="Pinned" />
-                  <CardGrid cards={pinnedCards} viewMode={viewMode} idx0={0} {...sharedProps({ aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, openReport, handleDelete, handleDuplicate, handleExport, handleShare, setConfirmDelId, setRenamingId, setRenameDraft, handleRename, setRenaming, saveFolder, setShowFolderEdit, setFolderDraft, refreshSummary, togglePin, setShareModalId, setShareModalEmail })} />
+                  <CardGrid cards={pinnedCards} viewMode={viewMode} idx0={0} {...sharedProps({ aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, openReport, handleDelete, handleDuplicate, handleExport, handleShare, setConfirmDelId, setRenamingId, setRenameDraft, handleRename, setRenaming, saveFolder, setShowFolderEdit, setFolderDraft, refreshSummary, togglePin, setShareModalId, setShareModalEmail, openIntelligence: (id: string) => router.push('/intelligence/' + id) })} />
                 </section>
               )}
 
@@ -572,7 +572,7 @@ export default function DashboardPage() {
                     {aiResults !== null ? 'No reports match your query.' : `No reports match "${search || filterFolder}"`}
                   </p>
                 ) : (
-                  <CardGrid cards={filtered} viewMode={viewMode} idx0={pinnedCards.length} {...sharedProps({ aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, openReport, handleDelete, handleDuplicate, handleExport, handleShare, setConfirmDelId, setRenamingId, setRenameDraft, handleRename, setRenaming, saveFolder, setShowFolderEdit, setFolderDraft, refreshSummary, togglePin, setShareModalId, setShareModalEmail })} />
+                  <CardGrid cards={filtered} viewMode={viewMode} idx0={pinnedCards.length} {...sharedProps({ aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, openReport, handleDelete, handleDuplicate, handleExport, handleShare, setConfirmDelId, setRenamingId, setRenameDraft, handleRename, setRenaming, saveFolder, setShowFolderEdit, setFolderDraft, refreshSummary, togglePin, setShareModalId, setShareModalEmail, openIntelligence: (id: string) => router.push('/intelligence/' + id) })} />
                 )}
               </section>
             </>
@@ -694,6 +694,7 @@ function sharedProps(p: any) {
     onSaveFolder: p.saveFolder,
     onFolderDraftChange: p.setFolderDraft,
     onOpenShareModal: (id: string) => { p.setShareModalId(id); p.setShareModalEmail('') },
+    onOpenIntelligence: p.openIntelligence,
   }
 }
 
@@ -740,7 +741,7 @@ function RecentChip({ dash, idx, onClick }: { dash: DashCard; idx: number; onCli
 }
 
 // ─── List Row ─────────────────────────────────────────────────────────────────
-function ListRow({ dash, idx, aiSummaries, onOpen, onExport, onShare, onDelete, onDuplicate, confirmDelId, deletingId, duplicating, onCancelDel, onOpenShareModal }: any) {
+function ListRow({ dash, idx, aiSummaries, onOpen, onExport, onShare, onDelete, onDuplicate, confirmDelId, deletingId, duplicating, onCancelDel, onOpenShareModal, onOpenIntelligence }: any) {
   const [hov, setHov] = useState(false)
   const g = getGrad(dash.theme)
   const stale = isStale(dash.updated_at)
@@ -773,6 +774,9 @@ function ListRow({ dash, idx, aiSummaries, onOpen, onExport, onShare, onDelete, 
         <button onClick={() => onDuplicate(dash.id)} disabled={duplicating === dash.id} className="p-1.5 text-gray-400 hover:text-green-600 rounded-lg hover:bg-green-50 transition-all">
           {duplicating === dash.id ? <Loader2 size={13} className="animate-spin" /> : <Copy size={13} />}
         </button>
+        <button onClick={() => onOpenIntelligence(dash.id)} className="p-1.5 text-gray-400 hover:text-teal-500 rounded-lg hover:bg-teal-50 transition-all" title="Open Intelligence view">
+          <Zap size={13} />
+        </button>
         {confirmDelId === dash.id ? (
           <div className="flex gap-1" style={{ animation: 'popSpring .2s ease both' }}>
             <button onClick={() => onDelete(dash.id)} disabled={deletingId === dash.id} className="px-2 py-1 text-[10px] font-bold bg-red-500 text-white rounded-lg">
@@ -789,7 +793,7 @@ function ListRow({ dash, idx, aiSummaries, onOpen, onExport, onShare, onDelete, 
 }
 
 // ─── Dashboard Card ───────────────────────────────────────────────────────────
-function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, onOpen, onExport, onShare, onTogglePin, onDelete, onDuplicate, onCancelDel, onStartRename, onRename, onRenameChange, onRefreshAi, onEditFolder, onSaveFolder, onFolderDraftChange, onOpenShareModal }: any) {
+function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId, duplicating, renamingId, renameDraft, renaming, pinned, folders, showFolderEdit, folderDraft, onOpen, onExport, onShare, onTogglePin, onDelete, onDuplicate, onCancelDel, onStartRename, onRename, onRenameChange, onRefreshAi, onEditFolder, onSaveFolder, onFolderDraftChange, onOpenShareModal, onOpenIntelligence }: any) {
   const [hovered, setHovered] = useState(false)
   const renameRef = useRef<HTMLInputElement>(null)
   const g         = getGrad(dash.theme)
@@ -937,6 +941,9 @@ function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId,
                   <Sparkles size={12} />
                 </SmallBtn>
               )}
+              <SmallBtn onClick={() => onOpenIntelligence(dash.id)} title="Open Intelligence view">
+                <Zap size={12} style={{ color: '#00a9d4' }} />
+              </SmallBtn>
             </div>
           </div>
         )}

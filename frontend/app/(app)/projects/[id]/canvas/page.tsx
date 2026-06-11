@@ -1,7 +1,7 @@
 'use client'
 import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { Plus, Layers, ArrowRight, Loader2, AlertCircle, BarChart2, Trash2, Pencil, Check, X } from 'lucide-react'
+import { Plus, Layers, ArrowRight, Loader2, AlertCircle, BarChart2, Trash2, Pencil, Check, X, Zap } from 'lucide-react'
 import { canvasApi } from '@/lib/api'
 
 interface Canvas {
@@ -106,12 +106,14 @@ export default function CanvasListPage() {
           <Layers size={18} className="text-brand" />
           <h1 className="text-base font-semibold text-gray-900">Canvas</h1>
         </div>
-        <button
-          onClick={() => setShowNew(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-brand text-white text-sm font-medium rounded-lg hover:bg-brand/90 transition-colors"
-        >
-          <Plus size={14} /> New Canvas
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowNew(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-brand text-white text-sm font-medium rounded-lg hover:bg-brand/90 transition-colors"
+          >
+            <Plus size={14} /> New Canvas
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-auto p-6">
@@ -250,6 +252,13 @@ export default function CanvasListPage() {
                       </div>
                     ) : (
                       <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); router.push('/intelligence/' + canvas.id) }}
+                          className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-400 hover:text-teal-500 hover:bg-teal-50 rounded-lg transition-all bg-white shadow-sm border border-gray-100"
+                          title="Open Intelligence view"
+                        >
+                          <Zap size={13} />
+                        </button>
                         <button
                           onClick={(e) => { e.stopPropagation(); setEditingId(canvas.id); setEditingName(canvas.name) }}
                           className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-400 hover:text-brand hover:bg-blue-50 rounded-lg transition-all bg-white shadow-sm border border-gray-100"

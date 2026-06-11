@@ -88,13 +88,13 @@ def _crawl_sync(
     cursor = conn.cursor()
 
     try:
-        # Tables via information_schema (accessible to all users)
+        # Tables and views via information_schema
         cursor.execute("""
-            SELECT table_schema, table_name
+            SELECT table_schema, table_name, table_type
             FROM information_schema.tables
             WHERE table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
-            AND table_type = 'BASE TABLE'
-            ORDER BY table_schema, table_name
+            AND table_type IN ('BASE TABLE', 'VIEW')
+            ORDER BY table_type, table_schema, table_name
         """)
         tables_raw = cursor.fetchall()
 
@@ -187,7 +187,8 @@ def _crawl_sync(
         all_table_names = {row[1] for row in tables_raw}
 
         for trow in tables_raw:
-            tschema, tname = trow[0], trow[1]
+            tschema, tname, ttype = trow[0], trow[1], trow[2]
+            is_view = ttype == 'VIEW'
             row_count = row_count_map.get(f"{tschema}.{tname}", 0)
             tkey = f"{tschema}.{tname}"
 
@@ -205,13 +206,13 @@ def _crawl_sync(
 
             explicit = [{**fk, "inferred": False} for fk in fks.get(tkey, [])]
 
-            # ── Sample rows (25 rows, TABLESAMPLE for Redshift, PII masked) ───
+            # ── Sample rows (25 rows; views always use LIMIT, never TABLESAMPLE) ───
             col_names = [c["column_name"] for c in (col_map.get(tkey) or [])]
             sample_rows: list[dict] = []
             try:
                 sample_sql = (
                     f'SELECT * FROM "{tschema}"."{tname}" LIMIT 25'
-                    if row_count <= 100
+                    if row_count <= 100 or is_view
                     else f'SELECT * FROM "{tschema}"."{tname}" TABLESAMPLE BERNOULLI(1) LIMIT 25'
                 )
                 cursor.execute(sample_sql)
@@ -241,6 +242,7 @@ def _crawl_sync(
                                   "text", "email", "phone", "address", "addr")
             _SKIP_COL_PREFIXES = ("description", "note", "comment", "addr",
                                   "narrative", "detail")
+            _distinct_done = 0  # cap DISTINCT queries per table to limit crawl time
             for col in (col_map.get(tkey) or []):
                 cname = col["column_name"]
                 cname_lower = cname.lower()
@@ -263,8 +265,8 @@ def _crawl_sync(
                         if s:
                             seen_vals[s] = True
 
-                # Phase B — full DISTINCT for small tables
-                if row_count <= 5_000:
+                # Phase B — full DISTINCT for very small base tables (max 5 cols per table, skip views)
+                if row_count <= 1_000 and not is_view and _distinct_done < 5:
                     try:
                         cursor.execute(
                             f'SELECT DISTINCT "{cname}" FROM "{tschema}"."{tname}" '
@@ -275,6 +277,7 @@ def _crawl_sync(
                                 s = str(r[0]).strip()
                                 if s:
                                     seen_vals[s] = True
+                        _distinct_done += 1
                     except Exception:
                         pass
 
@@ -286,6 +289,7 @@ def _crawl_sync(
             table_data[tkey] = {
                 "table_schema": tschema,
                 "table_name": tname,
+                "is_view": is_view,
                 "row_count": row_count,
                 "columns": col_map.get(tkey, []),
                 "primary_keys": list(pks.get(tkey, [])),
@@ -354,9 +358,10 @@ async def crawl_redshift(
         tables_out.append({
             "name": tdata["table_name"],
             "schema": tdata["table_schema"],
+            "is_view": tdata.get("is_view", False),
             "row_count": tdata["row_count"],
             "importance_rank": rank_idx,
-            "description": desc.get("description", f"Table {tdata['table_name']}"),
+            "description": desc.get("description", f"{'View' if tdata.get('is_view') else 'Table'} {tdata['table_name']}"),
             "columns": columns_out,
             "relationships": rels_out,
         })

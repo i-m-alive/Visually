@@ -113,7 +113,7 @@ export function ChatSidebar({ token, dashboardName }: ChatSidebarProps) {
         setSchemaRefreshing(false)
       }
 
-      const rawCharts: InlineChartItem[] = d.inline_charts ?? (d.inline_chart ? [d.inline_chart] : [])
+      const rawCharts: InlineChartItem[] = (d.inline_charts as InlineChartItem[] | undefined) ?? (d.inline_chart ? [d.inline_chart as InlineChartItem] : [])
       setMessages(prev => [...prev, {
         role: 'assistant',
         text: d.text,
