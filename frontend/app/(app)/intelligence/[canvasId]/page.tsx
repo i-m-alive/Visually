@@ -45,8 +45,8 @@ const TREND_GRAD: Record<string, string> = {
 }
 
 // ── Section icon — 35 named icons ─────────────────────────────────────────────
-function SectionIcon({ name, size = 15 }: { name: string; size?: number }) {
-  const p = { size }
+function SectionIcon({ name, size = 15, color }: { name: string; size?: number; color?: string }) {
+  const p = { size, ...(color ? { color } : {}) }
   switch (name) {
     case 'trending_up':    return <TrendingUp {...p} />
     case 'trending_down':  return <TrendingDown {...p} />
@@ -203,12 +203,11 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
   const suffix = String(kpi.value).match(/[^0-9.]+$/)?.[0] ?? ''
   const animatable = !isNaN(raw) && isFinite(raw)
   return (
-    <div style={{
+    <div className="intel-kpi-card" style={{
       background: C.card, borderRadius: 16, padding: '16px 18px',
       border: '1px solid #e2eaf4',
       boxShadow: '0 2px 12px rgba(10,33,58,0.06)',
       display: 'flex', flexDirection: 'column', gap: 8,
-      animation: 'fadeSlideIn 0.4s ease both',
       position: 'relative', overflow: 'hidden',
     }}>
       {/* Colored top accent bar */}
@@ -254,14 +253,13 @@ function InsightCards({ insights }: { insights: InsightCard[] }) {
         const style = INSIGHT_TYPE_STYLE[ins.type] ?? INSIGHT_TYPE_STYLE.neutral
         const icon = INSIGHT_ICON_MAP[ins.icon] ?? <Lightbulb size={14} />
         return (
-          <div key={i} style={{
+          <div key={i} className="intel-insight" style={{
             borderRadius: 14, padding: '14px 16px',
             background: style.bg,
             border: `1px solid ${style.border}`,
             borderLeft: `3px solid ${style.icon}`,
             display: 'flex', gap: 12, alignItems: 'flex-start',
-            animation: 'fadeSlideIn 0.4s ease both',
-            animationDelay: `${i * 0.07}s`,
+            animation: `popIn 0.3s ${i * 0.07}s ease both`,
             boxShadow: '0 1px 6px rgba(10,33,58,0.04)',
           }}>
             <div style={{
@@ -303,7 +301,7 @@ function PerformerPanel({ top, bottom, label }: { top: PerformerRow[]; bottom: P
       </div>
       <div style={{ padding: '8px 0' }}>
         {rows.map((r, i) => (
-          <div key={i} style={{ padding: '7px 16px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: i < rows.length - 1 ? '1px solid #f8fafc' : 'none' }}>
+          <div key={i} className="intel-performer-row" style={{ padding: '7px 16px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: i < rows.length - 1 ? '1px solid #f8fafc' : 'none' }}>
             <span style={{ width: 20, height: 20, borderRadius: '50%', background: tab === 'top' ? `${C.amber}20` : `${C.red}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 800, color: tab === 'top' ? C.amber : C.red, flexShrink: 0 }}>{r.rank}</span>
             <div style={{ flex: 1, minWidth: 0 }}>
               <p style={{ fontSize: 11, fontWeight: 600, color: C.navy, margin: '0 0 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.label}</p>
@@ -464,32 +462,142 @@ function addTrendToData(data: Array<{name: string; value: number; [key:string]: 
 }
 
 // ── Real HTML table ────────────────────────────────────────────────────────────
+const YEAR_RE = /^(19|20)\d{2}$/
+
+function MiniSparkline({ values, color }: { values: number[]; color: string }) {
+  if (values.length < 2) return null
+  const min = Math.min(...values), max = Math.max(...values)
+  const range = max - min || 1
+  const W = 72, H = 26
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * W
+    const y = H - ((v - min) / range) * (H - 4) - 2
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+  const isUp = values[values.length - 1] >= values[0]
+  const lineColor = isUp ? '#16a34a' : '#dc2626'
+  return (
+    <svg width={W} height={H} style={{ display: 'block', overflow: 'visible' }}>
+      <polyline points={pts} fill="none" stroke={lineColor} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={pts.split(' ').at(-1)?.split(',')[0]} cy={pts.split(' ').at(-1)?.split(',')[1]} r={2.5} fill={lineColor} />
+    </svg>
+  )
+}
+
 function TableView({ chart }: { chart: AgentChart }) {
-  const cols = chart.data.length > 0
+  const [sortCol, setSortCol] = React.useState<string | null>(null)
+  const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('desc')
+  const [showAll, setShowAll] = React.useState(false)
+  const PAGE_SIZE = 15
+
+  const rawCols = chart.data.length > 0
     ? Object.keys(chart.data[0]).filter(k => !['_trend'].includes(k))
     : ['name', 'value']
+
+  // Detect year-like columns (2020–2030) to build sparkline
+  const yearCols = rawCols.filter(c => YEAR_RE.test(c))
+  const hasTrend = yearCols.length >= 2
+  const displayCols = hasTrend ? rawCols.filter(c => !YEAR_RE.test(c)) : rawCols
+
+  const sortedData = React.useMemo(() => {
+    if (!sortCol) return chart.data
+    return [...chart.data].sort((a, b) => {
+      const av = a[sortCol] ?? '', bv = b[sortCol] ?? ''
+      const an = Number(av), bn = Number(bv)
+      const cmp = !isNaN(an) && !isNaN(bn) ? an - bn : String(av).localeCompare(String(bv))
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [chart.data, sortCol, sortDir])
+
+  const visibleData = showAll ? sortedData : sortedData.slice(0, PAGE_SIZE)
+  const total = sortedData.length
+
+  const toggleSort = (col: string) => {
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortCol(col); setSortDir('desc') }
+  }
+
+  const fmtCell = (val: unknown): React.ReactNode => {
+    if (val === null || val === undefined) return <span style={{ color: '#cbd5e1' }}>—</span>
+    const num = Number(val)
+    if (isNaN(num) || val === '') return <span style={{ color: '#374151' }}>{String(val)}</span>
+    const isPct2 = typeof val === 'string' && val.endsWith('%')
+    const color = isPct2 ? (parseFloat(val) >= 0 ? '#16a34a' : '#dc2626') : '#374151'
+    if (Math.abs(num) >= 1e9) return <span style={{ color, fontWeight: 600 }}>{(num/1e9).toFixed(1)}B</span>
+    if (Math.abs(num) >= 1e6) return <span style={{ color, fontWeight: 600 }}>{(num/1e6).toFixed(1)}M</span>
+    if (Math.abs(num) >= 1e3) return <span style={{ color, fontWeight: 600 }}>{num.toLocaleString()}</span>
+    if (isPct2) return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color, fontWeight: 700 }}>
+        {parseFloat(val) >= 0 ? '↑' : '↓'}{val}
+      </span>
+    )
+    return <span style={{ color, fontWeight: 600 }}>{String(val)}</span>
+  }
+
   return (
-    <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e8eef5' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-        <thead>
-          <tr style={{ background: C.navy }}>
-            {cols.map(c => (
-              <th key={c} style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 700, color: 'rgba(255,255,255,0.85)', whiteSpace: 'nowrap', fontSize: 10, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{c}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {chart.data.map((row, i) => (
-            <tr key={i} style={{ background: i % 2 === 0 ? 'white' : '#fafbfd', borderBottom: '1px solid #f1f5f9' }}>
-              {cols.map(c => (
-                <td key={c} style={{ padding: '7px 12px', color: '#374151', whiteSpace: 'nowrap' }}>
-                  {String(row[c] ?? '')}
-                </td>
+    <div className="intel-table-card" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid #e8eef5', boxShadow: '0 2px 8px rgba(0,0,0,0.04)' }}>
+      {/* Header bar */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px 10px 14px', background: C.navy }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.7)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{chart.title}</span>
+        {total > PAGE_SIZE && (
+          <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', background: 'rgba(255,255,255,0.08)', borderRadius: 10, padding: '2px 8px' }}>
+            {showAll ? total : Math.min(PAGE_SIZE, total)} of {total}
+          </span>
+        )}
+      </div>
+      <div style={{ overflowX: 'auto', background: 'white' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead>
+            <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+              {displayCols.map(c => (
+                <th key={c}
+                  onClick={() => toggleSort(c)}
+                  style={{ padding: '9px 14px', textAlign: 'left', fontWeight: 600, color: '#64748b', whiteSpace: 'nowrap', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', cursor: 'pointer', userSelect: 'none', transition: 'color 0.1s' }}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    {c.replace(/_/g, ' ')}
+                    {sortCol === c ? (sortDir === 'desc' ? ' ↓' : ' ↑') : <span style={{ color: '#cbd5e1', fontSize: 8 }}>⇅</span>}
+                  </span>
+                </th>
               ))}
+              {hasTrend && (
+                <th style={{ padding: '9px 14px', textAlign: 'left', fontWeight: 600, color: '#64748b', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
+                  Trend {yearCols[0]}–{yearCols[yearCols.length - 1]}
+                </th>
+              )}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {visibleData.map((row, i) => {
+              const trendVals = hasTrend ? yearCols.map(y => Number(row[y] ?? 0)) : []
+              return (
+                <tr key={i} style={{ borderBottom: '1px solid #f1f5f9', transition: 'background 0.1s' }}
+                  onMouseEnter={e => (e.currentTarget.style.background = '#f0f9ff')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'white')}
+                >
+                  {displayCols.map((c, ci) => (
+                    <td key={c} style={{ padding: '9px 14px', whiteSpace: 'nowrap', fontWeight: ci === 0 ? 600 : 400, color: ci === 0 ? C.ink : '#374151' }}>
+                      {fmtCell(row[c])}
+                    </td>
+                  ))}
+                  {hasTrend && (
+                    <td style={{ padding: '6px 14px' }}>
+                      <MiniSparkline values={trendVals} color={C.teal} />
+                    </td>
+                  )}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      {total > PAGE_SIZE && (
+        <div style={{ padding: '8px 16px', background: '#fafbfd', borderTop: '1px solid #f1f5f9', textAlign: 'center' }}>
+          <button onClick={() => setShowAll(v => !v)} style={{ fontSize: 11, color: C.teal, background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}>
+            {showAll ? `Show less ↑` : `Show all ${total} rows ↓`}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -583,7 +691,7 @@ function AgentChartView({
     : []
 
   return (
-    <div style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', animation: 'fadeSlideIn 0.5s ease both', boxShadow: '0 2px 10px rgba(10,33,58,0.05)' }}>
+    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)' }}>
       <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: `linear-gradient(180deg, ${color}, ${color}70)`, flexShrink: 0 }} />
         <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{chart.title}</p>
@@ -638,9 +746,9 @@ function AgentChartView({
                 )}
               </div>
             )}
-            {onAnnotate && <button onClick={() => onAnnotate('_chart')} title="Add note" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Pin size={10} /></button>}
-            <button onClick={downloadPng} title="Download PNG" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
-            {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
+            {onAnnotate && <button onClick={() => onAnnotate('_chart')} title="Add note" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Pin size={10} /></button>}
+            <button onClick={downloadPng} title="Download PNG" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
+            {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
           </div>
         </div>
       </div>
@@ -839,12 +947,11 @@ function AgentChartView({
 // ── Section content ────────────────────────────────────────────────────────────
 function SectionContent({
   section, sectionIdx,
-  shareToken, onRegenSection, regenning,
+  onRegenSection, regenning,
   onDrill, onFullscreen,
   annotations, onAnnotate,
 }: {
   section: AgentSection; sectionIdx: number
-  shareToken?: string
   onRegenSection?: () => void
   regenning?: boolean
   onDrill?: (chart: AgentChart, segment: string) => void
@@ -853,99 +960,117 @@ function SectionContent({
   onAnnotate?: (chartTitle: string, pointName: string) => void
 }) {
   const hasPerformers = (section.top_performers?.length ?? 0) > 0 || (section.bottom_performers?.length ?? 0) > 0
-  const sourceSqls = Array.from(new Set(section.charts.map(c => c.source_sql).filter(Boolean) as string[]))
+  const accentColor = PALETTE[sectionIdx % PALETTE.length]
+
+  const chartProps = (ch: AgentChart, i: number) => ({
+    chart: ch, colorIdx: sectionIdx * 4 + i,
+    onDrill: onDrill ? (seg: string) => onDrill(ch, seg) : undefined,
+    onFullscreen: onFullscreen ? () => onFullscreen(ch) : undefined,
+    annotations: annotations ? Object.fromEntries(
+      Object.entries(annotations)
+        .filter(([k]) => k.startsWith(`${section.id}|${ch.title}|`))
+        .map(([k, v]) => [k.split('|')[2] ?? k, v])
+    ) : undefined,
+    onAnnotate: onAnnotate ? (pt: string) => onAnnotate(ch.title, pt) : undefined,
+  })
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-      {/* Chapter cover — data_story large headline */}
-      {section.data_story && (
-        <div style={{
-          background: `linear-gradient(135deg, ${C.navy} 0%, #0d2d52 60%, #0a2540 100%)`,
-          borderRadius: 20, padding: '30px 32px 26px',
-          position: 'relative', overflow: 'hidden',
-          animation: 'fadeSlideIn 0.4s ease both',
-          boxShadow: '0 8px 32px rgba(8,33,58,0.18)',
-        }}>
-          {/* Decorative circles */}
-          <div style={{ position: 'absolute', top: -30, right: -30, width: 160, height: 160, borderRadius: '50%', background: `radial-gradient(circle, ${C.teal}18 0%, transparent 70%)`, pointerEvents: 'none' }} />
-          <div style={{ position: 'absolute', bottom: -40, left: '25%', width: 180, height: 180, borderRadius: '50%', background: `radial-gradient(circle, ${C.violet}12 0%, transparent 70%)`, pointerEvents: 'none' }} />
-          {/* Subtle dot grid */}
-          <div style={{ position: 'absolute', inset: 0, backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.04) 1px, transparent 1px)`, backgroundSize: '20px 20px', pointerEvents: 'none' }} />
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14, position: 'relative' }}>
-            <div style={{ width: 32, height: 32, borderRadius: 10, background: `${C.teal}25`, border: `1px solid ${C.teal}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.teal2, flexShrink: 0 }}>
-              <SectionIcon name={section.icon} size={15} />
-            </div>
-            <span style={{ fontSize: 11, fontWeight: 700, color: C.teal2, textTransform: 'uppercase', letterSpacing: '0.1em', flex: 1 }}>{section.label}</span>
-            {/* Feature 3: per-section regeneration */}
-            {onRegenSection && (
-              <button onClick={onRegenSection} disabled={regenning} title="Refresh this section" style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, padding: '4px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.75)', cursor: 'pointer', flexShrink: 0, opacity: regenning ? 0.5 : 1 }}>
-                <RefreshCw size={9} style={regenning ? { animation: 'ispin 1s linear infinite' } : {}} />
-                {regenning ? 'Refreshing…' : 'Refresh section'}
-              </button>
-            )}
+      {/* ── Section header bar (replaces huge dark chapter cover) ── */}
+      <div className="intel-section-hdr" style={{
+        display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between',
+        paddingBottom: 14, borderBottom: `2px solid ${accentColor}20`,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flex: 1 }}>
+          <div style={{
+            width: 36, height: 36, borderRadius: 10, flexShrink: 0, marginTop: 2,
+            background: `linear-gradient(135deg, ${accentColor}20, ${accentColor}10)`,
+            border: `1px solid ${accentColor}30`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <SectionIcon name={section.icon} size={16} color={accentColor} />
           </div>
-          <p style={{ fontSize: 22, fontWeight: 800, color: 'white', margin: 0, lineHeight: 1.3, position: 'relative', maxWidth: '88%', letterSpacing: '-0.01em' }}>{section.data_story}</p>
-          {/* Bottom accent line */}
-          <div style={{ position: 'absolute', bottom: 0, left: 32, width: 48, height: 3, borderRadius: '3px 3px 0 0', background: `linear-gradient(90deg, ${C.teal}, ${C.teal2})` }} />
+          <div style={{ flex: 1 }}>
+            <p style={{ fontSize: 10, fontWeight: 700, color: accentColor, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 4px' }}>{section.label}</p>
+            {section.data_story
+              ? <p style={{ fontSize: 18, fontWeight: 800, color: C.ink, margin: 0, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{section.data_story}</p>
+              : section.key_finding
+                ? <p style={{ fontSize: 16, fontWeight: 700, color: C.ink, margin: 0, lineHeight: 1.35 }}>{section.key_finding}</p>
+                : <p style={{ fontSize: 14, fontWeight: 600, color: C.slate, margin: 0 }}>{section.narrative?.slice(0, 90) ?? ''}</p>
+            }
+          </div>
+        </div>
+        {onRegenSection && (
+          <button onClick={onRegenSection} disabled={regenning} style={{
+            display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, padding: '5px 12px',
+            borderRadius: 8, border: '1px solid #e2eaf4', background: 'white',
+            color: regenning ? C.teal : C.slate, cursor: 'pointer', flexShrink: 0, marginLeft: 12,
+            transition: 'all 0.15s',
+          }}>
+            <RefreshCw size={9} style={regenning ? { animation: 'ispin 1s linear infinite' } : {}} />
+            {regenning ? 'Refreshing…' : 'Refresh'}
+          </button>
+        )}
+      </div>
+
+      {/* ── Key finding + Recommendation side-by-side (only if data_story is the headline) ── */}
+      {section.data_story && (section.key_finding || section.recommendation) && (
+        <div style={{ display: 'grid', gridTemplateColumns: section.key_finding && section.recommendation ? '1fr 1fr' : '1fr', gap: 12 }}>
+          {section.key_finding && (
+            <div className="intel-finding-card" style={{ display: 'flex', gap: 10, background: `${C.teal}08`, borderRadius: 12, padding: '12px 15px', borderLeft: `3px solid ${C.teal}` }}>
+              <Zap size={13} style={{ color: C.teal, marginTop: 2, flexShrink: 0 }} />
+              <div>
+                <p style={{ fontSize: 9, fontWeight: 700, color: C.teal, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 3px' }}>Key Finding</p>
+                <p style={{ fontSize: 12, fontWeight: 600, color: C.ink, margin: 0, lineHeight: 1.5 }}>{section.key_finding}</p>
+              </div>
+            </div>
+          )}
+          {section.recommendation && (
+            <div className="intel-rec-card" style={{ display: 'flex', gap: 10, background: '#fff7ed', borderRadius: 12, padding: '12px 15px', borderLeft: '3px solid #f97316' }}>
+              <ArrowRight size={13} style={{ color: '#f97316', marginTop: 2, flexShrink: 0 }} />
+              <div>
+                <p style={{ fontSize: 9, fontWeight: 700, color: '#f97316', textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 3px' }}>Next Step</p>
+                <p style={{ fontSize: 12, fontWeight: 600, color: '#7c2d12', margin: 0, lineHeight: 1.5 }}>{section.recommendation}</p>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Key finding callout */}
-      {section.key_finding && (
-        <div style={{
-          display: 'flex', alignItems: 'flex-start', gap: 14,
-          background: `${C.teal}0c`,
-          borderRadius: 14, padding: '15px 18px',
-          border: `1px solid ${C.teal}30`,
-          borderLeft: `4px solid ${C.teal}`,
-          boxShadow: '0 2px 8px rgba(10,33,58,0.04)',
-        }}>
-          <Zap size={15} style={{ color: C.teal, marginTop: 1, flexShrink: 0 }} />
-          <p style={{ fontSize: 14, fontWeight: 700, color: C.ink, margin: 0, lineHeight: 1.55 }}>{section.key_finding}</p>
+      {/* ── Recommendation alongside key_finding when data_story is the headline ── */}
+      {!section.data_story && section.recommendation && (
+        <div className="intel-rec-card" style={{ display: 'flex', gap: 10, background: '#fff7ed', borderRadius: 12, padding: '12px 15px', borderLeft: '3px solid #f97316' }}>
+          <ArrowRight size={13} style={{ color: '#f97316', marginTop: 2, flexShrink: 0 }} />
+          <div>
+            <p style={{ fontSize: 9, fontWeight: 700, color: '#f97316', textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 3px' }}>Next Step</p>
+            <p style={{ fontSize: 12, fontWeight: 600, color: '#7c2d12', margin: 0, lineHeight: 1.5 }}>{section.recommendation}</p>
+          </div>
         </div>
       )}
 
-      {/* Narrative (show only if no data_story, or always if both present) */}
-      {section.narrative && !section.data_story && (
-        <div style={{ background: `linear-gradient(135deg, ${C.navy} 0%, #1a3a5c 100%)`, borderRadius: 16, padding: '18px 22px' }}>
-          <p style={{ fontSize: 13, lineHeight: 1.78, color: 'rgba(255,255,255,0.84)', margin: 0 }}>{section.narrative}</p>
-        </div>
-      )}
-      {section.narrative && section.data_story && (
-        <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0, padding: '0 4px' }}>{section.narrative}</p>
+      {/* ── Narrative body text ── */}
+      {section.narrative && (
+        <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{section.narrative}</p>
       )}
 
-      {/* Insight cards */}
+      {/* ── Insight cards ── */}
       {section.insights && section.insights.length > 0 && <InsightCards insights={section.insights} />}
 
-      {/* Section KPIs */}
+      {/* ── Section KPIs ── */}
       {section.kpis.length > 0 && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(145px, 1fr))', gap: 10 }}>
           {section.kpis.map((k, i) => <KpiCard key={i} kpi={k} idx={sectionIdx * 4 + i} />)}
         </div>
       )}
 
-      {/* Performers + Charts — performers beside first chart; remaining charts in 2-col grid */}
+      {/* ── Performers + Charts ── */}
       {(hasPerformers || section.charts.length > 0) && (() => {
         const charts = section.charts
         const firstChart = charts[0]
         const restCharts = charts.slice(1)
-        const chartProps = (ch: typeof charts[0], i: number) => ({
-          chart: ch, colorIdx: sectionIdx * 4 + i,
-          onDrill: onDrill ? (seg: string) => onDrill(ch, seg) : undefined,
-          onFullscreen: onFullscreen ? () => onFullscreen(ch) : undefined,
-          annotations: annotations ? Object.fromEntries(
-            Object.entries(annotations)
-              .filter(([k]) => k.startsWith(`${section.id}|${ch.title}|`))
-              .map(([k, v]) => [k.split('|')[2] ?? k, v])
-          ) : undefined,
-          onAnnotate: onAnnotate ? (pt: string) => onAnnotate(ch.title, pt) : undefined,
-        })
         return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {/* Row 1: performers (fixed 290px) + first chart */}
             {(hasPerformers || firstChart) && (
               <div style={{
                 display: 'grid',
@@ -953,49 +1078,29 @@ function SectionContent({
                 gap: 16, alignItems: 'start',
               }}>
                 {hasPerformers && (
-                  <PerformerPanel
-                    top={section.top_performers ?? []}
-                    bottom={section.bottom_performers ?? []}
-                    label={section.label}
-                  />
+                  <div style={{ animation: 'fadeInLeft 0.3s 0.05s ease both' }}>
+                    <PerformerPanel top={section.top_performers ?? []} bottom={section.bottom_performers ?? []} label={section.label} />
+                  </div>
                 )}
-                {firstChart && <AgentChartView key={0} {...chartProps(firstChart, 0)} />}
+                {firstChart && (
+                  <div style={{ animation: 'fadeInUp 0.32s 0.08s ease both' }}>
+                    <AgentChartView key={0} {...chartProps(firstChart, 0)} />
+                  </div>
+                )}
               </div>
             )}
-            {/* Row 2+: remaining charts in responsive 2-col grid */}
             {restCharts.length > 0 && (
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: restCharts.length === 1 ? '1fr' : '1fr 1fr',
-                gap: 16,
-              }}>
+              <div style={{ display: 'grid', gridTemplateColumns: restCharts.length === 1 ? '1fr' : '1fr 1fr', gap: 16 }}>
                 {restCharts.map((ch, i) => (
-                  <AgentChartView key={i + 1} {...chartProps(ch, i + 1)} />
+                  <div key={i + 1} style={{ animation: `fadeInUp 0.32s ${0.12 + i * 0.08}s ease both` }}>
+                    <AgentChartView {...chartProps(ch, i + 1)} />
+                  </div>
                 ))}
               </div>
             )}
           </div>
         )
       })()}
-
-      {/* SQL drawer */}
-      {sourceSqls.length > 0 && <SqlDrawer sqls={sourceSqls} shareToken={shareToken} />}
-
-      {/* Recommendation footer */}
-      {section.recommendation && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 12,
-          background: `linear-gradient(135deg, ${C.teal}08, ${C.teal2}04)`,
-          borderRadius: 12, padding: '13px 18px',
-          border: `1px solid ${C.teal}20`,
-          boxShadow: '0 1px 6px rgba(0,180,216,0.06)',
-        }}>
-          <div style={{ width: 28, height: 28, borderRadius: 8, background: `${C.teal}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-            <ArrowRight size={13} style={{ color: C.teal }} />
-          </div>
-          <p style={{ fontSize: 13, color: C.ink, margin: 0, lineHeight: 1.55 }}><strong style={{ color: C.teal, fontWeight: 700 }}>Recommended Action: </strong>{section.recommendation}</p>
-        </div>
-      )}
 
       {!section.narrative && !section.key_finding && !section.data_story && !section.kpis.length && !section.charts.length && (
         <div style={{ textAlign: 'center', padding: '60px 0', color: '#94a3b8', fontSize: 13 }}>No content generated for this section.</div>
@@ -1017,6 +1122,7 @@ function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; activ
             key={s.id}
             onClick={() => onNav(s.id)}
             title={s.label}
+            className="intel-nav-item"
             style={{
               width: 52, flexShrink: 0,
               background: 'transparent', border: 'none', cursor: 'pointer',
@@ -1283,8 +1389,8 @@ function DrillThroughModal({
 }: { title: string; segment: string; rows: Record<string, unknown>[]; columns: string[]; onClose: () => void }) {
   const cols = columns.length ? columns : rows[0] ? Object.keys(rows[0]) : []
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.55)', backdropFilter: 'blur(6px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
-      <div style={{ background: 'white', borderRadius: 20, width: '90%', maxWidth: 760, maxHeight: '80vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(8,33,58,0.25)' }}>
+    <div className="intel-modal-enter" style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.55)', backdropFilter: 'blur(6px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+      <div className="intel-modal-inner-enter" style={{ background: 'white', borderRadius: 20, width: '90%', maxWidth: 760, maxHeight: '80vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(8,33,58,0.25)' }}>
         <div style={{ padding: '16px 20px', borderBottom: '1px solid #e8eef5', display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ flex: 1 }}>
             <p style={{ fontSize: 13, fontWeight: 700, color: C.navy, margin: 0 }}>Drill-Through: <span style={{ color: C.teal }}>{segment}</span></p>
@@ -1328,8 +1434,8 @@ function FullscreenChartModal({ chart, colorIdx, onClose }: { chart: AgentChart;
   const accentColor = chart.color ?? PALETTE[colorIdx % PALETTE.length]
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.7)', backdropFilter: 'blur(8px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32 }}>
-      <div style={{ background: 'white', borderRadius: 20, width: '94%', maxWidth: 900, display: 'flex', flexDirection: 'column', boxShadow: '0 24px 80px rgba(8,33,58,0.3)' }}>
+    <div className="intel-modal-enter" style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.7)', backdropFilter: 'blur(8px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32 }}>
+      <div className="intel-modal-inner-enter" style={{ background: 'white', borderRadius: 20, width: '94%', maxWidth: 900, display: 'flex', flexDirection: 'column', boxShadow: '0 24px 80px rgba(8,33,58,0.3)' }}>
         <div style={{ padding: '14px 20px', borderBottom: '1px solid #e8eef5', display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 4, height: 18, borderRadius: 2, background: accentColor }} />
           <p style={{ fontSize: 15, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{chart.title}</p>
@@ -1547,6 +1653,17 @@ export default function IntelligenceCanvasPage() {
   const [aiFallbackWarning, setAiFallbackWarning] = useState(false)
   const [rerunning, setRerunning] = useState(false)
   const [activeSection, setActiveSection] = useState('')
+  const [sectionLeaving, setSectionLeaving] = useState(false)
+  const sectionNavPending = useRef<string>('')
+  const handleNavSection = useCallback((id: string) => {
+    if (id === activeSection) return
+    setSectionLeaving(true)
+    sectionNavPending.current = id
+    setTimeout(() => {
+      setActiveSection(sectionNavPending.current)
+      setSectionLeaving(false)
+    }, 240)
+  }, [activeSection])
   const [briefExpanded, setBriefExpanded] = useState(true)
 
   // Feature 1: Time range override
@@ -1735,25 +1852,31 @@ export default function IntelligenceCanvasPage() {
   }, [analysis, canvasId])
 
   useEffect(() => {
-    const load = async () => {
-      // Check localStorage first — if saved, skip the AI run but still fetch canvas for projectId
-      let savedObj: ExecutiveAnalysis | null = null
-      if (typeof window !== 'undefined') {
-        try {
-          const savedRaw = localStorage.getItem(`intel_analysis_${canvasId}`)
-          if (savedRaw) {
-            const parsed = JSON.parse(savedRaw) as ExecutiveAnalysis
-            if (parsed.sections?.length) savedObj = parsed
-          }
-        } catch {}
-      }
+    let cancelled = false
+    const LOCK_KEY    = `intel_lock_${canvasId}`
+    const RESULT_KEY  = `intel_analysis_${canvasId}`
+    const LOCK_STALE  = 10 * 60 * 1000  // 10 min — stale lock threshold
 
+    const load = async () => {
+      // ── 1. Check for saved analysis in localStorage ──────────────────────
+      let savedObj: ExecutiveAnalysis | null = null
+      try {
+        const savedRaw = localStorage.getItem(RESULT_KEY)
+        if (savedRaw) {
+          const parsed = JSON.parse(savedRaw) as ExecutiveAnalysis
+          if (parsed.sections?.length) savedObj = parsed
+        }
+      } catch {}
+
+      // ── 2. Always fetch canvas metadata (projectId, shareToken) ──────────
       setAgentStatus('loading_canvas')
       try {
         const [canvasResp, sharesResp] = await Promise.all([
           canvasApi.get(canvasId),
           shareApi.list(canvasId).catch(() => ({ data: null })),
         ])
+        if (cancelled) return
+
         const detail = canvasResp.data?.dashboard ?? canvasResp.data
         let widgets: unknown[] = detail?.widgets ?? []
         setCanvas(detail); setProjectId(detail?.project_id ?? '')
@@ -1761,44 +1884,100 @@ export default function IntelligenceCanvasPage() {
         const token = sharesList.length ? ((sharesList[0] as Record<string,string>).token ?? '') : ''
         if (token) setShareToken(token)
 
-        // If we have saved analysis, skip the AI run — canvas metadata (projectId, shareToken) is now loaded
+        // Saved analysis available — use it, skip AI run
         if (savedObj) {
-          setAnalysis(savedObj)
-          setActiveSection(savedObj.sections[0]?.id ?? '')
-          setAgentStatus('done')
-          setHasSavedData(true)
+          if (cancelled) return
+          setAnalysis(savedObj); setActiveSection(savedObj.sections[0]?.id ?? '')
+          setAgentStatus('done'); setHasSavedData(true)
           return
         }
 
-        // Bulk-fetch live SQL rows for every widget before running the agent
+        // ── 3. Cross-tab lock: only one tab runs the analysis ─────────────
+        const existingLock = localStorage.getItem(LOCK_KEY)
+        const lockAge = existingLock ? Date.now() - Number(existingLock) : Infinity
+        const lockHeld = existingLock && lockAge < LOCK_STALE
+
+        if (lockHeld) {
+          // Another tab is already running — wait for it to write the result
+          console.log('[intelligence:page] another tab is running analysis, waiting…')
+          setAgentStatus('running')
+          setAgentStep('Another tab is generating this report — waiting…')
+          const POLL_INTERVAL = 3000, MAX_WAIT = 5 * 60 * 1000
+          const started = Date.now()
+          await new Promise<void>(resolve => {
+            const poll = setInterval(() => {
+              if (cancelled) { clearInterval(poll); resolve(); return }
+              try {
+                const raw = localStorage.getItem(RESULT_KEY)
+                if (raw) {
+                  const parsed = JSON.parse(raw) as ExecutiveAnalysis
+                  if (parsed.sections?.length) {
+                    clearInterval(poll)
+                    if (!cancelled) {
+                      setAnalysis(parsed); setActiveSection(parsed.sections[0]?.id ?? '')
+                      setAgentStatus('done'); setHasSavedData(true)
+                    }
+                    resolve(); return
+                  }
+                }
+              } catch {}
+              // Lock gone or stale — take over
+              const currentLock = localStorage.getItem(LOCK_KEY)
+              const currentAge = currentLock ? Date.now() - Number(currentLock) : Infinity
+              if (!currentLock || currentAge >= LOCK_STALE || Date.now() - started > MAX_WAIT) {
+                clearInterval(poll); resolve()
+              }
+            }, POLL_INTERVAL)
+          })
+          if (cancelled) return
+          // If we got here due to timeout/lock-gone but still no result, fall through to compute
+          const fallbackRaw = localStorage.getItem(RESULT_KEY)
+          if (fallbackRaw) return  // resolved above already set state
+          // else fall through and compute
+        }
+
+        // ── 4. Acquire lock and run analysis ─────────────────────────────
+        localStorage.setItem(LOCK_KEY, String(Date.now()))
+
+        // Bulk-fetch live SQL rows for every widget
         try {
           setAgentStep('Fetching live data for all widgets…')
           const liveResp = await intelligenceApi.fetchWidgetData(canvasId)
+          if (cancelled) { localStorage.removeItem(LOCK_KEY); return }
           const liveData = liveResp.data?.widget_data ?? []
           widgets = mergeWidgetData(widgets, liveData)
           const upgraded = liveData.filter(d => d.ok && (d.rows?.length ?? 0) > 0).length
           console.log(`[intelligence:page] bulk-fetch done  upgraded=${upgraded}/${liveData.length} widgets`)
           setLastFetchedAt(new Date())
         } catch (e) {
+          if (cancelled) { localStorage.removeItem(LOCK_KEY); return }
           console.warn('[intelligence:page] bulk-fetch failed, continuing with cached data:', e)
         }
 
+        if (cancelled) { localStorage.removeItem(LOCK_KEY); return }
         setRawWidgets(widgets)
         setAgentStatus('running')
         setAiFallbackWarning(false)
         const result = await runIntelligenceAgent(
           { projectId: detail?.project_id ?? '', canvasId, canvasName: detail?.name ?? 'Report', widgets: widgets as never, shareToken: token || undefined },
-          s => setAgentStep(s),
+          s => { if (!cancelled) setAgentStep(s) },
         )
+        if (cancelled) { localStorage.removeItem(LOCK_KEY); return }
         if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
         setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
         setAgentStatus('done')
+        // Auto-save so waiting tabs pick it up and future loads skip the AI run
+        try { localStorage.setItem(RESULT_KEY, JSON.stringify(result)) } catch {}
       } catch (err) {
+        if (cancelled) return
         setAgentError(err instanceof Error ? err.message : 'Failed to load')
         setAgentStatus('error')
+      } finally {
+        localStorage.removeItem(LOCK_KEY)
       }
     }
     load()
+    return () => { cancelled = true }
   }, [canvasId, mergeWidgetData])
 
   // Feature 1: apply date range and re-generate
@@ -1894,7 +2073,7 @@ export default function IntelligenceCanvasPage() {
     <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: '62px 1fr', overflow: 'hidden' }}>
 
       {/* Left rail */}
-      <LeftRail sections={analysis.sections} active={activeSection} onNav={setActiveSection} />
+      <LeftRail sections={analysis.sections} active={activeSection} onNav={handleNavSection} />
 
       {/* Main content */}
       <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', background: C.bg }}>
@@ -1919,21 +2098,20 @@ export default function IntelligenceCanvasPage() {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
             {lastFetchedAt && <FreshnessBadge fetchedAt={lastFetchedAt} />}
-            <HealthBadge score={analysis.health_score} color={analysis.health_color} />
             {/* Feature 1: date range toggle */}
-            <button onClick={() => setShowDatePicker(p => !p)} title="Filter by date range" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${showDatePicker ? C.teal : 'rgba(255,255,255,0.2)'}`, background: showDatePicker ? `${C.teal}30` : 'rgba(255,255,255,0.1)', color: showDatePicker ? C.teal2 : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+            <button onClick={() => setShowDatePicker(p => !p)} title="Filter by date range" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${showDatePicker ? C.teal : 'rgba(255,255,255,0.2)'}`, background: showDatePicker ? `${C.teal}30` : 'rgba(255,255,255,0.1)', color: showDatePicker ? C.teal2 : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <CalendarRange size={11} />{appliedDateRange ? `${appliedDateRange.from.slice(5)} → ${appliedDateRange.to.slice(5)}` : 'Date'}
             </button>
             {/* Feature 6: present */}
-            <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+            <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Play size={11} /> Present
             </button>
             {/* Feature 7: print/PDF */}
-            <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+            <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Printer size={11} /> PDF
             </button>
             {/* Feature 8: share */}
-            <button onClick={() => setShareModalUrl(window.location.href)} title="Share report" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+            <button onClick={() => setShareModalUrl(window.location.href)} title="Share report" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Link size={11} /> Share
             </button>
             {/* Save button */}
@@ -1997,32 +2175,28 @@ export default function IntelligenceCanvasPage() {
             </div>
           )}
 
-          {/* Morning brief — collapsible */}
+          {/* Morning brief — compact collapsible */}
           {analysis.morning_brief && (
-            <div style={{
-              background: `linear-gradient(135deg, ${C.navy} 0%, #0d3060 60%, #0a2540 100%)`,
-              borderRadius: 18, marginBottom: 20, overflow: 'hidden',
-              boxShadow: '0 4px 24px rgba(8,33,58,0.14)',
-              border: '1px solid rgba(255,255,255,0.06)',
-              position: 'relative',
+            <div className="intel-morning" style={{
+              borderRadius: 14, marginBottom: 20, overflow: 'hidden',
+              border: '1px solid #e2eaf4', background: 'white',
+              boxShadow: '0 1px 6px rgba(0,0,0,0.05)',
             }}>
-              {/* Subtle pattern */}
-              <div style={{ position: 'absolute', inset: 0, backgroundImage: `radial-gradient(circle, rgba(0,180,216,0.06) 1px, transparent 1px)`, backgroundSize: '24px 24px', pointerEvents: 'none' }} />
               <button
                 onClick={() => setBriefExpanded(e => !e)}
-                style={{ width: '100%', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 10, background: 'transparent', border: 'none', cursor: 'pointer', textAlign: 'left', position: 'relative' }}
+                style={{ width: '100%', padding: '11px 16px', display: 'flex', alignItems: 'center', gap: 10, background: 'transparent', border: 'none', cursor: 'pointer', textAlign: 'left' }}
               >
-                <div style={{ width: 28, height: 28, borderRadius: 8, background: `${C.teal}20`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                  <Sparkles size={13} style={{ color: C.teal2 }} />
+                <div style={{ width: 26, height: 26, borderRadius: 8, background: `${C.teal}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <Sparkles size={12} style={{ color: C.teal }} />
                 </div>
-                <span style={{ fontSize: 11, fontWeight: 700, color: C.teal2, textTransform: 'uppercase', letterSpacing: '0.09em', flex: 1 }}>AI Morning Brief</span>
-                <span style={{ fontSize: 9, fontWeight: 700, color: 'rgba(255,255,255,0.35)', background: 'rgba(255,255,255,0.08)', borderRadius: 20, padding: '2px 8px', marginRight: 6 }}>OPUS</span>
-                {briefExpanded ? <ChevronUp size={13} style={{ color: 'rgba(255,255,255,0.35)', flexShrink: 0 }} /> : <ChevronDown size={13} style={{ color: 'rgba(255,255,255,0.35)', flexShrink: 0 }} />}
+                <span style={{ fontSize: 11, fontWeight: 700, color: C.ink, flex: 1 }}>AI Morning Brief</span>
+                <span style={{ fontSize: 9, fontWeight: 700, color: C.teal, background: `${C.teal}12`, borderRadius: 20, padding: '2px 8px', marginRight: 6 }}>OPUS</span>
+                {briefExpanded ? <ChevronUp size={12} style={{ color: '#94a3b8' }} /> : <ChevronDown size={12} style={{ color: '#94a3b8' }} />}
               </button>
               {briefExpanded && (
-                <div style={{ padding: '0 24px 22px', position: 'relative' }}>
-                  <div style={{ height: 1, background: 'rgba(255,255,255,0.07)', marginBottom: 16 }} />
-                  <p style={{ fontSize: 14, lineHeight: 1.82, color: 'rgba(255,255,255,0.88)', margin: 0, fontWeight: 400 }}>{analysis.morning_brief}</p>
+                <div style={{ padding: '0 16px 16px' }}>
+                  <div style={{ height: 1, background: '#f1f5f9', marginBottom: 12 }} />
+                  <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{analysis.morning_brief}</p>
                 </div>
               )}
             </div>
@@ -2031,10 +2205,9 @@ export default function IntelligenceCanvasPage() {
 
           {/* Active section — or side-by-side (Feature 12) */}
           {!compareMode && currentSection && (
-            <div key={currentSection.id} className="intel-section-enter">
+            <div key={currentSection.id} className={`intel-section-enter${sectionLeaving ? ' intel-section-leave' : ''}`}>
             <SectionContent
               section={currentSection} sectionIdx={sectionIdx}
-              shareToken={shareToken}
               onRegenSection={() => handleRegenSection(currentSection.id)}
               regenning={regenSection === currentSection.id}
               onDrill={(chart, seg) => {
@@ -2055,7 +2228,6 @@ export default function IntelligenceCanvasPage() {
                   <div style={{ fontSize: 10, fontWeight: 700, color: C.teal, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, padding: '4px 10px', background: `${C.teal}10`, borderRadius: 20, display: 'inline-block' }}>Primary</div>
                   <SectionContent
                     section={currentSection} sectionIdx={sectionIdx}
-                    shareToken={shareToken}
                     onRegenSection={() => handleRegenSection(currentSection.id)}
                     regenning={regenSection === currentSection.id}
                     onDrill={(chart, seg) => {
@@ -2078,7 +2250,6 @@ export default function IntelligenceCanvasPage() {
                     <div style={{ fontSize: 10, fontWeight: 700, color: C.violet, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, padding: '4px 10px', background: `${C.violet}10`, borderRadius: 20, display: 'inline-block' }}>Compare</div>
                     <SectionContent
                       section={compSec} sectionIdx={compIdx}
-                      shareToken={shareToken}
                       onFullscreen={(chart) => setFsChart({ chart, colorIdx: compIdx * 4 })}
                       annotations={annotations}
                       onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${compSec.id}|${chartTitle}|${pt}`)}
@@ -2122,6 +2293,7 @@ export default function IntelligenceCanvasPage() {
         <button
           onClick={() => setCopilotOpen(p => !p)}
           title={copilotOpen ? 'Close AI Copilot' : 'Open AI Copilot'}
+          className="intel-fab-btn"
           style={{
             width: 56, height: 56, borderRadius: '50%', border: 'none', cursor: 'pointer',
             background: copilotOpen
@@ -2140,43 +2312,160 @@ export default function IntelligenceCanvasPage() {
       </div>
 
       <style>{`
-        @keyframes fadeSlideIn  { from { opacity: 0; transform: translateY(8px); }  to { opacity: 1; transform: translateY(0); } }
-        @keyframes fadeInUp     { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes scaleIn      { from { opacity: 0; transform: scale(0.93); }      to { opacity: 1; transform: scale(1); } }
-        @keyframes slideUpPanel { from { opacity: 0; transform: translateY(28px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
-        @keyframes fabFloat     { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
-        @keyframes ipulse { 0%,100%{transform:scale(1);opacity:.15} 50%{transform:scale(1.3);opacity:.06} }
-        @keyframes ispin  { to { transform: rotate(360deg); } }
-        @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        /* ── Appear keyframes ──────────────────────────────────── */
+        @keyframes fadeSlideIn   { from { opacity:0; transform:translateY(8px);        } to { opacity:1; transform:translateY(0);    } }
+        @keyframes fadeInUp      { from { opacity:0; transform:translateY(22px);       } to { opacity:1; transform:translateY(0);    } }
+        @keyframes fadeInLeft    { from { opacity:0; transform:translateX(-18px);      } to { opacity:1; transform:translateX(0);    } }
+        @keyframes fadeInRight   { from { opacity:0; transform:translateX(18px);       } to { opacity:1; transform:translateX(0);    } }
+        @keyframes scaleIn       { from { opacity:0; transform:scale(0.88) translateY(6px); } to { opacity:1; transform:scale(1) translateY(0); } }
+        @keyframes popIn         { from { opacity:0; transform:scale(0.82);             } to { opacity:1; transform:scale(1);         } }
+        @keyframes blurIn        { from { opacity:0; filter:blur(6px); transform:scale(0.97); } to { opacity:1; filter:blur(0); transform:scale(1); } }
+        @keyframes slideDown     { from { opacity:0; transform:translateY(-14px);      } to { opacity:1; transform:translateY(0);    } }
+        @keyframes slideUpPanel  { from { opacity:0; transform:translateY(28px) scale(0.95); } to { opacity:1; transform:translateY(0) scale(1); } }
 
-        /* Hover lift for cards */
+        /* ── Disappear keyframes ───────────────────────────────── */
+        @keyframes fadeOutDown   { from { opacity:1; transform:translateY(0);          } to { opacity:0; transform:translateY(16px); } }
+        @keyframes fadeOutUp     { from { opacity:1; transform:translateY(0);          } to { opacity:0; transform:translateY(-14px);} }
+        @keyframes fadeOutLeft   { from { opacity:1; transform:translateX(0);          } to { opacity:0; transform:translateX(-20px);} }
+        @keyframes scaleOutFade  { from { opacity:1; transform:scale(1);               } to { opacity:0; transform:scale(0.94);      } }
+        @keyframes blurOut       { from { opacity:1; filter:blur(0); transform:scale(1); } to { opacity:0; filter:blur(4px); transform:scale(1.02); } }
+
+        /* ── Misc ──────────────────────────────────────────────── */
+        @keyframes fabFloat  { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
+        @keyframes ipulse    { 0%,100%{transform:scale(1);opacity:.15} 50%{transform:scale(1.3);opacity:.06} }
+        @keyframes ispin     { to { transform:rotate(360deg); } }
+        @keyframes shimmer   { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        @keyframes cdot      { 0%,80%,100%{transform:scale(.7);opacity:.5} 40%{transform:scale(1);opacity:1} }
+        @keyframes borderPulse { 0%,100%{box-shadow:0 0 0 0 rgba(0,180,216,0.18)} 50%{box-shadow:0 0 0 5px rgba(0,180,216,0)} }
+
+        /* ── Section transitions ───────────────────────────────── */
+        .intel-section-enter { animation: fadeInUp 0.38s cubic-bezier(0.22,1,0.36,1) both; }
+        .intel-section-leave { animation: fadeOutDown 0.24s ease both; pointer-events:none; }
+
+        /* ── Global KPI stagger ────────────────────────────────── */
+        .intel-kpi-0 { animation: scaleIn 0.32s 0.04s both; }
+        .intel-kpi-1 { animation: scaleIn 0.32s 0.09s both; }
+        .intel-kpi-2 { animation: scaleIn 0.32s 0.14s both; }
+        .intel-kpi-3 { animation: scaleIn 0.32s 0.19s both; }
+        .intel-kpi-4 { animation: scaleIn 0.32s 0.24s both; }
+        .intel-kpi-5 { animation: scaleIn 0.32s 0.29s both; }
+
+        /* ── KPI cards ─────────────────────────────────────────── */
+        .intel-kpi-card {
+          transition: transform 0.22s cubic-bezier(.34,1.56,.64,1), box-shadow 0.22s ease, border-color 0.2s !important;
+        }
+        .intel-kpi-card:hover {
+          transform: translateY(-5px) scale(1.02) !important;
+          box-shadow: 0 16px 40px rgba(0,0,0,0.12) !important;
+          border-color: rgba(0,180,216,0.25) !important;
+        }
+
+        /* ── Chart cards ───────────────────────────────────────── */
+        .intel-chart-card {
+          transition: transform 0.24s cubic-bezier(.34,1.56,.64,1), box-shadow 0.24s ease, border-color 0.2s !important;
+        }
+        .intel-chart-card:hover {
+          transform: translateY(-4px) !important;
+          box-shadow: 0 18px 44px rgba(0,0,0,0.1) !important;
+          border-color: rgba(0,180,216,0.2) !important;
+        }
+
+        /* ── Section header bar ────────────────────────────────── */
+        .intel-section-hdr { animation: fadeInLeft 0.32s 0.05s ease both; }
+
+        /* ── Finding / Recommendation cards ────────────────────── */
+        .intel-finding-card {
+          animation: fadeInLeft 0.3s 0.1s ease both;
+          transition: transform 0.2s ease, box-shadow 0.2s ease !important;
+        }
+        .intel-finding-card:hover {
+          transform: translateX(4px) !important;
+          box-shadow: 0 6px 20px rgba(0,180,216,0.12) !important;
+        }
+        .intel-rec-card {
+          animation: fadeInRight 0.3s 0.15s ease both;
+          transition: transform 0.2s ease, box-shadow 0.2s ease !important;
+        }
+        .intel-rec-card:hover {
+          transform: translateX(-4px) !important;
+          box-shadow: 0 6px 20px rgba(249,115,22,0.12) !important;
+        }
+
+        /* ── Insight cards ─────────────────────────────────────── */
+        .intel-insight {
+          animation: popIn 0.28s ease both;
+          transition: transform 0.2s cubic-bezier(.34,1.56,.64,1), box-shadow 0.2s ease !important;
+        }
+        .intel-insight:hover {
+          transform: translateY(-3px) scale(1.015) !important;
+          box-shadow: 0 10px 28px rgba(0,0,0,0.09) !important;
+        }
+
+        /* ── LeftRail nav buttons ──────────────────────────────── */
+        .intel-nav-item {
+          transition: transform 0.18s cubic-bezier(.34,1.56,.64,1) !important;
+        }
+        .intel-nav-item:hover { transform: scale(1.14) !important; }
+        .intel-nav-item:active { transform: scale(0.95) !important; }
+
+        /* ── Header action buttons ─────────────────────────────── */
+        .intel-hdr-btn {
+          transition: background 0.14s, border-color 0.14s, color 0.14s, transform 0.14s !important;
+        }
+        .intel-hdr-btn:hover { transform: translateY(-1px) scale(1.04) !important; }
+        .intel-hdr-btn:active { transform: scale(0.97) !important; }
+
+        /* ── Performer panel items ──────────────────────────────── */
+        .intel-performer-row {
+          transition: background 0.15s, transform 0.18s ease, padding-left 0.15s !important;
+          border-radius: 8px;
+        }
+        .intel-performer-row:hover {
+          background: rgba(0,180,216,0.06) !important;
+          transform: translateX(4px) !important;
+          padding-left: 18px !important;
+        }
+
+        /* ── Table view ─────────────────────────────────────────── */
+        .intel-table-card { animation: fadeInUp 0.3s 0.12s ease both; }
+        .intel-table-row {
+          transition: background 0.12s !important;
+        }
+        .intel-table-row:hover { background: #f0f9ff !important; }
+
+        /* ── Morning brief ──────────────────────────────────────── */
+        .intel-morning { animation: slideDown 0.28s 0.06s ease both; transition: box-shadow 0.2s, border-color 0.2s !important; }
+        .intel-morning:hover { box-shadow: 0 4px 18px rgba(0,0,0,0.07) !important; border-color: rgba(0,180,216,0.2) !important; }
+
+        /* ── Section tabs (old-style cards — unused but keep) ───── */
         .intel-card { transition: transform 0.22s ease, box-shadow 0.22s ease !important; }
         .intel-card:hover { transform: translateY(-3px) !important; box-shadow: 0 12px 32px rgba(0,0,0,0.1) !important; }
 
-        /* Hover pulse for header buttons */
-        .intel-hdr-btn { transition: background 0.15s, opacity 0.15s, transform 0.15s !important; }
-        .intel-hdr-btn:hover { opacity: 0.9 !important; transform: scale(1.04) !important; }
+        /* ── Modal overlays ─────────────────────────────────────── */
+        .intel-modal-enter { animation: blurIn 0.22s ease both; }
+        .intel-modal-leave { animation: blurOut 0.18s ease both; pointer-events:none; }
+        .intel-modal-inner-enter { animation: scaleIn 0.25s cubic-bezier(.34,1.56,.64,1) both; }
+        .intel-modal-inner-leave { animation: scaleOutFade 0.18s ease both; pointer-events:none; }
 
-        /* Section nav icon buttons */
-        .intel-nav-btn { transition: background 0.18s, transform 0.18s !important; }
-        .intel-nav-btn:hover { transform: scale(1.12) !important; }
+        /* ── FAB ────────────────────────────────────────────────── */
+        .intel-fab-btn {
+          transition: transform 0.2s cubic-bezier(.34,1.56,.64,1), box-shadow 0.2s !important;
+        }
+        .intel-fab-btn:hover { transform: scale(1.08) !important; box-shadow: 0 12px 40px rgba(0,180,216,0.4) !important; }
+        .intel-fab-btn:active { transform: scale(0.95) !important; }
 
-        /* Insight cards */
-        .intel-insight { transition: transform 0.2s ease, box-shadow 0.2s ease !important; }
-        .intel-insight:hover { transform: translateY(-2px) !important; box-shadow: 0 8px 20px rgba(0,0,0,0.08) !important; }
+        /* ── Chart type switcher buttons ───────────────────────── */
+        .intel-chart-type-btn { transition: all 0.15s !important; }
+        .intel-chart-type-btn:hover { transform: scale(1.12) !important; }
 
-        /* Section content fade-in on section change */
-        .intel-section-enter { animation: fadeInUp 0.35s cubic-bezier(0.22,1,0.36,1) both; }
+        /* ── Toolbar icon buttons (download, fullscreen, annotate) */
+        .intel-toolbar-btn {
+          transition: background 0.14s, color 0.14s, transform 0.15s cubic-bezier(.34,1.56,.64,1) !important;
+        }
+        .intel-toolbar-btn:hover { transform: scale(1.18) !important; }
+        .intel-toolbar-btn:active { transform: scale(0.9) !important; }
 
-        /* KPI card stagger */
-        .intel-kpi-0 { animation: scaleIn 0.3s 0.05s both; }
-        .intel-kpi-1 { animation: scaleIn 0.3s 0.1s both; }
-        .intel-kpi-2 { animation: scaleIn 0.3s 0.15s both; }
-        .intel-kpi-3 { animation: scaleIn 0.3s 0.2s both; }
-        .intel-kpi-4 { animation: scaleIn 0.3s 0.25s both; }
-        .intel-kpi-5 { animation: scaleIn 0.3s 0.3s both; }
-
-        /* Feature 7: PDF / print styles */
+        /* ── Feature 7: PDF / print ─────────────────────────────── */
         @media print {
           body * { visibility: hidden !important; }
           .print-zone, .print-zone * { visibility: visible !important; }

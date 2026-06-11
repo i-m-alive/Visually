@@ -17,6 +17,7 @@ intelligence.py — Intelligence data + analysis endpoints
 """
 
 import asyncio
+import hashlib
 import json
 import re
 import uuid
@@ -31,6 +32,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
+from shared.redis_client import get_redis
 
 from shared.database import get_db
 from shared.models.dashboards import Dashboard
@@ -147,18 +150,89 @@ class AnalyzeRequest(BaseModel):
     canvas_name: Optional[str] = None
 
 
-@router.post("/intelligence/analyze")
-async def intelligence_analyze(body: AnalyzeRequest):
-    """
-    Dedicated intelligence analysis endpoint.
+# Cache TTL and lock timeout for intelligence results
+_INTEL_CACHE_TTL  = int(os.getenv("INTELLIGENCE_CACHE_TTL",  "1800"))  # 30 min result cache
+_INTEL_LOCK_TTL   = int(os.getenv("INTELLIGENCE_LOCK_TTL",   "600"))   # 10 min lock (Bedrock can take ~160 s)
+_INTEL_LOCK_POLL  = float(os.getenv("INTELLIGENCE_LOCK_POLL", "2.0"))  # poll interval when waiting
+_INTEL_LOCK_WAIT  = int(os.getenv("INTELLIGENCE_LOCK_WAIT",   "300"))  # max seconds to wait for a peer
 
-    Uses a dedicated Bedrock client with read_timeout=300 s so large JSON
-    responses are never cut off mid-generation.  max_tokens=16 384 keeps the
-    response well within what the model produces in <160 s.
+
+@router.post("/intelligence/analyze")
+async def intelligence_analyze(body: AnalyzeRequest, redis=Depends(get_redis)):
     """
+    Dedicated intelligence analysis endpoint with Redis result cache and
+    request coalescing.
+
+    - First request for a given prompt hash: runs Bedrock, stores result in Redis (30 min TTL)
+    - Concurrent duplicate requests: wait for the first to finish and return the cached result
+    - Subsequent requests within TTL: return cached result immediately (no Bedrock call)
+    """
+    # Stable key = SHA-256 of the exact prompt (includes all widget data)
+    prompt_hash = hashlib.sha256(body.prompt.encode()).hexdigest()[:24]
+    cache_key = f"intel:result:{prompt_hash}"
+    lock_key  = f"intel:lock:{prompt_hash}"
+    canvas    = body.canvas_name or "?"
+
+    # ── 1. Fast-path: cached result ──────────────────────────────────────────
+    try:
+        cached = await redis.get(cache_key)
+        if cached:
+            raw = cached.decode() if isinstance(cached, bytes) else cached
+            print(
+                f"[intelligence/analyze] CACHE HIT  hash={prompt_hash[:8]}"
+                f"  canvas={canvas}  len={len(raw)}",
+                flush=True,
+            )
+            return {"text": raw}
+    except Exception as _re:
+        print(f"[intelligence/analyze] Redis read failed (non-fatal): {_re}", flush=True)
+
+    # ── 2. Try to acquire lock (prevent thundering herd) ─────────────────────
+    lock_acquired = False
+    try:
+        lock_acquired = await redis.set(lock_key, "1", nx=True, ex=_INTEL_LOCK_TTL)
+    except Exception as _re:
+        print(f"[intelligence/analyze] Redis lock failed (non-fatal): {_re}", flush=True)
+        lock_acquired = True  # treat as acquired so we proceed
+
+    if not lock_acquired:
+        # Another instance is already computing — wait for cached result
+        t_wait = time.time()
+        print(
+            f"[intelligence/analyze] WAITING for peer  hash={prompt_hash[:8]}"
+            f"  canvas={canvas}",
+            flush=True,
+        )
+        while time.time() - t_wait < _INTEL_LOCK_WAIT:
+            await asyncio.sleep(_INTEL_LOCK_POLL)
+            try:
+                cached = await redis.get(cache_key)
+                if cached:
+                    raw = cached.decode() if isinstance(cached, bytes) else cached
+                    print(
+                        f"[intelligence/analyze] PEER RESULT  waited={time.time()-t_wait:.1f}s"
+                        f"  hash={prompt_hash[:8]}  canvas={canvas}",
+                        flush=True,
+                    )
+                    return {"text": raw}
+                # Check if lock is gone (peer failed) — take over
+                lock_exists = await redis.exists(lock_key)
+                if not lock_exists:
+                    lock_acquired = await redis.set(lock_key, "1", nx=True, ex=_INTEL_LOCK_TTL)
+                    if lock_acquired:
+                        print(f"[intelligence/analyze] TOOK OVER after peer failure  hash={prompt_hash[:8]}", flush=True)
+                        break
+            except Exception:
+                break  # Redis unavailable — fall through and compute
+        else:
+            # Timed out waiting — fall through and compute anyway
+            print(f"[intelligence/analyze] WAIT TIMEOUT  hash={prompt_hash[:8]}, computing independently", flush=True)
+
+    # ── 3. Compute via Bedrock ────────────────────────────────────────────────
     t0 = time.time()
     print(
-        f"[intelligence/analyze] START  prompt_len={len(body.prompt)}  canvas={body.canvas_name or '?'}",
+        f"[intelligence/analyze] START  prompt_len={len(body.prompt)}  canvas={canvas}"
+        f"  hash={prompt_hash[:8]}",
         flush=True,
     )
     try:
@@ -171,10 +245,22 @@ async def intelligence_analyze(body: AnalyzeRequest):
             f"[intelligence/analyze] OK  response_len={len(raw)}  elapsed={time.time()-t0:.1f}s",
             flush=True,
         )
+        # Store result in cache
+        try:
+            await redis.set(cache_key, raw.encode() if isinstance(raw, str) else raw, ex=_INTEL_CACHE_TTL)
+        except Exception as _re:
+            print(f"[intelligence/analyze] Redis write failed (non-fatal): {_re}", flush=True)
         return {"text": raw}
     except Exception as exc:
         print(f"[intelligence/analyze] FAILED after {time.time()-t0:.1f}s: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=502, detail=f"Bedrock call failed: {exc}")
+    finally:
+        # Release lock whether we succeeded or failed
+        try:
+            if lock_acquired:
+                await redis.delete(lock_key)
+        except Exception:
+            pass
 
 
 # ─── /dashboards/{id}/schema-context ────────────────────────────────────────
