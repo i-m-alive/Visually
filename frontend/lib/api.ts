@@ -79,8 +79,14 @@ export const intelligenceApi = {
   /**
    * Execute every widget's sql_query in parallel on the backend and return
    * fresh rows + columns so the AI agent has real data instead of stale cache.
+   *
+   * Pass dateRange to filter all widget queries to a specific time window.
+   * The backend detects date columns and injects a WHERE clause automatically.
    */
-  fetchWidgetData: (dashboardId: string) =>
+  fetchWidgetData: (
+    dashboardId: string,
+    dateRange?: { from: string; to: string } | null,
+  ) =>
     api.post<{
       widget_data: Array<{
         widget_id: string
@@ -91,7 +97,10 @@ export const intelligenceApi = {
         values?: unknown[]
         error?: string
       }>
-    }>(`/dashboards/${dashboardId}/intelligence-data`),
+    }>(
+      `/dashboards/${dashboardId}/intelligence-data`,
+      dateRange ? { date_from: dateRange.from, date_to: dateRange.to } : {},
+    ),
 }
 
 export const screenshotApi = {

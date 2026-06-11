@@ -1,12 +1,12 @@
 'use client'
-import { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { canvasApi, shareApi, chatApi, intelligenceApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
 import {
-  runIntelligenceAgent, buildFallbackAnalysis,
+  runIntelligenceAgent, buildFallbackAnalysis, runSectionAgent,
   type ExecutiveAnalysis, type AgentKPI, type AgentChart, type AgentSection,
-  type InsightCard, type PerformerRow,
+  type InsightCard, type PerformerRow, type WidgetInput,
 } from '@/lib/intelligenceAgent'
 import {
   Zap, TrendingUp, TrendingDown, Minus, BarChart2, PieChart as PieChartIcon,
@@ -17,6 +17,8 @@ import {
   Settings, Calendar, Clock, FileText, Filter, MapPin, Percent, Shield,
   Award, Package, Briefcase, LineChart as LineChartIcon, ChevronDown, ChevronUp,
   Code2,
+  X, Download, Maximize2, Play, Link, Copy, Printer, Pin,
+  Columns, ChevronRight, CalendarRange, Edit3,
 } from 'lucide-react'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -229,6 +231,18 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
   )
 }
 
+// ── Confidence stars (Feature 11) ─────────────────────────────────────────────
+function ConfidenceStars({ score }: { score?: number }) {
+  if (!score) return null
+  return (
+    <div style={{ display: 'flex', gap: 1, marginTop: 4 }} title={`Confidence: ${score}/5`}>
+      {[1, 2, 3, 4, 5].map(n => (
+        <Star key={n} size={9} style={{ color: n <= score ? C.amber : '#d1d5db', fill: n <= score ? C.amber : 'none' }} />
+      ))}
+    </div>
+  )
+}
+
 // ── Insight cards ──────────────────────────────────────────────────────────────
 function InsightCards({ insights }: { insights: InsightCard[] }) {
   if (!insights?.length) return null
@@ -258,6 +272,7 @@ function InsightCards({ insights }: { insights: InsightCard[] }) {
             <div style={{ minWidth: 0 }}>
               <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: '0 0 4px', lineHeight: 1.35 }}>{ins.headline}</p>
               <p style={{ fontSize: 11, color: '#5a6b7c', margin: 0, lineHeight: 1.6 }}>{ins.detail}</p>
+              <ConfidenceStars score={ins.confidence} />
             </div>
           </div>
         )
@@ -305,12 +320,36 @@ function PerformerPanel({ top, bottom, label }: { top: PerformerRow[]; bottom: P
   )
 }
 
-// ── SQL drawer ─────────────────────────────────────────────────────────────────
-function SqlDrawer({ sqls }: { sqls: string[] }) {
+// ── SQL drawer with inline editor (Feature 4) ──────────────────────────────────
+function SqlDrawer({ sqls, shareToken }: { sqls: string[]; shareToken?: string }) {
   const [open, setOpen] = useState(false)
   const [activeIdx, setActiveIdx] = useState(0)
+  const [editMode, setEditMode] = useState(false)
+  const [editSql, setEditSql] = useState('')
+  const [running, setRunning] = useState(false)
+  const [runResult, setRunResult] = useState<{ rows: Record<string, unknown>[]; columns: string[] } | null>(null)
+  const [runError, setRunError] = useState<string | null>(null)
+
   if (!sqls.length) return null
   const sql = sqls[activeIdx] ?? ''
+
+  const enterEdit = () => { setEditSql(sql); setEditMode(true); setRunResult(null); setRunError(null) }
+  const exitEdit  = () => { setEditMode(false); setRunResult(null); setRunError(null) }
+
+  const runSql = async () => {
+    if (!shareToken || !editSql.trim()) return
+    setRunning(true); setRunError(null); setRunResult(null)
+    try {
+      const { analystApi } = await import('@/lib/api')
+      const resp = await analystApi.query(shareToken, editSql.trim())
+      const rows = (resp.data as Record<string, unknown>)?.rows as Record<string, unknown>[] ?? []
+      const cols = (resp.data as Record<string, unknown>)?.columns as string[] ?? (rows[0] ? Object.keys(rows[0]) : [])
+      setRunResult({ rows, columns: cols })
+    } catch (e) {
+      setRunError(e instanceof Error ? e.message : 'Query failed')
+    } finally { setRunning(false) }
+  }
+
   return (
     <div style={{ borderRadius: 12, border: '1px solid #e8eef5', overflow: 'hidden' }}>
       <button onClick={() => setOpen(o => !o)} style={{ width: '100%', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 8, background: '#f8fafc', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
@@ -320,18 +359,66 @@ function SqlDrawer({ sqls }: { sqls: string[] }) {
       </button>
       {open && (
         <div style={{ background: '#0d1b2a' }}>
+          {/* query tab strip */}
           {sqls.length > 1 && (
             <div style={{ display: 'flex', gap: 4, padding: '8px 12px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
               {sqls.map((_, i) => (
-                <button key={i} onClick={() => setActiveIdx(i)} style={{ fontSize: 10, padding: '3px 9px', borderRadius: 20, border: 'none', cursor: 'pointer', background: i === activeIdx ? C.teal : 'rgba(255,255,255,0.1)', color: i === activeIdx ? 'white' : 'rgba(255,255,255,0.5)', fontWeight: 600 }}>
+                <button key={i} onClick={() => { setActiveIdx(i); exitEdit() }} style={{ fontSize: 10, padding: '3px 9px', borderRadius: 20, border: 'none', cursor: 'pointer', background: i === activeIdx ? C.teal : 'rgba(255,255,255,0.1)', color: i === activeIdx ? 'white' : 'rgba(255,255,255,0.5)', fontWeight: 600 }}>
                   Query {i + 1}
                 </button>
               ))}
             </div>
           )}
-          <div style={{ padding: '14px 16px', overflowX: 'auto' }}>
-            <SqlHighlight sql={sql} />
-          </div>
+
+          {/* read-only or edit view */}
+          {!editMode ? (
+            <div style={{ padding: '14px 16px', overflowX: 'auto', position: 'relative' }}>
+              <SqlHighlight sql={sql} />
+              {shareToken && (
+                <button onClick={enterEdit} style={{ position: 'absolute', top: 10, right: 12, display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, padding: '4px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', fontWeight: 600 }}>
+                  <Edit3 size={10} /> Edit & Run
+                </button>
+              )}
+            </div>
+          ) : (
+            <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <textarea
+                value={editSql}
+                onChange={e => setEditSql(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) runSql() }}
+                rows={6}
+                style={{ width: '100%', background: '#0a1525', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8, color: '#a8b8cc', fontFamily: "'Fira Code', monospace", fontSize: 11, padding: '10px 12px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
+                spellCheck={false}
+              />
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button onClick={runSql} disabled={running || !editSql.trim()} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, padding: '5px 14px', borderRadius: 8, border: 'none', background: C.teal, color: 'white', cursor: 'pointer', fontWeight: 600, opacity: running ? 0.6 : 1 }}>
+                  {running ? <Loader2 size={11} style={{ animation: 'ispin 1s linear infinite' }} /> : <Play size={11} />}
+                  {running ? 'Running…' : 'Run (Ctrl+Enter)'}
+                </button>
+                <button onClick={exitEdit} style={{ fontSize: 11, padding: '5px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.15)', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer' }}>Cancel</button>
+              </div>
+              {runError && <p style={{ fontSize: 11, color: C.red, margin: 0 }}>{runError}</p>}
+              {runResult && (
+                <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid rgba(255,255,255,0.1)', maxHeight: 260, overflowY: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+                    <thead>
+                      <tr style={{ background: 'rgba(255,255,255,0.06)' }}>
+                        {runResult.columns.map(c => <th key={c} style={{ padding: '6px 10px', textAlign: 'left', color: 'rgba(255,255,255,0.6)', whiteSpace: 'nowrap', fontWeight: 600 }}>{c}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {runResult.rows.slice(0, 200).map((row, i) => (
+                        <tr key={i} style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                          {runResult!.columns.map(c => <td key={c} style={{ padding: '5px 10px', color: 'rgba(255,255,255,0.7)', whiteSpace: 'nowrap' }}>{String(row[c] ?? '')}</td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', padding: '4px 10px', margin: 0 }}>{runResult.rows.length} row(s)</p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -411,7 +498,20 @@ const XAXIS = <XAxis dataKey="name" tick={{ fontSize: 9, fill: '#94a3b8' }} axis
 const YAXIS = <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={40} />
 const GRID  = <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
 
-function AgentChartView({ chart, colorIdx = 0 }: { chart: AgentChart; colorIdx?: number }) {
+type DrillFn = (segment: string) => void
+
+function AgentChartView({
+  chart, colorIdx = 0,
+  onDrill, onFullscreen,
+  annotations,
+  onAnnotate,
+}: {
+  chart: AgentChart; colorIdx?: number
+  onDrill?: DrillFn
+  onFullscreen?: () => void
+  annotations?: Record<string, string>
+  onAnnotate?: (pointName: string) => void
+}) {
   const color = chart.color ?? PALETTE[colorIdx % PALETTE.length]
   const gid = `g${colorIdx}`
 
@@ -433,12 +533,56 @@ function AgentChartView({ chart, colorIdx = 0 }: { chart: AgentChart; colorIdx?:
       label={{ value: rl.label, fill: rl.color ?? '#94a3b8', fontSize: 9, position: 'insideTopRight' }} />
   )) ?? []
 
+  const chartRef = React.useRef<HTMLDivElement>(null)
+  const downloadPng = () => {
+    const svgEl = chartRef.current?.querySelector('svg')
+    if (!svgEl) return
+    const serializer = new XMLSerializer()
+    const svgStr = serializer.serializeToString(svgEl)
+    const rect = svgEl.getBoundingClientRect()
+    const canvas = document.createElement('canvas')
+    canvas.width = rect.width * 2; canvas.height = rect.height * 2
+    const ctx = canvas.getContext('2d')
+    const img = new Image()
+    img.onload = () => {
+      ctx?.drawImage(img, 0, 0, canvas.width, canvas.height)
+      const a = document.createElement('a')
+      a.href = canvas.toDataURL('image/png')
+      a.download = `${chart.title.replace(/[^a-z0-9]/gi, '_')}.png`
+      a.click()
+      URL.revokeObjectURL(img.src)
+    }
+    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' })
+    img.src = URL.createObjectURL(blob)
+  }
+
+  const pinnedAnnotations = annotations
+    ? Object.entries(annotations).map(([k, v]) => ({ point: k, note: v }))
+    : []
+
   return (
     <div style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', animation: 'fadeSlideIn 0.5s ease both', boxShadow: '0 2px 10px rgba(10,33,58,0.05)' }}>
       <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: `linear-gradient(180deg, ${color}, ${color}70)`, flexShrink: 0 }} />
-        <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0 }}>{chart.title}</p>
+        <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{chart.title}</p>
+        {/* Fullscreen + Download controls */}
+        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+          {onAnnotate && <button onClick={() => onAnnotate('_chart')} title="Add note" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Pin size={10} /></button>}
+          <button onClick={downloadPng} title="Download PNG" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
+          {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
+        </div>
       </div>
+      {/* annotation pins display */}
+      {pinnedAnnotations.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
+          {pinnedAnnotations.map(({ point, note }) => (
+            <div key={point} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, padding: '3px 8px', borderRadius: 20, background: `${C.amber}15`, border: `1px solid ${C.amber}30`, color: '#7a5900' }}>
+              <Pin size={8} style={{ color: C.amber }} />{note.length > 40 ? note.slice(0, 40) + '…' : note}
+            </div>
+          ))}
+        </div>
+      )}
+      <div ref={chartRef}>
 
       {/* ── TABLE ── */}
       {chart.type === 'table' && <TableView chart={chart} />}
@@ -543,7 +687,9 @@ function AgentChartView({ chart, colorIdx = 0 }: { chart: AgentChart; colorIdx?:
         <ResponsiveContainer width="100%" height={170}>
           <ComposedChart data={dataWithTrend} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
-            <Bar dataKey="value" fill={color} radius={[4, 4, 0, 0]} maxBarSize={44} opacity={0.88}>
+            <Bar dataKey="value" fill={color} radius={[4, 4, 0, 0]} maxBarSize={44} opacity={0.88}
+              onClick={onDrill ? (d: { name?: string }) => onDrill(String(d?.name ?? '')) : undefined}
+              style={onDrill ? { cursor: 'pointer' } : undefined}>
               <LabelList dataKey="value" position="top" style={{ fontSize: 8, fill: '#94a3b8' }} formatter={(v: number) => Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v/1e3).toFixed(1)}K` : v} />
             </Bar>
             {dataWithTrend.some(d => '_trend' in d) && (
@@ -587,7 +733,10 @@ function AgentChartView({ chart, colorIdx = 0 }: { chart: AgentChart; colorIdx?:
       {chart.type === 'pie' && (
         <ResponsiveContainer width="100%" height={190}>
           <PieChart>
-            <Pie data={chart.data} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={72} labelLine={false} label={({ name, percent }) => percent > 0.06 ? `${name} ${(percent * 100).toFixed(0)}%` : ''}>
+            <Pie data={chart.data} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={72} labelLine={false}
+              label={({ name, percent }) => percent > 0.06 ? `${name} ${(percent * 100).toFixed(0)}%` : ''}
+              onClick={onDrill ? (d: { name?: string }) => onDrill(String(d?.name ?? '')) : undefined}
+              style={onDrill ? { cursor: 'pointer' } : undefined}>
               {chart.data.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
             </Pie>
             <Tooltip {...TTP} />
@@ -595,12 +744,27 @@ function AgentChartView({ chart, colorIdx = 0 }: { chart: AgentChart; colorIdx?:
           </PieChart>
         </ResponsiveContainer>
       )}
+      </div>{/* /ref */}
     </div>
   )
 }
 
 // ── Section content ────────────────────────────────────────────────────────────
-function SectionContent({ section, sectionIdx }: { section: AgentSection; sectionIdx: number }) {
+function SectionContent({
+  section, sectionIdx,
+  shareToken, onRegenSection, regenning,
+  onDrill, onFullscreen,
+  annotations, onAnnotate,
+}: {
+  section: AgentSection; sectionIdx: number
+  shareToken?: string
+  onRegenSection?: () => void
+  regenning?: boolean
+  onDrill?: (chart: AgentChart, segment: string) => void
+  onFullscreen?: (chart: AgentChart) => void
+  annotations?: Record<string, string>
+  onAnnotate?: (chartTitle: string, pointName: string) => void
+}) {
   const hasPerformers = (section.top_performers?.length ?? 0) > 0 || (section.bottom_performers?.length ?? 0) > 0
   const sourceSqls = Array.from(new Set(section.charts.map(c => c.source_sql).filter(Boolean) as string[]))
 
@@ -626,7 +790,14 @@ function SectionContent({ section, sectionIdx }: { section: AgentSection; sectio
             <div style={{ width: 32, height: 32, borderRadius: 10, background: `${C.teal}25`, border: `1px solid ${C.teal}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.teal2, flexShrink: 0 }}>
               <SectionIcon name={section.icon} size={15} />
             </div>
-            <span style={{ fontSize: 11, fontWeight: 700, color: C.teal2, textTransform: 'uppercase', letterSpacing: '0.1em' }}>{section.label}</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: C.teal2, textTransform: 'uppercase', letterSpacing: '0.1em', flex: 1 }}>{section.label}</span>
+            {/* Feature 3: per-section regeneration */}
+            {onRegenSection && (
+              <button onClick={onRegenSection} disabled={regenning} title="Refresh this section" style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, padding: '4px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.75)', cursor: 'pointer', flexShrink: 0, opacity: regenning ? 0.5 : 1 }}>
+                <RefreshCw size={9} style={regenning ? { animation: 'ispin 1s linear infinite' } : {}} />
+                {regenning ? 'Refreshing…' : 'Refresh section'}
+              </button>
+            )}
           </div>
           <p style={{ fontSize: 22, fontWeight: 800, color: 'white', margin: 0, lineHeight: 1.3, position: 'relative', maxWidth: '88%', letterSpacing: '-0.01em' }}>{section.data_story}</p>
           {/* Bottom accent line */}
@@ -681,14 +852,24 @@ function SectionContent({ section, sectionIdx }: { section: AgentSection; sectio
           )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {section.charts.map((ch, i) => (
-              <AgentChartView key={i} chart={ch} colorIdx={sectionIdx * 4 + i} />
+              <AgentChartView
+                key={i} chart={ch} colorIdx={sectionIdx * 4 + i}
+                onDrill={onDrill ? seg => onDrill(ch, seg) : undefined}
+                onFullscreen={onFullscreen ? () => onFullscreen(ch) : undefined}
+                annotations={annotations ? Object.fromEntries(
+                  Object.entries(annotations)
+                    .filter(([k]) => k.startsWith(`${section.id}|${ch.title}|`))
+                    .map(([k, v]) => [k.split('|')[2] ?? k, v])
+                ) : undefined}
+                onAnnotate={onAnnotate ? (pt) => onAnnotate(ch.title, pt) : undefined}
+              />
             ))}
           </div>
         </div>
       )}
 
       {/* SQL drawer */}
-      {sourceSqls.length > 0 && <SqlDrawer sqls={sourceSqls} />}
+      {sourceSqls.length > 0 && <SqlDrawer sqls={sourceSqls} shareToken={shareToken} />}
 
       {/* Recommendation footer */}
       {section.recommendation && (
@@ -716,29 +897,41 @@ function SectionContent({ section, sectionIdx }: { section: AgentSection; sectio
 // ── Left rail ──────────────────────────────────────────────────────────────────
 function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; active: string; onNav: (id: string) => void }) {
   return (
-    <div style={{ background: C.navy, display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 12, gap: 3, overflowY: 'auto' }}>
+    <div style={{ background: '#071a2e', display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 14, paddingBottom: 14, gap: 4, overflowY: 'auto', overflowX: 'hidden', borderRight: '1px solid rgba(255,255,255,0.06)', scrollbarWidth: 'none' } as React.CSSProperties}>
       {sections.map((s, idx) => {
         const isActive = s.id === active
+        const color = PALETTE[idx % PALETTE.length]
+        const color2 = PALETTE[(idx + 2) % PALETTE.length]
         return (
           <button
             key={s.id}
             onClick={() => onNav(s.id)}
             title={s.label}
             style={{
-              width: 54, height: 58, borderRadius: 10,
-              border: isActive ? `1.5px solid ${C.teal}80` : `1.5px solid transparent`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column',
-              background: isActive ? 'rgba(0,169,212,0.18)' : 'transparent',
-              color: isActive ? C.teal2 : 'rgba(255,255,255,0.45)',
-              cursor: 'pointer', transition: 'all 0.15s', gap: 3, position: 'relative',
+              width: 52, flexShrink: 0,
+              background: 'transparent', border: 'none', cursor: 'pointer',
+              display: 'flex', flexDirection: 'column', alignItems: 'center',
+              gap: 5, padding: '5px 0', outline: 'none',
             }}
           >
-            {/* Index badge */}
-            <span style={{ position: 'absolute', top: 4, left: 6, fontSize: 7, fontWeight: 800, color: isActive ? C.teal2 : 'rgba(255,255,255,0.25)', lineHeight: 1 }}>{idx + 1}</span>
-            <SectionIcon name={s.icon} size={14} />
-            <span style={{ fontSize: 8, letterSpacing: '0.03em', fontWeight: 600, maxWidth: 46, textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.2 }}>
-              {s.label.length > 8 ? s.label.slice(0, 7) + '…' : s.label}
-            </span>
+            <div style={{
+              width: 44, height: 44, borderRadius: 13,
+              background: `linear-gradient(135deg, ${color} 0%, ${color2} 100%)`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: 'white',
+              boxShadow: isActive ? `0 0 0 2.5px ${C.teal}, 0 4px 16px ${color}70` : `0 2px 8px ${color}44`,
+              transform: isActive ? 'scale(1.1)' : 'scale(1)',
+              transition: 'all 0.2s ease',
+            }}>
+              <SectionIcon name={s.icon} size={17} />
+            </div>
+            <span style={{
+              fontSize: 8, fontWeight: 600, letterSpacing: '0.01em',
+              color: isActive ? C.teal2 : 'rgba(255,255,255,0.38)',
+              textAlign: 'center', lineHeight: 1.2, maxWidth: 54,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              transition: 'color 0.2s',
+            }}>{s.label.length > 9 ? s.label.slice(0, 9) : s.label}</span>
           </button>
         )
       })}
@@ -839,10 +1032,28 @@ function AgentLoader({ step, canvasName }: { step: string; canvasName: string })
 interface ChatMsg { role: 'user' | 'assistant'; text: string }
 const PAGE_CHIPS = ['What are the key risks?', 'Which metrics need attention?', 'Summarize the top performers', 'What actions do you recommend?']
 
-function InlineCopilot({ canvasId, projectId, canvasName }: { canvasId: string; projectId: string; canvasName: string }) {
+function buildReportContext(analysis: ExecutiveAnalysis, canvasName: string): string {
+  const kpiSummary = analysis.kpis.slice(0, 8).map(k => `${k.label}: ${k.value} (${k.trend}${k.trend_pct ? ', ' + k.trend_pct : ''})`).join('; ')
+  const sectionSummary = analysis.sections.map(s =>
+    `• ${s.label}: ${s.key_finding ?? s.narrative?.slice(0, 120) ?? ''}${s.recommendation ? ' → ' + s.recommendation : ''}`
+  ).join('\n')
+  const correlations = analysis.correlations.slice(0, 3).join('; ')
+  return `[INTELLIGENCE REPORT — ${canvasName.toUpperCase()}]
+Health Score: ${analysis.health_score}/100 (${analysis.health_color})
+KPIs: ${kpiSummary}
+Key Correlations: ${correlations || 'none'}
+Sections:
+${sectionSummary}
+Morning Brief: ${analysis.morning_brief?.slice(0, 400) ?? ''}
+
+User: `
+}
+
+function InlineCopilot({ canvasId, projectId, canvasName, analysis }: { canvasId: string; projectId: string; canvasName: string; analysis?: ExecutiveAnalysis }) {
   const [msgs, setMsgs] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const contextInjectedRef = useRef(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs])
 
@@ -850,7 +1061,18 @@ function InlineCopilot({ canvasId, projectId, canvasName }: { canvasId: string; 
     if (!text.trim() || sending) return
     setMsgs(p => [...p, { role: 'user', text }]); setInput(''); setSending(true)
     try {
-      const resp = await chatApi.send({ message: text, project_id: projectId, dashboard_id: canvasId, model_preference: 'opus' })
+      // Prepend report context to the first message only
+      let fullMessage = text
+      if (!contextInjectedRef.current && analysis) {
+        fullMessage = buildReportContext(analysis, canvasName) + text
+        contextInjectedRef.current = true
+      }
+      const resp = await chatApi.send({
+        message: fullMessage,
+        project_id: projectId,
+        dashboard_id: canvasId,
+        model_preference: 'sonnet',  // explicit — prevents backend auto-upgrade to Opus on large messages
+      })
       setMsgs(p => [...p, { role: 'assistant', text: resp.data?.text ?? resp.data?.response ?? 'No response.' }])
     } catch { setMsgs(p => [...p, { role: 'assistant', text: 'Failed. Please retry.' }]) }
     finally { setSending(false) }
@@ -858,14 +1080,17 @@ function InlineCopilot({ canvasId, projectId, canvasName }: { canvasId: string; 
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#fafbfd' }}>
-      <div style={{ padding: '13px 16px', borderBottom: '1px solid #e8eef5', background: 'white', flexShrink: 0 }}>
+      <div style={{ padding: '13px 16px', borderBottom: '1px solid #e8eef5', background: `linear-gradient(135deg, ${C.navy}, #0d3060)`, flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ width: 28, height: 28, borderRadius: 8, background: `linear-gradient(135deg,${C.teal},${C.teal2})`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-            <MessageSquare size={13} style={{ color: 'white' }} />
+            <Zap size={13} style={{ color: 'white' }} />
           </div>
-          <div>
-            <p style={{ fontSize: 13, fontWeight: 700, color: C.navy, margin: 0 }}>AI Copilot <span style={{ fontSize: 9, fontWeight: 600, color: C.teal, background: `${C.teal}15`, padding: '1px 6px', borderRadius: 10, marginLeft: 4 }}>Opus</span></p>
-            <p style={{ fontSize: 10, color: '#94a3b8', margin: 0 }}>{canvasName}</p>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <p style={{ fontSize: 13, fontWeight: 700, color: 'white', margin: 0 }}>Report Copilot</p>
+              <span style={{ fontSize: 8, fontWeight: 700, color: C.green, background: `${C.green}20`, border: `1px solid ${C.green}40`, borderRadius: 10, padding: '1px 6px' }}>SONNET</span>
+            </div>
+            <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', margin: 0 }}>Full report context loaded</p>
           </div>
         </div>
       </div>
@@ -874,7 +1099,7 @@ function InlineCopilot({ canvasId, projectId, canvasName }: { canvasId: string; 
           <div style={{ textAlign: 'center', padding: '28px 16px' }}>
             <div style={{ width: 40, height: 40, borderRadius: 14, background: `linear-gradient(135deg,${C.teal},${C.teal2})`, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px' }}><Zap size={18} style={{ color: 'white' }} /></div>
             <p style={{ fontSize: 13, fontWeight: 600, color: C.navy, margin: '0 0 4px' }}>Ask about this report</p>
-            <p style={{ fontSize: 11, color: '#94a3b8', margin: 0 }}>Powered by Claude Opus + 18 skills</p>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: 0 }}>Powered by Claude Sonnet — full report context</p>
           </div>
         )}
         {msgs.map((m, i) => (
@@ -907,6 +1132,255 @@ function InlineCopilot({ canvasId, projectId, canvasName }: { canvasId: string; 
   )
 }
 
+// ── Feature 2: Drill-Through Modal ────────────────────────────────────────────
+function DrillThroughModal({
+  title, segment, rows, columns, onClose,
+}: { title: string; segment: string; rows: Record<string, unknown>[]; columns: string[]; onClose: () => void }) {
+  const cols = columns.length ? columns : rows[0] ? Object.keys(rows[0]) : []
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.55)', backdropFilter: 'blur(6px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+      <div style={{ background: 'white', borderRadius: 20, width: '90%', maxWidth: 760, maxHeight: '80vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(8,33,58,0.25)' }}>
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid #e8eef5', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <p style={{ fontSize: 13, fontWeight: 700, color: C.navy, margin: 0 }}>Drill-Through: <span style={{ color: C.teal }}>{segment}</span></p>
+            <p style={{ fontSize: 11, color: C.muted, margin: 0 }}>{title} · {rows.length} row{rows.length !== 1 ? 's' : ''}</p>
+          </div>
+          <button onClick={onClose} style={{ padding: 6, border: '1px solid #e8eef5', borderRadius: 8, background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><X size={14} /></button>
+        </div>
+        <div style={{ overflow: 'auto', flex: 1 }}>
+          {rows.length === 0 ? (
+            <p style={{ textAlign: 'center', color: C.muted, padding: '40px 0', fontSize: 13 }}>No rows available for this segment.</p>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+              <thead>
+                <tr style={{ background: C.navy, position: 'sticky', top: 0 }}>
+                  {cols.map(c => <th key={c} style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 700, color: 'rgba(255,255,255,0.85)', whiteSpace: 'nowrap', fontSize: 10, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{c}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 500).map((row, i) => (
+                  <tr key={i} style={{ background: i % 2 === 0 ? 'white' : '#fafbfd', borderBottom: '1px solid #f1f5f9' }}>
+                    {cols.map(c => <td key={c} style={{ padding: '6px 12px', color: '#374151', whiteSpace: 'nowrap' }}>{String(row[c] ?? '')}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Feature 5: Full-Screen Chart Modal ────────────────────────────────────────
+function FullscreenChartModal({ chart, colorIdx, onClose }: { chart: AgentChart; colorIdx: number; onClose: () => void }) {
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  const accentColor = chart.color ?? PALETTE[colorIdx % PALETTE.length]
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.7)', backdropFilter: 'blur(8px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32 }}>
+      <div style={{ background: 'white', borderRadius: 20, width: '94%', maxWidth: 900, display: 'flex', flexDirection: 'column', boxShadow: '0 24px 80px rgba(8,33,58,0.3)' }}>
+        <div style={{ padding: '14px 20px', borderBottom: '1px solid #e8eef5', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ width: 4, height: 18, borderRadius: 2, background: accentColor }} />
+          <p style={{ fontSize: 15, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{chart.title}</p>
+          <button onClick={onClose} style={{ padding: 6, border: '1px solid #e8eef5', borderRadius: 8, background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><X size={15} /></button>
+        </div>
+        <div style={{ padding: 24 }}>
+          <AgentChartView chart={{ ...chart }} colorIdx={colorIdx} />
+        </div>
+        <p style={{ fontSize: 10, color: C.muted, textAlign: 'center', padding: '0 0 12px' }}>Press ESC to close</p>
+      </div>
+    </div>
+  )
+}
+
+// ── Feature 6: Presentation Slide Deck Mode ───────────────────────────────────
+function PresentationOverlay({
+  sections, startIdx, onClose,
+}: { sections: AgentSection[]; startIdx: number; onClose: () => void }) {
+  const [idx, setIdx] = useState(startIdx)
+  const section = sections[idx]
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') setIdx(i => Math.min(i + 1, sections.length - 1))
+      if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')   setIdx(i => Math.max(i - 1, 0))
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [sections.length, onClose])
+
+  if (!section) return null
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: C.navy, zIndex: 2000, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {/* slide header */}
+      <div style={{ padding: '14px 28px', borderBottom: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ width: 36, height: 36, borderRadius: 12, background: `${C.teal}25`, border: `1px solid ${C.teal}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.teal2, flexShrink: 0 }}>
+          <SectionIcon name={section.icon} size={17} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <p style={{ fontSize: 11, fontWeight: 700, color: C.teal2, textTransform: 'uppercase', letterSpacing: '0.09em', margin: 0 }}>{section.label}</p>
+          <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', margin: 0 }}>{idx + 1} / {sections.length}</p>
+        </div>
+        <button onClick={onClose} style={{ padding: 8, border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8, background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex' }}><X size={15} /></button>
+      </div>
+
+      {/* slide body */}
+      <div style={{ flex: 1, overflow: 'auto', padding: '32px 60px' }}>
+        {section.data_story && (
+          <p style={{ fontSize: 32, fontWeight: 800, color: 'white', margin: '0 0 20px', lineHeight: 1.25, letterSpacing: '-0.02em', maxWidth: 820 }}>{section.data_story}</p>
+        )}
+        {section.key_finding && (
+          <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', background: `${C.teal}15`, borderLeft: `4px solid ${C.teal}`, borderRadius: '0 12px 12px 0', padding: '14px 18px', marginBottom: 20, maxWidth: 780 }}>
+            <Zap size={16} style={{ color: C.teal, flexShrink: 0 }} />
+            <p style={{ fontSize: 18, fontWeight: 600, color: 'white', margin: 0, lineHeight: 1.5 }}>{section.key_finding}</p>
+          </div>
+        )}
+        {section.narrative && (
+          <p style={{ fontSize: 15, lineHeight: 1.8, color: 'rgba(255,255,255,0.75)', margin: '0 0 24px', maxWidth: 780 }}>{section.narrative}</p>
+        )}
+        {section.kpis.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 14, marginBottom: 24 }}>
+            {section.kpis.map((k, i) => <KpiCard key={i} kpi={k} idx={i} />)}
+          </div>
+        )}
+        {section.charts.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 16 }}>
+            {section.charts.slice(0, 4).map((ch, i) => <AgentChartView key={i} chart={ch} colorIdx={i} />)}
+          </div>
+        )}
+      </div>
+
+      {/* nav arrows */}
+      <div style={{ padding: '14px 28px', borderTop: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <button onClick={() => setIdx(i => Math.max(i - 1, 0))} disabled={idx === 0} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, padding: '8px 18px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.7)', cursor: idx === 0 ? 'not-allowed' : 'pointer', opacity: idx === 0 ? 0.3 : 1 }}>
+          <ChevronLeft size={14} /> Prev
+        </button>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {sections.map((_, i) => <div key={i} style={{ width: i === idx ? 18 : 6, height: 6, borderRadius: 3, background: i === idx ? C.teal : 'rgba(255,255,255,0.25)', transition: 'all 0.2s' }} />)}
+        </div>
+        <button onClick={() => setIdx(i => Math.min(i + 1, sections.length - 1))} disabled={idx === sections.length - 1} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, padding: '8px 18px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.7)', cursor: idx === sections.length - 1 ? 'not-allowed' : 'pointer', opacity: idx === sections.length - 1 ? 0.3 : 1 }}>
+          Next <ChevronRight size={14} />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ── Feature 8: Share modal ────────────────────────────────────────────────────
+function ShareModal({
+  url, onClose,
+}: { url: string; onClose: () => void }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    navigator.clipboard.writeText(url).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000) })
+  }
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.45)', backdropFilter: 'blur(4px)', zIndex: 900, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+      <div style={{ background: 'white', borderRadius: 18, width: '90%', maxWidth: 480, padding: '24px 24px', boxShadow: '0 16px 48px rgba(8,33,58,0.2)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 10, background: `${C.teal}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.teal }}><Link size={16} /></div>
+          <div style={{ flex: 1 }}>
+            <p style={{ fontSize: 14, fontWeight: 700, color: C.navy, margin: 0 }}>Share Report</p>
+            <p style={{ fontSize: 11, color: C.muted, margin: 0 }}>Anyone with access can view this report</p>
+          </div>
+          <button onClick={onClose} style={{ padding: 6, border: '1px solid #e8eef5', borderRadius: 8, background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><X size={14} /></button>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input readOnly value={url} style={{ flex: 1, padding: '9px 12px', borderRadius: 9, border: '1px solid #e2eaf4', fontSize: 12, color: '#374151', background: '#fafbfd', outline: 'none', fontFamily: 'monospace' }} onClick={e => (e.target as HTMLInputElement).select()} />
+          <button onClick={copy} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '9px 16px', borderRadius: 9, border: 'none', background: copied ? C.green : C.teal, color: 'white', cursor: 'pointer', fontWeight: 600, fontSize: 12, flexShrink: 0 }}>
+            {copied ? <><CheckCircle2 size={13} /> Copied!</> : <><Copy size={13} /> Copy</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Feature 10: Annotation popover ───────────────────────────────────────────
+function AnnotationPopover({
+  annotKey, existing, onSave, onDelete, onClose,
+}: { annotKey: string; existing?: string; onSave: (text: string) => void; onDelete: () => void; onClose: () => void }) {
+  const [text, setText] = useState(existing ?? '')
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(8,33,58,0.3)', backdropFilter: 'blur(3px)', zIndex: 950, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+      <div style={{ background: 'white', borderRadius: 16, width: '90%', maxWidth: 380, padding: '20px', boxShadow: '0 12px 36px rgba(8,33,58,0.18)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <Pin size={14} style={{ color: C.amber }} />
+          <p style={{ fontSize: 13, fontWeight: 700, color: C.navy, margin: 0, flex: 1 }}>
+            {existing ? 'Edit Note' : 'Add Note'}
+          </p>
+          <button onClick={onClose} style={{ padding: 4, border: 'none', background: 'none', cursor: 'pointer', color: C.slate }}><X size={13} /></button>
+        </div>
+        <p style={{ fontSize: 10, color: C.muted, margin: '0 0 8px', fontFamily: 'monospace' }}>{annotKey}</p>
+        <textarea value={text} onChange={e => setText(e.target.value)} rows={3} placeholder="Add your annotation…" style={{ width: '100%', border: '1px solid #e2eaf4', borderRadius: 8, padding: '8px 10px', fontSize: 12, resize: 'none', outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit' }} autoFocus />
+        <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+          <button onClick={() => text.trim() && onSave(text.trim())} disabled={!text.trim()} style={{ flex: 1, padding: '8px', borderRadius: 8, border: 'none', background: C.teal, color: 'white', fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Save</button>
+          {existing && <button onClick={onDelete} style={{ padding: '8px 12px', borderRadius: 8, border: `1px solid ${C.red}30`, background: `${C.red}10`, color: C.red, fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>Delete</button>}
+          <button onClick={onClose} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2eaf4', background: 'white', color: C.slate, fontSize: 12, cursor: 'pointer' }}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Feature 1: Date range picker bar ─────────────────────────────────────────
+function DateRangeBar({
+  value, onChange, onApply, onClear, loading,
+}: {
+  value: { from: string; to: string }
+  onChange: (v: { from: string; to: string }) => void
+  onApply: () => void
+  onClear: () => void
+  loading?: boolean
+}) {
+  return (
+    <div style={{ padding: '8px 22px', background: `${C.teal}08`, borderBottom: '1px solid #dde8f0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', flexShrink: 0 }}>
+      <CalendarRange size={13} style={{ color: C.teal, flexShrink: 0 }} />
+      <span style={{ fontSize: 11, fontWeight: 600, color: C.teal, marginRight: 4 }}>Date Range Override</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <input type="date" value={value.from} onChange={e => onChange({ ...value, from: e.target.value })}
+          style={{ fontSize: 11, padding: '4px 8px', border: '1px solid #dde8f0', borderRadius: 7, outline: 'none', color: C.ink, background: 'white' }} />
+        <span style={{ fontSize: 11, color: C.muted }}>→</span>
+        <input type="date" value={value.to} onChange={e => onChange({ ...value, to: e.target.value })}
+          style={{ fontSize: 11, padding: '4px 8px', border: '1px solid #dde8f0', borderRadius: 7, outline: 'none', color: C.ink, background: 'white' }} />
+      </div>
+      <button onClick={onApply} disabled={!value.from || !value.to || loading} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, padding: '5px 13px', borderRadius: 7, border: 'none', background: C.teal, color: 'white', cursor: 'pointer', fontWeight: 600, opacity: !value.from || !value.to ? 0.5 : 1 }}>
+        {loading ? <Loader2 size={10} style={{ animation: 'ispin 1s linear infinite' }} /> : <RefreshCw size={10} />}
+        Apply & Regenerate
+      </button>
+      <button onClick={onClear} style={{ fontSize: 11, padding: '5px 10px', borderRadius: 7, border: '1px solid #dde8f0', background: 'white', color: C.slate, cursor: 'pointer' }}>Clear</button>
+    </div>
+  )
+}
+
+// ── Feature 9: Freshness badge ────────────────────────────────────────────────
+function FreshnessBadge({ fetchedAt }: { fetchedAt: Date }) {
+  const [label, setLabel] = useState('')
+  useEffect(() => {
+    const update = () => {
+      const diffMs = Date.now() - fetchedAt.getTime()
+      const mins = Math.floor(diffMs / 60000)
+      setLabel(mins < 1 ? 'just now' : mins === 1 ? '1 min ago' : `${mins} min ago`)
+    }
+    update()
+    const t = setInterval(update, 30000)
+    return () => clearInterval(t)
+  }, [fetchedAt])
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9, padding: '3px 9px', borderRadius: 20, background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.55)', flexShrink: 0 }}>
+      <div style={{ width: 5, height: 5, borderRadius: '50%', background: C.green, flexShrink: 0 }} />
+      Data {label}
+    </div>
+  )
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Main page
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -928,6 +1402,99 @@ export default function IntelligenceCanvasPage() {
   const [rerunning, setRerunning] = useState(false)
   const [activeSection, setActiveSection] = useState('')
   const [briefExpanded, setBriefExpanded] = useState(true)
+
+  // Feature 1: Time range override
+  const [showDatePicker, setShowDatePicker] = useState(false)
+  const [pendingDate, setPendingDate] = useState({ from: '', to: '' })
+  const [appliedDateRange, setAppliedDateRange] = useState<{ from: string; to: string } | null>(null)
+  const [dateLoading, setDateLoading] = useState(false)
+
+  // Feature 2: Drill-through
+  const [drillData, setDrillData] = useState<{ chart: AgentChart; segment: string; rows: Record<string, unknown>[]; columns: string[] } | null>(null)
+
+  // Feature 3: Per-section regeneration
+  const [regenSection, setRegenSection] = useState<string | null>(null)
+
+  // Feature 5: Fullscreen chart
+  const [fsChart, setFsChart] = useState<{ chart: AgentChart; colorIdx: number } | null>(null)
+
+  // Feature 6: Presentation mode
+  const [presenting, setPresenting] = useState(false)
+  const [presentStartIdx, setPresentStartIdx] = useState(0)
+
+  // Feature 7: Print mode
+  const [printMode, setPrintMode] = useState(false)
+
+  // Feature 8: Share modal
+  const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
+
+  // Feature 9: Data freshness
+  const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null)
+
+  // Feature 10: Annotations
+  const [annotations, setAnnotations] = useState<Record<string, string>>(() => {
+    if (typeof window === 'undefined') return {}
+    try { return JSON.parse(localStorage.getItem(`intel_annot_${canvasId}`) ?? '{}') } catch { return {} }
+  })
+  const [annotatingKey, setAnnotatingKey] = useState<string | null>(null)
+
+  // Feature 12: Side-by-side comparison
+  const [compareMode, setCompareMode] = useState(false)
+  const [compareSectionId, setCompareSectionId] = useState('')
+
+  // Feature 2: map SQL → rows for drill-through
+  const sqlToRows = React.useMemo(() => {
+    const m = new Map<string, { rows: Record<string, unknown>[]; columns: string[] }>()
+    for (const w of rawWidgets as WidgetInput[]) {
+      if (w.sql_query && w.chart_data?.rows?.length) {
+        m.set(w.sql_query.trim(), { rows: w.chart_data.rows, columns: w.chart_data.columns ?? [] })
+      }
+    }
+    return m
+  }, [rawWidgets])
+
+  // Feature 10: save annotation to localStorage
+  const saveAnnotation = useCallback((key: string, text: string) => {
+    setAnnotations(prev => {
+      const next = { ...prev, [key]: text }
+      try { localStorage.setItem(`intel_annot_${canvasId}`, JSON.stringify(next)) } catch {}
+      return next
+    })
+    setAnnotatingKey(null)
+  }, [canvasId])
+
+  const deleteAnnotation = useCallback((key: string) => {
+    setAnnotations(prev => {
+      const next = { ...prev }
+      delete next[key]
+      try { localStorage.setItem(`intel_annot_${canvasId}`, JSON.stringify(next)) } catch {}
+      return next
+    })
+    setAnnotatingKey(null)
+  }, [canvasId])
+
+  // Feature 3: regenerate a single section
+  const handleRegenSection = useCallback(async (sectionId: string) => {
+    if (!canvas || !analysis) return
+    const sec = analysis.sections.find(s => s.id === sectionId)
+    if (!sec) return
+    setRegenSection(sectionId)
+    try {
+      const updated = await runSectionAgent(
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: rawWidgets as never, shareToken: shareToken || undefined },
+        sec.label,
+        analysis,
+        s => setAgentStep(s),
+      )
+      if (updated) {
+        setAnalysis(prev => prev ? {
+          ...prev,
+          sections: prev.sections.map(s => s.id === sectionId ? { ...updated, id: sectionId } : s),
+        } : prev)
+      }
+    } catch { /* keep old section */ }
+    finally { setRegenSection(null) }
+  }, [canvas, analysis, projectId, canvasId, rawWidgets, shareToken])
 
   // Merge fresh bulk-fetched rows into the widget array from the canvas API
   const mergeWidgetData = useCallback(
@@ -975,6 +1542,7 @@ export default function IntelligenceCanvasPage() {
           widgets = mergeWidgetData(widgets, liveData)
           const upgraded = liveData.filter(d => d.ok && (d.rows?.length ?? 0) > 0).length
           console.log(`[intelligence:page] bulk-fetch done  upgraded=${upgraded}/${liveData.length} widgets`)
+          setLastFetchedAt(new Date())
         } catch (e) {
           console.warn('[intelligence:page] bulk-fetch failed, continuing with cached data:', e)
         }
@@ -995,6 +1563,31 @@ export default function IntelligenceCanvasPage() {
     load()
   }, [canvasId, mergeWidgetData])
 
+  // Feature 1: apply date range and re-generate
+  const applyDateRange = useCallback(async () => {
+    if (!canvas || !pendingDate.from || !pendingDate.to) return
+    const dr = { from: pendingDate.from, to: pendingDate.to }
+    setAppliedDateRange(dr)
+    setDateLoading(true); setAgentStatus('running'); setAgentError(null)
+    try {
+      let widgets = rawWidgets
+      try {
+        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, dr)
+        widgets = mergeWidgetData(rawWidgets, liveResp.data?.widget_data ?? [])
+        setRawWidgets(widgets)
+        setLastFetchedAt(new Date())
+      } catch { /* keep stale */ }
+      const result = await runIntelligenceAgent(
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: dr },
+        s => setAgentStep(s),
+      )
+      setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
+      setAgentStatus('done')
+    } catch {
+      setAgentStatus('done')
+    } finally { setDateLoading(false) }
+  }, [canvas, pendingDate, rawWidgets, projectId, canvasId, shareToken, mergeWidgetData])
+
   const rerun = useCallback(async () => {
     if (!canvas || rerunning) return
     setRerunning(true); setAgentStatus('running'); setAgentError(null)
@@ -1002,9 +1595,10 @@ export default function IntelligenceCanvasPage() {
       // Re-fetch live data on regenerate too
       let widgets = rawWidgets
       try {
-        const liveResp = await intelligenceApi.fetchWidgetData(canvasId)
+        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, appliedDateRange ?? undefined)
         widgets = mergeWidgetData(rawWidgets, liveResp.data?.widget_data ?? [])
         setRawWidgets(widgets)
+        setLastFetchedAt(new Date())
       } catch { /* keep stale data */ }
 
       const result = await runIntelligenceAgent(
@@ -1018,7 +1612,7 @@ export default function IntelligenceCanvasPage() {
       setAnalysis(fb); setActiveSection(fb.sections[0]?.id ?? '')
       setAgentStatus('done')
     } finally { setRerunning(false) }
-  }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData])
+  }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange])
 
   const currentSection = analysis?.sections.find(s => s.id === activeSection)
   const sectionIdx = analysis?.sections.findIndex(s => s.id === activeSection) ?? 0
@@ -1078,16 +1672,44 @@ export default function IntelligenceCanvasPage() {
               <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{analysis.subtitle}</p>
             </div>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            {lastFetchedAt && <FreshnessBadge fetchedAt={lastFetchedAt} />}
             <HealthBadge score={analysis.health_score} color={analysis.health_color} />
+            {/* Feature 1: date range toggle */}
+            <button onClick={() => setShowDatePicker(p => !p)} title="Filter by date range" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${showDatePicker ? C.teal : 'rgba(255,255,255,0.2)'}`, background: showDatePicker ? `${C.teal}30` : 'rgba(255,255,255,0.1)', color: showDatePicker ? C.teal2 : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+              <CalendarRange size={11} />{appliedDateRange ? `${appliedDateRange.from.slice(5)} → ${appliedDateRange.to.slice(5)}` : 'Date'}
+            </button>
+            {/* Feature 6: present */}
+            <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+              <Play size={11} /> Present
+            </button>
+            {/* Feature 7: print/PDF */}
+            <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+              <Printer size={11} /> PDF
+            </button>
+            {/* Feature 8: share */}
+            <button onClick={() => setShareModalUrl(window.location.href)} title="Share report" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+              <Link size={11} /> Share
+            </button>
             <button onClick={rerun} disabled={rerunning} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.85)', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>
               <RefreshCw size={10} className={rerunning ? 'animate-spin' : ''} /> Regenerate
             </button>
           </div>
         </div>
 
+        {/* Feature 1: date range picker bar */}
+        {showDatePicker && (
+          <DateRangeBar
+            value={pendingDate}
+            onChange={setPendingDate}
+            onApply={applyDateRange}
+            onClear={() => { setAppliedDateRange(null); setPendingDate({ from: '', to: '' }) }}
+            loading={dateLoading}
+          />
+        )}
+
         {/* Scrollable body */}
-        <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 22 }}>
+        <div className="print-zone" style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 22 }}>
 
           {/* Global KPIs */}
           {analysis.kpis.length > 0 && (
@@ -1130,30 +1752,96 @@ export default function IntelligenceCanvasPage() {
           {/* Correlations */}
           <CorrelationCard correlations={analysis.correlations} />
 
-          {/* Section tabs */}
-          <div style={{ display: 'flex', gap: 6, marginBottom: 20, flexWrap: 'wrap' }}>
+          {/* Section tabs + compare toggle (Feature 12) */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 20, flexWrap: 'wrap', alignItems: 'center' }}>
             {analysis.sections.map(s => {
               const isActive = s.id === activeSection
+              const isCompare = compareMode && s.id === compareSectionId
               return (
-                <button key={s.id} onClick={() => setActiveSection(s.id)}
+                <button key={s.id} onClick={() => {
+                  if (compareMode && s.id !== activeSection) { setCompareSectionId(s.id); return }
+                  setActiveSection(s.id)
+                }}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 7,
                     padding: '7px 15px', borderRadius: 22, fontSize: 12, fontWeight: 600,
-                    border: isActive ? `1.5px solid ${C.teal}60` : '1.5px solid #dde5ef',
-                    background: isActive ? `linear-gradient(135deg, ${C.teal}18, ${C.teal2}0a)` : C.card,
-                    color: isActive ? C.teal : '#5a6b7c',
+                    border: isActive ? `1.5px solid ${C.teal}60` : isCompare ? `1.5px solid ${C.violet}60` : '1.5px solid #dde5ef',
+                    background: isActive ? `linear-gradient(135deg, ${C.teal}18, ${C.teal2}0a)` : isCompare ? `${C.violet}12` : C.card,
+                    color: isActive ? C.teal : isCompare ? C.violet : '#5a6b7c',
                     cursor: 'pointer', transition: 'all 0.18s',
                     boxShadow: isActive ? `0 2px 10px ${C.teal}22` : '0 1px 3px rgba(10,33,58,0.04)',
                   }}>
-                  <span style={{ color: isActive ? C.teal : C.muted }}><SectionIcon name={s.icon} size={12} /></span>
+                  <span style={{ color: isActive ? C.teal : isCompare ? C.violet : C.muted }}><SectionIcon name={s.icon} size={12} /></span>
                   {s.label}
                 </button>
               )
             })}
+            {/* Feature 12 toggle */}
+            <button
+              onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }}
+              title="Side-by-side compare"
+              style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, padding: '7px 13px', borderRadius: 22, fontSize: 11, fontWeight: 600, border: `1.5px solid ${compareMode ? C.violet : '#dde5ef'}`, background: compareMode ? `${C.violet}12` : 'white', color: compareMode ? C.violet : C.muted, cursor: 'pointer' }}>
+              <Columns size={12} /> Compare
+            </button>
           </div>
 
-          {/* Active section */}
-          {currentSection && <SectionContent section={currentSection} sectionIdx={sectionIdx} />}
+          {/* Active section — or side-by-side (Feature 12) */}
+          {!compareMode && currentSection && (
+            <SectionContent
+              section={currentSection} sectionIdx={sectionIdx}
+              shareToken={shareToken}
+              onRegenSection={() => handleRegenSection(currentSection.id)}
+              regenning={regenSection === currentSection.id}
+              onDrill={(chart, seg) => {
+                const entry = chart.source_sql ? sqlToRows.get(chart.source_sql.trim()) : undefined
+                const filtered = entry ? entry.rows.filter(r => Object.values(r).some(v => String(v) === seg)) : []
+                setDrillData({ chart, segment: seg, rows: filtered.length ? filtered : entry?.rows ?? [], columns: entry?.columns ?? [] })
+              }}
+              onFullscreen={(chart) => setFsChart({ chart, colorIdx: sectionIdx * 4 })}
+              annotations={annotations}
+              onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${currentSection.id}|${chartTitle}|${pt}`)}
+            />
+          )}
+          {compareMode && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'start' }}>
+              {currentSection && (
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: C.teal, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, padding: '4px 10px', background: `${C.teal}10`, borderRadius: 20, display: 'inline-block' }}>Primary</div>
+                  <SectionContent
+                    section={currentSection} sectionIdx={sectionIdx}
+                    shareToken={shareToken}
+                    onRegenSection={() => handleRegenSection(currentSection.id)}
+                    regenning={regenSection === currentSection.id}
+                    onDrill={(chart, seg) => {
+                      const entry = chart.source_sql ? sqlToRows.get(chart.source_sql.trim()) : undefined
+                      const filtered = entry ? entry.rows.filter(r => Object.values(r).some(v => String(v) === seg)) : []
+                      setDrillData({ chart, segment: seg, rows: filtered.length ? filtered : entry?.rows ?? [], columns: entry?.columns ?? [] })
+                    }}
+                    onFullscreen={(chart) => setFsChart({ chart, colorIdx: sectionIdx * 4 })}
+                    annotations={annotations}
+                    onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${currentSection.id}|${chartTitle}|${pt}`)}
+                  />
+                </div>
+              )}
+              {(() => {
+                const compSec = analysis.sections.find(s => s.id === compareSectionId)
+                const compIdx = analysis.sections.findIndex(s => s.id === compareSectionId)
+                if (!compSec) return <div style={{ textAlign: 'center', color: C.muted, fontSize: 12, padding: '40px 0' }}>Click a section tab to compare</div>
+                return (
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: C.violet, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, padding: '4px 10px', background: `${C.violet}10`, borderRadius: 20, display: 'inline-block' }}>Compare</div>
+                    <SectionContent
+                      section={compSec} sectionIdx={compIdx}
+                      shareToken={shareToken}
+                      onFullscreen={(chart) => setFsChart({ chart, colorIdx: compIdx * 4 })}
+                      annotations={annotations}
+                      onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${compSec.id}|${chartTitle}|${pt}`)}
+                    />
+                  </div>
+                )
+              })()}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1161,7 +1849,7 @@ export default function IntelligenceCanvasPage() {
       <div style={{ borderLeft: '1px solid #e8eef5', overflow: 'hidden' }}>
         {shareToken
           ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
-          : <InlineCopilot canvasId={canvasId} projectId={projectId} canvasName={String(canvas?.name ?? 'Report')} />}
+          : <InlineCopilot canvasId={canvasId} projectId={projectId} canvasName={String(canvas?.name ?? 'Report')} analysis={analysis} />}
       </div>
 
       <style>{`
@@ -1169,7 +1857,61 @@ export default function IntelligenceCanvasPage() {
         @keyframes ipulse { 0%,100%{transform:scale(1);opacity:.15} 50%{transform:scale(1.3);opacity:.06} }
         @keyframes ispin  { to { transform: rotate(360deg); } }
         @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+        /* Feature 7: PDF / print styles */
+        @media print {
+          body * { visibility: hidden !important; }
+          .print-zone, .print-zone * { visibility: visible !important; }
+          .print-zone { position: absolute; left: 0; top: 0; width: 100%; }
+          .no-print { display: none !important; }
+          @page { margin: 16mm; }
+        }
       `}</style>
+
+      {/* Feature 2: Drill-through modal */}
+      {drillData && (
+        <DrillThroughModal
+          title={drillData.chart.title}
+          segment={drillData.segment}
+          rows={drillData.rows}
+          columns={drillData.columns}
+          onClose={() => setDrillData(null)}
+        />
+      )}
+
+      {/* Feature 5: Fullscreen chart */}
+      {fsChart && (
+        <FullscreenChartModal
+          chart={fsChart.chart}
+          colorIdx={fsChart.colorIdx}
+          onClose={() => setFsChart(null)}
+        />
+      )}
+
+      {/* Feature 6: Presentation mode */}
+      {presenting && (
+        <PresentationOverlay
+          sections={analysis.sections}
+          startIdx={presentStartIdx}
+          onClose={() => setPresenting(false)}
+        />
+      )}
+
+      {/* Feature 8: Share modal */}
+      {shareModalUrl && (
+        <ShareModal url={shareModalUrl} onClose={() => setShareModalUrl(null)} />
+      )}
+
+      {/* Feature 10: Annotation popover */}
+      {annotatingKey && (
+        <AnnotationPopover
+          annotKey={annotatingKey}
+          existing={annotations[annotatingKey]}
+          onSave={text => saveAnnotation(annotatingKey, text)}
+          onDelete={() => deleteAnnotation(annotatingKey)}
+          onClose={() => setAnnotatingKey(null)}
+        />
+      )}
     </div>
   )
 }

@@ -84,6 +84,7 @@ export interface InsightCard {
   headline: string
   detail: string
   type: 'positive' | 'negative' | 'neutral' | 'warning'
+  confidence?: number  // 1–5 stars; AI-assigned statistical confidence
 }
 
 export interface PerformerRow {
@@ -922,7 +923,7 @@ RESPOND WITH ONLY RAW JSON — no markdown, no explanation, no trailing text:
     "key_finding": "<1 sentence with exact metric>",
     "narrative": "<2–3 sentences with real numbers>",
     "recommendation": "<concrete action>",
-    "insights": [{"icon":"<icon>","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning"}],
+    "insights": [{"icon":"<icon>","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning","confidence":4}],
     "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
     "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
     "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
@@ -949,31 +950,51 @@ function _tryRepairJson(s: string): string {
   return repaired
 }
 
-function parseResponse(text: string): Omit<ExecutiveAnalysis, 'health_score' | 'health_color' | 'correlations'> | null {
-  const clean = text.trim()
-  const candidates = [
-    clean,
-    clean.replace(/^```(?:json)?\n?|```$/gm, '').trim(),
-    (clean.match(/\{[\s\S]*\}/) ?? [])[0] ?? '',
-    // JSON might be truncated — extract everything from first { and try to repair
-    clean.slice(clean.indexOf('{')),
-  ]
-  for (const candidate of candidates) {
-    if (!candidate) continue
-    for (const attempt of [candidate, _tryRepairJson(candidate)]) {
-      try {
-        const p = JSON.parse(attempt)
-        // Accept if we have at least sections or kpis (not both required)
-        if (p && (Array.isArray(p.sections) || Array.isArray(p.kpis))) {
-          if (!p.sections) p.sections = []
-          if (!p.kpis) p.kpis = []
-          console.log(`[intelligence] parseResponse success  sections=${p.sections.length}  kpis=${p.kpis.length}  repaired=${attempt !== candidate}`)
-          return p
-        }
-      } catch { /* try next */ }
+/** Walk the text char-by-char and extract every balanced { ... } object. Returns all candidates longest-first. */
+function _extractJsonObjects(text: string): string[] {
+  const results: string[] = []
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{') continue
+    let depth = 0, inStr = false, esc = false
+    for (let j = i; j < text.length; j++) {
+      const c = text[j]
+      if (esc) { esc = false; continue }
+      if (c === '\\' && inStr) { esc = true; continue }
+      if (c === '"') { inStr = !inStr; continue }
+      if (inStr) continue
+      if (c === '{') depth++
+      else if (c === '}') {
+        depth--
+        if (depth === 0) { results.push(text.slice(i, j + 1)); break }
+      }
     }
   }
-  console.warn('[intelligence] parseResponse: all candidates failed, first 200 chars:', clean.slice(0, 200))
+  return results.sort((a, b) => b.length - a.length)
+}
+
+function parseResponse(text: string): Omit<ExecutiveAnalysis, 'health_score' | 'health_color' | 'correlations'> | null {
+  const clean = text.trim()
+  // Strip markdown code fences then try balanced-brace extraction
+  const stripped = clean.replace(/^```(?:json)?\n?|```$/gm, '').trim()
+
+  const candidates: string[] = [
+    ..._extractJsonObjects(stripped),
+    ..._extractJsonObjects(clean),
+    _tryRepairJson(clean.slice(clean.indexOf('{'))),
+  ].filter(Boolean)
+
+  for (const candidate of candidates) {
+    try {
+      const p = JSON.parse(candidate)
+      if (p && (Array.isArray(p.sections) || Array.isArray(p.kpis))) {
+        if (!p.sections) p.sections = []
+        if (!p.kpis) p.kpis = []
+        console.log(`[intelligence] parseResponse success  sections=${p.sections.length}  kpis=${p.kpis.length}  candidate_len=${candidate.length}`)
+        return p
+      }
+    } catch { /* try next */ }
+  }
+  console.warn('[intelligence] parseResponse: all candidates failed  response_len=' + clean.length + '  first300=' + clean.slice(0, 300))
   return null
 }
 
@@ -994,11 +1015,13 @@ function sanitizeKpi(k: AgentKPI): AgentKPI {
 }
 
 function sanitizeInsight(ins: InsightCard): InsightCard {
+  const conf = Number(ins.confidence)
   return {
     icon: String(ins.icon ?? 'lightbulb'),
     headline: String(ins.headline ?? ''),
     detail: String(ins.detail ?? ''),
     type: (['positive', 'negative', 'neutral', 'warning'] as const).includes(ins.type as never) ? ins.type : 'neutral',
+    confidence: !isNaN(conf) && conf >= 1 && conf <= 5 ? Math.round(conf) : undefined,
   }
 }
 
@@ -1190,6 +1213,7 @@ export interface AgentOptions {
   canvasName: string
   widgets: WidgetInput[]
   shareToken?: string   // enables Skill 18 live SQL fetching
+  dateRange?: { from: string; to: string } | null  // Feature 1: time range override
 }
 
 export async function runIntelligenceAgent(
@@ -1361,4 +1385,150 @@ export async function runIntelligenceAgent(
   )
 
   return analysis
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Per-section regeneration (Feature 3)
+// Re-runs the statistical skills and asks the AI for just one section with a
+// different angle.  No live SQL fetch — uses cached widget data for speed.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export async function runSectionAgent(
+  opts: AgentOptions,
+  sectionLabel: string,
+  existingAnalysis: ExecutiveAnalysis,
+  onProgress?: (step: string) => void,
+): Promise<AgentSection | null> {
+  const { projectId, canvasId, canvasName, widgets } = opts
+
+  onProgress?.(`Regenerating "${sectionLabel}"…`)
+
+  // Quick statistical pass (no network calls)
+  const widgetContexts: WidgetContext[] = []
+  const qualityScores: number[] = []
+  const forecastMap = new Map<string, ForecastResult>()
+  const labelMap = new Map<string, string[]>()
+  const widgetSqlMap = new Map<string, string>()
+  for (const w of widgets) { if (w.sql_query) widgetSqlMap.set(w.title, w.sql_query) }
+
+  for (const w of widgets) {
+    const rows = w.chart_data?.rows ?? []
+    const cols = w.chart_data?.columns ?? []
+    const vals = (w.chart_data?.values ?? []).map(toNum)
+    const labs = (w.chart_data?.labels ?? []).map(v => String(v ?? ''))
+    const pattern = detectPattern(w)
+    const ts = isTimeSeries(w)
+    const quality = assessDataQuality(w)
+    const schema = detectSchema(w)
+    const trend = ts ? analyzeTrend(vals, labs) : null
+    const anomaly = detectAnomalies(vals, labs)
+    const period = ts && vals.length >= 4 ? comparePeriods(vals) : null
+    const pareto = ['comparison', 'distribution', 'general'].includes(pattern) ? paretoAnalysis(labs, vals) : null
+    const fc = ts && vals.length >= 4 ? forecast(vals, labs, 3) : null
+    if (fc) { forecastMap.set(w.title, fc); labelMap.set(w.title, labs) }
+    const colProfiles = rows.length >= 2 && cols.length >= 1 ? profileColumns(rows, cols) : []
+    const dimBreakdowns = colProfiles.length ? computeDimensionBreakdowns(rows, colProfiles) : []
+    const withinCorrs = colProfiles.length ? withinWidgetCorrelations(rows, colProfiles) : []
+    const primaryNumCol = colProfiles.find(p => p.type === 'numeric')?.name
+    const primaryLabelCol = colProfiles.find(p => p.type === 'categorical' || p.type === 'date')?.name
+    const ranked = primaryNumCol && primaryLabelCol && rows.length >= 3
+      ? rankRows(rows, primaryNumCol, primaryLabelCol, 5) : null
+    qualityScores.push(quality.score)
+    widgetContexts.push({
+      title: w.title || '(untitled)', type: w.chart_type, pattern,
+      quality_score: quality.score, quality_issues: quality.issues,
+      narrative: buildNarrativeContext(w, trend, anomaly, period, fc, pareto),
+      schema: { targetColumn: schema.targetColumn, actualColumn: schema.actualColumn,
+        attainmentRate: schema.attainmentRate != null ? +schema.attainmentRate.toFixed(1) : null,
+        currencyLikely: schema.currencyLikely, percentageLikely: schema.percentageLikely },
+      sample_labels: labs.slice(0, 20), sample_values: vals.slice(0, 20),
+      forecast_next: fc?.reliable ? `next period: ${fmtVal(fc.points[0].value)} (R²=${fc.r2.toFixed(2)})` : undefined,
+      anomaly_count: anomaly?.anomalies.length ?? 0,
+      pareto_summary: pareto ? `Top ${pareto.itemsFor80pct.length} items = 80% of ${fmtVal(pareto.total)}` : undefined,
+      sql_query: w.sql_query, table_columns: cols.length ? cols : undefined,
+      column_profiles: colProfiles.length ? colProfiles : undefined,
+      top_rows: ranked?.top, bottom_rows: ranked?.bottom,
+      dim_breakdowns: dimBreakdowns.length ? dimBreakdowns : undefined,
+      within_correlations: withinCorrs.length ? withinCorrs : undefined,
+    })
+  }
+
+  const correlations = correlateWidgets(widgets)
+  const { score: healthScore, color: healthColor } = computeHealthScore(qualityScores)
+  const widgetBlocks = widgetContexts.map(buildWidgetBlock).join('\n\n---\n\n')
+
+  const sectionPrompt = `You are a senior executive intelligence analyst. Regenerate the "${sectionLabel}" section of the report "${canvasName}" with a FRESH PERSPECTIVE — use different language, emphasize different patterns, and surface insights not covered in the prior version.
+
+DATA QUALITY: ${healthScore}/100
+
+WIDGET DATA:
+${widgetBlocks}
+
+Return ONLY the JSON for a single section — no other text:
+{
+  "id": "sec_regen",
+  "label": "${sectionLabel}",
+  "icon": "<from icon list: overview|trending_up|trending_down|users|bar_chart|pie_chart|lightbulb|target|activity|dollar_sign|shopping_cart|building|globe|database|calendar|award|shield|zap>",
+  "data_story": "<bold headline with specific number>",
+  "key_finding": "<1 sentence with exact metric>",
+  "narrative": "<2-3 sentences with real numbers>",
+  "recommendation": "<concrete action>",
+  "insights": [{"icon":"lightbulb","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning","confidence":4}],
+  "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
+  "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
+  "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
+  "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","data":[{"name":"...","value":0}]}]
+}`
+
+  onProgress?.(`Sending section prompt for "${sectionLabel}"…`)
+  let responseText = ''
+  try {
+    const resp = await chatApi.send({
+      message: sectionPrompt,
+      project_id: projectId,
+      dashboard_id: canvasId,
+      model_preference: 'opus',
+    })
+    responseText = resp.data?.text ?? resp.data?.response ?? resp.data?.message ?? ''
+  } catch {
+    return null
+  }
+
+  const parsed = parseResponse(responseText)
+  if (!parsed) return null
+
+  // parseResponse returns the top-level object; sections array may or may not be present
+  const rawSection: AgentSection | null = (() => {
+    // If it wrapped it in sections array
+    if (Array.isArray((parsed as Record<string, unknown>).sections)) {
+      return ((parsed as Record<string, unknown>).sections as AgentSection[])[0] ?? null
+    }
+    // If it returned just the section object
+    if ((parsed as Record<string, unknown>).id && (parsed as Record<string, unknown>).label) {
+      return parsed as unknown as AgentSection
+    }
+    return null
+  })()
+
+  if (!rawSection) return null
+
+  const section: AgentSection = {
+    id: String(rawSection.id ?? `sec_regen_${Date.now()}`),
+    label: String(rawSection.label ?? sectionLabel),
+    icon: String(rawSection.icon ?? 'bar_chart'),
+    narrative: String(rawSection.narrative ?? ''),
+    data_story: rawSection.data_story ? String(rawSection.data_story) : undefined,
+    key_finding: rawSection.key_finding ? String(rawSection.key_finding) : undefined,
+    recommendation: rawSection.recommendation ? String(rawSection.recommendation) : undefined,
+    insights: (rawSection.insights ?? []).slice(0, 4).map(sanitizeInsight),
+    top_performers: (rawSection.top_performers ?? []).slice(0, 5).map(sanitizePerformer),
+    bottom_performers: (rawSection.bottom_performers ?? []).slice(0, 5).map(sanitizePerformer),
+    kpis: (rawSection.kpis ?? []).slice(0, 4).map(sanitizeKpi),
+    charts: (rawSection.charts ?? []).slice(0, 4).map(sanitizeChart),
+  }
+
+  injectSourceSql([section], widgetSqlMap)
+  injectReferenceLines([section])
+
+  return section
 }
