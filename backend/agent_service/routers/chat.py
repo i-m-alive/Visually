@@ -256,9 +256,15 @@ async def _get_schema_context(
     project_id: str, db: AsyncSession
 ) -> tuple[dict, str, str]:
     """Returns (schema_doc, connection_id_str, db_type_str)."""
+    if not project_id:
+        return {}, "", "postgresql"
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except ValueError:
+        return {}, "", "postgresql"
     conn_result = await db.execute(
         select(DatabaseConnection)
-        .where(DatabaseConnection.project_id == uuid.UUID(project_id))
+        .where(DatabaseConnection.project_id == project_uuid)
         .where(DatabaseConnection.is_active == True)
         .limit(1)
     )

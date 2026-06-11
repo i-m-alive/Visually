@@ -101,6 +101,45 @@ export const intelligenceApi = {
       `/dashboards/${dashboardId}/intelligence-data`,
       dateRange ? { date_from: dateRange.from, date_to: dateRange.to } : {},
     ),
+
+  /**
+   * Send the pre-built analysis prompt to a dedicated Bedrock endpoint that:
+   * - Uses a clean system prompt focused on JSON generation only
+   * - Has 32 768 max_tokens (enough for a full 6-10 section report)
+   * - Has NO conversation history or chart-creation system prompt contamination
+   */
+  analyze: (data: { prompt: string; canvas_name?: string }) =>
+    api.post<{ text: string }>('/intelligence/analyze', data),
+
+  /**
+   * Fetch table/column metadata for every table referenced in this dashboard's
+   * widget SQL queries so the agent prompt includes DDL-level context.
+   */
+  fetchSchemaContext: (dashboardId: string) =>
+    api.get<{
+      tables: Array<{
+        name: string
+        business_name?: string
+        description?: string
+        grain?: string
+        is_fact?: boolean
+        key_metrics: string[]
+        key_dimensions: string[]
+        key_dates: string[]
+        columns: Array<{
+          name: string
+          business_name?: string
+          description?: string
+          type?: string
+          is_metric?: boolean
+          is_dimension?: boolean
+          fk_target?: string
+          examples: unknown[]
+        }>
+      }>
+      referenced_tables: string[]
+      message?: string
+    }>(`/dashboards/${dashboardId}/schema-context`),
 }
 
 export const screenshotApi = {

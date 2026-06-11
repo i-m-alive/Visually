@@ -143,6 +143,13 @@ For dashboard modifications, include:
 {{"action": "filter_widget"|"add_widget"|"rename_widget", "params": {{}}}}
 ```
 
+WHEN THE USER MESSAGE CONTAINS AN [INTELLIGENCE REPORT] OR ╔══ BLOCK:
+The user has already provided the full pre-computed report data inline.
+- Answer IMMEDIATELY with specific numbers from that data block.
+- NEVER say "I'll analyze", "I would show you", "I'll look into", or "Let me check".
+- If the answer is in the data, cite the exact numbers right away.
+- Only generate SQL if the question explicitly asks for something NOT present in the provided data.
+
 TONE: Be concise, helpful, and data-focused. Reference actual values from the data. Avoid filler phrases."""
 
 

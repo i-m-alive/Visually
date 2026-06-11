@@ -36,6 +36,15 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
   const isBuilder = user.role !== 'end_user'
 
+  // Intelligence pages get a full-canvas layout — no sidebar
+  if (pathname.includes('/intelligence/')) {
+    return (
+      <div className="flex h-screen bg-gray-50">
+        <div className="flex-1 flex flex-col min-w-0">{children}</div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-screen bg-gray-50">
       {/* Sidebar */}

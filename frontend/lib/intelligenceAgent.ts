@@ -26,7 +26,7 @@
  * 18.  LIVE_SQL_TRENDS          — fetch full rows via share token live query
  */
 
-import { chatApi, analystApi } from './api'
+import { intelligenceApi, analystApi } from './api'
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public output types
@@ -77,6 +77,7 @@ export interface AgentChart {
   x_key?: string
   y_key?: string
   source_sql?: string      // injected post-AI from widget sql_query
+  insight?: string         // 1-2 sentence finding specific to this chart's data
 }
 
 export interface InsightCard {
@@ -837,7 +838,7 @@ function buildWidgetBlock(ctx: WidgetContext): string {
   const liveTag = ctx.live_data ? ' [LIVE DATA]' : ''
   lines.push(`WIDGET: "${ctx.title}" [${ctx.pattern} | quality ${ctx.quality_score}/100${liveTag}]`)
   lines.push(`NARRATIVE: ${ctx.narrative}`)
-  if (ctx.sql_query) lines.push(`SQL_QUERY: ${ctx.sql_query.slice(0, 400)}`)
+  if (ctx.sql_query) lines.push(`SQL_QUERY: ${ctx.sql_query.slice(0, 2000)}`)
   if (ctx.table_columns?.length) lines.push(`COLUMNS: ${ctx.table_columns.join(', ')}`)
   if (ctx.column_profiles?.length) lines.push(`PROFILES:\n  ${ctx.column_profiles.map(fmtColProfile).join('\n  ')}`)
   if (ctx.top_rows?.length) lines.push(`TOP PERFORMERS: ${ctx.top_rows.map(r => `${r.label} ${r.formatted_value}${r.pct_of_total ? ` (${r.pct_of_total.toFixed(0)}%)` : ''}`).join(', ')}`)
@@ -865,20 +866,72 @@ const VALID_ICON_NAMES = [
   'heart_pulse', 'line_chart', 'zap',
 ].join(' | ')
 
+function buildSchemaContextBlock(
+  tables: Array<{
+    name: string
+    business_name?: string
+    description?: string
+    grain?: string
+    is_fact?: boolean
+    key_metrics: string[]
+    key_dimensions: string[]
+    key_dates: string[]
+    columns: Array<{
+      name: string
+      business_name?: string
+      description?: string
+      type?: string
+      is_metric?: boolean
+      is_dimension?: boolean
+      fk_target?: string
+      examples: unknown[]
+    }>
+  }>,
+): string {
+  if (!tables.length) return ''
+  const lines: string[] = ['━━━ DATABASE SCHEMA CONTEXT ━━━']
+  for (const t of tables) {
+    const label = t.business_name ? `${t.name} (${t.business_name})` : t.name
+    const kind = t.is_fact ? 'FACT TABLE' : 'TABLE/VIEW'
+    lines.push(`\n${kind}: ${label}`)
+    if (t.description) lines.push(`  PURPOSE: ${t.description}`)
+    if (t.grain) lines.push(`  GRAIN: ${t.grain}`)
+    if (t.key_metrics.length) lines.push(`  KEY METRICS: ${t.key_metrics.join(', ')}`)
+    if (t.key_dimensions.length) lines.push(`  KEY DIMENSIONS: ${t.key_dimensions.join(', ')}`)
+    if (t.key_dates.length) lines.push(`  DATE COLUMNS: ${t.key_dates.join(', ')}`)
+    if (t.columns.length) {
+      lines.push('  COLUMNS:')
+      for (const c of t.columns) {
+        const cLabel = c.business_name ? `${c.name} (${c.business_name})` : c.name
+        const typeTag = c.type ? ` [${c.type}]` : ''
+        const fkTag = c.fk_target ? ` → FK: ${c.fk_target}` : ''
+        const exTag = c.examples.length ? ` e.g. ${c.examples.slice(0, 3).join(', ')}` : ''
+        const descTag = c.description ? `: ${c.description}` : ''
+        lines.push(`    • ${cLabel}${typeTag}${fkTag}${descTag}${exTag}`)
+      }
+    }
+  }
+  lines.push('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+  return lines.join('\n')
+}
+
 function buildPrompt(
   canvasName: string,
   healthScore: number,
   healthColor: string,
   correlations: CorrelationResult[],
   widgetContexts: WidgetContext[],
+  schemaBlock?: string,
 ): string {
   const corrLines = correlations.slice(0, 4).map(c => c.description).join('\n')
   const widgetBlocks = widgetContexts.map(buildWidgetBlock).join('\n\n---\n\n')
 
-  return `You are a senior executive intelligence analyst. Rich pre-computed statistical data is provided below — including live SQL rows, column profiles, dimension breakdowns, performer rankings, correlations, and the SQL query behind each visualization. Use ALL of it to produce a deeply specific, narrative-driven executive report with real numbers and concrete findings.
+  return `You are a senior executive intelligence analyst. Rich pre-computed statistical data is provided below — including live SQL rows, column profiles, dimension breakdowns, performer rankings, correlations, the SQL query behind each visualization, and the full database schema context. Use ALL of it to produce a deeply specific, narrative-driven executive report with real numbers and concrete findings.
 
 REPORT: "${canvasName}"
 DATA QUALITY SCORE: ${healthScore}/100 (${healthColor.toUpperCase()})
+
+${schemaBlock || ''}
 
 CROSS-WIDGET CORRELATIONS:
 ${corrLines || 'None detected'}
@@ -888,17 +941,17 @@ ${widgetBlocks}
 ━━━━━━━━━━━━━━━━━━
 
 INSTRUCTIONS:
-1. Create 6–10 thematic sections — each a chapter telling one story from the data (Revenue Performance, Customer Trends, Regional Breakdown, Forecast, etc.).
+1. Create 4–6 thematic sections — each a chapter telling one story from the data (Revenue Performance, Customer Trends, Regional Breakdown, Forecast, etc.).
 2. For every section:
    • data_story: ONE bold headline sentence with a specific number (e.g. "North region drives 61% of total revenue at $4.2M")
    • key_finding: single most important metric fact from the widget data
    • narrative: 2–3 sentences citing exact numbers from PROFILES, BREAKDOWNS, TOP/BOTTOM PERFORMERS
    • recommendation: one concrete, measurable action
-   • 2–4 insights[] cards — use specific values; type = positive/negative/neutral/warning
-   • top_performers / bottom_performers: populate from the TOP/BOTTOM PERFORMERS data (5 rows each)
-   • 2–4 charts built from the actual data rows provided (bar, line, pie, combo, waterfall, scatter, bullet)
-3. Extract 5–8 top-level KPIs from the most prominent metrics. For sparkline_data use the actual numeric values from the widget sample_values or column profile.
-4. Write a 5-sentence morning_brief that opens with the single biggest finding (a specific number), covers top 3 themes, ends with a risk or opportunity.
+   • 2–3 insights[] cards — use specific values; type = positive/negative/neutral/warning
+   • top_performers / bottom_performers: 3 rows each, from TOP/BOTTOM PERFORMERS data
+   • 2–3 charts built from the actual data rows (bar, line, pie, combo, waterfall, scatter, bullet) — max 20 data points per chart
+3. Extract 4–6 top-level KPIs from the most prominent metrics. For sparkline_data use the actual numeric values from the widget sample_values or column profile (max 12 values).
+4. Write a 3-sentence morning_brief that opens with the single biggest finding (a specific number), covers the top 2 themes, ends with a risk or opportunity.
 
 CHART DATA RULES — build charts from the real row data provided:
    • bar/line/area: data: [{name: dimension_value, value: metric_value}, ...]
@@ -927,7 +980,7 @@ RESPOND WITH ONLY RAW JSON — no markdown, no explanation, no trailing text:
     "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
     "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
     "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
-    "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
+    "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
   }]
 }`
 }
@@ -937,16 +990,24 @@ RESPOND WITH ONLY RAW JSON — no markdown, no explanation, no trailing text:
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function _tryRepairJson(s: string): string {
-  // Close unclosed arrays and objects to recover truncated JSON
+  if (!s || s.indexOf('{') === -1) return ''
   let repaired = s
-  const opens = (s.match(/\[/g) ?? []).length - (s.match(/\]/g) ?? []).length
-  const objs  = (s.match(/\{/g) ?? []).length - (s.match(/\}/g) ?? []).length
+  // Remove inline JS comments the model sometimes emits
+  repaired = repaired.replace(/\/\/[^\n]*/g, '')
+  // Remove trailing commas before ] or } (JSON.parse rejects them)
+  repaired = repaired.replace(/,(\s*[}\]])/g, '$1')
   // Trim trailing incomplete key/value (e.g. ends with , "title": )
   repaired = repaired.replace(/,\s*"[^"]*"?\s*:?\s*$/, '')
-  // Close dangling string
-  if ((repaired.match(/"/g) ?? []).length % 2 !== 0) repaired += '"'
-  for (let i = 0; i < Math.min(opens, 20); i++) repaired += ']'
-  for (let i = 0; i < Math.min(objs, 20); i++) repaired += '}'
+  // Trim trailing comma-only dangling tokens
+  repaired = repaired.replace(/,\s*$/, '')
+  // Close dangling string (odd number of unescaped quotes → add one)
+  const quoteCount = (repaired.match(/(?<!\\)"/g) ?? []).length
+  if (quoteCount % 2 !== 0) repaired += '"'
+  // Count remaining unclosed brackets/braces AFTER repairs
+  const opens = (repaired.match(/\[/g) ?? []).length - (repaired.match(/\]/g) ?? []).length
+  const objs  = (repaired.match(/\{/g) ?? []).length - (repaired.match(/\}/g) ?? []).length
+  for (let i = 0; i < Math.min(opens, 30); i++) repaired += ']'
+  for (let i = 0; i < Math.min(objs, 30); i++) repaired += '}'
   return repaired
 }
 
@@ -977,10 +1038,17 @@ function parseResponse(text: string): Omit<ExecutiveAnalysis, 'health_score' | '
   // Strip markdown code fences then try balanced-brace extraction
   const stripped = clean.replace(/^```(?:json)?\n?|```$/gm, '').trim()
 
+  // Sanitize trailing commas — JSON.parse rejects them but the model often emits them
+  const sanitized = clean.replace(/,(\s*[}\]])/g, '$1')
+  const sanitizedStripped = stripped.replace(/,(\s*[}\]])/g, '$1')
+
+  const startIdx = clean.indexOf('{')
   const candidates: string[] = [
+    ..._extractJsonObjects(sanitizedStripped),
+    ..._extractJsonObjects(sanitized),
     ..._extractJsonObjects(stripped),
     ..._extractJsonObjects(clean),
-    _tryRepairJson(clean.slice(clean.indexOf('{'))),
+    startIdx >= 0 ? _tryRepairJson(clean.slice(startIdx)) : '',
   ].filter(Boolean)
 
   for (const candidate of candidates) {
@@ -1049,6 +1117,7 @@ function sanitizeChart(ch: AgentChart): AgentChart {
     max_value: ch.max_value != null ? Number(ch.max_value) : undefined,
     x_key: ch.x_key ? String(ch.x_key) : undefined,
     y_key: ch.y_key ? String(ch.y_key) : undefined,
+    insight: ch.insight ? String(ch.insight) : undefined,
     data: (ch.data ?? []).slice(0, 60).map((d: AgentChartRow) => {
       const row: AgentChartRow = { name: String(d.name ?? ''), value: Number(d.value ?? 0) }
       if (d.base != null) row.base = Number(d.base)
@@ -1212,8 +1281,9 @@ export interface AgentOptions {
   canvasId: string
   canvasName: string
   widgets: WidgetInput[]
-  shareToken?: string   // enables Skill 18 live SQL fetching
+  shareToken?: string     // enables Skill 18 live SQL fetching
   dateRange?: { from: string; to: string } | null  // Feature 1: time range override
+  skipSchemaFetch?: boolean  // set true to skip schema-context fetch (e.g. per-section regen)
 }
 
 export async function runIntelligenceAgent(
@@ -1252,8 +1322,14 @@ export async function runIntelligenceAgent(
       `[intelligence:widget] "${w.title}"  type=${w.chart_type}  rows=${rows.length}  cols=${cols.length}  sql=${w.sql_query ? 'yes' : 'no'}`
     )
 
-    // Skill 18: fetch richer rows via live SQL if share token available
-    if (shareToken && w.sql_query && rows.length < 50) {
+    const vals = (w.chart_data?.values ?? []).map(toNum)
+
+    // Skill 18: fetch richer rows via live SQL if share token available.
+    // Trigger when: cached data is absent/poor (rows=0 or cols=0) OR fewer than 20 rows.
+    // Previously gated at < 50 which blocked Skill 18 whenever bulk-fetch "succeeded"
+    // but the widget_id match had silently failed and returned 0 rows.
+    const cachedDataPoor = rows.length === 0 || cols.length === 0 || vals.filter(v => !isNaN(v)).length < 3
+    if (shareToken && w.sql_query && (cachedDataPoor || rows.length < 20)) {
       onProgress?.(`[2/6] Fetching live data for "${w.title}"…`)
       const liveRows = await fetchLiveSqlRows(shareToken, w.sql_query)
       if (liveRows && liveRows.length > rows.length) {
@@ -1262,8 +1338,6 @@ export async function runIntelligenceAgent(
         liveData = true
       }
     }
-
-    const vals = (w.chart_data?.values ?? []).map(toNum)
     const labs = (w.chart_data?.labels ?? []).map(v => String(v ?? ''))
     const pattern = detectPattern(w)
     const ts = isTimeSeries(w)
@@ -1339,20 +1413,37 @@ export async function runIntelligenceAgent(
     correlations: correlations.map(c => c.description),
   }
 
+  onProgress?.('[5/6] Fetching database schema context…')
+
+  // Fix G: Fetch table/column DDL context for all tables referenced in widget SQL.
+  // This gives the model grounded knowledge of column types, business names, FK relationships.
+  let schemaBlock = ''
+  if (!opts.skipSchemaFetch) {
+    try {
+      const schemaResp = await intelligenceApi.fetchSchemaContext(canvasId)
+      const tables = schemaResp.data?.tables ?? []
+      if (tables.length) {
+        schemaBlock = buildSchemaContextBlock(tables)
+        console.log(`[intelligence] schema_context  tables=${tables.length}`)
+      } else {
+        console.log(`[intelligence] schema_context empty (${schemaResp.data?.message ?? 'no metadata'})`)
+      }
+    } catch (err) {
+      console.warn('[intelligence] schema-context fetch failed (non-fatal):', err)
+    }
+  }
+
   onProgress?.('[5/6] Sending enriched context to Opus AI analyst…')
 
-  const prompt = buildPrompt(canvasName, healthScore, healthColor, correlations, widgetContexts)
-  console.log(`[intelligence] prompt_len=${prompt.length}  sending to model=opus`)
+  // Fix A+D: Use dedicated /intelligence/analyze endpoint (not chatApi.send).
+  // This endpoint: focused system prompt, no chart-creation instructions, max_tokens=32768.
+  const prompt = buildPrompt(canvasName, healthScore, healthColor, correlations, widgetContexts, schemaBlock)
+  console.log(`[intelligence] prompt_len=${prompt.length}  schema_included=${schemaBlock.length > 0}  sending to /intelligence/analyze`)
 
   let responseText = ''
   try {
-    const resp = await chatApi.send({
-      message: prompt,
-      project_id: projectId,
-      dashboard_id: canvasId,
-      model_preference: 'opus',
-    })
-    responseText = resp.data?.text ?? resp.data?.response ?? resp.data?.message ?? ''
+    const resp = await intelligenceApi.analyze({ prompt, canvas_name: canvasName })
+    responseText = resp.data?.text ?? ''
     console.log(`[intelligence] ai response received  len=${responseText.length}`)
   } catch (err) {
     console.warn('[intelligence] ai call failed, falling back to deterministic analysis:', err)
@@ -1364,9 +1455,17 @@ export async function runIntelligenceAgent(
 
   const parsed = parseResponse(responseText)
   if (!parsed) {
-    console.warn('[intelligence] parseResponse returned null — unexpected AI format, using fallback')
+    const truncated = responseText.length > 0 && !responseText.trim().endsWith('}')
+    console.warn(
+      `[intelligence] parseResponse null — ${truncated ? 'RESPONSE TRUNCATED (check max_tokens)' : 'unexpected format'}  ` +
+      `response_len=${responseText.length}  first200=${responseText.slice(0, 200)}`
+    )
     onProgress?.('AI returned unexpected format — using deterministic analysis…')
-    return buildFallbackAnalysis(canvasName, widgets, meta)
+    return { ...buildFallbackAnalysis(canvasName, widgets, meta), _fallback: true } as ExecutiveAnalysis
+  }
+
+  if ((parsed.sections?.length ?? 0) < 3) {
+    console.warn(`[intelligence] suspiciously few sections (${parsed.sections?.length}) — possible truncation`)
   }
 
   console.log(
@@ -1477,19 +1576,14 @@ Return ONLY the JSON for a single section — no other text:
   "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
   "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
   "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
-  "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","data":[{"name":"...","value":0}]}]
+  "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}]}]
 }`
 
   onProgress?.(`Sending section prompt for "${sectionLabel}"…`)
   let responseText = ''
   try {
-    const resp = await chatApi.send({
-      message: sectionPrompt,
-      project_id: projectId,
-      dashboard_id: canvasId,
-      model_preference: 'opus',
-    })
-    responseText = resp.data?.text ?? resp.data?.response ?? resp.data?.message ?? ''
+    const resp = await intelligenceApi.analyze({ prompt: sectionPrompt, canvas_name: canvasName })
+    responseText = resp.data?.text ?? ''
   } catch {
     return null
   }

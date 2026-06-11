@@ -1,8 +1,10 @@
 'use client'
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { canvasApi, shareApi, chatApi, intelligenceApi } from '@/lib/api'
+import { canvasApi, shareApi, intelligenceApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
+import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
+import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import {
   runIntelligenceAgent, buildFallbackAnalysis, runSectionAgent,
   type ExecutiveAnalysis, type AgentKPI, type AgentChart, type AgentSection,
@@ -18,7 +20,7 @@ import {
   Award, Package, Briefcase, LineChart as LineChartIcon, ChevronDown, ChevronUp,
   Code2,
   X, Download, Maximize2, Play, Link, Copy, Printer, Pin,
-  Columns, ChevronRight, CalendarRange, Edit3,
+  Columns, ChevronRight, CalendarRange, Edit3, Bookmark, BookmarkCheck,
 } from 'lucide-react'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -494,9 +496,25 @@ function TableView({ chart }: { chart: AgentChart }) {
 
 // ── Chart renderer ─────────────────────────────────────────────────────────────
 const TTP = { contentStyle: { fontSize: 11, borderRadius: 8, border: '1px solid #e8eef5', boxShadow: '0 4px 12px rgba(0,0,0,0.08)' } }
-const XAXIS = <XAxis dataKey="name" tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-const YAXIS = <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={40} />
+const fmtTick = (v: number) =>
+  Math.abs(v) >= 1e9 ? `${(v/1e9).toFixed(1)}B`
+  : Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M`
+  : Math.abs(v) >= 1e3 ? `${(v/1e3).toFixed(0)}K`
+  : String(v)
+const XAXIS = <XAxis dataKey="name" tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+const YAXIS = <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={46} tickFormatter={fmtTick} />
 const GRID  = <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+
+// Chart types that can be swapped freely (same {name,value} data shape)
+const CHART_SWITCH_OPTS: Record<string, string[]> = {
+  bar: ['bar', 'line', 'area'],
+  line: ['line', 'bar', 'area'],
+  area: ['area', 'bar', 'line'],
+  pie: ['pie', 'bar'],
+}
+const CHART_TYPE_ICONS: Record<string, string> = {
+  bar: '▌', line: '∿', area: '△', pie: '◕',
+}
 
 type DrillFn = (segment: string) => void
 
@@ -512,6 +530,10 @@ function AgentChartView({
   annotations?: Record<string, string>
   onAnnotate?: (pointName: string) => void
 }) {
+  const [viewType, setViewType] = useState(chart.type)
+  const [insightVisible, setInsightVisible] = useState(false)
+  const switchOpts = CHART_SWITCH_OPTS[chart.type] ?? []
+
   const color = chart.color ?? PALETTE[colorIdx % PALETTE.length]
   const gid = `g${colorIdx}`
 
@@ -524,7 +546,7 @@ function AgentChartView({
   }
 
   // For bar/line/area: add computed trend line to data
-  const dataWithTrend = ['bar', 'line', 'area'].includes(chart.type)
+  const dataWithTrend = ['bar', 'line', 'area'].includes(viewType)
     ? addTrendToData(chart.data as Array<{name:string;value:number;[key:string]:unknown}>)
     : chart.data
 
@@ -565,11 +587,61 @@ function AgentChartView({
       <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: `linear-gradient(180deg, ${color}, ${color}70)`, flexShrink: 0 }} />
         <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{chart.title}</p>
-        {/* Fullscreen + Download controls */}
-        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-          {onAnnotate && <button onClick={() => onAnnotate('_chart')} title="Add note" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Pin size={10} /></button>}
-          <button onClick={downloadPng} title="Download PNG" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
-          {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
+        {/* Chart type switcher + controls */}
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'center' }}>
+          {switchOpts.length > 1 && (
+            <div style={{ display: 'flex', gap: 1, background: '#f1f5f9', borderRadius: 8, padding: 2 }}>
+              {switchOpts.map(t => (
+                <button key={t} onClick={() => setViewType(t)} title={`View as ${t}`} style={{
+                  padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
+                  background: viewType === t ? C.navy : 'transparent',
+                  color: viewType === t ? 'white' : '#94a3b8',
+                  fontSize: 11, fontWeight: 700, transition: 'all 0.15s', lineHeight: 1,
+                }}>{CHART_TYPE_ICONS[t] ?? t.slice(0,3)}</button>
+              ))}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            {/* ⓘ Insight tooltip */}
+            {chart.insight && (
+              <div style={{ position: 'relative' }}
+                onMouseEnter={() => setInsightVisible(true)}
+                onMouseLeave={() => setInsightVisible(false)}
+              >
+                <button title="Chart insight" style={{
+                  width: 20, height: 20, borderRadius: '50%', border: `1.5px solid ${C.teal}`,
+                  background: insightVisible ? C.teal : 'white', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 11, fontWeight: 700, lineHeight: 1,
+                  color: insightVisible ? 'white' : C.teal,
+                  transition: 'all 0.15s', flexShrink: 0,
+                }}>i</button>
+                {insightVisible && (
+                  <div style={{
+                    position: 'absolute', bottom: 'calc(100% + 8px)', right: 0,
+                    width: 240, padding: '10px 13px',
+                    background: C.navy, color: 'white',
+                    borderRadius: 10, fontSize: 11, lineHeight: 1.55,
+                    boxShadow: '0 8px 24px rgba(10,33,58,0.25)',
+                    zIndex: 200, pointerEvents: 'none',
+                    animation: 'fadeInUp 0.18s ease both',
+                  }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', opacity: 0.6, marginBottom: 5 }}>Chart Insight</div>
+                    {chart.insight}
+                    {/* Caret */}
+                    <div style={{
+                      position: 'absolute', bottom: -6, right: 8,
+                      width: 12, height: 12, background: C.navy,
+                      transform: 'rotate(45deg)', borderRadius: 2,
+                    }} />
+                  </div>
+                )}
+              </div>
+            )}
+            {onAnnotate && <button onClick={() => onAnnotate('_chart')} title="Add note" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Pin size={10} /></button>}
+            <button onClick={downloadPng} title="Download PNG" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
+            {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
+          </div>
         </div>
       </div>
       {/* annotation pins display */}
@@ -585,12 +657,12 @@ function AgentChartView({
       <div ref={chartRef}>
 
       {/* ── TABLE ── */}
-      {chart.type === 'table' && <TableView chart={chart} />}
+      {viewType === 'table' && <TableView chart={chart} />}
 
       {/* ── FORECAST ── */}
-      {chart.type === 'forecast' && (
-        <ResponsiveContainer width="100%" height={170}>
-          <ComposedChart margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+      {viewType === 'forecast' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             <defs><linearGradient id={gid} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity={0.25} /><stop offset="100%" stopColor={color} stopOpacity={0} /></linearGradient></defs>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
             <Area type="monotone" dataKey="value" data={chart.data} stroke={color} fill={`url(#${gid})`} strokeWidth={2} dot={false} name="Historical" />
@@ -602,9 +674,9 @@ function AgentChartView({
       )}
 
       {/* ── COMBO ── */}
-      {chart.type === 'combo' && (
-        <ResponsiveContainer width="100%" height={170}>
-          <ComposedChart data={chart.data} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+      {viewType === 'combo' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={chart.data} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} /><Legend iconSize={8} wrapperStyle={{ fontSize: 10 }} />
             {(chart.series ?? [{ key: 'value', type: 'bar' }]).map((s, i) => {
               const sc = s.color ?? PALETTE[(colorIdx + i) % PALETTE.length]
@@ -618,9 +690,9 @@ function AgentChartView({
       )}
 
       {/* ── WATERFALL ── */}
-      {chart.type === 'waterfall' && (
-        <ResponsiveContainer width="100%" height={170}>
-          <ComposedChart data={chart.data} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+      {viewType === 'waterfall' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={chart.data} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} formatter={(v, name) => name === 'base' ? null : v} />
             <Bar dataKey="base" stackId="wf" fill="transparent" />
             <Bar dataKey="value" stackId="wf" radius={[4, 4, 0, 0]} maxBarSize={44}>
@@ -633,13 +705,13 @@ function AgentChartView({
       )}
 
       {/* ── SCATTER ── */}
-      {chart.type === 'scatter' && (() => {
+      {viewType === 'scatter' && (() => {
         const xKey = chart.x_key ?? 'x'
         const yKey = chart.y_key ?? 'y'
         const scatterData = chart.data.map(d => ({ ...d, x: Number(d[xKey] ?? d.value ?? 0), y: Number(d[yKey] ?? 0) }))
         return (
-          <ResponsiveContainer width="100%" height={170}>
-            <ScatterChart margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+          <ResponsiveContainer width="100%" height={240}>
+            <ScatterChart margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
               {GRID}
               <XAxis dataKey="x" type="number" name={xKey} tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} label={{ value: xKey, fill: '#94a3b8', fontSize: 9, position: 'insideBottom', offset: -2 }} />
               <YAxis dataKey="y" type="number" name={yKey} tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={40} label={{ value: yKey, fill: '#94a3b8', fontSize: 9, angle: -90, position: 'insideLeft' }} />
@@ -683,9 +755,9 @@ function AgentChartView({
       })()}
 
       {/* ── BAR — switches to ComposedChart for trend line ── */}
-      {chart.type === 'bar' && (
-        <ResponsiveContainer width="100%" height={170}>
-          <ComposedChart data={dataWithTrend} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+      {viewType === 'bar' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={dataWithTrend} margin={{ top: 18, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
             <Bar dataKey="value" fill={color} radius={[4, 4, 0, 0]} maxBarSize={44} opacity={0.88}
               onClick={onDrill ? (d: { name?: string }) => onDrill(String(d?.name ?? '')) : undefined}
@@ -701,9 +773,9 @@ function AgentChartView({
       )}
 
       {/* ── AREA — with trend line ── */}
-      {chart.type === 'area' && (
-        <ResponsiveContainer width="100%" height={170}>
-          <ComposedChart data={dataWithTrend} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+      {viewType === 'area' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={dataWithTrend} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             <defs><linearGradient id={gid} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity={0.28} /><stop offset="100%" stopColor={color} stopOpacity={0} /></linearGradient></defs>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
             <Area type="monotone" dataKey="value" stroke={color} fill={`url(#${gid})`} strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
@@ -716,9 +788,9 @@ function AgentChartView({
       )}
 
       {/* ── LINE — with trend line ── */}
-      {chart.type === 'line' && (
-        <ResponsiveContainer width="100%" height={170}>
-          <ComposedChart data={dataWithTrend} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
+      {viewType === 'line' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={dataWithTrend} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
             <Line type="monotone" dataKey="value" stroke={color} strokeWidth={2.5} dot={false} activeDot={{ r: 4, fill: color }} />
             {dataWithTrend.some(d => '_trend' in d) && (
@@ -730,17 +802,32 @@ function AgentChartView({
       )}
 
       {/* ── PIE ── */}
-      {chart.type === 'pie' && (
-        <ResponsiveContainer width="100%" height={190}>
-          <PieChart>
-            <Pie data={chart.data} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={72} labelLine={false}
-              label={({ name, percent }) => percent > 0.06 ? `${name} ${(percent * 100).toFixed(0)}%` : ''}
+      {viewType === 'pie' && (
+        <ResponsiveContainer width="100%" height={260}>
+          <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+            <Pie
+              data={chart.data} dataKey="value" nameKey="name"
+              cx="50%" cy="46%" outerRadius="42%" innerRadius="18%"
+              labelLine={false}
+              label={({ cx: pcx, cy: pcy, midAngle, outerRadius: or, percent }) => {
+                if (percent < 0.07) return null
+                const RADIAN = Math.PI / 180
+                const r = (or as number) + 18
+                const x = (pcx as number) + r * Math.cos(-midAngle * RADIAN)
+                const y = (pcy as number) + r * Math.sin(-midAngle * RADIAN)
+                return (
+                  <text x={x} y={y} fill="#374151" textAnchor={x > (pcx as number) ? 'start' : 'end'}
+                    dominantBaseline="central" fontSize={10} fontWeight={600}>
+                    {`${(percent * 100).toFixed(0)}%`}
+                  </text>
+                )
+              }}
               onClick={onDrill ? (d: { name?: string }) => onDrill(String(d?.name ?? '')) : undefined}
               style={onDrill ? { cursor: 'pointer' } : undefined}>
               {chart.data.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
             </Pie>
-            <Tooltip {...TTP} />
-            <Legend iconSize={8} wrapperStyle={{ fontSize: 10 }} />
+            <Tooltip {...TTP} formatter={(v: number) => [fmtTick(v), '']} />
+            <Legend iconSize={9} wrapperStyle={{ fontSize: 10, paddingTop: 4 }} iconType="circle" />
           </PieChart>
         </ResponsiveContainer>
       )}
@@ -840,33 +927,56 @@ function SectionContent({
         </div>
       )}
 
-      {/* Performers + Charts */}
-      {(hasPerformers || section.charts.length > 0) && (
-        <div style={{ display: 'grid', gridTemplateColumns: hasPerformers && section.charts.length > 0 ? '1fr 1fr' : '1fr', gap: 14, alignItems: 'start' }}>
-          {hasPerformers && (
-            <PerformerPanel
-              top={section.top_performers ?? []}
-              bottom={section.bottom_performers ?? []}
-              label={section.label}
-            />
-          )}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {section.charts.map((ch, i) => (
-              <AgentChartView
-                key={i} chart={ch} colorIdx={sectionIdx * 4 + i}
-                onDrill={onDrill ? seg => onDrill(ch, seg) : undefined}
-                onFullscreen={onFullscreen ? () => onFullscreen(ch) : undefined}
-                annotations={annotations ? Object.fromEntries(
-                  Object.entries(annotations)
-                    .filter(([k]) => k.startsWith(`${section.id}|${ch.title}|`))
-                    .map(([k, v]) => [k.split('|')[2] ?? k, v])
-                ) : undefined}
-                onAnnotate={onAnnotate ? (pt) => onAnnotate(ch.title, pt) : undefined}
-              />
-            ))}
+      {/* Performers + Charts — performers beside first chart; remaining charts in 2-col grid */}
+      {(hasPerformers || section.charts.length > 0) && (() => {
+        const charts = section.charts
+        const firstChart = charts[0]
+        const restCharts = charts.slice(1)
+        const chartProps = (ch: typeof charts[0], i: number) => ({
+          chart: ch, colorIdx: sectionIdx * 4 + i,
+          onDrill: onDrill ? (seg: string) => onDrill(ch, seg) : undefined,
+          onFullscreen: onFullscreen ? () => onFullscreen(ch) : undefined,
+          annotations: annotations ? Object.fromEntries(
+            Object.entries(annotations)
+              .filter(([k]) => k.startsWith(`${section.id}|${ch.title}|`))
+              .map(([k, v]) => [k.split('|')[2] ?? k, v])
+          ) : undefined,
+          onAnnotate: onAnnotate ? (pt: string) => onAnnotate(ch.title, pt) : undefined,
+        })
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Row 1: performers (fixed 290px) + first chart */}
+            {(hasPerformers || firstChart) && (
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: hasPerformers && firstChart ? '290px 1fr' : '1fr',
+                gap: 16, alignItems: 'start',
+              }}>
+                {hasPerformers && (
+                  <PerformerPanel
+                    top={section.top_performers ?? []}
+                    bottom={section.bottom_performers ?? []}
+                    label={section.label}
+                  />
+                )}
+                {firstChart && <AgentChartView key={0} {...chartProps(firstChart, 0)} />}
+              </div>
+            )}
+            {/* Row 2+: remaining charts in responsive 2-col grid */}
+            {restCharts.length > 0 && (
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: restCharts.length === 1 ? '1fr' : '1fr 1fr',
+                gap: 16,
+              }}>
+                {restCharts.map((ch, i) => (
+                  <AgentChartView key={i + 1} {...chartProps(ch, i + 1)} />
+                ))}
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* SQL drawer */}
       {sourceSqls.length > 0 && <SqlDrawer sqls={sourceSqls} shareToken={shareToken} />}
@@ -1028,28 +1138,63 @@ function AgentLoader({ step, canvasName }: { step: string; canvasName: string })
   )
 }
 
-// ── Inline copilot ─────────────────────────────────────────────────────────────
-interface ChatMsg { role: 'user' | 'assistant'; text: string }
-const PAGE_CHIPS = ['What are the key risks?', 'Which metrics need attention?', 'Summarize the top performers', 'What actions do you recommend?']
+// ── Inline copilot replaced by CanvasChatPanel ─────────────────────────────────
+// (InlineCopilot removed — CanvasChatPanel is used directly in the FAB)
 
-function buildReportContext(analysis: ExecutiveAnalysis, canvasName: string): string {
-  const kpiSummary = analysis.kpis.slice(0, 8).map(k => `${k.label}: ${k.value} (${k.trend}${k.trend_pct ? ', ' + k.trend_pct : ''})`).join('; ')
-  const sectionSummary = analysis.sections.map(s =>
-    `• ${s.label}: ${s.key_finding ?? s.narrative?.slice(0, 120) ?? ''}${s.recommendation ? ' → ' + s.recommendation : ''}`
+function buildReportContext_UNUSED(analysis: ExecutiveAnalysis, canvasName: string): string {
+  const kpiLines = analysis.kpis.slice(0, 10).map(k =>
+    `  • ${k.label}: ${k.value}${k.trend !== 'neutral' ? ` (${k.trend}${k.trend_pct ? ' ' + k.trend_pct : ''})` : ''}`
   ).join('\n')
-  const correlations = analysis.correlations.slice(0, 3).join('; ')
-  return `[INTELLIGENCE REPORT — ${canvasName.toUpperCase()}]
-Health Score: ${analysis.health_score}/100 (${analysis.health_color})
-KPIs: ${kpiSummary}
-Key Correlations: ${correlations || 'none'}
-Sections:
-${sectionSummary}
-Morning Brief: ${analysis.morning_brief?.slice(0, 400) ?? ''}
 
-User: `
+  const sectionDetails = analysis.sections.map(s => {
+    const chartLines = s.charts.slice(0, 4).map(ch => {
+      const pts = ch.data.slice(0, 15).map(d => `${d.name}=${d.value}`).join(', ')
+      return `    [${ch.type.toUpperCase()}] "${ch.title}": ${pts}${ch.insight ? `\n      → ${ch.insight}` : ''}`
+    }).join('\n')
+
+    const insightLines = (s.insights ?? []).slice(0, 4).map(ins =>
+      `    ${ins.type.toUpperCase()}: ${ins.headline} — ${ins.detail}`
+    ).join('\n')
+
+    const performers = [
+      ...(s.top_performers ?? []).slice(0, 3).map(p => `▲ ${p.label} ${p.formatted_value}`),
+      ...(s.bottom_performers ?? []).slice(0, 3).map(p => `▼ ${p.label} ${p.formatted_value}`),
+    ].join('  ')
+
+    return [
+      `──── ${s.label.toUpperCase()} ────`,
+      `  Finding: ${s.key_finding ?? ''}`,
+      `  Narrative: ${s.narrative?.slice(0, 250) ?? ''}`,
+      s.recommendation ? `  Action: ${s.recommendation}` : '',
+      chartLines ? `  Charts:\n${chartLines}` : '',
+      insightLines ? `  Signals:\n${insightLines}` : '',
+      performers ? `  Performers: ${performers}` : '',
+    ].filter(Boolean).join('\n')
+  }).join('\n\n')
+
+  return `╔══════════════════════════════════════════════════════╗
+║  INTELLIGENCE REPORT: ${canvasName.toUpperCase().slice(0, 30).padEnd(30)} ║
+╚══════════════════════════════════════════════════════╝
+Health Score: ${analysis.health_score}/100   Brief: ${analysis.morning_brief?.slice(0, 200) ?? ''}
+
+TOP KPIs:
+${kpiLines}
+
+DETAILED SECTION DATA (use these exact numbers to answer):
+${sectionDetails}
+${analysis.correlations.length ? `\nKEY CORRELATIONS: ${analysis.correlations.slice(0, 4).join(' | ')}` : ''}
+
+══════════════════════════════════════════════════════
+INSTRUCTION: You have the complete intelligence report data above with actual numbers.
+Answer ALL user questions with SPECIFIC VALUES from the data above.
+NEVER say "I'll analyze", "I would show", or "I'll look into" — give the direct answer NOW using the numbers provided.
+If the user asks for something NOT in the context, generate SQL to query it live.
+══════════════════════════════════════════════════════
+
+User question: `
 }
 
-function InlineCopilot({ canvasId, projectId, canvasName, analysis }: { canvasId: string; projectId: string; canvasName: string; analysis?: ExecutiveAnalysis }) {
+function InlineCopilot_UNUSED({ canvasId, projectId, canvasName, analysis }: { canvasId: string; projectId: string; canvasName: string; analysis?: ExecutiveAnalysis }) {
   const [msgs, setMsgs] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -1399,6 +1544,7 @@ export default function IntelligenceCanvasPage() {
   const [agentStep, setAgentStep] = useState('')
   const [analysis, setAnalysis] = useState<ExecutiveAnalysis | null>(null)
   const [agentError, setAgentError] = useState<string | null>(null)
+  const [aiFallbackWarning, setAiFallbackWarning] = useState(false)
   const [rerunning, setRerunning] = useState(false)
   const [activeSection, setActiveSection] = useState('')
   const [briefExpanded, setBriefExpanded] = useState(true)
@@ -1441,6 +1587,11 @@ export default function IntelligenceCanvasPage() {
   // Feature 12: Side-by-side comparison
   const [compareMode, setCompareMode] = useState(false)
   const [compareSectionId, setCompareSectionId] = useState('')
+
+  // Save analysis + Copilot FAB
+  const [saved, setSaved] = useState(false)
+  const [hasSavedData, setHasSavedData] = useState(false)
+  const [copilotOpen, setCopilotOpen] = useState(false)
 
   // Feature 2: map SQL → rows for drill-through
   const sqlToRows = React.useMemo(() => {
@@ -1496,12 +1647,15 @@ export default function IntelligenceCanvasPage() {
     finally { setRegenSection(null) }
   }, [canvas, analysis, projectId, canvasId, rawWidgets, shareToken])
 
-  // Merge fresh bulk-fetched rows into the widget array from the canvas API
+  // Merge fresh bulk-fetched rows into the widget array from the canvas API.
+  // Fix C: normalize both sides of the widget_id comparison to lowercase without dashes
+  // so UUID format differences (e.g. "abc-123" vs "abc123") never cause silent mismatches.
   const mergeWidgetData = useCallback(
     (baseWidgets: unknown[], liveData: Array<{ widget_id: string; ok: boolean; rows?: Record<string, unknown>[]; columns?: string[]; labels?: string[]; values?: unknown[] }>) => {
-      const byId = new Map(liveData.filter(d => d.ok).map(d => [d.widget_id, d]))
-      return (baseWidgets as Record<string, unknown>[]).map(w => {
-        const live = byId.get(String(w.id))
+      const norm = (id: unknown) => String(id ?? '').toLowerCase().replace(/-/g, '')
+      const byId = new Map(liveData.filter(d => d.ok).map(d => [norm(d.widget_id), d]))
+      const merged = (baseWidgets as Record<string, unknown>[]).map(w => {
+        const live = byId.get(norm(w.id))
         if (!live) return w
         const existingCd = (w.chart_data as Record<string, unknown>) ?? {}
         return {
@@ -1515,12 +1669,41 @@ export default function IntelligenceCanvasPage() {
           },
         }
       })
+      const enriched = merged.filter(w => ((w as Record<string,unknown>).chart_data as Record<string,unknown>)?.rows && ((((w as Record<string,unknown>).chart_data as Record<string,unknown>).rows) as unknown[]).length > 0).length
+      if (enriched === 0 && liveData.filter(d => d.ok).length > 0) {
+        console.warn('[intelligence:merge] ZERO widgets enriched — widget_id mismatch? sample ids:', liveData.slice(0,2).map(d=>d.widget_id), 'widget ids:', (baseWidgets as Record<string,unknown>[]).slice(0,2).map(w=>w.id))
+      } else {
+        console.log(`[intelligence:merge] enriched=${enriched}/${baseWidgets.length} widgets with live rows`)
+      }
+      return merged
     },
     [],
   )
 
+  const saveAnalysis = useCallback(() => {
+    if (!analysis) return
+    try {
+      localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(analysis))
+      setSaved(true)
+      setHasSavedData(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch {}
+  }, [analysis, canvasId])
+
   useEffect(() => {
     const load = async () => {
+      // Check localStorage first — if saved, skip the AI run but still fetch canvas for projectId
+      let savedObj: ExecutiveAnalysis | null = null
+      if (typeof window !== 'undefined') {
+        try {
+          const savedRaw = localStorage.getItem(`intel_analysis_${canvasId}`)
+          if (savedRaw) {
+            const parsed = JSON.parse(savedRaw) as ExecutiveAnalysis
+            if (parsed.sections?.length) savedObj = parsed
+          }
+        } catch {}
+      }
+
       setAgentStatus('loading_canvas')
       try {
         const [canvasResp, sharesResp] = await Promise.all([
@@ -1533,6 +1716,15 @@ export default function IntelligenceCanvasPage() {
         const sharesList: unknown[] = sharesResp.data?.shares ?? (Array.isArray(sharesResp.data) ? sharesResp.data : [])
         const token = sharesList.length ? ((sharesList[0] as Record<string,string>).token ?? '') : ''
         if (token) setShareToken(token)
+
+        // If we have saved analysis, skip the AI run — canvas metadata (projectId, shareToken) is now loaded
+        if (savedObj) {
+          setAnalysis(savedObj)
+          setActiveSection(savedObj.sections[0]?.id ?? '')
+          setAgentStatus('done')
+          setHasSavedData(true)
+          return
+        }
 
         // Bulk-fetch live SQL rows for every widget before running the agent
         try {
@@ -1549,10 +1741,12 @@ export default function IntelligenceCanvasPage() {
 
         setRawWidgets(widgets)
         setAgentStatus('running')
+        setAiFallbackWarning(false)
         const result = await runIntelligenceAgent(
           { projectId: detail?.project_id ?? '', canvasId, canvasName: detail?.name ?? 'Report', widgets: widgets as never, shareToken: token || undefined },
           s => setAgentStep(s),
         )
+        if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
         setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
         setAgentStatus('done')
       } catch (err) {
@@ -1568,7 +1762,7 @@ export default function IntelligenceCanvasPage() {
     if (!canvas || !pendingDate.from || !pendingDate.to) return
     const dr = { from: pendingDate.from, to: pendingDate.to }
     setAppliedDateRange(dr)
-    setDateLoading(true); setAgentStatus('running'); setAgentError(null)
+    setDateLoading(true); setAgentStatus('running'); setAgentError(null); setAiFallbackWarning(false)
     try {
       let widgets = rawWidgets
       try {
@@ -1581,6 +1775,7 @@ export default function IntelligenceCanvasPage() {
         { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: dr },
         s => setAgentStep(s),
       )
+      if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
     } catch {
@@ -1590,7 +1785,10 @@ export default function IntelligenceCanvasPage() {
 
   const rerun = useCallback(async () => {
     if (!canvas || rerunning) return
-    setRerunning(true); setAgentStatus('running'); setAgentError(null)
+    // Clear any saved analysis so fresh data is used
+    try { localStorage.removeItem(`intel_analysis_${canvasId}`) } catch {}
+    setHasSavedData(false)
+    setRerunning(true); setAgentStatus('running'); setAgentError(null); setAiFallbackWarning(false)
     try {
       // Re-fetch live data on regenerate too
       let widgets = rawWidgets
@@ -1605,11 +1803,13 @@ export default function IntelligenceCanvasPage() {
         { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined },
         s => setAgentStep(s),
       )
+      if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
     } catch {
       const fb = buildFallbackAnalysis(String(canvas?.name ?? 'Report'), rawWidgets as never)
       setAnalysis(fb); setActiveSection(fb.sections[0]?.id ?? '')
+      setAiFallbackWarning(true)
       setAgentStatus('done')
     } finally { setRerunning(false) }
   }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange])
@@ -1647,7 +1847,7 @@ export default function IntelligenceCanvasPage() {
   if (!analysis) return null
 
   return (
-    <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: '62px 1fr 360px', overflow: 'hidden' }}>
+    <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: '62px 1fr', overflow: 'hidden' }}>
 
       {/* Left rail */}
       <LeftRail sections={analysis.sections} active={activeSection} onNav={setActiveSection} />
@@ -1668,6 +1868,7 @@ export default function IntelligenceCanvasPage() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <h1 style={{ fontSize: 15, fontWeight: 700, color: 'white', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{analysis.title}</h1>
                 <span style={{ fontSize: 9, fontWeight: 700, color: C.teal2, background: `${C.teal}25`, border: `1px solid ${C.teal}50`, borderRadius: 20, padding: '2px 8px', letterSpacing: '0.06em', flexShrink: 0 }}>OPUS AI</span>
+              {hasSavedData && <span style={{ fontSize: 9, fontWeight: 700, color: C.green, background: `${C.green}20`, border: `1px solid ${C.green}50`, borderRadius: 20, padding: '2px 8px', letterSpacing: '0.06em', flexShrink: 0 }}>SAVED</span>}
               </div>
               <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{analysis.subtitle}</p>
             </div>
@@ -1691,6 +1892,15 @@ export default function IntelligenceCanvasPage() {
             <button onClick={() => setShareModalUrl(window.location.href)} title="Share report" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Link size={11} /> Share
             </button>
+            {/* Save button */}
+            <button onClick={saveAnalysis} title={hasSavedData ? 'Analysis saved locally' : 'Save analysis to browser'} style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${saved ? C.green + '80' : 'rgba(255,255,255,0.2)'}`, background: saved ? `${C.green}25` : 'rgba(255,255,255,0.1)', color: saved ? C.green : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
+              {saved ? <BookmarkCheck size={11} /> : <Bookmark size={11} />}
+              {saved ? 'Saved!' : hasSavedData ? 'Re-save' : 'Save'}
+            </button>
+            {/* Compare (moved from section tabs) */}
+            <button onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }} title="Side-by-side compare" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${compareMode ? C.violet + '80' : 'rgba(255,255,255,0.2)'}`, background: compareMode ? `${C.violet}30` : 'rgba(255,255,255,0.1)', color: compareMode ? '#c4b5fd' : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
+              <Columns size={11} /> Compare
+            </button>
             <button onClick={rerun} disabled={rerunning} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.85)', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>
               <RefreshCw size={10} className={rerunning ? 'animate-spin' : ''} /> Regenerate
             </button>
@@ -1708,13 +1918,38 @@ export default function IntelligenceCanvasPage() {
           />
         )}
 
+        {/* Fix F: fallback warning — AI response failed, showing deterministic output */}
+        {aiFallbackWarning && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 10,
+            background: '#fef3c7', border: '1px solid #f59e0b',
+            borderRadius: 8, padding: '8px 14px', margin: '0 22px',
+            fontSize: 13, color: '#92400e',
+          }}>
+            <span style={{ fontSize: 16 }}>⚠️</span>
+            <span>
+              <strong>AI analysis unavailable</strong> — showing deterministic report from raw data.
+              The /intelligence/analyze endpoint may be unreachable or the response was malformed.
+              Check backend logs for <code>[intelligence/analyze]</code> errors.
+            </span>
+            <button
+              onClick={() => setAiFallbackWarning(false)}
+              style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#92400e', fontWeight: 700 }}
+            >✕</button>
+          </div>
+        )}
+
         {/* Scrollable body */}
         <div className="print-zone" style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 22 }}>
 
           {/* Global KPIs */}
           {analysis.kpis.length > 0 && (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12, marginBottom: 20 }}>
-              {analysis.kpis.map((k, i) => <KpiCard key={i} kpi={k} idx={i} />)}
+              {analysis.kpis.map((k, i) => (
+                <div key={i} className={`intel-card intel-kpi-${Math.min(i, 5)}`}>
+                  <KpiCard kpi={k} idx={i} />
+                </div>
+              ))}
             </div>
           )}
 
@@ -1749,44 +1984,10 @@ export default function IntelligenceCanvasPage() {
             </div>
           )}
 
-          {/* Correlations */}
-          <CorrelationCard correlations={analysis.correlations} />
-
-          {/* Section tabs + compare toggle (Feature 12) */}
-          <div style={{ display: 'flex', gap: 6, marginBottom: 20, flexWrap: 'wrap', alignItems: 'center' }}>
-            {analysis.sections.map(s => {
-              const isActive = s.id === activeSection
-              const isCompare = compareMode && s.id === compareSectionId
-              return (
-                <button key={s.id} onClick={() => {
-                  if (compareMode && s.id !== activeSection) { setCompareSectionId(s.id); return }
-                  setActiveSection(s.id)
-                }}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 7,
-                    padding: '7px 15px', borderRadius: 22, fontSize: 12, fontWeight: 600,
-                    border: isActive ? `1.5px solid ${C.teal}60` : isCompare ? `1.5px solid ${C.violet}60` : '1.5px solid #dde5ef',
-                    background: isActive ? `linear-gradient(135deg, ${C.teal}18, ${C.teal2}0a)` : isCompare ? `${C.violet}12` : C.card,
-                    color: isActive ? C.teal : isCompare ? C.violet : '#5a6b7c',
-                    cursor: 'pointer', transition: 'all 0.18s',
-                    boxShadow: isActive ? `0 2px 10px ${C.teal}22` : '0 1px 3px rgba(10,33,58,0.04)',
-                  }}>
-                  <span style={{ color: isActive ? C.teal : isCompare ? C.violet : C.muted }}><SectionIcon name={s.icon} size={12} /></span>
-                  {s.label}
-                </button>
-              )
-            })}
-            {/* Feature 12 toggle */}
-            <button
-              onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }}
-              title="Side-by-side compare"
-              style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, padding: '7px 13px', borderRadius: 22, fontSize: 11, fontWeight: 600, border: `1.5px solid ${compareMode ? C.violet : '#dde5ef'}`, background: compareMode ? `${C.violet}12` : 'white', color: compareMode ? C.violet : C.muted, cursor: 'pointer' }}>
-              <Columns size={12} /> Compare
-            </button>
-          </div>
 
           {/* Active section — or side-by-side (Feature 12) */}
           {!compareMode && currentSection && (
+            <div key={currentSection.id} className="intel-section-enter">
             <SectionContent
               section={currentSection} sectionIdx={sectionIdx}
               shareToken={shareToken}
@@ -1801,6 +2002,7 @@ export default function IntelligenceCanvasPage() {
               annotations={annotations}
               onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${currentSection.id}|${chartTitle}|${pt}`)}
             />
+            </div>
           )}
           {compareMode && (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'start' }}>
@@ -1845,18 +2047,84 @@ export default function IntelligenceCanvasPage() {
         </div>
       </div>
 
-      {/* Copilot */}
-      <div style={{ borderLeft: '1px solid #e8eef5', overflow: 'hidden' }}>
-        {shareToken
-          ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
-          : <InlineCopilot canvasId={canvasId} projectId={projectId} canvasName={String(canvas?.name ?? 'Report')} analysis={analysis} />}
+      {/* AI Copilot — floating action button + slide-out panel */}
+      <div style={{ position: 'fixed', bottom: 28, right: 28, zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 12 }}>
+        {copilotOpen && (
+          <div style={{
+            width: 380, height: 'calc(100vh - 140px)',
+            background: 'white', borderRadius: 20,
+            boxShadow: '0 24px 64px rgba(0,0,0,0.18), 0 8px 32px rgba(0,180,216,0.1)',
+            border: '1px solid #e2eaf4', overflow: 'hidden',
+            animation: 'slideUpPanel 0.3s cubic-bezier(0.34,1.56,0.64,1)',
+          }}>
+            {shareToken
+              ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
+              : <CanvasChatPanel
+                  projectId={projectId}
+                  canvasId={canvasId}
+                  widgets={rawWidgets as CanvasWidgetData[]}
+                  pages={(canvas?.layout_config as { pages?: { id: string; name: string; order: number }[] })?.pages ?? []}
+                  onClose={() => setCopilotOpen(false)}
+                  onWidgetAdded={() => {}}
+                />}
+          </div>
+        )}
+        <button
+          onClick={() => setCopilotOpen(p => !p)}
+          title={copilotOpen ? 'Close AI Copilot' : 'Open AI Copilot'}
+          style={{
+            width: 56, height: 56, borderRadius: '50%', border: 'none', cursor: 'pointer',
+            background: copilotOpen
+              ? `linear-gradient(135deg, ${C.red}, #f97316)`
+              : `linear-gradient(135deg, ${C.teal} 0%, ${C.teal2} 100%)`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: `0 6px 24px ${copilotOpen ? C.red : C.teal}60, 0 2px 8px rgba(0,0,0,0.15)`,
+            transition: 'all 0.25s cubic-bezier(0.34,1.56,0.64,1)',
+            animation: copilotOpen ? 'none' : 'fabFloat 3s ease-in-out infinite',
+          }}
+        >
+          <span style={{ transition: 'transform 0.25s', transform: copilotOpen ? 'rotate(90deg)' : 'rotate(0deg)', display: 'flex' }}>
+            {copilotOpen ? <X size={22} color="white" /> : <MessageSquare size={22} color="white" />}
+          </span>
+        </button>
       </div>
 
       <style>{`
-        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeSlideIn  { from { opacity: 0; transform: translateY(8px); }  to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeInUp     { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes scaleIn      { from { opacity: 0; transform: scale(0.93); }      to { opacity: 1; transform: scale(1); } }
+        @keyframes slideUpPanel { from { opacity: 0; transform: translateY(28px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        @keyframes fabFloat     { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
         @keyframes ipulse { 0%,100%{transform:scale(1);opacity:.15} 50%{transform:scale(1.3);opacity:.06} }
         @keyframes ispin  { to { transform: rotate(360deg); } }
         @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+        /* Hover lift for cards */
+        .intel-card { transition: transform 0.22s ease, box-shadow 0.22s ease !important; }
+        .intel-card:hover { transform: translateY(-3px) !important; box-shadow: 0 12px 32px rgba(0,0,0,0.1) !important; }
+
+        /* Hover pulse for header buttons */
+        .intel-hdr-btn { transition: background 0.15s, opacity 0.15s, transform 0.15s !important; }
+        .intel-hdr-btn:hover { opacity: 0.9 !important; transform: scale(1.04) !important; }
+
+        /* Section nav icon buttons */
+        .intel-nav-btn { transition: background 0.18s, transform 0.18s !important; }
+        .intel-nav-btn:hover { transform: scale(1.12) !important; }
+
+        /* Insight cards */
+        .intel-insight { transition: transform 0.2s ease, box-shadow 0.2s ease !important; }
+        .intel-insight:hover { transform: translateY(-2px) !important; box-shadow: 0 8px 20px rgba(0,0,0,0.08) !important; }
+
+        /* Section content fade-in on section change */
+        .intel-section-enter { animation: fadeInUp 0.35s cubic-bezier(0.22,1,0.36,1) both; }
+
+        /* KPI card stagger */
+        .intel-kpi-0 { animation: scaleIn 0.3s 0.05s both; }
+        .intel-kpi-1 { animation: scaleIn 0.3s 0.1s both; }
+        .intel-kpi-2 { animation: scaleIn 0.3s 0.15s both; }
+        .intel-kpi-3 { animation: scaleIn 0.3s 0.2s both; }
+        .intel-kpi-4 { animation: scaleIn 0.3s 0.25s both; }
+        .intel-kpi-5 { animation: scaleIn 0.3s 0.3s both; }
 
         /* Feature 7: PDF / print styles */
         @media print {
