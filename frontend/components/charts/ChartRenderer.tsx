@@ -120,9 +120,37 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   }
 
   // recharts data array from rows (or from labels/values if rows is empty)
-  const rechartData = rows.length > 0
+  const rawRechartData = rows.length > 0
     ? rows
     : labels.map((l, i) => ({ [xKey]: l, [yKey]: values[i] }))
+
+  // Strip trailing all-zero rows (SQL often returns future months with 0 values)
+  const lastNonZeroIdx = (() => {
+    for (let i = rawRechartData.length - 1; i >= 0; i--) {
+      const v = Number(rawRechartData[i][yKey] ?? 0)
+      if (!isNaN(v) && v !== 0) return i
+    }
+    return rawRechartData.length - 1
+  })()
+  const trimmedData = rawRechartData.slice(0, lastNonZeroIdx + 1)
+
+  // Format ISO datetime labels to a readable short form (e.g. "2026-03-01T00:00:00" → "Mar 2026")
+  const formatXLabel = (val: unknown): string => {
+    const s = String(val ?? '')
+    // Matches ISO datetime: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD 00:00:00
+    const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ]/)
+    if (isoMatch) {
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+      const mon = months[parseInt(isoMatch[2], 10) - 1] ?? isoMatch[2]
+      return `${mon} ${isoMatch[1]}`
+    }
+    return s
+  }
+
+  const rechartData = trimmedData.map(row => ({
+    ...row,
+    [xKey]: formatXLabel(row[xKey]),
+  }))
 
   // ── Shared computed values (used by ref-line, labels, comparison) ──────────
   const numYVals = rechartData.map(r => Number(r[yKey] ?? 0)).filter(n => !isNaN(n) && isFinite(n))

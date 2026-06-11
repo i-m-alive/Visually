@@ -42,6 +42,12 @@ interface Props {
   activePageId?: string
   onClose: () => void
   onWidgetAdded: () => void
+  // optional overrides for embedding contexts (e.g. intelligence page)
+  title?: string
+  subtitle?: string
+  suggestedQuestions?: string[]
+  initialWidth?: number
+  onAddToPage?: (charts: Array<ChartResult | ChatMsg['newWidget']>) => void
 }
 
 function inlineRender(text: string): React.ReactNode[] {
@@ -106,10 +112,12 @@ function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]):
   return Array.from(new Set(qs)).slice(0, 5)
 }
 
-export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded }: Props) {
+export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([{
     role: 'assistant',
-    content: 'Hi! I have full access to your canvas report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
+    content: title
+      ? `Hi! I'm your **${title}**. I have full access to your report data and live database. Ask me anything about the data, explore trends, or generate new charts.`
+      : 'Hi! I have full access to your canvas report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
   }])
   const [input, setInput]     = useState('')
   const [sending, setSending]   = useState(false)
@@ -117,15 +125,18 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   const [showSuggestions, setShowSuggestions] = useState(true)
   const endRef                  = useRef<HTMLDivElement>(null)
   const textareaRef             = useRef<HTMLTextAreaElement>(null)
-  const [panelWidth, setPanelWidth] = useState(320)
+  const [panelWidth, setPanelWidth] = useState(initialWidth ?? 320)
   const resizingRef  = useRef(false)
   const resizeStartX = useRef(0)
-  const resizeStartW = useRef(320)
+  const resizeStartW = useRef(initialWidth ?? 320)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
-  const recommended  = buildRecommendations(widgets, pages)
+  const widgetRecs   = buildRecommendations(widgets, pages)
+  const recommended  = suggestedQuestions?.length
+    ? Array.from(new Set([...suggestedQuestions, ...widgetRecs])).slice(0, 6)
+    : widgetRecs
 
   const startResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
@@ -272,26 +283,30 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   }, [])
 
   return (
-    <div
-      className="relative bg-white border-l border-gray-100 flex flex-col h-full"
-      style={{ width: panelWidth, flexShrink: 0 }}
-    >
-      {/* Resize handle — drag left edge to widen */}
+    <div className="relative flex h-full" style={{ width: panelWidth, flexShrink: 0 }}>
+      {/* Resize handle — sits outside overflow:hidden so it's always clickable */}
       <div
         onMouseDown={startResize}
-        className="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize z-20 flex items-center justify-center group hover:bg-indigo-50/80 transition-colors"
+        className="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize z-30 flex items-center justify-center group"
+        style={{ left: -4 }}
       >
-        <div className="w-0.5 h-8 rounded-full bg-gray-300 group-hover:bg-indigo-400 transition-colors" />
+        <div className="w-1 h-10 rounded-full bg-gray-300 group-hover:bg-blue-400 transition-colors" />
       </div>
+      <div className="relative bg-white flex flex-col h-full w-full" style={{ borderRadius: 16, overflow: 'hidden', border: '1px solid #e2eaf4' }}>
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-full flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
-            <Sparkles size={12} className="text-white" />
+      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0" style={{ background: 'linear-gradient(135deg, #0a213a, #0d3060)' }}>
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: 'linear-gradient(135deg, #00b4d8, #0077b6)' }}>
+            <Sparkles size={13} className="text-white" />
           </div>
-          <span className="text-sm font-semibold text-gray-900">Canvas Assistant</span>
+          <div>
+            <span className="text-sm font-semibold text-white">{title ?? 'Canvas Assistant'}</span>
+            {subtitle && <p className="text-[10px] leading-tight" style={{ color: 'rgba(255,255,255,0.45)', margin: 0 }}>{subtitle}</p>}
+          </div>
         </div>
-        <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-700 rounded transition-colors">
+        <button onClick={onClose} className="p-1 rounded transition-colors" style={{ color: 'rgba(255,255,255,0.5)' }}
+          onMouseEnter={e => (e.currentTarget.style.color = 'white')}
+          onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.5)')}>
           <X size={16} />
         </button>
       </div>
@@ -326,13 +341,25 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                   <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
                     <p className="text-xs font-semibold text-gray-700 mb-2">{msg.inlineCharts[0].title}</p>
                     <ChartRenderer result={msg.inlineCharts[0]} height={150} />
-                    <button
-                      onClick={() => handleAddWidgets([msg.inlineCharts![0]])}
-                      className="mt-2.5 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
-                      style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
-                    >
-                      <Plus size={11} /> Add to Canvas
-                    </button>
+                    <div className="mt-2.5">
+                      {onAddToPage ? (
+                        <button
+                          onClick={() => onAddToPage([msg.inlineCharts![0]])}
+                          className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors"
+                          style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
+                        >
+                          <Plus size={11} /> Add to Page
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleAddWidgets([msg.inlineCharts![0]])}
+                          className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
+                          style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
+                        >
+                          <Plus size={11} /> Add to Canvas
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ) : (
                   // Multiple charts — selectable list
@@ -360,21 +387,26 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                         <ChartRenderer result={chart} height={110} />
                       </div>
                     ))}
-                    <div className="px-3 py-2.5 flex gap-2 bg-white">
-                      <button
-                        onClick={() => handleAddWidgets(msg.inlineCharts!.filter(c => c.selected))}
-                        disabled={!msg.inlineCharts.some(c => c.selected)}
-                        className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-white rounded-lg disabled:opacity-40 transition-opacity"
-                        style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
-                      >
-                        <Plus size={10} /> Add selected ({msg.inlineCharts.filter(c => c.selected).length})
-                      </button>
-                      <button
-                        onClick={() => handleAddWidgets(msg.inlineCharts!)}
-                        className="flex items-center justify-center gap-1 px-3 py-1.5 text-xs font-medium text-gray-600 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
-                      >
-                        All ({msg.inlineCharts.length})
-                      </button>
+                    <div className="px-3 py-2.5 bg-white">
+                      {onAddToPage ? (
+                        <button
+                          onClick={() => onAddToPage(msg.inlineCharts!.filter(c => c.selected))}
+                          disabled={!msg.inlineCharts.some(c => c.selected)}
+                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold rounded-lg disabled:opacity-40"
+                          style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
+                        >
+                          <Plus size={10} /> Add to Page ({msg.inlineCharts.filter(c => c.selected).length})
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleAddWidgets(msg.inlineCharts!.filter(c => c.selected))}
+                          disabled={!msg.inlineCharts.some(c => c.selected)}
+                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-white rounded-lg disabled:opacity-40 transition-opacity"
+                          style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
+                        >
+                          <Plus size={10} /> Add to Canvas ({msg.inlineCharts.filter(c => c.selected).length})
+                        </button>
+                      )}
                     </div>
                   </div>
                 )
@@ -382,12 +414,22 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
 
               {/* JSON widget add button */}
               {msg.newWidget && (
-                <button
-                  onClick={() => handleAddWidgets([msg.newWidget!])}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-brand bg-brand/10 rounded-lg hover:bg-brand/20 transition-colors self-start"
-                >
-                  <Plus size={12} /> Add to canvas
-                </button>
+                onAddToPage ? (
+                  <button
+                    onClick={() => onAddToPage([msg.newWidget!])}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg self-start"
+                    style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
+                  >
+                    <Plus size={12} /> Add to Page
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleAddWidgets([msg.newWidget!])}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-brand bg-brand/10 rounded-lg hover:bg-brand/20 transition-colors self-start"
+                  >
+                    <Plus size={12} /> Add to Canvas
+                  </button>
+                )
               )}
 
               {/* Retry button — shown when AI described a chart but didn't generate it */}
@@ -460,6 +502,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
         </div>
         <p className="text-xs text-gray-400 mt-1.5 text-center">Full DB access · All pages · Enter to send</p>
       </div>
+      </div>{/* end overflow:hidden inner panel */}
     </div>
   )
 }

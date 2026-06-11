@@ -1680,6 +1680,50 @@ export default function IntelligenceCanvasPage() {
     [],
   )
 
+  // Build suggested questions from the analysis for the copilot
+  const analysisSuggestions = React.useMemo<string[]>(() => {
+    if (!analysis) return []
+    const qs: string[] = []
+    const sec = analysis.sections.find(s => s.id === activeSection) ?? analysis.sections[0]
+    if (sec?.key_finding) qs.push(`What is driving: "${sec.key_finding.slice(0, 60)}"?`)
+    if (sec?.recommendation) qs.push(`How do I action this: "${sec.recommendation.slice(0, 60)}"?`)
+    analysis.sections.slice(0, 3).forEach(s => {
+      if (s.charts[0]) qs.push(`Show the trend for "${s.charts[0].title}"`)
+    })
+    const kpi = analysis.kpis[0]
+    if (kpi) qs.push(`What is driving "${kpi.label}" being ${kpi.value}?`)
+    qs.push('Which areas need the most attention?', 'What are the top risks in this report?', 'Summarize the key takeaways')
+    return Array.from(new Set(qs)).slice(0, 6)
+  }, [analysis, activeSection])
+
+  // Add copilot-generated charts to the active intelligence section
+  const handleAddToPage = useCallback((charts: Array<{ title: string; chart_type: string; chart_data?: { labels?: unknown[]; values?: unknown[] } } | undefined>) => {
+    if (!analysis) return
+    const targetId = activeSection || analysis.sections[0]?.id
+    const newCharts: AgentChart[] = charts.filter(Boolean).map(c => {
+      const ct = c!
+      const t = (['bar_vertical', 'bar'].includes(ct.chart_type) ? 'bar'
+        : ct.chart_type === 'line' ? 'line'
+        : ct.chart_type === 'area' ? 'area'
+        : ['pie', 'donut'].includes(ct.chart_type) ? 'pie'
+        : 'bar') as AgentChart['type']
+      const labels = ct.chart_data?.labels ?? []
+      const values = ct.chart_data?.values ?? []
+      return {
+        title: ct.title,
+        type: t,
+        data: (labels as unknown[]).map((l, i) => ({ name: String(l ?? ''), value: Number((values as unknown[])[i] ?? 0) })),
+      }
+    })
+    if (!newCharts.length) return
+    setAnalysis(prev => prev ? {
+      ...prev,
+      sections: prev.sections.map(s =>
+        s.id === targetId ? { ...s, charts: [...s.charts, ...newCharts] } : s
+      ),
+    } : prev)
+  }, [analysis, activeSection])
+
   const saveAnalysis = useCallback(() => {
     if (!analysis) return
     try {
@@ -2051,11 +2095,12 @@ export default function IntelligenceCanvasPage() {
       <div style={{ position: 'fixed', bottom: 28, right: 28, zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 12 }}>
         {copilotOpen && (
           <div style={{
-            width: 380, height: 'calc(100vh - 140px)',
-            background: 'white', borderRadius: 20,
+            height: 'calc(100vh - 120px)',
+            borderRadius: 16,
             boxShadow: '0 24px 64px rgba(0,0,0,0.18), 0 8px 32px rgba(0,180,216,0.1)',
-            border: '1px solid #e2eaf4', overflow: 'hidden',
+            overflow: 'visible',   /* let CanvasChatPanel's resize handle be clickable */
             animation: 'slideUpPanel 0.3s cubic-bezier(0.34,1.56,0.64,1)',
+            display: 'flex',
           }}>
             {shareToken
               ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
@@ -2066,6 +2111,11 @@ export default function IntelligenceCanvasPage() {
                   pages={(canvas?.layout_config as { pages?: { id: string; name: string; order: number }[] })?.pages ?? []}
                   onClose={() => setCopilotOpen(false)}
                   onWidgetAdded={() => {}}
+                  title="Report Copilot"
+                  subtitle="Full report context · Live DB access"
+                  initialWidth={440}
+                  suggestedQuestions={analysisSuggestions}
+                  onAddToPage={handleAddToPage}
                 />}
           </div>
         )}
