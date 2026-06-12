@@ -2,6 +2,15 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# Load .env so DATABASE_URL / ENCRYPTION_KEY resolve to the correct values
+_env_file = os.path.join(os.path.dirname(__file__), '..', '..', '.env')
+if os.path.exists(_env_file):
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv(_env_file, override=True)
+    except ImportError:
+        pass
+
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional

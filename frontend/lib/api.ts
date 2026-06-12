@@ -108,7 +108,7 @@ export const intelligenceApi = {
    * - Has 32 768 max_tokens (enough for a full 6-10 section report)
    * - Has NO conversation history or chart-creation system prompt contamination
    */
-  analyze: (data: { prompt: string; canvas_name?: string }) =>
+  analyze: (data: { prompt: string; canvas_name?: string; force?: boolean }) =>
     api.post<{ text: string }>('/intelligence/analyze', data),
 
   /**

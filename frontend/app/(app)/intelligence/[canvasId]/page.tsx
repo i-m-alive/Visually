@@ -464,52 +464,103 @@ function addTrendToData(data: Array<{name: string; value: number; [key:string]: 
 // ── Real HTML table ────────────────────────────────────────────────────────────
 const YEAR_RE = /^(19|20)\d{2}$/
 
-function MiniSparkline({ values, color }: { values: number[]; color: string }) {
+function MiniSparkline({ values }: { values: number[]; color?: string }) {
   if (values.length < 2) return null
   const min = Math.min(...values), max = Math.max(...values)
   const range = max - min || 1
-  const W = 72, H = 26
+  const W = 68, H = 28
   const pts = values.map((v, i) => {
     const x = (i / (values.length - 1)) * W
-    const y = H - ((v - min) / range) * (H - 4) - 2
-    return `${x.toFixed(1)},${y.toFixed(1)}`
-  }).join(' ')
+    const y = H - ((v - min) / range) * (H - 6) - 3
+    return [x.toFixed(1), y.toFixed(1)] as [string, string]
+  })
+  const polyPts = pts.map(p => p.join(',')).join(' ')
   const isUp = values[values.length - 1] >= values[0]
   const lineColor = isUp ? '#16a34a' : '#dc2626'
+  const areaPath = `M${pts[0].join(',')} ${pts.slice(1).map(p => `L${p.join(',')}`).join(' ')} L${W},${H} L0,${H} Z`
+  const [lx, ly] = pts[pts.length - 1]
   return (
-    <svg width={W} height={H} style={{ display: 'block', overflow: 'visible' }}>
-      <polyline points={pts} fill="none" stroke={lineColor} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
-      <circle cx={pts.split(' ').at(-1)?.split(',')[0]} cy={pts.split(' ').at(-1)?.split(',')[1]} r={2.5} fill={lineColor} />
+    <svg width={W} height={H} style={{ display: 'block', overflow: 'visible', flexShrink: 0 }}>
+      <defs>
+        <linearGradient id={`spk-${isUp ? 'up' : 'dn'}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={lineColor} stopOpacity={0.18} />
+          <stop offset="100%" stopColor={lineColor} stopOpacity={0.01} />
+        </linearGradient>
+      </defs>
+      <path d={areaPath} fill={`url(#spk-${isUp ? 'up' : 'dn'})`} />
+      <polyline points={polyPts} fill="none" stroke={lineColor} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={lx} cy={ly} r={2.5} fill={lineColor} />
     </svg>
+  )
+}
+
+function BulletBar({ value, max }: { value: number; max: number }) {
+  const pct = max > 0 ? Math.min(1, Math.abs(value) / max) : 0
+  const color = '#0e7490'
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 80 }}>
+      <div style={{ flex: 1, height: 5, background: '#e2e8f0', borderRadius: 3, overflow: 'hidden' }}>
+        <div style={{ width: `${pct * 100}%`, height: '100%', background: color, borderRadius: 3 }} />
+      </div>
+    </div>
   )
 }
 
 function TableView({ chart }: { chart: AgentChart }) {
   const [sortCol, setSortCol] = React.useState<string | null>(null)
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('desc')
-  const [showAll, setShowAll] = React.useState(false)
-  const PAGE_SIZE = 15
+  const [search, setSearch] = React.useState('')
 
   const rawCols = chart.data.length > 0
-    ? Object.keys(chart.data[0]).filter(k => !['_trend'].includes(k))
+    ? Object.keys(chart.data[0]).filter(k => k !== '_trend')
     : ['name', 'value']
 
+  // Drop columns where every value is identical to a prior column (e.g. NAME == CUSTOMER)
+  const dedupedCols = rawCols.filter((col, idx) =>
+    !rawCols.slice(0, idx).some(prev =>
+      chart.data.length > 0 &&
+      chart.data.every(row => String(row[col] ?? '') === String(row[prev] ?? ''))
+    )
+  )
+
   // Detect year-like columns (2020–2030) to build sparkline
-  const yearCols = rawCols.filter(c => YEAR_RE.test(c))
+  const yearCols = dedupedCols.filter(c => YEAR_RE.test(c))
   const hasTrend = yearCols.length >= 2
-  const displayCols = hasTrend ? rawCols.filter(c => !YEAR_RE.test(c)) : rawCols
+  const displayCols = hasTrend ? dedupedCols.filter(c => !YEAR_RE.test(c)) : dedupedCols
+
+  // Classify columns
+  const isYoyCol = (c: string) =>
+    /yoy|pct|percent|change|growth|vs\s/i.test(c) || c.includes('%')
+  const isNumericCol = (c: string) =>
+    chart.data.slice(0, 8).filter(r => r[c] !== null && r[c] !== undefined && r[c] !== '').some(r => !isNaN(Number(r[c])))
+
+  // Primary value column for bullet bars (first numeric non-YOY non-name column)
+  const valueCol = displayCols.find(c =>
+    isNumericCol(c) && !isYoyCol(c) && !['name', 'customer', 'label'].includes(c.toLowerCase())
+  )
+  const maxValue = valueCol
+    ? Math.max(...chart.data.map(r => Math.abs(Number(r[valueCol] ?? 0))).filter(v => !isNaN(v) && isFinite(v)))
+    : 0
+  const showBullet = !!valueCol && maxValue > 0 && !hasTrend
+
+  const filteredData = React.useMemo(() => {
+    if (!search.trim()) return chart.data
+    const q = search.toLowerCase()
+    return chart.data.filter(row =>
+      Object.values(row).some(v => String(v ?? '').toLowerCase().includes(q))
+    )
+  }, [chart.data, search])
 
   const sortedData = React.useMemo(() => {
-    if (!sortCol) return chart.data
-    return [...chart.data].sort((a, b) => {
+    if (!sortCol) return filteredData
+    return [...filteredData].sort((a, b) => {
       const av = a[sortCol] ?? '', bv = b[sortCol] ?? ''
       const an = Number(av), bn = Number(bv)
       const cmp = !isNaN(an) && !isNaN(bn) ? an - bn : String(av).localeCompare(String(bv))
       return sortDir === 'asc' ? cmp : -cmp
     })
-  }, [chart.data, sortCol, sortDir])
+  }, [filteredData, sortCol, sortDir])
 
-  const visibleData = showAll ? sortedData : sortedData.slice(0, PAGE_SIZE)
   const total = sortedData.length
 
   const toggleSort = (col: string) => {
@@ -517,72 +568,154 @@ function TableView({ chart }: { chart: AgentChart }) {
     else { setSortCol(col); setSortDir('desc') }
   }
 
-  const fmtCell = (val: unknown): React.ReactNode => {
-    if (val === null || val === undefined) return <span style={{ color: '#cbd5e1' }}>—</span>
+  const fmtNum = (num: number, yoy: boolean): React.ReactNode => {
+    if (num === 0) return <span style={{ color: '#d1d5db' }}>—</span>
+    if (yoy) {
+      // Values between -2 and 2 are typically decimal rates (0.08 → 8%)
+      const pct = Math.abs(num) <= 2 ? num * 100 : num
+      const pos = pct >= 0
+      const col = pos ? '#16a34a' : '#dc2626'
+      const label = Math.abs(pct) >= 100 ? `${pct.toFixed(0)}%` : Math.abs(pct) < 0.1 ? `${pct.toFixed(2)}%` : `${pct.toFixed(1)}%`
+      return (
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', gap: 3,
+          color: col, fontWeight: 600, fontSize: 11,
+          background: pos ? 'rgba(22,163,74,0.08)' : 'rgba(220,38,38,0.08)',
+          borderRadius: 4, padding: '2px 6px', whiteSpace: 'nowrap',
+        }}>
+          {pos ? '▲' : '▼'}&nbsp;{pos ? '+' : ''}{label}
+        </span>
+      )
+    }
+    if (Math.abs(num) >= 1e9) return <span style={{ color: '#0f172a', fontWeight: 600 }}>{(num / 1e9).toFixed(2)}B</span>
+    if (Math.abs(num) >= 1e6) return <span style={{ color: '#0f172a', fontWeight: 600 }}>{(num / 1e6).toFixed(2)}M</span>
+    if (Math.abs(num) >= 1e3) return <span style={{ color: '#0f172a', fontWeight: 600 }}>{num.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+    return <span style={{ color: '#0f172a', fontWeight: 600 }}>{num.toFixed(2)}</span>
+  }
+
+  const fmtCell = (val: unknown, col: string): React.ReactNode => {
+    if (val === null || val === undefined || val === '') return <span style={{ color: '#d1d5db' }}>—</span>
+    const yoy = isYoyCol(col)
+    if (typeof val === 'string' && val.endsWith('%')) {
+      const n = parseFloat(val)
+      return !isNaN(n) ? fmtNum(n / 100, true) : <span style={{ color: '#0f172a' }}>{val}</span>
+    }
     const num = Number(val)
-    if (isNaN(num) || val === '') return <span style={{ color: '#374151' }}>{String(val)}</span>
-    const isPct2 = typeof val === 'string' && val.endsWith('%')
-    const color = isPct2 ? (parseFloat(val) >= 0 ? '#16a34a' : '#dc2626') : '#374151'
-    if (Math.abs(num) >= 1e9) return <span style={{ color, fontWeight: 600 }}>{(num/1e9).toFixed(1)}B</span>
-    if (Math.abs(num) >= 1e6) return <span style={{ color, fontWeight: 600 }}>{(num/1e6).toFixed(1)}M</span>
-    if (Math.abs(num) >= 1e3) return <span style={{ color, fontWeight: 600 }}>{num.toLocaleString()}</span>
-    if (isPct2) return (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color, fontWeight: 700 }}>
-        {parseFloat(val) >= 0 ? '↑' : '↓'}{val}
-      </span>
-    )
-    return <span style={{ color, fontWeight: 600 }}>{String(val)}</span>
+    if (!isNaN(num)) return fmtNum(num, yoy)
+    return <span style={{ color: '#0f172a' }}>{String(val)}</span>
+  }
+
+  const thBase: React.CSSProperties = {
+    padding: '9px 14px', fontWeight: 700, color: '#64748b',
+    whiteSpace: 'nowrap', fontSize: 10, letterSpacing: '0.05em',
+    textTransform: 'uppercase', cursor: 'pointer', userSelect: 'none',
+    background: '#f8fafc', position: 'sticky', top: 0,
   }
 
   return (
-    <div className="intel-table-card" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid #e8eef5', boxShadow: '0 2px 8px rgba(0,0,0,0.04)' }}>
-      {/* Header bar */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px 10px 14px', background: C.navy }}>
-        <span style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.7)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{chart.title}</span>
-        {total > PAGE_SIZE && (
-          <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', background: 'rgba(255,255,255,0.08)', borderRadius: 10, padding: '2px 8px' }}>
-            {showAll ? total : Math.min(PAGE_SIZE, total)} of {total}
-          </span>
-        )}
+    <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(0,0,0,0.06)', background: 'white' }}>
+
+      {/* ── Header bar ── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', background: C.navy }}>
+        <span style={{ flex: 1, minWidth: 0, fontSize: 11, fontWeight: 700, color: 'white', textTransform: 'uppercase', letterSpacing: '0.08em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {chart.title}
+        </span>
+        {/* Search */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, background: 'rgba(255,255,255,0.1)', borderRadius: 7, padding: '4px 9px' }}>
+          <svg width={9} height={9} viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.45)" strokeWidth={2.5}>
+            <circle cx={11} cy={11} r={8} /><path d="m21 21-4.35-4.35" />
+          </svg>
+          <input
+            value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="Filter…"
+            style={{ background: 'none', border: 'none', outline: 'none', color: 'white', fontSize: 10, width: 80, '::placeholder': { color: 'rgba(255,255,255,0.4)' } } as React.CSSProperties}
+          />
+        </div>
+        {/* Row count */}
+        <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.08)', borderRadius: 10, padding: '3px 8px', whiteSpace: 'nowrap' }}>
+          {total} row{total !== 1 ? 's' : ''}
+        </span>
       </div>
-      <div style={{ overflowX: 'auto', background: 'white' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+
+      {/* ── Scrollable table ── */}
+      <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 440 }}>
+        <table style={{ width: '100%', minWidth: 480, borderCollapse: 'collapse', fontSize: 12 }}>
           <thead>
-            <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
-              {displayCols.map(c => (
-                <th key={c}
-                  onClick={() => toggleSort(c)}
-                  style={{ padding: '9px 14px', textAlign: 'left', fontWeight: 600, color: '#64748b', whiteSpace: 'nowrap', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', cursor: 'pointer', userSelect: 'none', transition: 'color 0.1s' }}
+            <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
+              {displayCols.map((c, ci) => (
+                <th key={c} onClick={() => toggleSort(c)}
+                  style={{
+                    ...thBase,
+                    textAlign: ci === 0 ? 'left' : isYoyCol(c) ? 'center' : 'right',
+                    color: sortCol === c ? C.teal : '#64748b',
+                    // non-first columns shrink to content; first column is capped
+                    width: ci === 0 ? undefined : '1%',
+                    maxWidth: ci === 0 ? 260 : undefined,
+                    ...(ci === 0 ? { position: 'sticky', left: 0, zIndex: 3, boxShadow: '2px 0 4px rgba(0,0,0,0.04)' } : {}),
+                  }}
                 >
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     {c.replace(/_/g, ' ')}
-                    {sortCol === c ? (sortDir === 'desc' ? ' ↓' : ' ↑') : <span style={{ color: '#cbd5e1', fontSize: 8 }}>⇅</span>}
+                    {sortCol === c
+                      ? <span>{sortDir === 'desc' ? ' ↓' : ' ↑'}</span>
+                      : <span style={{ color: '#d1d5db', fontSize: 8 }}>⇅</span>}
                   </span>
                 </th>
               ))}
               {hasTrend && (
-                <th style={{ padding: '9px 14px', textAlign: 'left', fontWeight: 600, color: '#64748b', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
-                  Trend {yearCols[0]}–{yearCols[yearCols.length - 1]}
+                <th style={{ ...thBase, textAlign: 'left', zIndex: 2 }}>
+                  Trend&nbsp;{yearCols[0]}–{yearCols[yearCols.length - 1]}
+                </th>
+              )}
+              {showBullet && (
+                <th style={{ ...thBase, textAlign: 'left', zIndex: 2 }}>
+                  Distribution
                 </th>
               )}
             </tr>
           </thead>
           <tbody>
-            {visibleData.map((row, i) => {
+            {sortedData.map((row, i) => {
               const trendVals = hasTrend ? yearCols.map(y => Number(row[y] ?? 0)) : []
+              const trendUp = trendVals.length >= 2 && trendVals[trendVals.length - 1] >= trendVals[0]
+              const rowValue = valueCol ? Number(row[valueCol] ?? 0) : 0
+              const zebraBase = i % 2 === 0 ? 'white' : '#f8fafc'
               return (
-                <tr key={i} style={{ borderBottom: '1px solid #f1f5f9', transition: 'background 0.1s' }}
-                  onMouseEnter={e => (e.currentTarget.style.background = '#f0f9ff')}
-                  onMouseLeave={e => (e.currentTarget.style.background = 'white')}
+                <tr key={i}
+                  style={{ borderBottom: '1px solid #f1f5f9', background: zebraBase }}
+                  onMouseEnter={e => { e.currentTarget.style.background = '#f0f9ff' }}
+                  onMouseLeave={e => { e.currentTarget.style.background = zebraBase }}
                 >
                   {displayCols.map((c, ci) => (
-                    <td key={c} style={{ padding: '9px 14px', whiteSpace: 'nowrap', fontWeight: ci === 0 ? 600 : 400, color: ci === 0 ? C.ink : '#374151' }}>
-                      {fmtCell(row[c])}
+                    <td key={c} style={{
+                      padding: '9px 14px',
+                      textAlign: ci === 0 ? 'left' : isYoyCol(c) ? 'center' : 'right',
+                      whiteSpace: 'nowrap',
+                      ...(ci === 0 ? {
+                        position: 'sticky', left: 0, zIndex: 1,
+                        background: 'inherit',
+                        borderLeft: '3px solid transparent',
+                        fontWeight: 600, color: C.ink,
+                        boxShadow: '2px 0 4px rgba(0,0,0,0.04)',
+                        maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis',
+                      } : {}),
+                    }}>
+                      {fmtCell(row[c], c)}
                     </td>
                   ))}
                   {hasTrend && (
                     <td style={{ padding: '6px 14px' }}>
-                      <MiniSparkline values={trendVals} color={C.teal} />
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                        <MiniSparkline values={trendVals} />
+                        <span style={{ fontSize: 9, fontWeight: 700, color: trendUp ? '#16a34a' : '#dc2626', minWidth: 14 }}>
+                          {trendUp ? '▲' : '▼'}
+                        </span>
+                      </div>
+                    </td>
+                  )}
+                  {showBullet && valueCol && (
+                    <td style={{ padding: '8px 14px', minWidth: 110 }}>
+                      <BulletBar value={rowValue} max={maxValue} />
                     </td>
                   )}
                 </tr>
@@ -590,14 +723,24 @@ function TableView({ chart }: { chart: AgentChart }) {
             })}
           </tbody>
         </table>
+
+        {total === 0 && (
+          <div style={{ padding: '32px', textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
+            No rows match &ldquo;{search}&rdquo;
+          </div>
+        )}
       </div>
-      {total > PAGE_SIZE && (
-        <div style={{ padding: '8px 16px', background: '#fafbfd', borderTop: '1px solid #f1f5f9', textAlign: 'center' }}>
-          <button onClick={() => setShowAll(v => !v)} style={{ fontSize: 11, color: C.teal, background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}>
-            {showAll ? `Show less ↑` : `Show all ${total} rows ↓`}
-          </button>
-        </div>
-      )}
+
+      {/* ── Footer ── */}
+      <div style={{ padding: '7px 14px', background: '#f8fafc', borderTop: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ fontSize: 10, color: '#94a3b8' }}>
+          {search ? `${total} of ${chart.data.length} rows` : `${total} rows`}
+          {hasTrend && <span style={{ marginLeft: 8, color: '#cbd5e1' }}>· sparkline: {yearCols[0]}–{yearCols[yearCols.length - 1]}</span>}
+        </span>
+        {chart.insight && (
+          <span style={{ fontSize: 10, color: '#64748b', fontStyle: 'italic' }}>{chart.insight}</span>
+        )}
+      </div>
     </div>
   )
 }
@@ -640,6 +783,7 @@ function AgentChartView({
 }) {
   const [viewType, setViewType] = useState(chart.type)
   const [insightVisible, setInsightVisible] = useState(false)
+  const [showRawData, setShowRawData] = useState(false)
   const switchOpts = CHART_SWITCH_OPTS[chart.type] ?? []
 
   const color = chart.color ?? PALETTE[colorIdx % PALETTE.length]
@@ -647,8 +791,9 @@ function AgentChartView({
 
   if (!chart.data?.length) {
     return (
-      <div style={{ background: 'white', borderRadius: 13, padding: 16, border: '1px solid #e8eef5', height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', fontSize: 12 }}>
-        No data available
+      <div style={{ background: '#f8fafc', borderRadius: 10, padding: '10px 14px', border: '1px dashed #e2e8f0', display: 'flex', alignItems: 'center', gap: 8, color: '#94a3b8', fontSize: 11 }}>
+        <span style={{ fontSize: 16, lineHeight: 1 }}>—</span>
+        <span><strong style={{ color: '#64748b' }}>{chart.title}</strong> · No data available</span>
       </div>
     )
   }
@@ -747,6 +892,23 @@ function AgentChartView({
               </div>
             )}
             {onAnnotate && <button onClick={() => onAnnotate('_chart')} title="Add note" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Pin size={10} /></button>}
+            {chart.type !== 'table' && (
+              <button
+                onClick={() => setShowRawData(v => !v)}
+                title={showRawData ? 'Hide raw data' : 'Show raw data table'}
+                className="intel-toolbar-btn"
+                style={{
+                  padding: '3px 7px', borderRadius: 6, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3,
+                  border: `1px solid ${showRawData ? C.teal : '#e8eef5'}`,
+                  background: showRawData ? `${C.teal}12` : 'white',
+                  color: showRawData ? C.teal : C.slate,
+                  fontSize: 9, fontWeight: 700, transition: 'all 0.15s',
+                }}
+              >
+                <Database size={9} />
+                {showRawData ? 'Hide' : 'Data'}
+              </button>
+            )}
             <button onClick={downloadPng} title="Download PNG" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
             {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
           </div>
@@ -940,6 +1102,18 @@ function AgentChartView({
         </ResponsiveContainer>
       )}
       </div>{/* /ref */}
+
+      {/* ── Raw data table (toggled by Data button) ── */}
+      {showRawData && chart.type !== 'table' && (
+        <div style={{ marginTop: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14, animation: 'slideDown 0.2s ease both' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+            <Database size={10} style={{ color: C.teal }} />
+            <span style={{ fontSize: 10, fontWeight: 700, color: C.teal, textTransform: 'uppercase', letterSpacing: '0.07em' }}>Raw Data</span>
+            <span style={{ fontSize: 9, color: '#94a3b8', marginLeft: 2 }}>{chart.data.length} rows</span>
+          </div>
+          <TableView chart={chart} />
+        </div>
+      )}
     </div>
   )
 }
@@ -999,6 +1173,15 @@ function SectionContent({
                 ? <p style={{ fontSize: 16, fontWeight: 700, color: C.ink, margin: 0, lineHeight: 1.35 }}>{section.key_finding}</p>
                 : <p style={{ fontSize: 14, fontWeight: 600, color: C.slate, margin: 0 }}>{section.narrative?.slice(0, 90) ?? ''}</p>
             }
+            {section.recommendation && (
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 8 }}>
+                <ArrowRight size={11} style={{ color: '#f97316', marginTop: 2, flexShrink: 0 }} />
+                <p style={{ fontSize: 12, color: '#7c2d12', margin: 0, lineHeight: 1.55 }}>
+                  <span style={{ fontWeight: 700, color: '#f97316' }}>Next Step: </span>
+                  {section.recommendation}
+                </p>
+              </div>
+            )}
           </div>
         </div>
         {onRegenSection && (
@@ -1013,41 +1196,6 @@ function SectionContent({
           </button>
         )}
       </div>
-
-      {/* ── Key finding + Recommendation side-by-side (only if data_story is the headline) ── */}
-      {section.data_story && (section.key_finding || section.recommendation) && (
-        <div style={{ display: 'grid', gridTemplateColumns: section.key_finding && section.recommendation ? '1fr 1fr' : '1fr', gap: 12 }}>
-          {section.key_finding && (
-            <div className="intel-finding-card" style={{ display: 'flex', gap: 10, background: `${C.teal}08`, borderRadius: 12, padding: '12px 15px', borderLeft: `3px solid ${C.teal}` }}>
-              <Zap size={13} style={{ color: C.teal, marginTop: 2, flexShrink: 0 }} />
-              <div>
-                <p style={{ fontSize: 9, fontWeight: 700, color: C.teal, textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 3px' }}>Key Finding</p>
-                <p style={{ fontSize: 12, fontWeight: 600, color: C.ink, margin: 0, lineHeight: 1.5 }}>{section.key_finding}</p>
-              </div>
-            </div>
-          )}
-          {section.recommendation && (
-            <div className="intel-rec-card" style={{ display: 'flex', gap: 10, background: '#fff7ed', borderRadius: 12, padding: '12px 15px', borderLeft: '3px solid #f97316' }}>
-              <ArrowRight size={13} style={{ color: '#f97316', marginTop: 2, flexShrink: 0 }} />
-              <div>
-                <p style={{ fontSize: 9, fontWeight: 700, color: '#f97316', textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 3px' }}>Next Step</p>
-                <p style={{ fontSize: 12, fontWeight: 600, color: '#7c2d12', margin: 0, lineHeight: 1.5 }}>{section.recommendation}</p>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── Recommendation alongside key_finding when data_story is the headline ── */}
-      {!section.data_story && section.recommendation && (
-        <div className="intel-rec-card" style={{ display: 'flex', gap: 10, background: '#fff7ed', borderRadius: 12, padding: '12px 15px', borderLeft: '3px solid #f97316' }}>
-          <ArrowRight size={13} style={{ color: '#f97316', marginTop: 2, flexShrink: 0 }} />
-          <div>
-            <p style={{ fontSize: 9, fontWeight: 700, color: '#f97316', textTransform: 'uppercase', letterSpacing: '0.08em', margin: '0 0 3px' }}>Next Step</p>
-            <p style={{ fontSize: 12, fontWeight: 600, color: '#7c2d12', margin: 0, lineHeight: 1.5 }}>{section.recommendation}</p>
-          </div>
-        </div>
-      )}
 
       {/* ── Narrative body text ── */}
       {section.narrative && (
@@ -1066,7 +1214,8 @@ function SectionContent({
 
       {/* ── Performers + Charts ── */}
       {(hasPerformers || section.charts.length > 0) && (() => {
-        const charts = section.charts
+        // skip charts with no data so they don't leave blank holes
+        const charts = section.charts.filter(ch => (ch.data?.length ?? 0) > 0)
         const firstChart = charts[0]
         const restCharts = charts.slice(1)
         return (
@@ -1775,14 +1924,23 @@ export default function IntelligenceCanvasPage() {
         const live = byId.get(norm(w.id))
         if (!live) return w
         const existingCd = (w.chart_data as Record<string, unknown>) ?? {}
+        const existingRows = (existingCd.rows as unknown[]) ?? []
+        const existingCols = (existingCd.columns as string[]) ?? []
+        const existingLabels = (existingCd.labels as unknown[]) ?? []
+        const existingValues = (existingCd.values as unknown[]) ?? []
+        const liveRows = live.rows ?? []
+        const liveCols = live.columns ?? []
+        const liveLabels = live.labels ?? []
+        const liveValues = live.values ?? []
         return {
           ...w,
           chart_data: {
             ...existingCd,
-            rows: live.rows ?? existingCd.rows ?? [],
-            columns: live.columns ?? existingCd.columns ?? [],
-            labels: live.labels ?? existingCd.labels ?? [],
-            values: live.values ?? existingCd.values ?? [],
+            // always keep whichever source has more rows — never downgrade
+            rows: liveRows.length > existingRows.length ? liveRows : existingRows,
+            columns: liveCols.length > 0 ? liveCols : existingCols,
+            labels: liveLabels.length > existingLabels.length ? liveLabels : existingLabels,
+            values: liveValues.length > existingValues.length ? liveValues : existingValues,
           },
         }
       })
@@ -2023,7 +2181,7 @@ export default function IntelligenceCanvasPage() {
       } catch { /* keep stale data */ }
 
       const result = await runIntelligenceAgent(
-        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined },
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, force: true },
         s => setAgentStep(s),
       )
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
@@ -2162,7 +2320,8 @@ export default function IntelligenceCanvasPage() {
         )}
 
         {/* Scrollable body */}
-        <div className="print-zone" style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 22 }}>
+        <div className="print-zone" style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '22px 28px' }}>
+          <div style={{ maxWidth: 1280, marginLeft: 'auto', marginRight: 'auto' }}>
 
           {/* Global KPIs */}
           {analysis.kpis.length > 0 && (
@@ -2259,6 +2418,7 @@ export default function IntelligenceCanvasPage() {
               })()}
             </div>
           )}
+          </div>{/* /maxWidth wrapper */}
         </div>
       </div>
 

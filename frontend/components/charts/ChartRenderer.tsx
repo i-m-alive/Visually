@@ -304,7 +304,8 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
               ) : sortedRows.map((row, i) => {
                 const rowBg = i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)'
                 const barVal = primaryNumCol ? (typeof row[primaryNumCol] === 'number' ? row[primaryNumCol] as number : parseFloat(String(row[primaryNumCol] ?? 0))) : 0
-                const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, (barVal as number) / primaryMax)) : 0
+                const barValSafe = isNaN(barVal as number) ? 0 : barVal as number
+                const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, barValSafe / primaryMax)) : 0
                 return (
                   <tr
                     key={i}
@@ -337,10 +338,12 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
                         className="border-b"
                         style={{ padding: `${T.padY}px ${T.padX}px`, borderColor: 'var(--dash-table-border, #E5E7EB)', background: rowBg, width: T.barW }}
                       >
-                        <svg width={T.barW - 8} height={8}>
-                          <rect x={0} y={0} width={T.barW - 8} height={8} rx={2} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
-                          <rect x={0} y={0} width={Math.max(2, barPct * (T.barW - 8))} height={8} rx={2} fill={COLORS[0]} opacity={0.75} />
-                        </svg>
+                        {(T.barW ?? 0) > 8 && (
+                          <svg width={T.barW - 8} height={8}>
+                            <rect x={0} y={0} width={T.barW - 8} height={8} rx={2} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
+                            <rect x={0} y={0} width={Math.max(2, barPct * (T.barW - 8))} height={8} rx={2} fill={COLORS[0]} opacity={0.75} />
+                          </svg>
+                        )}
                       </td>
                     )}
                   </tr>

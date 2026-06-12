@@ -42,6 +42,45 @@ from shared.models.database_connections import DatabaseConnection
 from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
 from shared.bedrock_client import BEDROCK_SONNET_MODEL, _BEDROCK_EXECUTOR
 
+# Direct SQL execution — bypasses the HTTP query executor service entirely.
+# Works because agent_service/main.py adds backend/ to sys.path and loads .env
+# (so the correct DATABASE_URL / ENCRYPTION_KEY are already in the environment).
+# Each driver import is isolated so a missing optional package (redshift_connector,
+# aiomysql) does not prevent the postgres driver from loading.
+try:
+    from shared.encryption import decrypt as _decrypt
+    _DECRYPT_AVAILABLE = True
+except ImportError as _ie:
+    _DECRYPT_AVAILABLE = False
+    print(f"[intelligence] ⚠ encryption unavailable ({_ie})", flush=True)
+
+try:
+    from query_executor.drivers.postgres import execute_postgres as _direct_postgres
+    _POSTGRES_DIRECT = True
+except ImportError as _ie:
+    _POSTGRES_DIRECT = False
+    print(f"[intelligence] ⚠ postgres direct driver unavailable ({_ie})", flush=True)
+
+try:
+    from query_executor.drivers.mysql import execute_mysql as _direct_mysql
+    _MYSQL_DIRECT = True
+except ImportError:
+    _MYSQL_DIRECT = False
+
+try:
+    from query_executor.drivers.redshift import execute_redshift as _direct_redshift
+    _REDSHIFT_DIRECT = True
+except ImportError:
+    _REDSHIFT_DIRECT = False
+
+_DIRECT_EXECUTION = _DECRYPT_AVAILABLE and (_POSTGRES_DIRECT or _MYSQL_DIRECT or _REDSHIFT_DIRECT)
+print(
+    f"[intelligence] direct execution: enabled={_DIRECT_EXECUTION}"
+    f"  decrypt={_DECRYPT_AVAILABLE}"
+    f"  postgres={_POSTGRES_DIRECT}  mysql={_MYSQL_DIRECT}  redshift={_REDSHIFT_DIRECT}",
+    flush=True,
+)
+
 # Intelligence calls use a larger output budget than normal chart calls.
 # Override via INTELLIGENCE_MAX_TOKENS env var if the model supports more.
 _INTELLIGENCE_MAX_TOKENS = int(os.getenv("INTELLIGENCE_MAX_TOKENS", "16384"))
@@ -148,6 +187,7 @@ CRITICAL RULES:
 class AnalyzeRequest(BaseModel):
     prompt: str
     canvas_name: Optional[str] = None
+    force: bool = False  # bypass cache and run fresh Bedrock call
 
 
 # Cache TTL and lock timeout for intelligence results
@@ -173,19 +213,30 @@ async def intelligence_analyze(body: AnalyzeRequest, redis=Depends(get_redis)):
     lock_key  = f"intel:lock:{prompt_hash}"
     canvas    = body.canvas_name or "?"
 
-    # ── 1. Fast-path: cached result ──────────────────────────────────────────
-    try:
-        cached = await redis.get(cache_key)
-        if cached:
-            raw = cached.decode() if isinstance(cached, bytes) else cached
-            print(
-                f"[intelligence/analyze] CACHE HIT  hash={prompt_hash[:8]}"
-                f"  canvas={canvas}  len={len(raw)}",
-                flush=True,
-            )
-            return {"text": raw}
-    except Exception as _re:
-        print(f"[intelligence/analyze] Redis read failed (non-fatal): {_re}", flush=True)
+    # ── 1. Fast-path: cached result (skipped when force=True) ───────────────
+    if not body.force:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                raw = cached.decode() if isinstance(cached, bytes) else cached
+                print(
+                    f"[intelligence/analyze] CACHE HIT  hash={prompt_hash[:8]}"
+                    f"  canvas={canvas}  len={len(raw)}",
+                    flush=True,
+                )
+                return {"text": raw}
+        except Exception as _re:
+            print(f"[intelligence/analyze] Redis read failed (non-fatal): {_re}", flush=True)
+    else:
+        print(
+            f"[intelligence/analyze] FORCE REFRESH  hash={prompt_hash[:8]}"
+            f"  canvas={canvas}  — deleting cached result",
+            flush=True,
+        )
+        try:
+            await redis.delete(cache_key)
+        except Exception:
+            pass
 
     # ── 2. Try to acquire lock (prevent thundering herd) ─────────────────────
     lock_acquired = False
@@ -459,14 +510,115 @@ def _inject_date_range(sql: str, date_from: str, date_to: str) -> str:
         return f"{sql} {connector} {date_clause}"
 
 
+def _build_result(widget_id: str, rows: list, columns: list) -> dict:
+    """Build a normalised success result dict from raw rows/columns."""
+    labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
+    values: list = []
+    if len(columns) > 1:
+        values = [r.get(columns[1]) for r in rows]
+    elif len(columns) == 1:
+        values = [r.get(columns[0]) for r in rows]
+    return {
+        "widget_id": widget_id,
+        "ok": True,
+        "rows": rows,
+        "columns": columns,
+        "labels": labels,
+        "values": values,
+    }
+
+
+async def _execute_direct(conn: "DatabaseConnection", widget_id: str, sql: str) -> dict:
+    """Execute SQL in-process using the connection object — no HTTP round-trip."""
+    password = ""
+    if conn.encrypted_password:
+        try:
+            password = _decrypt(conn.encrypted_password)
+        except Exception as exc:
+            return {"widget_id": widget_id, "ok": False, "error": f"decrypt failed: {exc}"}
+
+    db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+
+    try:
+        if db_type == "postgresql":
+            if not _POSTGRES_DIRECT:
+                return {"widget_id": widget_id, "ok": False, "error": "postgres direct driver not available"}
+            result = await _direct_postgres(
+                host=conn.host or "localhost",
+                port=conn.port or 5432,
+                database=conn.database_name or "",
+                user=conn.username or "",
+                password=password,
+                sql=sql,
+                timeout_seconds=int(_QUERY_TIMEOUT),
+                row_limit=_ROW_LIMIT,
+                ssl=conn.ssl_enabled,
+            )
+        elif db_type == "redshift":
+            if not _REDSHIFT_DIRECT:
+                return {"widget_id": widget_id, "ok": False, "error": "redshift direct driver not available"}
+            iam_role_arn = None
+            if conn.connection_options and isinstance(conn.connection_options, dict):
+                iam_role_arn = conn.connection_options.get("iam_role_arn")
+            result = await _direct_redshift(
+                host=conn.host or "localhost",
+                port=conn.port or 5439,
+                database=conn.database_name or "",
+                user=conn.username or "",
+                password=password,
+                ssl=conn.ssl_enabled,
+                sql=sql,
+                iam_role_arn=iam_role_arn,
+                row_limit=_ROW_LIMIT,
+            )
+        elif db_type == "mysql":
+            if not _MYSQL_DIRECT:
+                return {"widget_id": widget_id, "ok": False, "error": "mysql direct driver not available"}
+            result = await _direct_mysql(
+                host=conn.host or "localhost",
+                port=conn.port or 3306,
+                database=conn.database_name or "",
+                user=conn.username or "",
+                password=password,
+                sql=sql,
+                timeout_seconds=int(_QUERY_TIMEOUT),
+                row_limit=_ROW_LIMIT,
+                ssl=conn.ssl_enabled,
+            )
+        else:
+            return {"widget_id": widget_id, "ok": False, "error": f"Unsupported db_type: {db_type}"}
+
+        exec_error = result.get("error")
+        rows: list[dict] = result.get("rows") or []
+        columns: list[str] = result.get("columns") or []
+        if exec_error:
+            print(f"[intelligence-data] widget={widget_id[:8]} DIRECT_ERROR: {exec_error}", flush=True)
+            return {"widget_id": widget_id, "ok": False, "error": exec_error}
+
+        sample = rows[0] if rows else {}
+        print(
+            f"[intelligence-data] widget={widget_id[:8]}  rows={len(rows)}  cols={len(columns)}  mode=direct"
+            f"  col_names={columns}"
+            f"  sample_row={dict(list(sample.items())[:5])}",
+            flush=True,
+        )
+        return _build_result(widget_id, rows, columns)
+
+    except Exception as exc:
+        print(f"[intelligence-data] widget={widget_id[:8]} DIRECT_EXCEPTION: {exc}", flush=True)
+        return {"widget_id": widget_id, "ok": False, "error": str(exc)[:200]}
+
+
 async def _run_widget_sql(
     connection_id: str,
     widget_id: str,
     sql: str,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    conn_obj: Optional["DatabaseConnection"] = None,
 ) -> dict:
-    """Execute one widget's SQL via the query executor. Returns a result dict."""
+    """Execute one widget's SQL. Uses direct in-process driver when conn_obj is
+    supplied (preferred); falls back to HTTP query executor otherwise."""
     # Optionally inject date range filter
     working_sql = sql
     if date_from and date_to:
@@ -476,8 +628,16 @@ async def _run_widget_sql(
     cleaned = re.sub(r'\bLIMIT\s+\d+\b', '', working_sql, flags=re.IGNORECASE).rstrip('; ')
     capped_sql = f"{cleaned} LIMIT {_ROW_LIMIT}"
 
+    # ── Direct execution (preferred) ──────────────────────────────────────────
+    if conn_obj is not None and _DIRECT_EXECUTION:
+        return await _execute_direct(conn_obj, widget_id, capped_sql)
+
+    # ── HTTP fallback ─────────────────────────────────────────────────────────
+    # Use a slightly longer client timeout than the executor timeout so the
+    # executor has time to return its own error before the client gives up.
+    http_timeout = _QUERY_TIMEOUT + 10
     try:
-        async with httpx.AsyncClient(timeout=_QUERY_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
             resp = await client.post(
                 f"{QUERY_EXECUTOR_URL}/execute",
                 json={
@@ -489,35 +649,30 @@ async def _run_widget_sql(
             )
             if resp.status_code == 200:
                 data = resp.json()
+                exec_error = data.get("error")
                 rows: list[dict] = data.get("rows") or []
                 columns: list[str] = data.get("columns") or []
-                # Build labels / values from first two columns for chart compat
-                labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
-                values: list = []
-                if len(columns) > 1:
-                    values = [r.get(columns[1]) for r in rows]
-                elif len(columns) == 1:
-                    values = [r.get(columns[0]) for r in rows]
+                if exec_error:
+                    print(
+                        f"[intelligence-data] widget={widget_id[:8]} EXEC_ERROR: {exec_error}",
+                        flush=True,
+                    )
+                    return {"widget_id": widget_id, "ok": False, "error": exec_error}
+                sample = rows[0] if rows else {}
                 print(
-                    f"[intelligence-data] widget={widget_id[:8]}  rows={len(rows)}  cols={len(columns)}",
+                    f"[intelligence-data] widget={widget_id[:8]}  rows={len(rows)}  cols={len(columns)}  mode=http"
+                    f"  col_names={columns}"
+                    f"  sample_row={dict(list(sample.items())[:5])}",
                     flush=True,
                 )
-                return {
-                    "widget_id": widget_id,
-                    "ok": True,
-                    "rows": rows,
-                    "columns": columns,
-                    "labels": labels,
-                    "values": values,
-                }
+                return _build_result(widget_id, rows, columns)
             error_msg = f"executor HTTP {resp.status_code}"
+    except TimeoutError:
+        error_msg = f"HTTP executor timed out after {http_timeout}s"
     except Exception as exc:
-        error_msg = str(exc)[:200]
+        error_msg = repr(exc)[:200] or type(exc).__name__
 
-    print(
-        f"[intelligence-data] widget={widget_id[:8]} FAILED: {error_msg}",
-        flush=True,
-    )
+    print(f"[intelligence-data] widget={widget_id[:8]} FAILED: {error_msg}", flush=True)
     return {"widget_id": widget_id, "ok": False, "error": error_msg}
 
 
@@ -563,15 +718,17 @@ async def get_intelligence_data(
         if w.connection_id:
             conn_ids.add(w.connection_id)
 
-    conn_map: dict[str, str] = {}
+    # Store full DatabaseConnection objects so _run_widget_sql can execute directly
+    conn_obj_map: dict[str, "DatabaseConnection"] = {}
     if conn_ids:
         conns_result = await db.execute(
             select(DatabaseConnection).where(DatabaseConnection.id.in_(conn_ids))
         )
         for c in conns_result.scalars().all():
-            conn_map[str(c.id)] = str(c.id)
+            conn_obj_map[str(c.id)] = c
 
     project_conn_id: Optional[str] = None
+    project_conn_obj: Optional["DatabaseConnection"] = None
     if any(w.connection_id is None for w in widgets):
         proj_result = await db.execute(
             select(DatabaseConnection)
@@ -582,19 +739,23 @@ async def get_intelligence_data(
         pc = proj_result.scalar_one_or_none()
         if pc:
             project_conn_id = str(pc.id)
+            project_conn_obj = pc
 
-    # --- build task list ---
+    # --- build task list (keep widget reference for chart_data fallback) ---
     tasks = []
+    task_widgets: list = []  # parallel list — widget[i] corresponds to tasks[i]
     skipped = []
     for w in widgets:
         if not w.sql_query:
             skipped.append({"widget_id": str(w.id), "ok": False, "error": "no sql_query"})
             continue
-        conn_id = conn_map.get(str(w.connection_id)) if w.connection_id else project_conn_id
+        conn_id = str(w.connection_id) if w.connection_id else project_conn_id
+        conn_obj = conn_obj_map.get(conn_id) if conn_id else project_conn_obj
         if not conn_id:
             skipped.append({"widget_id": str(w.id), "ok": False, "error": "no connection"})
             continue
-        tasks.append(_run_widget_sql(conn_id, str(w.id), w.sql_query, date_from, date_to))
+        tasks.append(_run_widget_sql(conn_id, str(w.id), w.sql_query, date_from, date_to, conn_obj))
+        task_widgets.append(w)
 
     print(
         f"[intelligence-data] dashboard={dashboard_id[:8]}  "
@@ -604,6 +765,49 @@ async def get_intelligence_data(
     )
 
     # --- run all SQL queries in parallel ---
-    results = await asyncio.gather(*tasks) if tasks else []
+    results = list(await asyncio.gather(*tasks)) if tasks else []
 
-    return {"widget_data": list(results) + skipped}
+    # --- fallback: substitute stored chart_data for widgets that returned 0 rows ---
+    fallback_count = 0
+    for i, res in enumerate(results):
+        if res.get("ok") and len(res.get("rows") or []) == 0:
+            w = task_widgets[i]
+            cd = w.chart_data or {}
+            fb_rows: list[dict] = cd.get("rows") or []
+            fb_cols: list[str] = cd.get("columns") or []
+            if fb_rows and fb_cols:
+                results[i] = {
+                    "widget_id": res["widget_id"],
+                    "ok": True,
+                    "rows": fb_rows,
+                    "columns": fb_cols,
+                    "labels": cd.get("labels") or [],
+                    "values": cd.get("values") or [],
+                    "source": "chart_data_cache",
+                }
+                fallback_count += 1
+        elif not res.get("ok"):
+            # Also try chart_data fallback for failed SQL
+            w = task_widgets[i]
+            cd = w.chart_data or {}
+            fb_rows = cd.get("rows") or []
+            fb_cols = cd.get("columns") or []
+            if fb_rows and fb_cols:
+                results[i] = {
+                    "widget_id": res["widget_id"],
+                    "ok": True,
+                    "rows": fb_rows,
+                    "columns": fb_cols,
+                    "labels": cd.get("labels") or [],
+                    "values": cd.get("values") or [],
+                    "source": "chart_data_cache",
+                }
+                fallback_count += 1
+
+    if fallback_count:
+        print(
+            f"[intelligence-data] chart_data fallback applied to {fallback_count} widget(s)",
+            flush=True,
+        )
+
+    return {"widget_data": results + skipped}

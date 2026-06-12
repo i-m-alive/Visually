@@ -950,6 +950,7 @@ INSTRUCTIONS:
    • 2–3 insights[] cards — use specific values; type = positive/negative/neutral/warning
    • top_performers / bottom_performers: 3 rows each, from TOP/BOTTOM PERFORMERS data
    • 2–3 charts built from the actual data rows (bar, line, pie, combo, waterfall, scatter, bullet) — max 20 data points per chart
+   • If a widget's original chart_type is "table", OR if the widget has 3+ named columns of mixed dimensional/numeric data, ALSO include one chart with type:"table" — include up to 50 rows and preserve ALL meaningful column names as keys (e.g. {"customer":"Acme","revenue":120000,"region":"West","2023":95000,"2024":120000})
 3. Extract 4–6 top-level KPIs from the most prominent metrics. For sparkline_data use the actual numeric values from the widget sample_values or column profile (max 12 values).
 4. Write a 3-sentence morning_brief that opens with the single biggest finding (a specific number), covers the top 2 themes, ends with a risk or opportunity.
 
@@ -960,6 +961,7 @@ CHART DATA RULES — build charts from the real row data provided:
    • waterfall: data rows with base (cumulative subtotal) and value (delta)
    • bullet: target_value set, each data row is an entity vs that target
    • scatter: x_key + y_key + data rows containing those fields
+   • table: data rows preserving ALL column keys from the source widget, not just name/value — e.g. {"customer":"Acme","region":"West","2022":80000,"2023":95000,"2024":120000}
 
 ICON LIST (use ONLY these):
 ${VALID_ICON_NAMES}
@@ -1272,6 +1274,72 @@ function injectSourceSql(sections: AgentSection[], widgetSqlMap: Map<string, str
   }
 }
 
+function injectTableCharts(analysis: ExecutiveAnalysis, widgets: WidgetInput[]): void {
+  if (analysis.sections.length === 0) return
+
+  // Collect explicit table-type widgets first
+  let tableWidgets = widgets.filter(w =>
+    (w.chart_type === 'table' || w.chart_type === 'data_table') &&
+    (w.chart_data?.rows?.length ?? 0) > 0
+  )
+  // Fall back to multi-column widgets (4+ cols) if no explicit tables found
+  if (tableWidgets.length === 0) {
+    tableWidgets = widgets.filter(w =>
+      (w.chart_data?.columns?.length ?? 0) >= 4 &&
+      (w.chart_data?.rows?.length ?? 0) >= 3
+    )
+  }
+  if (tableWidgets.length === 0) return
+
+  // Round-robin index for widgets that don't match any section well
+  let rrIdx = 0
+
+  for (const w of tableWidgets) {
+    const allRows = w.chart_data?.rows ?? []
+    const cols = w.chart_data?.columns ?? []
+    const rows = allRows.slice(0, 100)
+    const firstCol = cols[0] ?? 'name'
+    const secondNumCol = cols.find(c => {
+      const sample = rows.slice(0, 5).map(r => r[c])
+      return sample.some(v => v !== null && v !== undefined && !isNaN(Number(v)))
+    }) ?? cols[1] ?? 'value'
+
+    const data: AgentChartRow[] = rows.map(row => ({
+      name: String(row[firstCol] ?? ''),
+      value: Number(row[secondNumCol] ?? 0),
+      ...row,
+    }))
+
+    const tableChart: AgentChart = {
+      title: w.title || 'Data Table',
+      type: 'table' as const,
+      data,
+      source_sql: w.sql_query,
+      insight: `${allRows.length} total rows · ${cols.length} columns`,
+    }
+
+    // Score each section by keyword overlap with the widget title
+    const widgetWords = (w.title || '').toLowerCase().split(/\W+/).filter(s => s.length > 3)
+    let bestSection = analysis.sections[rrIdx % analysis.sections.length]
+    let bestScore = 0
+
+    for (const section of analysis.sections) {
+      const haystack = [section.label, section.data_story ?? '', section.narrative ?? '']
+        .join(' ').toLowerCase()
+      const score = widgetWords.filter(word => haystack.includes(word)).length
+      if (score > bestScore) {
+        bestScore = score
+        bestSection = section
+      }
+    }
+
+    bestSection.charts.push(tableChart)
+    rrIdx++
+  }
+
+  console.log(`[intelligence] injected ${tableWidgets.length} raw table chart(s) into existing sections`)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1284,6 +1352,7 @@ export interface AgentOptions {
   shareToken?: string     // enables Skill 18 live SQL fetching
   dateRange?: { from: string; to: string } | null  // Feature 1: time range override
   skipSchemaFetch?: boolean  // set true to skip schema-context fetch (e.g. per-section regen)
+  force?: boolean            // bypass Redis cache and force a fresh Bedrock call
 }
 
 export async function runIntelligenceAgent(
@@ -1442,7 +1511,7 @@ export async function runIntelligenceAgent(
 
   let responseText = ''
   try {
-    const resp = await intelligenceApi.analyze({ prompt, canvas_name: canvasName })
+    const resp = await intelligenceApi.analyze({ prompt, canvas_name: canvasName, force: opts.force ?? false })
     responseText = resp.data?.text ?? ''
     console.log(`[intelligence] ai response received  len=${responseText.length}`)
   } catch (err) {
@@ -1477,6 +1546,7 @@ export async function runIntelligenceAgent(
   injectForecastData(analysis.sections, forecastMap, labelMap)
   injectReferenceLines(analysis.sections)
   injectSourceSql(analysis.sections, widgetSqlMap)
+  injectTableCharts(analysis, widgets as WidgetInput[])
 
   const injectedCount = analysis.sections.flatMap(s => s.charts).filter(c => c.source_sql).length
   console.log(
