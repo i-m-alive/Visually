@@ -464,6 +464,11 @@ function addTrendToData(data: Array<{name: string; value: number; [key:string]: 
 // ── Real HTML table ────────────────────────────────────────────────────────────
 const YEAR_RE = /^(19|20)\d{2}$/
 
+// Strip AI-appended placeholders like "(Sample)", "(Placeholder)", "(Demo)" from titles
+function cleanChartTitle(title: string): string {
+  return title.replace(/\s*\((sample|placeholder|demo|example|mock|no data|n\/a|test)\)\s*$/i, '').trim()
+}
+
 function MiniSparkline({ values }: { values: number[]; color?: string }) {
   if (values.length < 2) return null
   const min = Math.min(...values), max = Math.max(...values)
@@ -523,10 +528,19 @@ function TableView({ chart }: { chart: AgentChart }) {
     )
   )
 
+  // Drop columns where every value is null/empty — AI-generated phantom columns
+  const meaningfulCols = dedupedCols.filter(col =>
+    chart.data.length === 0 ||
+    chart.data.some(row => {
+      const v = row[col]
+      return v !== null && v !== undefined && v !== '' && String(v).trim() !== ''
+    })
+  )
+
   // Detect year-like columns (2020–2030) to build sparkline
-  const yearCols = dedupedCols.filter(c => YEAR_RE.test(c))
+  const yearCols = meaningfulCols.filter(c => YEAR_RE.test(c))
   const hasTrend = yearCols.length >= 2
-  const displayCols = hasTrend ? dedupedCols.filter(c => !YEAR_RE.test(c)) : dedupedCols
+  const displayCols = hasTrend ? meaningfulCols.filter(c => !YEAR_RE.test(c)) : meaningfulCols
 
   // Classify columns
   const isYoyCol = (c: string) =>
@@ -605,20 +619,56 @@ function TableView({ chart }: { chart: AgentChart }) {
     return <span style={{ color: '#0f172a' }}>{String(val)}</span>
   }
 
+  // Scale first-column width down as the table grows wider so data columns breathe
+  const totalVisualCols =
+    displayCols.length + (hasTrend ? 1 : 0) + (showBullet ? 1 : 0)
+  const firstColMaxW =
+    totalVisualCols <= 2 ? 320 :
+    totalVisualCols <= 4 ? 220 :
+    totalVisualCols <= 6 ? 180 :
+    totalVisualCols <= 9 ? 150 :
+    120
+
+  // Font + padding + visible-row budget scale inversely with column count
+  // — wide tables use smaller text so every column stays readable
+  const cellFontSize =
+    totalVisualCols <= 3 ? 12 :
+    totalVisualCols <= 6 ? 11 :
+    10
+
+  const cellPadV = totalVisualCols <= 4 ? 9 : totalVisualCols <= 7 ? 7 : 5  // px
+  const cellPadH = totalVisualCols <= 4 ? 14 : totalVisualCols <= 7 ? 10 : 8
+  const cellPad  = `${cellPadV}px ${cellPadH}px`
+
+  // How many rows fit comfortably before the table starts to dominate the page
+  const maxVisibleRows =
+    totalVisualCols <= 3 ? 15 :
+    totalVisualCols <= 6 ? 12 :
+    totalVisualCols <= 9 ? 8 :
+    6
+
+  // Derive a pixel height that shows exactly maxVisibleRows rows + the sticky header
+  const rowPxH        = cellFontSize <= 10 ? 29 : cellFontSize <= 11 ? 32 : 36
+  const headerPxH     = 42
+  const tableMaxHeight = Math.min(
+    maxVisibleRows * rowPxH + headerPxH,
+    totalVisualCols <= 3 ? 560 : 460,   // absolute cap per density tier
+  )
+
   const thBase: React.CSSProperties = {
-    padding: '9px 14px', fontWeight: 700, color: '#64748b',
-    whiteSpace: 'nowrap', fontSize: 10, letterSpacing: '0.05em',
+    padding: cellPad, fontWeight: 700, color: '#64748b',
+    whiteSpace: 'nowrap', fontSize: Math.max(9, cellFontSize - 1), letterSpacing: '0.05em',
     textTransform: 'uppercase', cursor: 'pointer', userSelect: 'none',
     background: '#f8fafc', position: 'sticky', top: 0,
   }
 
   return (
-    <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(0,0,0,0.06)', background: 'white' }}>
+    <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(0,0,0,0.06)', background: 'white', width: '100%', maxWidth: '100%', boxSizing: 'border-box' }}>
 
       {/* ── Header bar ── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', background: C.navy }}>
         <span style={{ flex: 1, minWidth: 0, fontSize: 11, fontWeight: 700, color: 'white', textTransform: 'uppercase', letterSpacing: '0.08em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {chart.title}
+          {cleanChartTitle(chart.title)}
         </span>
         {/* Search */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 5, background: 'rgba(255,255,255,0.1)', borderRadius: 7, padding: '4px 9px' }}>
@@ -638,8 +688,8 @@ function TableView({ chart }: { chart: AgentChart }) {
       </div>
 
       {/* ── Scrollable table ── */}
-      <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 440 }}>
-        <table style={{ width: '100%', minWidth: 480, borderCollapse: 'collapse', fontSize: 12 }}>
+      <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: tableMaxHeight }}>
+        <table style={{ width: '100%', minWidth: Math.max(320, totalVisualCols * 90), borderCollapse: 'collapse', fontSize: cellFontSize }}>
           <thead>
             <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
               {displayCols.map((c, ci) => (
@@ -650,7 +700,8 @@ function TableView({ chart }: { chart: AgentChart }) {
                     color: sortCol === c ? C.teal : '#64748b',
                     // non-first columns shrink to content; first column is capped
                     width: ci === 0 ? undefined : '1%',
-                    maxWidth: ci === 0 ? 260 : undefined,
+                    minWidth: ci === 0 ? undefined : isNumericCol(c) || isYoyCol(c) ? 80 : 70,
+                    maxWidth: ci === 0 ? firstColMaxW : undefined,
                     ...(ci === 0 ? { position: 'sticky', left: 0, zIndex: 3, boxShadow: '2px 0 4px rgba(0,0,0,0.04)' } : {}),
                   }}
                 >
@@ -688,7 +739,7 @@ function TableView({ chart }: { chart: AgentChart }) {
                 >
                   {displayCols.map((c, ci) => (
                     <td key={c} style={{
-                      padding: '9px 14px',
+                      padding: cellPad,
                       textAlign: ci === 0 ? 'left' : isYoyCol(c) ? 'center' : 'right',
                       whiteSpace: 'nowrap',
                       ...(ci === 0 ? {
@@ -697,14 +748,14 @@ function TableView({ chart }: { chart: AgentChart }) {
                         borderLeft: '3px solid transparent',
                         fontWeight: 600, color: C.ink,
                         boxShadow: '2px 0 4px rgba(0,0,0,0.04)',
-                        maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis',
+                        maxWidth: firstColMaxW, overflow: 'hidden', textOverflow: 'ellipsis',
                       } : {}),
                     }}>
                       {fmtCell(row[c], c)}
                     </td>
                   ))}
                   {hasTrend && (
-                    <td style={{ padding: '6px 14px' }}>
+                    <td style={{ padding: cellPad }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                         <MiniSparkline values={trendVals} />
                         <span style={{ fontSize: 9, fontWeight: 700, color: trendUp ? '#16a34a' : '#dc2626', minWidth: 14 }}>
@@ -714,7 +765,7 @@ function TableView({ chart }: { chart: AgentChart }) {
                     </td>
                   )}
                   {showBullet && valueCol && (
-                    <td style={{ padding: '8px 14px', minWidth: 110 }}>
+                    <td style={{ padding: cellPad, minWidth: 90 }}>
                       <BulletBar value={rowValue} max={maxValue} />
                     </td>
                   )}
@@ -735,6 +786,11 @@ function TableView({ chart }: { chart: AgentChart }) {
       <div style={{ padding: '7px 14px', background: '#f8fafc', borderTop: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <span style={{ fontSize: 10, color: '#94a3b8' }}>
           {search ? `${total} of ${chart.data.length} rows` : `${total} rows`}
+          {!search && total > maxVisibleRows && (
+            <span style={{ marginLeft: 6, color: C.teal, fontWeight: 600 }}>
+              · scroll to see {total - maxVisibleRows} more
+            </span>
+          )}
           {hasTrend && <span style={{ marginLeft: 8, color: '#cbd5e1' }}>· sparkline: {yearCols[0]}–{yearCols[yearCols.length - 1]}</span>}
         </span>
         {chart.insight && (
@@ -836,10 +892,10 @@ function AgentChartView({
     : []
 
   return (
-    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)' }}>
+    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)', width: '100%', minWidth: 0, boxSizing: 'border-box' }}>
       <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: `linear-gradient(180deg, ${color}, ${color}70)`, flexShrink: 0 }} />
-        <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{chart.title}</p>
+        <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{cleanChartTitle(chart.title)}</p>
         {/* Chart type switcher + controls */}
         <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'center' }}>
           {switchOpts.length > 1 && (
@@ -1214,39 +1270,77 @@ function SectionContent({
 
       {/* ── Performers + Charts ── */}
       {(hasPerformers || section.charts.length > 0) && (() => {
-        // skip charts with no data so they don't leave blank holes
-        const charts = section.charts.filter(ch => (ch.data?.length ?? 0) > 0)
-        const firstChart = charts[0]
-        const restCharts = charts.slice(1)
+        const charts = section.charts.filter(ch => {
+          if ((ch.data?.length ?? 0) === 0) return false
+          // Skip charts where every single cell is null/empty (AI-generated ghosts)
+          const hasAnyRealValue = ch.data.some(row =>
+            Object.values(row).some(v => v !== null && v !== undefined && v !== '' && String(v).trim() !== '')
+          )
+          return hasAnyRealValue
+        })
+
+        // A chart "needs the full row" if it's a table type OR its data rows carry
+        // more than 3 column keys beyond the standard name/value pair (e.g. multi-year
+        // revenue matrices, detail tables with 4+ dimensions). These cannot share a
+        // half-width column without truncating content.
+        const RESERVED = new Set(['name','value','base','total','projected','anomaly'])
+        const isWide = (ch: AgentChart) =>
+          ch.type === 'table' ||
+          (ch.data.length > 0 &&
+            Object.keys(ch.data[0]).filter(k => !RESERVED.has(k)).length > 2)
+
+        const wideCharts    = charts.filter(isWide)
+        const compactCharts = charts.filter(ch => !isWide(ch))
+        const firstCompact  = compactCharts[0]
+        const restCompact   = compactCharts.slice(1)
+
         return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {(hasPerformers || firstChart) && (
+
+            {/* Row 1 — performers sidebar + first compact chart */}
+            {(hasPerformers || firstCompact) && (
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: hasPerformers && firstChart ? '290px 1fr' : '1fr',
+                gridTemplateColumns: hasPerformers && firstCompact ? '260px minmax(0, 1fr)' : '1fr',
                 gap: 16, alignItems: 'start',
               }}>
                 {hasPerformers && (
-                  <div style={{ animation: 'fadeInLeft 0.3s 0.05s ease both' }}>
+                  <div style={{ animation: 'fadeInLeft 0.3s 0.05s ease both', minWidth: 0 }}>
                     <PerformerPanel top={section.top_performers ?? []} bottom={section.bottom_performers ?? []} label={section.label} />
                   </div>
                 )}
-                {firstChart && (
-                  <div style={{ animation: 'fadeInUp 0.32s 0.08s ease both' }}>
-                    <AgentChartView key={0} {...chartProps(firstChart, 0)} />
+                {firstCompact && (
+                  <div style={{ animation: 'fadeInUp 0.32s 0.08s ease both', minWidth: 0 }}>
+                    <AgentChartView {...chartProps(firstCompact, 0)} />
                   </div>
                 )}
               </div>
             )}
-            {restCharts.length > 0 && (
-              <div style={{ display: 'grid', gridTemplateColumns: restCharts.length === 1 ? '1fr' : '1fr 1fr', gap: 16 }}>
-                {restCharts.map((ch, i) => (
-                  <div key={i + 1} style={{ animation: `fadeInUp 0.32s ${0.12 + i * 0.08}s ease both` }}>
+
+            {/* Remaining compact charts — max 2 per row, responsive */}
+            {restCompact.length > 0 && (
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: restCompact.length === 1
+                  ? '1fr'
+                  : 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
+                gap: 16,
+              }}>
+                {restCompact.map((ch, i) => (
+                  <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0 }}>
                     <AgentChartView {...chartProps(ch, i + 1)} />
                   </div>
                 ))}
               </div>
             )}
+
+            {/* Wide charts (tables + multi-column) — always occupy the full row */}
+            {wideCharts.map((ch, i) => (
+              <div key={`wide-${i}`} style={{ animation: `fadeInUp 0.3s ${0.08 + i * 0.05}s ease both`, width: '100%', minWidth: 0 }}>
+                <AgentChartView {...chartProps(ch, compactCharts.length + i)} />
+              </div>
+            ))}
+
           </div>
         )
       })()}
@@ -2321,7 +2415,7 @@ export default function IntelligenceCanvasPage() {
 
         {/* Scrollable body */}
         <div className="print-zone" style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '22px 28px' }}>
-          <div style={{ maxWidth: 1280, marginLeft: 'auto', marginRight: 'auto' }}>
+          <div style={{ maxWidth: 1280, marginLeft: 'auto', marginRight: 'auto', width: '100%', boxSizing: 'border-box' }}>
 
           {/* Global KPIs */}
           {analysis.kpis.length > 0 && (
