@@ -61,18 +61,94 @@ export const agentApi = {
     api.get(`/agent/jobs/${jobId}`),
 }
 
+export interface ChatSendData {
+  session_id?: string
+  message: string
+  project_id: string
+  dashboard_id?: string
+  connection_id?: string
+  active_page_id?: string
+  model_preference?: 'opus' | 'sonnet'
+}
+
 export const chatApi = {
-  send: (data: {
-    session_id?: string
-    message: string
-    project_id: string
-    dashboard_id?: string
-    connection_id?: string
-    active_page_id?: string
-    model_preference?: 'opus' | 'sonnet'
-  }) => api.post('/agent/chat', data),
+  send: (data: ChatSendData) => api.post('/agent/chat', data),
   clear: (sessionId: string) =>
     api.delete(`/agent/chat/${sessionId}`),
+}
+
+export interface StreamChatHandlers {
+  onText: (delta: string) => void
+  onChart: (chart: Record<string, unknown>) => void
+  onAction?: (action: Record<string, unknown>) => void
+  onDone?: (meta: { session_id: string; turn_count: number }) => void
+  onError: (message: string) => void
+}
+
+/**
+ * Consume the /agent/chat/stream Server-Sent-Events endpoint.
+ * Streams the assistant's prose (onText deltas), then a final chart (onChart).
+ * Uses fetch because axios can't read a streaming response body in the browser.
+ */
+export async function streamChat(
+  data: ChatSendData,
+  handlers: StreamChatHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  let token: string | undefined
+  if (typeof window !== 'undefined') {
+    try {
+      const stored = localStorage.getItem('visually-auth')
+      if (stored) token = JSON.parse(stored)?.state?.accessToken
+    } catch {}
+  }
+
+  const resp = await fetch(`${API_URL}/agent/chat/stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(data),
+    signal,
+  })
+
+  if (!resp.ok || !resp.body) {
+    handlers.onError(`Stream request failed (${resp.status})`)
+    return
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+
+  const handle = (evt: {
+    type?: string; delta?: string; chart?: Record<string, unknown>;
+    action?: Record<string, unknown>; message?: string;
+    session_id?: string; turn_count?: number
+  }) => {
+    switch (evt.type) {
+      case 'text':   handlers.onText(evt.delta ?? ''); break
+      case 'chart':  if (evt.chart) handlers.onChart(evt.chart); break
+      case 'action': if (evt.action) handlers.onAction?.(evt.action); break
+      case 'error':  handlers.onError(evt.message ?? 'stream error'); break
+      case 'done':   handlers.onDone?.({ session_id: evt.session_id ?? '', turn_count: evt.turn_count ?? 0 }); break
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let sep: number
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const chunk = buf.slice(0, sep)
+      buf = buf.slice(sep + 2)
+      const line = chunk.split('\n').find(l => l.startsWith('data:'))
+      if (!line) continue
+      try { handle(JSON.parse(line.slice(5).trim())) } catch { /* skip malformed frame */ }
+    }
+  }
 }
 
 export const intelligenceApi = {

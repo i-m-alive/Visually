@@ -1,7 +1,7 @@
 'use client'
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { Send, Bot, Loader2, X, Plus, Sparkles } from 'lucide-react'
-import { chatApi, canvasApi, type WidgetCreate } from '@/lib/api'
+import { streamChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -168,77 +168,73 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
     setSending(true)
     setShowSuggestions(false)
 
-    setMessages(prev => [...prev, { role: 'user', content: text }])
+    // Push the user turn + an empty assistant placeholder we stream into.
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', content: text },
+      { role: 'assistant', content: '', triggerMsg: text },
+    ])
 
-    try {
-      const resp = await chatApi.send({
-        session_id:    sessionId,
-        message:       text,
-        project_id:    projectId,
-        dashboard_id:  canvasId,
-        connection_id: connectionId,
-        active_page_id: activePageId || undefined,
+    const toInlineChart = (ic: Record<string, unknown>): InlineChart => {
+      const extra: Record<string, unknown> = {}
+      if (ic.slicer_type)   extra.slicer_type   = ic.slicer_type
+      if (ic.slicer_column) extra.slicer_column = ic.slicer_column
+      return {
+        chart_type:     ic.chart_type as string,
+        title:          ic.title as string,
+        sql:            (ic.sql as string) ?? '',
+        score:          1,
+        low_confidence: false,
+        x_axis_label:   (ic.x_axis_label as string) ?? 'x',
+        y_axis_label:   (ic.y_axis_label as string) ?? 'y',
+        table_used:     '',
+        chart_data:     (ic.chart_data as ChartResult['chart_data']) ?? { rows: [], columns: [], labels: [], values: [] },
+        extra_config:   Object.keys(extra).length ? extra : undefined,
+        selected:       true,
+      }
+    }
+
+    // Mutate the most recent assistant message (the placeholder above).
+    const updateAssistant = (mut: (m: ChatMsg) => ChatMsg) => {
+      setMessages(prev => {
+        const next = [...prev]
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === 'assistant') { next[i] = mut(next[i]); break }
+        }
+        return next
       })
+    }
 
-      const data         = resp.data
-      const responseText = data?.text || 'I could not generate a response.'
-
-      // Build inlineCharts array from backend response
-      const toInlineChart = (ic: Record<string, unknown>): InlineChart => {
-        const extra: Record<string, unknown> = {}
-        if (ic.slicer_type)   extra.slicer_type   = ic.slicer_type
-        if (ic.slicer_column) extra.slicer_column = ic.slicer_column
-        return {
-          chart_type:     ic.chart_type as string,
-          title:          ic.title as string,
-          sql:            (ic.sql as string) ?? '',
-          score:          1,
-          low_confidence: false,
-          x_axis_label:   (ic.x_axis_label as string) ?? 'x',
-          y_axis_label:   (ic.y_axis_label as string) ?? 'y',
-          table_used:     '',
-          chart_data:     (ic.chart_data as ChartResult['chart_data']) ?? { rows: [], columns: [], labels: [], values: [] },
-          extra_config:   Object.keys(extra).length ? extra : undefined,
-          selected:       true,
-        }
-      }
-
-      let inlineCharts: InlineChart[] | undefined
-      const rawCharts: Record<string, unknown>[] = data?.inline_charts ?? []
-      if (rawCharts.length > 0) {
-        inlineCharts = rawCharts.map(toInlineChart)
-      } else if (data?.inline_chart) {
-        inlineCharts = [toInlineChart(data.inline_chart)]
-      }
-
-      // Fallback: detect JSON chart spec in text
-      let newWidget: ChatMsg['newWidget'] | undefined
-      if (!inlineCharts) {
-        const jsonMatch = responseText.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/)
-        if (jsonMatch) {
-          try {
-            const p = JSON.parse(jsonMatch[1])
-            if (p.sql || p.chart_type) {
-              newWidget = {
-                title:      p.title      || 'New Chart',
-                chart_type: p.chart_type || 'bar',
-                sql:        p.sql        || '',
-                chart_data: p.chart_data,
-              }
-            }
-          } catch { /* not a chart JSON */ }
-        }
-      }
-
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: responseText,
-        inlineCharts,
-        newWidget: inlineCharts ? undefined : newWidget,
-        triggerMsg: text,
-      }])
+    let acc = ''
+    try {
+      await streamChat(
+        {
+          session_id:     sessionId,
+          message:        text,
+          project_id:     projectId,
+          dashboard_id:   canvasId,
+          connection_id:  connectionId,
+          active_page_id: activePageId || undefined,
+        },
+        {
+          onText: (delta) => { acc += delta; updateAssistant(m => ({ ...m, content: acc })) },
+          onChart: (chart) => { updateAssistant(m => ({ ...m, inlineCharts: [toInlineChart(chart)] })) },
+          onError: () => {
+            updateAssistant(m => ({
+              ...m,
+              content: (m.content || '') + (m.content ? '\n\n' : '') + 'Sorry, something went wrong. Please try again.',
+            }))
+          },
+        },
+      )
+      // If the model produced no prose and no chart, leave a friendly fallback.
+      updateAssistant(m =>
+        (!m.content && !m.inlineCharts)
+          ? { ...m, content: 'I could not generate a response.' }
+          : m
+      )
     } catch {
-      setMessages(prev => [...prev, { role: 'assistant', content: 'Sorry, something went wrong. Please try again.' }])
+      updateAssistant(m => ({ ...m, content: m.content || 'Sorry, something went wrong. Please try again.' }))
     } finally {
       setSending(false)
     }
@@ -351,7 +347,9 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                   : 'bg-gray-100 text-gray-800 rounded-tl-sm'
               }`}>
                 {msg.role === 'assistant'
-                  ? <MarkdownText text={msg.content} />
+                  ? (msg.content
+                      ? <MarkdownText text={msg.content} />
+                      : <Loader2 size={12} className="animate-spin text-gray-400" />)
                   : msg.content}
               </div>
 
@@ -466,7 +464,10 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
           </div>
         ))}
 
-        {sending && (
+        {/* "More coming" indicator — shown only after prose has started streaming
+            (the empty placeholder bubble carries its own spinner before then),
+            so it signals that the chart is still being executed/rendered. */}
+        {sending && messages[messages.length - 1]?.role === 'assistant' && !!messages[messages.length - 1]?.content && (
           <div className="flex gap-2">
             <div className="w-6 h-6 rounded-full flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
               <Sparkles size={10} className="text-white" />
