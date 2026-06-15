@@ -1,7 +1,8 @@
 'use client'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { api, dashboardApi, shareApi, aiInsightsApi } from '@/lib/api'
+import { api, dashboardApi, shareApi, aiInsightsApi, vlyApi, endUserApi } from '@/lib/api'
+import { ConnectionPromptModal } from '@/components/end-user/ConnectionPromptModal'
 import {
   Loader2, AlertCircle, Search, X,
   BarChart2, Clock, RefreshCw, Share2, Heart, TrendingUp, Zap,
@@ -86,6 +87,10 @@ export default function EndUserDashboardPage() {
   const [importing, setImporting]         = useState(false)
   const [importError, setImportError]     = useState<string | null>(null)
   const [importSuccess, setImportSuccess] = useState<{ name: string; id: string; hasIntel: boolean } | null>(null)
+  // Connect-a-DB step (required before import — analysts have no projects/connections UI)
+  const [pendingFile, setPendingFile]     = useState<File | null>(null)
+  const [connHint, setConnHint]           = useState<Record<string, string> | undefined>(undefined)
+  const [showConnPrompt, setShowConnPrompt] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -141,31 +146,72 @@ export default function EndUserDashboardPage() {
     router.push(`/share/canvas/${token}`)
   }
 
+  // Step 1 — a file was picked: peek its connection fingerprint and require a DB
+  // connection before importing (analysts get live data, never a stale snapshot).
   const handleVlyFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
     e.target.value = ''
-    setImporting(true)
     setImportError(null)
     setImportSuccess(null)
+    let hint: Record<string, string> | undefined
     try {
+      const { default: JSZip } = await import('jszip')
+      const zip = await JSZip.loadAsync(file)
+      const metaFile = zip.file('meta.json')
+      if (metaFile) {
+        const meta = JSON.parse(await metaFile.async('string'))
+        if (meta?.connection_hint?.host) hint = meta.connection_hint
+      }
+    } catch { /* no hint — the form starts blank */ }
+    setConnHint(hint)
+    setPendingFile(file)
+    setShowConnPrompt(true)
+  }
+
+  // Step 2 — analyst supplied credentials: create + verify the connection, import the
+  // .vly, then bind the connection (crawl schema + refresh widgets with live data).
+  const connectImportAndBind = useCallback(async (details: {
+    db_type: string; host: string; port: string; database_name: string; username: string
+    password: string; ssl_enabled?: boolean; iam_role_arn?: string
+  }) => {
+    if (!pendingFile) return
+    // 2a — create + test the connection (throws on failure → modal shows the error)
+    const connResp = await endUserApi.createConnection({
+      db_type: details.db_type,
+      host: details.host,
+      port: details.port ? Number(details.port) : undefined,
+      database_name: details.database_name,
+      username: details.username,
+      password: details.password,
+      ssl_enabled: details.ssl_enabled,
+      iam_role_arn: details.iam_role_arn || undefined,
+    })
+    const connectionId = connResp.data.connection_id
+
+    setShowConnPrompt(false)
+    setImporting(true)
+    try {
+      // 2b — import the canvas
       const form = new FormData()
-      form.append('file', file)
+      form.append('file', pendingFile)
       const resp = await api.post('/end-user/import-vly', form, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
       const { dashboard_id, name, has_intelligence } = resp.data
-      // Canvas is now permanently saved via CanvasCollaborator — reload the list
+      // 2c — bind: sets connection on widgets + layout, crawls schema, refreshes live data
+      await vlyApi.bindConnection(dashboard_id, connectionId, { crawl: true, refresh: true })
       await load()
       setImportSuccess({ name, id: dashboard_id, hasIntel: has_intelligence })
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-        ?? 'Failed to import. Make sure it is a valid .vly file.'
+        ?? 'Imported, but failed to connect live data. Open the report to retry.'
       setImportError(msg)
     } finally {
       setImporting(false)
+      setPendingFile(null)
     }
-  }
+  }, [pendingFile, load])
 
   const filtered = dashboards.filter(d => {
     if (!search) return true
@@ -222,6 +268,16 @@ export default function EndUserDashboardPage() {
 
       {/* Hidden file input */}
       <input ref={fileRef} type="file" accept=".vly" className="hidden" onChange={handleVlyFile} />
+
+      {/* Required connect-a-DB step before importing — gives the analyst live data */}
+      {showConnPrompt && pendingFile && (
+        <ConnectionPromptModal
+          fileName={pendingFile.name}
+          connectionHint={connHint}
+          onConnect={connectImportAndBind}
+          onClose={() => { setShowConnPrompt(false); setPendingFile(null) }}
+        />
+      )}
 
       {/* Header */}
       <div className="px-6 py-4 bg-white border-b border-gray-100 flex-shrink-0">

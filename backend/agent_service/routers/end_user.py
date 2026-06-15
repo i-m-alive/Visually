@@ -12,6 +12,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +61,118 @@ async def _get_user(
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found")
     return user
+
+
+async def _get_or_create_personal_project(current_user: User, db: AsyncSession):
+    """The analyst UI has no 'projects' — every imported report and any DB connection
+    lives in this single auto-created personal project, invisibly."""
+    from shared.models.projects import Project
+    from shared.models.project_members import ProjectMember, MemberRole
+
+    proj_result = await db.execute(
+        select(Project)
+        .where(Project.owner_id == current_user.id)
+        .where(Project.name == "Imported Reports")
+    )
+    personal_project = proj_result.scalar_one_or_none()
+    if personal_project:
+        return personal_project
+
+    personal_project = Project(
+        id=uuid.uuid4(),
+        owner_id=current_user.id,
+        name="Imported Reports",
+        description="Auto-created for .vly reports you import",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(personal_project)
+    await db.flush()
+    db.add(ProjectMember(
+        id=uuid.uuid4(),
+        project_id=personal_project.id,
+        user_id=current_user.id,
+        role=MemberRole.owner,
+        joined_at=datetime.utcnow(),
+    ))
+    await db.flush()
+    return personal_project
+
+
+# ── POST /end-user/connections ────────────────────────────────────────────────
+
+class EndUserConnectionRequest(BaseModel):
+    db_type: str
+    host: str
+    database_name: str
+    username: str
+    password: Optional[str] = None
+    port: Optional[int] = None
+    name: Optional[str] = None
+    ssl_enabled: bool = False
+    iam_role_arn: Optional[str] = None   # Redshift IAM auth (optional)
+
+
+@router.post("/end-user/connections", status_code=201)
+async def end_user_create_connection(
+    body: EndUserConnectionRequest,
+    current_user: User = Depends(_get_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create + test a database connection in the analyst's personal project.
+
+    No project picker needed — the project is implicit. The password is Fernet-encrypted
+    (never stored raw). The connection is verified with a trivial query before we keep it,
+    so a canvas is only ever bound to a connection that actually works.
+    """
+    from shared.models.database_connections import DatabaseConnection, DbType
+    from shared.encryption import encrypt
+    from agent_service.utils.http_clients import call_query_executor
+
+    try:
+        db_type_enum = DbType(body.db_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unsupported database type: {body.db_type}")
+
+    personal_project = await _get_or_create_personal_project(current_user, db)
+
+    # Redshift IAM auth (when supplied) is carried in connection_options, where the
+    # query-executor router looks for it.
+    connection_options = {"iam_role_arn": body.iam_role_arn} if body.iam_role_arn else None
+
+    conn = DatabaseConnection(
+        id=uuid.uuid4(),
+        project_id=personal_project.id,
+        name=body.name or f"{body.database_name} @ {body.host}",
+        db_type=db_type_enum,
+        host=body.host,
+        port=body.port,
+        database_name=body.database_name,
+        username=body.username,
+        encrypted_password=encrypt(body.password) if body.password else None,
+        ssl_enabled=body.ssl_enabled,
+        connection_options=connection_options,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(conn)
+    await db.commit()
+    await db.refresh(conn)
+
+    # Verify it actually connects — a dead connection is worse than none.
+    test = await call_query_executor(str(conn.id), "SELECT 1", row_limit=1)
+    if test.get("error"):
+        await db.delete(conn)
+        await db.commit()
+        raise HTTPException(status_code=400, detail=f"Could not connect to the database: {test['error']}")
+
+    print(f"[end-user] created connection {str(conn.id)[:8]} for user {str(current_user.id)[:8]}", flush=True)
+    return {
+        "connection_id": str(conn.id),
+        "project_id": str(personal_project.id),
+        "name": conn.name,
+        "ok": True,
+    }
 
 
 # ── POST /end-user/import-vly ─────────────────────────────────────────────────

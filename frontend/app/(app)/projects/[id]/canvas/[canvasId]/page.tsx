@@ -11,7 +11,7 @@ import {
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
   FunctionSquare, Clock, Shield, FileDown, Zap,
 } from 'lucide-react'
-import { canvasApi, widgetApi, vlyApi } from '@/lib/api'
+import { canvasApi, widgetApi, vlyApi, scheduleApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import { ZoomModal } from '@/components/canvas/ZoomModal'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
@@ -407,19 +407,39 @@ export default function CanvasEditorPage() {
     ))
   }, [lockedWidgets])
 
+  // Re-execute SQL on the server (replacing cached chart_data with live results),
+  // THEN reload the canvas. Without the refresh-now call we'd just re-read the same
+  // stale cache and falsely report "refreshed".
   const handleRefreshWidget = useCallback(async (widgetId: string) => {
     setRefreshingId(widgetId)
-    await load()
-    setRefreshingId(null)
-    showToast('Widget data refreshed')
-  }, [load])
+    try {
+      await scheduleApi.refreshNow(canvasId)
+      await load()
+      showToast('Data refreshed from database')
+    } catch {
+      showToast('Refresh failed')
+    } finally {
+      setRefreshingId(null)
+    }
+  }, [canvasId, load])
 
   const handleRefreshAll = useCallback(async () => {
     setRefreshingId('all')
-    await load()
-    setRefreshingId(null)
-    showToast('All widgets refreshed')
-  }, [load])
+    try {
+      const resp = await scheduleApi.refreshNow(canvasId)
+      await load()
+      const r = (resp?.data ?? {}) as { refreshed?: number; total?: number }
+      showToast(
+        typeof r.refreshed === 'number'
+          ? `Refreshed ${r.refreshed}/${r.total ?? r.refreshed} widgets`
+          : 'All widgets refreshed',
+      )
+    } catch {
+      showToast('Refresh failed')
+    } finally {
+      setRefreshingId(null)
+    }
+  }, [canvasId, load])
 
   const handleApplyDateFilter = async () => {
     const active = Object.fromEntries(

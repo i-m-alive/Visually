@@ -269,8 +269,8 @@ async def refresh_now(
 ):
     """Re-run all widget SQL for this dashboard, save fresh chart_data."""
     from agent_service.scheduler import run_dashboard_refresh
-    await run_dashboard_refresh(dashboard_id)
-    return {"status": "refreshed", "dashboard_id": dashboard_id}
+    summary = await run_dashboard_refresh(dashboard_id)
+    return {"status": "refreshed", "dashboard_id": dashboard_id, **summary}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

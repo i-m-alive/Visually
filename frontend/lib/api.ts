@@ -355,6 +355,32 @@ export const widgetApi = {
     api.delete(`/widgets/${widgetId}`),
 }
 
+// ─── End-user (analyst) connections ───────────────────────────────────────────
+
+export interface EndUserConnectionInput {
+  db_type: string
+  host: string
+  database_name: string
+  username: string
+  password?: string
+  port?: number
+  name?: string
+  ssl_enabled?: boolean
+  iam_role_arn?: string
+}
+
+export const endUserApi = {
+  /**
+   * Create + test a DB connection in the analyst's implicit personal project.
+   * Returns the new connection id, which the caller then binds to a dashboard
+   * via vlyApi.bindConnection. Throws (400) if the database can't be reached.
+   */
+  createConnection: (data: EndUserConnectionInput) =>
+    api.post<{ connection_id: string; project_id: string; name: string; ok: boolean }>(
+      '/end-user/connections', data,
+    ),
+}
+
 // ─── AI Insights (end-user) ───────────────────────────────────────────────────
 
 export const aiInsightsApi = {
@@ -382,12 +408,17 @@ export const vlyApi = {
     if (stored) {
       try { token = JSON.parse(stored)?.state?.accessToken ?? '' } catch { /* ignore */ }
     }
-    let url = `${API_URL}/dashboards/${canvasId}/export-vly`
-    if (intelligence) {
-      url += `?intelligence=${encodeURIComponent(JSON.stringify(intelligence))}`
-    }
-
-    const response = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+    // POST the intelligence in the body — a bundled AI report can be tens of KB,
+    // which overflows the URL-length limit if sent as a query string.
+    const url = `${API_URL}/dashboards/${canvasId}/export-vly`
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ intelligence: intelligence ?? null }),
+    })
     if (!response.ok) throw new Error(`Export failed: ${response.status}`)
 
     // Read server-supplied filename from the now-exposed Content-Disposition header
@@ -438,6 +469,28 @@ export const vlyApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
+
+  /**
+   * Bind a live DB connection to a canvas (e.g. one just imported with cached data).
+   * Sets the connection on every widget + the layout, crawls the schema so the AI
+   * copilot is live-aware, and refreshes all widgets with live results.
+   */
+  bindConnection: (
+    dashboardId: string,
+    connectionId: string,
+    opts?: { crawl?: boolean; refresh?: boolean },
+  ) => api.post<{
+    status: string
+    dashboard_id: string
+    connection_id: string
+    widgets_bound: number
+    crawl_triggered: boolean
+    refreshed: boolean
+  }>(`/dashboards/${dashboardId}/bind-connection`, {
+    connection_id: connectionId,
+    crawl:   opts?.crawl   ?? true,
+    refresh: opts?.refresh ?? true,
+  }),
 }
 
 // ─── Share links ──────────────────────────────────────────────────────────────

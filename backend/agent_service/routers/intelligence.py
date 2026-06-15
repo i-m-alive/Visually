@@ -203,9 +203,32 @@ class AnalyzeRequest(BaseModel):
 
 # Cache TTL and lock timeout for intelligence results
 _INTEL_CACHE_TTL  = int(os.getenv("INTELLIGENCE_CACHE_TTL",  "1800"))  # 30 min result cache
-_INTEL_LOCK_TTL   = int(os.getenv("INTELLIGENCE_LOCK_TTL",   "600"))   # 10 min lock (Bedrock can take ~160 s)
+# Lock TTL must stay BELOW _INTEL_LOCK_WAIT so an orphaned lock (e.g. left by a
+# killed/--reload'd process) self-expires before a waiter gives up — letting the
+# waiter take over fast instead of hanging the full wait window. A *live* holder
+# keeps its lock fresh via _heartbeat_lock(), so this short TTL never cuts off a
+# healthy run even though Bedrock can take ~160 s.
+_INTEL_LOCK_TTL       = int(os.getenv("INTELLIGENCE_LOCK_TTL",       "120"))  # < LOCK_WAIT; refreshed by heartbeat
+_INTEL_LOCK_HEARTBEAT = float(os.getenv("INTELLIGENCE_LOCK_HEARTBEAT", "30.0"))  # re-extend lock TTL this often while computing
 _INTEL_LOCK_POLL  = float(os.getenv("INTELLIGENCE_LOCK_POLL", "2.0"))  # poll interval when waiting
 _INTEL_LOCK_WAIT  = int(os.getenv("INTELLIGENCE_LOCK_WAIT",   "300"))  # max seconds to wait for a peer
+
+
+async def _heartbeat_lock(redis, lock_key: str) -> None:
+    """Keep a held lock fresh while we compute so a live run never looks orphaned.
+
+    Re-extends the lock's TTL every _INTEL_LOCK_HEARTBEAT seconds. If the process
+    dies, the heartbeat stops and the short TTL lapses within one interval, so a
+    waiting peer can take over quickly."""
+    try:
+        while True:
+            await asyncio.sleep(_INTEL_LOCK_HEARTBEAT)
+            try:
+                await redis.expire(lock_key, _INTEL_LOCK_TTL)
+            except Exception:
+                return  # Redis unavailable — stop heartbeating, lock will lapse
+    except asyncio.CancelledError:
+        return
 
 
 @router.post("/intelligence/analyze")
@@ -297,6 +320,10 @@ async def intelligence_analyze(body: AnalyzeRequest, redis=Depends(get_redis)):
         f"  hash={prompt_hash[:8]}",
         flush=True,
     )
+    # Keep the lock fresh for the duration of a live run (only if we own it).
+    heartbeat_task = (
+        asyncio.create_task(_heartbeat_lock(redis, lock_key)) if lock_acquired else None
+    )
     try:
         raw = await _intel_bedrock_invoke(
             system_prompt=_INTELLIGENCE_SYSTEM_PROMPT,
@@ -317,6 +344,13 @@ async def intelligence_analyze(body: AnalyzeRequest, redis=Depends(get_redis)):
         print(f"[intelligence/analyze] FAILED after {time.time()-t0:.1f}s: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=502, detail=f"Bedrock call failed: {exc}")
     finally:
+        # Stop the heartbeat before releasing the lock.
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # Release lock whether we succeeded or failed
         try:
             if lock_acquired:
@@ -470,6 +504,10 @@ async def get_intelligence_schema_context(
 QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
 _ROW_LIMIT = 500          # rows per widget — enough for all 18 skills
 _QUERY_TIMEOUT = 20.0     # seconds per widget query
+# Cap simultaneous widget queries. The executor opens one DB connection per
+# request, so firing all N at once (a 30+ widget dashboard) saturates the pool
+# and the slow ones time out. Run a bounded batch instead — env-overridable.
+_INTEL_QUERY_CONCURRENCY = int(os.getenv("INTELLIGENCE_QUERY_CONCURRENCY", "6"))
 
 # Common date column name patterns (ORDER matters — more specific first)
 _DATE_COL_RE = re.compile(
@@ -770,13 +808,23 @@ async def get_intelligence_data(
 
     print(
         f"[intelligence-data] dashboard={dashboard_id[:8]}  "
-        f"executing={len(tasks)}  skipped={len(skipped)}"
+        f"executing={len(tasks)}  skipped={len(skipped)}  concurrency={_INTEL_QUERY_CONCURRENCY}"
         + (f"  date_range={date_from}→{date_to}" if date_from else ""),
         flush=True,
     )
 
-    # --- run all SQL queries in parallel ---
-    results = list(await asyncio.gather(*tasks)) if tasks else []
+    # --- run SQL queries with bounded concurrency ---
+    # Coroutines are lazy: building the list above didn't start them; each only
+    # runs once awaited inside the semaphore, so at most N execute at a time.
+    sem = asyncio.Semaphore(_INTEL_QUERY_CONCURRENCY)
+
+    async def _bounded(coro):
+        async with sem:
+            return await coro
+
+    results = (
+        list(await asyncio.gather(*[_bounded(t) for t in tasks])) if tasks else []
+    )
 
     # --- fallback: substitute stored chart_data for widgets that returned 0 rows ---
     fallback_count = 0

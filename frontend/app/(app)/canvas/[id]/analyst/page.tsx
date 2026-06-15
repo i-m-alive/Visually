@@ -10,8 +10,9 @@ import {
   Download, Bookmark, Calendar, Terminal, MessageSquare, Database,
   FileDown,
 } from 'lucide-react'
-import { api, publicCanvasApi, analystApi } from '@/lib/api'
+import { api, publicCanvasApi, analystApi, vlyApi, endUserApi } from '@/lib/api'
 import type { FilterItem, AnnotationData } from '@/lib/api'
+import { ConnectionPromptModal } from '@/components/end-user/ConnectionPromptModal'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
 import { FilterBar } from '@/components/analyst/FilterBar'
@@ -90,6 +91,9 @@ export default function AuthedAnalystPage() {
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [activePageId, setActivePageId] = useState('')
+  // Live-data connection (analysts have no projects UI — bind on demand)
+  const [connected, setConnected] = useState(false)
+  const [showConnect, setShowConnect] = useState(false)
   const lastRefresh = useRef<Date | null>(null)
 
   // Panel state
@@ -133,6 +137,7 @@ export default function AuthedAnalystPage() {
       .then(r => {
         const data: CanvasData = r.data
         setCanvas(data)
+        setConnected(Boolean((data.layout_config as Record<string, unknown>)?.connection_id))
         if (data.pages.length > 0) setActivePageId(data.pages[0].id)
       })
       .catch(err => {
@@ -164,6 +169,8 @@ export default function AuthedAnalystPage() {
 
   const handleRefresh = async () => {
     if (!canvas || !analystToken || refreshing) return
+    // No live DB bound yet → ask the analyst to connect before refreshing.
+    if (!connected) { setShowConnect(true); return }
     setRefreshing(true)
     try {
       const resp = await publicCanvasApi.refresh(analystToken)
@@ -177,6 +184,33 @@ export default function AuthedAnalystPage() {
     } catch { /* ignore */ }
     finally { setRefreshing(false) }
   }
+
+  // Create + verify a DB connection, bind it to this canvas (schema crawl + live
+  // refresh), then re-pull the canvas so widgets + the copilot are live.
+  const connectLiveData = useCallback(async (details: {
+    db_type: string; host: string; port: string; database_name: string; username: string
+    password: string; ssl_enabled?: boolean; iam_role_arn?: string
+  }) => {
+    const connResp = await endUserApi.createConnection({
+      db_type: details.db_type,
+      host: details.host,
+      port: details.port ? Number(details.port) : undefined,
+      database_name: details.database_name,
+      username: details.username,
+      password: details.password,
+      ssl_enabled: details.ssl_enabled,
+      iam_role_arn: details.iam_role_arn || undefined,
+    })
+    await vlyApi.bindConnection(String(id), connResp.data.connection_id, { crawl: true, refresh: true })
+    setConnected(true)
+    setShowConnect(false)
+    if (analystToken) {
+      try {
+        const r = await publicCanvasApi.get(analystToken)
+        setCanvas(r.data)
+      } catch { /* keep current view; data will refresh on next action */ }
+    }
+  }, [id, analystToken])
 
   // ── Filter application ────────────────────────────────────────────────────────
 
@@ -425,7 +459,11 @@ export default function AuthedAnalystPage() {
 
           {/* AI Chat toggle + annotation badge */}
           <button
-            onClick={() => setRightOpen(v => !v)}
+            onClick={() => {
+              // The copilot needs live data — require a connection before opening it.
+              if (!rightOpen && !connected) { setShowConnect(true); return }
+              setRightOpen(v => !v)
+            }}
             className={`relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-gray-200 transition-colors ${rightOpen ? 'bg-purple-100 border-purple-200 text-purple-600' : 'text-gray-600 hover:bg-gray-50'}`}
             title="AI Chat"
           >
@@ -625,6 +663,15 @@ export default function AuthedAnalystPage() {
           token={analystToken}
           dashboardName={canvas.name}
           onClose={() => setScheduleModal(false)}
+        />
+      )}
+
+      {showConnect && (
+        <ConnectionPromptModal
+          fileName={canvas.name}
+          connectionHint={(canvas.layout_config as { connection_hint?: Record<string, string> })?.connection_hint}
+          onConnect={connectLiveData}
+          onClose={() => setShowConnect(false)}
         />
       )}
     </div>

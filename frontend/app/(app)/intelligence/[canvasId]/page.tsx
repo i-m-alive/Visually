@@ -1206,11 +1206,11 @@ function AgentChartView({
 
       {/* ── PIE ── */}
       {viewType === 'pie' && (
-        <ResponsiveContainer width="100%" height={260}>
+        <ResponsiveContainer width="100%" height={300}>
           <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
             <Pie
               data={chart.data} dataKey="value" nameKey="name"
-              cx="50%" cy="46%" outerRadius="42%" innerRadius="18%"
+              cx="50%" cy="48%" outerRadius="62%" innerRadius="34%"
               labelLine={false}
               label={({ cx: pcx, cy: pcy, midAngle, outerRadius: or, percent }) => {
                 if (percent < 0.07) return null
@@ -2193,21 +2193,73 @@ export default function IntelligenceCanvasPage() {
   }, [analysis, activeSection])
 
   // Add copilot-generated charts to the active intelligence section
-  const handleAddToPage = useCallback((charts: Array<{ title: string; chart_type: string; chart_data?: { labels?: unknown[]; values?: unknown[] } } | undefined>) => {
+  const handleAddToPage = useCallback((charts: Array<{ title: string; chart_type: string; chart_data?: { labels?: unknown[]; values?: unknown[]; rows?: Record<string, unknown>[]; columns?: string[] } } | undefined>) => {
     if (!analysis) return
     const targetId = activeSection || analysis.sections[0]?.id
+
+    const isNum = (v: unknown) => v !== null && v !== undefined && v !== '' && !isNaN(Number(v))
+
     const newCharts: AgentChart[] = charts.filter(Boolean).map(c => {
       const ct = c!
-      const t = (['bar_vertical', 'bar'].includes(ct.chart_type) ? 'bar'
+      const baseType = (['bar_vertical', 'bar'].includes(ct.chart_type) ? 'bar'
         : ct.chart_type === 'line' ? 'line'
         : ct.chart_type === 'area' ? 'area'
         : ['pie', 'donut'].includes(ct.chart_type) ? 'pie'
         : 'bar') as AgentChart['type']
+
+      // Rebuild from rows+columns when available — the backend's labels/values
+      // mis-handle 3-column results (it puts the 2nd column, often a text
+      // dimension, into `values`, which renders as NaN = a blank chart).
+      const rows = (ct.chart_data?.rows ?? []) as Record<string, unknown>[]
+      const columns = (ct.chart_data?.columns ?? []) as string[]
+      if (rows.length && columns.length >= 2) {
+        const numericCols = columns.filter(col => {
+          const sample = rows.slice(0, 12).filter(r => r[col] !== null && r[col] !== undefined && r[col] !== '')
+          return sample.length > 0 && sample.every(r => isNum(r[col]))
+        })
+        const dimCols = columns.filter(col => !numericCols.includes(col))
+        const nameCol = dimCols[0] ?? columns[0]
+        const measureCol = numericCols[0]
+
+        // 2 dimensions + 1 measure (e.g. month × status × count) → pivot the
+        // second dimension into series so every category renders.
+        if (measureCol && dimCols.length >= 2 && baseType !== 'pie') {
+          const seriesCol = dimCols[1]
+          const seriesKeys = Array.from(new Set(rows.map(r => String(r[seriesCol] ?? '')))).slice(0, 12)
+          const byName = new Map<string, Record<string, unknown>>()
+          for (const r of rows) {
+            const nm = String(r[nameCol] ?? '')
+            if (!byName.has(nm)) byName.set(nm, { name: nm })
+            byName.get(nm)![String(r[seriesCol] ?? '')] = Number(r[measureCol] ?? 0)
+          }
+          const data = Array.from(byName.values()).map(d => {
+            for (const k of seriesKeys) if (!(k in d)) d[k] = 0
+            return d
+          }) as unknown as AgentChart['data']
+          return {
+            title: ct.title,
+            type: 'combo' as AgentChart['type'],
+            data,
+            series: seriesKeys.map(k => ({ key: k, type: (baseType === 'line' ? 'line' : 'bar') as 'bar' | 'line' })),
+          }
+        }
+
+        // 1 dimension + 1 measure → simple name/value.
+        if (measureCol) {
+          return {
+            title: ct.title,
+            type: baseType,
+            data: rows.map(r => ({ name: String(r[nameCol] ?? ''), value: Number(r[measureCol] ?? 0) })),
+          }
+        }
+      }
+
+      // Fallback: labels/values (2-column results work fine here).
       const labels = ct.chart_data?.labels ?? []
       const values = ct.chart_data?.values ?? []
       return {
         title: ct.title,
-        type: t,
+        type: baseType,
         data: (labels as unknown[]).map((l, i) => ({ name: String(l ?? ''), value: Number((values as unknown[])[i] ?? 0) })),
       }
     })

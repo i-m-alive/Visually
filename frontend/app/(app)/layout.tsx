@@ -136,7 +136,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                 </div>
                 <div className="min-w-0">
                   <p className="text-sm font-medium text-gray-900 truncate">{user.full_name}</p>
-                  <p className="text-xs text-gray-500 truncate">{user.email}</p>
                 </div>
               </div>
               <div className="flex items-center gap-1.5 mb-1.5">

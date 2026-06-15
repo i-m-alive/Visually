@@ -25,8 +25,13 @@ except ImportError:
 _scheduler: Optional["AsyncIOScheduler"] = None  # type: ignore[type-arg]
 
 
-async def run_dashboard_refresh(dashboard_id: str) -> None:
-    """Re-run all widget SQL for a dashboard and persist chart_data in DB."""
+async def run_dashboard_refresh(dashboard_id: str) -> dict:
+    """Re-run all widget SQL for a dashboard and persist fresh chart_data in DB.
+
+    Returns {refreshed, total, skipped, errors} so callers can report the real
+    outcome instead of blindly claiming success."""
+    import uuid as _uuid
+    summary: dict = {"refreshed": 0, "total": 0, "skipped": 0, "errors": []}
     try:
         from shared.database import AsyncSessionLocal
         from shared.models.dashboards import Dashboard
@@ -34,25 +39,33 @@ async def run_dashboard_refresh(dashboard_id: str) -> None:
         from agent_service.utils.http_clients import call_query_executor
         from sqlalchemy import select
 
+        # The id columns are UUID(as_uuid=True); compare with a real UUID, not a str.
+        try:
+            dash_uuid = _uuid.UUID(str(dashboard_id))
+        except ValueError:
+            log.warning("Scheduler: invalid dashboard id %s", dashboard_id)
+            return summary
+
         async with AsyncSessionLocal() as db:
             dash_result = await db.execute(
-                select(Dashboard).where(Dashboard.id == dashboard_id)
+                select(Dashboard).where(Dashboard.id == dash_uuid)
             )
             dash = dash_result.scalar_one_or_none()
             if not dash:
                 log.warning("Scheduler: dashboard %s not found", dashboard_id)
-                return
+                return summary
 
             widgets_result = await db.execute(
-                select(WidgetModel).where(WidgetModel.dashboard_id == dashboard_id)
+                select(WidgetModel).where(WidgetModel.dashboard_id == dash_uuid)
             )
             widgets = widgets_result.scalars().all()
+            summary["total"] = len(widgets)
 
-            refreshed = 0
             for w in widgets:
                 sql = w.base_sql or w.sql_query
                 conn_id = str(w.connection_id) if w.connection_id else None
                 if not sql or not conn_id:
+                    summary["skipped"] += 1
                     continue
                 try:
                     result = await call_query_executor(conn_id, sql, row_limit=500)
@@ -65,14 +78,23 @@ async def run_dashboard_refresh(dashboard_id: str) -> None:
                             **(w.config or {}),
                             "updated_at": int(datetime.utcnow().timestamp() * 1000),
                         }
-                        refreshed += 1
+                        summary["refreshed"] += 1
+                    else:
+                        summary["errors"].append(
+                            {"widget_id": str(w.id), "error": (result or {}).get("error", "unknown")}
+                        )
                 except Exception as exc:
+                    summary["errors"].append({"widget_id": str(w.id), "error": str(exc)})
                     log.warning("Scheduler: widget %s failed: %s", w.id, exc)
 
             await db.commit()
-            log.info("Scheduler: refreshed %d/%d widgets for dashboard %s", refreshed, len(widgets), dashboard_id)
+            log.info(
+                "Scheduler: refreshed %d/%d widgets (skipped %d, errors %d) for dashboard %s",
+                summary["refreshed"], summary["total"], summary["skipped"], len(summary["errors"]), dashboard_id,
+            )
     except Exception as exc:
         log.exception("Scheduler: refresh failed for dashboard %s: %s", dashboard_id, exc)
+    return summary
 
 
 def _make_job_id(dashboard_id: str) -> str:

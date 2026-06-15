@@ -28,11 +28,13 @@ import re
 import uuid
 import zipfile
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +55,8 @@ DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
 VLY_VERSION   = "2.1"
 VLY_MIME_TYPE = "application/vnd.visually.canvas+zip"
 VLY_MAGIC     = f"VISUALLY_CANVAS_ARCHIVE\nFORMAT_VERSION={VLY_VERSION}\nCREATED_BY=Visually\n"
+
+SCHEMA_CRAWLER_URL = os.getenv("SCHEMA_CRAWLER_URL", "http://localhost:8003")
 
 
 # ── auth helper ───────────────────────────────────────────────────────────────
@@ -176,21 +180,46 @@ def _dsn_template(conn_hint: dict) -> str:
     return f"{db_type}://{user}:<password>@{host}{port_str}/{db_name}"
 
 
-# ── GET /dashboards/{id}/export-vly ───────────────────────────────────────────
+# ── export-vly (GET + POST) ───────────────────────────────────────────────────
+
+class ExportVlyBody(BaseModel):
+    intelligence: Optional[Any] = None
+
 
 @router.get("/dashboards/{dashboard_id}/export-vly")
 async def export_vly(
     dashboard_id: str,
-    intelligence: Optional[str] = Query(None, description="JSON-encoded intelligence analysis from the frontend"),
+    intelligence: Optional[str] = Query(None, description="JSON-encoded intelligence analysis"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_get_user),
 ):
-    """
-    Stream a .vly archive for the given canvas.
+    """Stream a .vly archive (GET — for the small / no-intelligence case)."""
+    return await _generate_vly(dashboard_id, intelligence, db, current_user)
 
-    Optional ?intelligence=<json> query param bundles the AI analysis
-    (passed from the Intelligence page frontend).
+
+@router.post("/dashboards/{dashboard_id}/export-vly")
+async def export_vly_post(
+    dashboard_id: str,
+    body: ExportVlyBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(_get_user),
+):
+    """Stream a .vly archive, bundling the AI analysis from the request BODY.
+
+    The intelligence report can be tens of KB, which overflows the URL length limit
+    if passed as a query string — so the frontend POSTs it here instead.
     """
+    intel_str = json.dumps(body.intelligence, default=str) if body.intelligence is not None else None
+    return await _generate_vly(dashboard_id, intel_str, db, current_user)
+
+
+async def _generate_vly(
+    dashboard_id: str,
+    intelligence: Optional[str],   # JSON string (or None)
+    db: AsyncSession,
+    current_user: User,
+):
+    """Build and stream the .vly archive for a canvas."""
     dash_result = await db.execute(
         select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
     )
@@ -615,13 +644,20 @@ async def import_vly(
         if morning:
             intel_note = f"\n\n[AI Brief] {morning[:300]}{'…' if len(morning) > 300 else ''}"
 
+    imported_layout = dict(canvas_doc.get("layout_config") or {"pages": canvas_doc.get("pages", [])})
+    # Persist the connection on the layout too — the chat copilot resolves a
+    # dashboard's connection from layout_config.connection_id (or a widget's), so
+    # storing it here keeps live data working even if a widget loses its binding.
+    if resolved_conn_id:
+        imported_layout["connection_id"] = str(resolved_conn_id)
+
     new_dash = Dashboard(
         id=uuid.uuid4(),
         project_id=uuid.UUID(project_id),
         name=f"{canvas_name} (imported)",
         description=(description + intel_note).strip(),
         theme=canvas_doc.get("theme", "frost"),
-        layout_config=canvas_doc.get("layout_config") or {"pages": canvas_doc.get("pages", [])},
+        layout_config=imported_layout,
         filter_config=None,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
@@ -686,4 +722,107 @@ async def import_vly(
         "project_id":         project_id,
         "original_name":      canvas_doc.get("name"),
         "intelligence_bundled": bool(intel_doc.get("analysis")),
+    }
+
+
+# ── POST /dashboards/{id}/bind-connection ─────────────────────────────────────
+
+class BindConnectionRequest(BaseModel):
+    connection_id: str
+    crawl:   bool = True   # crawl the bound DB's schema so the AI copilot is schema-aware
+    refresh: bool = True   # re-run every widget's SQL to replace cached data with live data
+
+
+@router.post("/dashboards/{dashboard_id}/bind-connection")
+async def bind_connection(
+    dashboard_id: str,
+    body: BindConnectionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(_get_user),
+):
+    """Bind a live database connection to a canvas (typically one just imported from a
+    .vly with no auto-matched connection). This is what turns a cached snapshot into a
+    live, AI-queryable report:
+
+      1. sets connection_id on EVERY widget + on the dashboard layout_config,
+      2. (optional) crawls the bound DB's schema so the copilot/query-gen are schema-aware,
+      3. (optional) re-runs every widget's SQL to swap cached data for live results.
+
+    Steps 2 and 3 are best-effort — binding always succeeds so the canvas is at least
+    connected; a failed crawl/refresh is reported in the response, not fatal.
+    """
+    dash_result = await db.execute(
+        select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
+    )
+    dashboard = dash_result.scalar_one_or_none()
+    if not dashboard:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
+    try:
+        conn_uuid = uuid.UUID(body.connection_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid connection_id")
+
+    # The connection must belong to the same project as the dashboard.
+    conn_result = await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.id == conn_uuid,
+            DatabaseConnection.project_id == dashboard.project_id,
+        )
+    )
+    conn = conn_result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found in this project")
+
+    # 1 — bind every widget + the layout_config
+    widget_result = await db.execute(
+        select(Widget).where(Widget.dashboard_id == dashboard.id)
+    )
+    widgets = list(widget_result.scalars().all())
+    for w in widgets:
+        w.connection_id = conn_uuid
+        w.updated_at = datetime.utcnow()
+
+    lc = dict(dashboard.layout_config or {})
+    lc["connection_id"] = str(conn_uuid)
+    dashboard.layout_config = lc
+    dashboard.updated_at = datetime.utcnow()
+    await db.commit()
+
+    # 2 — crawl schema (best-effort) so the AI copilot has the live schema
+    crawl_triggered = False
+    if body.crawl:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    f"{SCHEMA_CRAWLER_URL}/crawl",
+                    json={"connection_id": str(conn_uuid), "project_id": str(dashboard.project_id)},
+                )
+                crawl_triggered = resp.status_code == 200
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bind-connection] ⚠ schema crawl failed (non-fatal): {exc}", flush=True)
+
+    # 3 — refresh widgets with live data (best-effort)
+    refreshed = False
+    if body.refresh:
+        try:
+            from agent_service.scheduler import run_dashboard_refresh
+            await run_dashboard_refresh(dashboard_id)
+            refreshed = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bind-connection] ⚠ live refresh failed (non-fatal): {exc}", flush=True)
+
+    print(
+        f"[bind-connection] dashboard={dashboard_id[:8]}  connection={str(conn_uuid)[:8]}  "
+        f"widgets={len(widgets)}  crawl={crawl_triggered}  refreshed={refreshed}",
+        flush=True,
+    )
+
+    return {
+        "status":          "bound",
+        "dashboard_id":    dashboard_id,
+        "connection_id":   str(conn_uuid),
+        "widgets_bound":   len(widgets),
+        "crawl_triggered": crawl_triggered,
+        "refreshed":       refreshed,
     }
