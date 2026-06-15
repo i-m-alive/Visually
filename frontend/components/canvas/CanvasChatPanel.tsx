@@ -48,6 +48,7 @@ interface Props {
   suggestedQuestions?: string[]
   initialWidth?: number
   onAddToPage?: (charts: Array<ChartResult | ChatMsg['newWidget']>) => void
+  prefillMessage?: string
 }
 
 function inlineRender(text: string): React.ReactNode[] {
@@ -112,7 +113,7 @@ function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]):
   return Array.from(new Set(qs)).slice(0, 5)
 }
 
-export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage }: Props) {
+export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([{
     role: 'assistant',
     content: title
@@ -131,6 +132,9 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   const resizeStartW = useRef(initialWidth ?? 320)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => {
+    if (prefillMessage) { setInput(prefillMessage); setTimeout(() => textareaRef.current?.focus(), 100) }
+  }, [prefillMessage])
 
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
   const widgetRecs   = buildRecommendations(widgets, pages)

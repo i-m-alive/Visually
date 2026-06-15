@@ -231,17 +231,25 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
     except Exception as _re:
         print(f"[schema_cache] ⚠ Redis read failed (non-fatal): {_re}", flush=True)
 
-    # L2b: filesystem cache (survives server restarts when Redis is down)
-    if not redis_available:
-        fs_json = _fs_read(connection_id, schema_hash)
-        if fs_json:
-            enriched = _deserialize_enriched(fs_json)
-            _store[connection_id] = enriched
-            print(
-                f"[schema_cache] ✓ filesystem hit  connection={connection_id}  hash={schema_hash}",
-                flush=True,
-            )
-            return enriched
+    # L2b: filesystem cache — always check after a Redis miss (not only when Redis is down)
+    fs_json = _fs_read(connection_id, schema_hash)
+    if fs_json:
+        enriched = _deserialize_enriched(fs_json)
+        _store[connection_id] = enriched
+        print(
+            f"[schema_cache] ✓ filesystem hit  connection={connection_id}  hash={schema_hash}",
+            flush=True,
+        )
+        # Backfill Redis while we're here so the next hit is faster
+        if redis_available:
+            try:
+                redis = await get_redis()
+                if redis is not None:
+                    await redis.setex(redis_key, SCHEMA_CACHE_TTL, fs_json)
+                    print(f"[schema_cache] ✓ backfilled Redis from filesystem  connection={connection_id}", flush=True)
+            except Exception:
+                pass
+        return enriched
 
     # L3: cold build
     print(
@@ -252,7 +260,7 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
     enriched = await _build(schema_doc, db_type, connection_id)
     _store[connection_id] = enriched
 
-    # Persist to Redis if available, otherwise write to filesystem
+    # Persist to both Redis and filesystem so either can warm the cache after a restart
     serialized = _serialize_enriched(enriched)
     if redis_available:
         try:
@@ -266,14 +274,8 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
                 )
         except Exception as _re:
             print(f"[schema_cache] ⚠ Redis write failed (non-fatal): {_re}", flush=True)
-    else:
-        _fs_write(connection_id, schema_hash, serialized)
-        print(
-            f"[schema_cache] ✓ stored on filesystem  connection={connection_id}"
-            f"  hash={schema_hash}  size={len(serialized)//1024}KB"
-            f"  path={_FS_CACHE_DIR}",
-            flush=True,
-        )
+    # Always write filesystem — survives Redis eviction and server restarts
+    _fs_write(connection_id, schema_hash, serialized)
 
     print(
         f"[schema_cache] ✓ built  ambiguous_cols={len(enriched.ambiguous_columns)}"

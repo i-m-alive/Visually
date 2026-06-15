@@ -1,7 +1,7 @@
 'use client'
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { canvasApi, shareApi, intelligenceApi, vlyApi } from '@/lib/api'
+import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -18,7 +18,7 @@ import {
   Star, Info, DollarSign, ShoppingCart, Building, Globe, Database, Cpu,
   Settings, Calendar, Clock, FileText, Filter, MapPin, Percent, Shield,
   Award, Package, Briefcase, LineChart as LineChartIcon, ChevronDown, ChevronUp,
-  Code2,
+  Code2, Scale,
   X, Download, Maximize2, Play, Link, Copy, Printer, Pin,
   Columns, ChevronRight, CalendarRange, Edit3, Bookmark, BookmarkCheck,
 } from 'lucide-react'
@@ -253,28 +253,87 @@ function ConfidenceStars({ score }: { score?: number }) {
   )
 }
 
+
+
 // ── Insight cards ──────────────────────────────────────────────────────────────
 function InsightCards({ insights }: { insights: InsightCard[] }) {
+  const [sectionOpen, setSectionOpen] = useState(false)
+
   if (!insights?.length) return null
+
+  const negCount  = insights.filter(i => i.type === 'negative').length
+  const warnCount = insights.filter(i => i.type === 'warning').length
+  const posCount  = insights.filter(i => i.type === 'positive').length
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
+    <div style={{ borderRadius: 14, border: '1px solid #e2eaf4', overflow: 'hidden', background: 'white' }}>
+
+      {/* ── Collapsed header ── */}
+      <button
+        onClick={() => setSectionOpen(p => !p)}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px',
+          background: sectionOpen ? '#f8fafc' : 'white', border: 'none', cursor: 'pointer',
+          borderBottom: sectionOpen ? '1px solid #e2eaf4' : 'none',
+          transition: 'background 0.15s',
+        }}
+      >
+        <Lightbulb size={13} style={{ color: C.amber, flexShrink: 0 }} />
+        <span style={{ fontSize: 11, fontWeight: 700, color: C.navy }}>
+          {insights.length} Insight{insights.length !== 1 ? 's' : ''}
+        </span>
+        <div style={{ display: 'flex', gap: 5, marginLeft: 2 }}>
+          {negCount > 0 && (
+            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 20, background: `${C.red}15`, color: C.red, border: `1px solid ${C.red}25` }}>
+              {negCount} critical
+            </span>
+          )}
+          {warnCount > 0 && (
+            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 20, background: `${C.amber}15`, color: '#7a5900', border: `1px solid ${C.amber}30` }}>
+              {warnCount} warning
+            </span>
+          )}
+          {posCount > 0 && (
+            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 20, background: `${C.green}12`, color: '#065f46', border: `1px solid ${C.green}25` }}>
+              {posCount} positive
+            </span>
+          )}
+        </div>
+        <ChevronDown size={13} style={{
+          color: C.muted, marginLeft: 'auto', flexShrink: 0,
+          transform: sectionOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+          transition: 'transform 0.25s ease',
+        }} />
+      </button>
+
+      {/* ── Cards grid (animated expand) ── */}
+      <div style={{
+        maxHeight: sectionOpen ? 2400 : 0,
+        overflow: 'hidden',
+        transition: 'max-height 0.4s cubic-bezier(0.4,0,0.2,1)',
+      }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(270px, 1fr))', gap: 12, padding: 14 }}>
       {insights.map((ins, i) => {
         const style = INSIGHT_TYPE_STYLE[ins.type] ?? INSIGHT_TYPE_STYLE.neutral
         const icon = INSIGHT_ICON_MAP[ins.icon] ?? <Lightbulb size={14} />
+        const pulseClass = ins.type === 'negative' ? ' intel-insight-pulse' : ins.type === 'warning' ? ' intel-insight-pulse-warn' : ''
+
         return (
-          <div key={i} className="intel-insight" style={{
-            borderRadius: 14, padding: '14px 16px',
-            background: style.bg,
-            border: `1px solid ${style.border}`,
-            borderLeft: `3px solid ${style.icon}`,
-            display: 'flex', gap: 12, alignItems: 'flex-start',
-            animation: `popIn 0.3s ${i * 0.07}s ease both`,
-            boxShadow: '0 1px 6px rgba(10,33,58,0.04)',
-          }}>
+          <div key={i}
+            className={`intel-insight${pulseClass}`}
+            style={{
+              borderRadius: 14, padding: '14px 16px',
+              background: style.bg,
+              border: `1px solid ${style.border}`,
+              borderLeft: `3px solid ${style.icon}`,
+              animation: `popIn 0.3s ${i * 0.07}s ease both`,
+              display: 'flex', gap: 12, alignItems: 'flex-start',
+              boxShadow: '0 1px 6px rgba(10,33,58,0.04)',
+            }}
+          >
             <div style={{
               width: 34, height: 34, borderRadius: 10,
-              background: `${style.icon}18`,
-              border: `1px solid ${style.icon}30`,
+              background: `${style.icon}18`, border: `1px solid ${style.icon}30`,
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               flexShrink: 0, color: style.icon,
             }}>{icon}</div>
@@ -286,6 +345,8 @@ function InsightCards({ insights }: { insights: InsightCard[] }) {
           </div>
         )
       })}
+        </div>
+      </div>
     </div>
   )
 }
@@ -1312,7 +1373,9 @@ function SectionContent({
       )}
 
       {/* ── Insight cards ── */}
-      {section.insights && section.insights.length > 0 && <InsightCards insights={section.insights} />}
+      {section.insights && section.insights.length > 0 && (
+        <InsightCards insights={section.insights} />
+      )}
 
       {/* ── Performers + Charts ── */}
       {(hasPerformers || section.charts.length > 0) && (() => {
@@ -1953,6 +2016,12 @@ export default function IntelligenceCanvasPage() {
   const [agentError, setAgentError] = useState<string | null>(null)
   const [aiFallbackWarning, setAiFallbackWarning] = useState(false)
   const [rerunning, setRerunning] = useState(false)
+  const [syncMenuOpen, setSyncMenuOpen] = useState(false)
+  const [autoSyncMins, setAutoSyncMins] = useState<number | null>(() => {
+    try { return parseInt(localStorage.getItem(`intel_sync_${canvasId}`) ?? '') || null } catch { return null }
+  })
+  const syncMenuRef = useRef<HTMLDivElement>(null)
+  const rerunRef = useRef<() => void>(() => {})
   const [activeSection, setActiveSection] = useState('')
   const [sectionLeaving, setSectionLeaving] = useState(false)
   const sectionNavPending = useRef<string>('')
@@ -2348,6 +2417,42 @@ export default function IntelligenceCanvasPage() {
     } finally { setRerunning(false) }
   }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange])
 
+  // Keep rerunRef current so the auto-sync interval never closes over a stale rerun
+  useEffect(() => { rerunRef.current = rerun }, [rerun])
+
+  // Auto-sync interval
+  useEffect(() => {
+    if (!autoSyncMins) return
+    const id = setInterval(() => rerunRef.current(), autoSyncMins * 60 * 1000)
+    return () => clearInterval(id)
+  }, [autoSyncMins])
+
+  // Close sync dropdown on outside click
+  useEffect(() => {
+    if (!syncMenuOpen) return
+    const handler = (e: MouseEvent) => {
+      if (syncMenuRef.current && !syncMenuRef.current.contains(e.target as Node)) setSyncMenuOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [syncMenuOpen])
+
+  const SYNC_OPTS = [
+    { label: 'Every 30 min', mins: 30 },
+    { label: 'Every hour',   mins: 60 },
+    { label: 'Every 6 hours', mins: 360 },
+    { label: 'Daily',        mins: 1440 },
+  ]
+
+  function applySchedule(mins: number | null) {
+    setAutoSyncMins(mins)
+    try {
+      if (mins) localStorage.setItem(`intel_sync_${canvasId}`, String(mins))
+      else localStorage.removeItem(`intel_sync_${canvasId}`)
+    } catch {}
+    setSyncMenuOpen(false)
+  }
+
   const currentSection = analysis?.sections.find(s => s.id === activeSection)
   const sectionIdx = analysis?.sections.findIndex(s => s.id === activeSection) ?? 0
 
@@ -2443,9 +2548,106 @@ export default function IntelligenceCanvasPage() {
             <button onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }} title="Side-by-side compare" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${compareMode ? C.violet + '80' : 'rgba(255,255,255,0.2)'}`, background: compareMode ? `${C.violet}30` : 'rgba(255,255,255,0.1)', color: compareMode ? '#c4b5fd' : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
               <Columns size={11} /> Compare
             </button>
-            <button onClick={rerun} disabled={rerunning} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.85)', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>
-              <RefreshCw size={10} className={rerunning ? 'animate-spin' : ''} /> Regenerate
-            </button>
+            {/* ── Sync split-button ── */}
+            <div ref={syncMenuRef} style={{ position: 'relative', display: 'flex' }}>
+              {/* Left: Sync Now */}
+              <button
+                onClick={rerun}
+                disabled={rerunning}
+                title="Fetch fresh data and regenerate analysis"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 5,
+                  padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: rerunning ? 'not-allowed' : 'pointer',
+                  background: rerunning ? `${C.teal}40` : `${C.teal}30`,
+                  border: `1px solid ${C.teal}70`, borderRight: 'none',
+                  borderRadius: '8px 0 0 8px', color: C.teal2,
+                  transition: 'all 0.15s',
+                }}
+              >
+                <RefreshCw size={11} style={rerunning ? { animation: 'ispin 1s linear infinite' } : {}} />
+                {rerunning ? 'Syncing…' : 'Sync Now'}
+                {autoSyncMins && !rerunning && (
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: C.green, flexShrink: 0 }} />
+                )}
+              </button>
+              {/* Right: Schedule dropdown trigger */}
+              <button
+                onClick={() => setSyncMenuOpen(p => !p)}
+                title="Schedule auto-sync"
+                style={{
+                  display: 'flex', alignItems: 'center', padding: '6px 8px',
+                  background: syncMenuOpen ? `${C.teal}40` : `${C.teal}20`,
+                  border: `1px solid ${C.teal}70`,
+                  borderRadius: '0 8px 8px 0', color: C.teal2, cursor: 'pointer',
+                  transition: 'all 0.15s',
+                }}
+              >
+                <ChevronDown size={12} style={{ transition: 'transform 0.2s', transform: syncMenuOpen ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+              </button>
+
+              {/* Dropdown */}
+              {syncMenuOpen && (
+                <div style={{
+                  position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 9999,
+                  background: 'white', borderRadius: 12, border: '1px solid #e2eaf4',
+                  boxShadow: '0 8px 32px rgba(0,0,0,0.14)', minWidth: 200, overflow: 'hidden',
+                  animation: 'slideDown 0.18s ease both',
+                }}>
+                  {/* Sync Now row */}
+                  <button
+                    onClick={() => { rerun(); setSyncMenuOpen(false) }}
+                    disabled={rerunning}
+                    style={{
+                      width: '100%', display: 'flex', alignItems: 'center', gap: 9,
+                      padding: '11px 14px', background: 'none', border: 'none',
+                      borderBottom: '1px solid #f1f5f9', cursor: 'pointer',
+                      fontSize: 12, fontWeight: 600, color: C.navy,
+                    }}
+                  >
+                    <RefreshCw size={13} style={{ color: C.teal }} />
+                    Sync Now
+                    <span style={{ marginLeft: 'auto', fontSize: 10, color: C.muted }}>fetch + regenerate</span>
+                  </button>
+
+                  {/* Schedule section */}
+                  <div style={{ padding: '8px 14px 4px' }}>
+                    <p style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.07em', margin: '0 0 6px' }}>Auto-sync</p>
+                  </div>
+                  {SYNC_OPTS.map(opt => (
+                    <button
+                      key={opt.mins}
+                      onClick={() => applySchedule(autoSyncMins === opt.mins ? null : opt.mins)}
+                      style={{
+                        width: '100%', display: 'flex', alignItems: 'center', gap: 9,
+                        padding: '9px 14px', background: autoSyncMins === opt.mins ? `${C.teal}08` : 'none',
+                        border: 'none', cursor: 'pointer', fontSize: 12,
+                        fontWeight: autoSyncMins === opt.mins ? 700 : 400,
+                        color: autoSyncMins === opt.mins ? C.teal : C.navy,
+                      }}
+                    >
+                      <Clock size={12} style={{ color: autoSyncMins === opt.mins ? C.teal : C.muted, flexShrink: 0 }} />
+                      {opt.label}
+                      {autoSyncMins === opt.mins && (
+                        <span style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: C.green }}>● Active</span>
+                      )}
+                    </button>
+                  ))}
+                  {autoSyncMins && (
+                    <button
+                      onClick={() => applySchedule(null)}
+                      style={{
+                        width: '100%', display: 'flex', alignItems: 'center', gap: 9,
+                        padding: '9px 14px', background: 'none', border: 'none',
+                        borderTop: '1px solid #f1f5f9', cursor: 'pointer',
+                        fontSize: 12, color: C.red, fontWeight: 600,
+                      }}
+                    >
+                      Cancel schedule
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -2762,6 +2964,18 @@ export default function IntelligenceCanvasPage() {
         }
 
         /* ── Insight cards ─────────────────────────────────────── */
+        @keyframes insightPulse {
+          0%,100% { box-shadow: 0 1px 6px rgba(239,71,111,0.04); }
+          50% { box-shadow: 0 0 0 7px rgba(239,71,111,0.07), 0 4px 16px rgba(239,71,111,0.15); }
+        }
+        @keyframes insightPulseWarn {
+          0%,100% { box-shadow: 0 1px 6px rgba(255,183,3,0.04); }
+          50% { box-shadow: 0 0 0 7px rgba(255,183,3,0.08), 0 4px 16px rgba(255,183,3,0.14); }
+        }
+        @keyframes insightExpandIn {
+          from { opacity: 0; transform: translateY(-6px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
         .intel-insight {
           animation: popIn 0.28s ease both;
           transition: transform 0.2s cubic-bezier(.34,1.56,.64,1), box-shadow 0.2s ease !important;
@@ -2769,6 +2983,22 @@ export default function IntelligenceCanvasPage() {
         .intel-insight:hover {
           transform: translateY(-3px) scale(1.015) !important;
           box-shadow: 0 10px 28px rgba(0,0,0,0.09) !important;
+        }
+        .intel-insight-pulse {
+          animation: popIn 0.28s ease both, insightPulse 3s 1s ease-in-out infinite !important;
+        }
+        .intel-insight-pulse:hover {
+          transform: translateY(-3px) scale(1.015) !important;
+          box-shadow: 0 10px 28px rgba(239,71,111,0.18) !important;
+          animation: none !important;
+        }
+        .intel-insight-pulse-warn {
+          animation: popIn 0.28s ease both, insightPulseWarn 3s 1.5s ease-in-out infinite !important;
+        }
+        .intel-insight-pulse-warn:hover {
+          transform: translateY(-3px) scale(1.015) !important;
+          box-shadow: 0 10px 28px rgba(255,183,3,0.18) !important;
+          animation: none !important;
         }
 
         /* ── LeftRail nav buttons ──────────────────────────────── */
