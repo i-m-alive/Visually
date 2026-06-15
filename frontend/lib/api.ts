@@ -73,6 +73,10 @@ export const chatApi = {
   }) => api.post('/agent/chat', data),
   clear: (sessionId: string) =>
     api.delete(`/agent/chat/${sessionId}`),
+  warmup: (data: {
+    session_id: string
+    project_id?: string
+  }) => api.post('/agent/chat/warmup', data),
 }
 
 export const intelligenceApi = {

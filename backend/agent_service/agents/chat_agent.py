@@ -1,7 +1,11 @@
 import json
 import re
-from typing import Optional, TYPE_CHECKING
-from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL, BEDROCK_OPUS_MODEL
+from typing import Optional, Literal, TYPE_CHECKING
+from shared.bedrock_client import (
+    bedrock_invoke_with_history_cached,
+    BEDROCK_SONNET_MODEL,
+    BEDROCK_OPUS_MODEL,
+)
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
@@ -12,13 +16,9 @@ CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 # In-memory fallback when Redis is unavailable
 _memory_history: dict[str, list[dict]] = {}
 
-_SYSTEM_PROMPT_TEMPLATE = """You are a conversational data analyst embedded in a BI platform called Visually.
+# Static instructions — no variables. Identical on every call → Bedrock prompt cache always hits.
+_SYSTEM_INSTRUCTIONS = """You are a conversational data analyst embedded in a BI platform called Visually.
 You have full access to the user's live database and their complete multi-page canvas report.
-
-{schema_section}
-
-CANVAS REPORT STRUCTURE:
-{dashboard_context}
 
 CAPABILITIES:
 1. Answer questions about any chart or data across all canvas pages.
@@ -51,7 +51,7 @@ When the user asks a question that requires fetching data (e.g. "what was X",
 ✅ CORRECT:
    "Here are the billing hours for Scarbrough Medlin in 2023:"
    ```sql_execute
-   {{"sql": "SELECT ...", "chart_type": "table", "title": "Billing Hours - Scarbrough Medlin 2023", "x_label": "", "y_label": ""}}
+   {"sql": "SELECT ...", "chart_type": "table", "title": "Billing Hours - Scarbrough Medlin 2023", "x_label": "", "y_label": ""}
    ```
 
 ══════════════════════════════════════════════════════════════════════
@@ -73,7 +73,7 @@ a chart, table, graph, visualization, or KPI:
 ✅ CORRECT — this is the ONLY acceptable pattern:
    "Here's the Current Status pie chart:"
    ```sql_execute
-   {{"sql": "...", "chart_type": "pie", ...}}
+   {"sql": "...", "chart_type": "pie", ...}
    ```
 
 BEFORE you write your response, ask yourself:
@@ -97,10 +97,10 @@ Example — two charts at once:
 User: "Create a bar chart for monthly placements and a KPI for total count"
 Response: "Here are 2 charts:"
 ```sql_execute
-{{"sql": "SELECT DATE_TRUNC('month', start_date) AS \"Month\", COUNT(*) AS \"Placements\" FROM bullhorn_core_placement GROUP BY 1 ORDER BY 1", "chart_type": "bar_vertical", "title": "Monthly Placements", "x_label": "Month", "y_label": "Placements"}}
+{"sql": "SELECT DATE_TRUNC('month', start_date) AS \"Month\", COUNT(*) AS \"Placements\" FROM bullhorn_core_placement GROUP BY 1 ORDER BY 1", "chart_type": "bar_vertical", "title": "Monthly Placements", "x_label": "Month", "y_label": "Placements"}
 ```
 ```sql_execute
-{{"sql": "SELECT COUNT(*) AS \"Total Placements\" FROM bullhorn_core_placement", "chart_type": "kpi", "title": "Total Placements", "x_label": "", "y_label": ""}}
+{"sql": "SELECT COUNT(*) AS \"Total Placements\" FROM bullhorn_core_placement", "chart_type": "kpi", "title": "Total Placements", "x_label": "", "y_label": ""}
 ```
 
 RESPONSE FORMAT:
@@ -109,7 +109,7 @@ For chart/table/KPI creation: one sentence + sql_execute block(s) (see CHART CRE
 For conversational questions (greetings, explanations, "what is X concept"): plain English only, no sql_execute.
 
 ```sql_execute
-{{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
+{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer", "title": "Chart Title", "x_label": "...", "y_label": "..."}
 ```
 
 CHART TYPE SELECTION RULES:
@@ -126,28 +126,28 @@ Example 1 — pie chart by specific columns (user names table + columns):
 User: "Create a PieChart for current status. Table: bullhorn_core_placement. Columns: placementID, status."
 Response: "Here's the Current Status pie chart:"
 ```sql_execute
-{{"sql": "SELECT status AS \"Status\", COUNT(DISTINCT \"placementID\") AS \"Count\" FROM bullhorn_core_placement GROUP BY status ORDER BY 2 DESC LIMIT 20", "chart_type": "pie", "title": "Current Status", "x_label": "Status", "y_label": "Count"}}
+{"sql": "SELECT status AS \"Status\", COUNT(DISTINCT \"placementID\") AS \"Count\" FROM bullhorn_core_placement GROUP BY status ORDER BY 2 DESC LIMIT 20", "chart_type": "pie", "title": "Current Status", "x_label": "Status", "y_label": "Count"}
 ```
 
 Example 2 — table chart:
 User: "Create a table chart showing employee name and salary"
 Response: "Here's the table:"
 ```sql_execute
-{{"sql": "SELECT name AS \"Name\", salary AS \"Salary\" FROM employees ORDER BY salary DESC LIMIT 1000", "chart_type": "table", "title": "Employee Salaries", "x_label": "", "y_label": ""}}
+{"sql": "SELECT name AS \"Name\", salary AS \"Salary\" FROM employees ORDER BY salary DESC LIMIT 1000", "chart_type": "table", "title": "Employee Salaries", "x_label": "", "y_label": ""}
 ```
 
 Example 3 — grouped KPI (multi_row_card):
 User: "Show job count broken down by source type" or "KPI showing jobs per category"
 Response: "Here's the Job Count by Source:"
 ```sql_execute
-{{"sql": "SELECT source AS \"Source\", COUNT(*) AS \"Count\" FROM jobs GROUP BY source ORDER BY 2 DESC LIMIT 20", "chart_type": "multi_row_card", "title": "Job Count by Source", "x_label": "Source", "y_label": "Count"}}
+{"sql": "SELECT source AS \"Source\", COUNT(*) AS \"Count\" FROM jobs GROUP BY source ORDER BY 2 DESC LIMIT 20", "chart_type": "multi_row_card", "title": "Job Count by Source", "x_label": "Source", "y_label": "Count"}
 ```
 
 Example 4 — slicer / filter widget:
 User: "Add a filter for status" / "Create a dropdown to filter by region" / "Add a checkbox slicer for category"
 Response: "Here's a Status slicer:"
 ```sql_execute
-{{"sql": "SELECT DISTINCT status FROM jobs WHERE status IS NOT NULL ORDER BY 1 LIMIT 300", "chart_type": "slicer", "title": "Status Filter", "slicer_type": "dropdown", "slicer_column": "status", "x_label": "", "y_label": ""}}
+{"sql": "SELECT DISTINCT status FROM jobs WHERE status IS NOT NULL ORDER BY 1 LIMIT 300", "chart_type": "slicer", "title": "Status Filter", "slicer_type": "dropdown", "slicer_column": "status", "x_label": "", "y_label": ""}
 ```
 NOTE for slicers:
 - chart_type must be "slicer"
@@ -160,8 +160,40 @@ NOTE for slicers:
 
 For dashboard modifications, include:
 ```dashboard_action
-{{"action": "filter_widget"|"add_widget"|"rename_widget", "params": {{}}}}
+{"action": "filter_widget"|"add_widget"|"rename_widget", "params": {}}
 ```
+
+══════════════════════════════════════════════════════════════════════
+ANALYTICAL QUESTIONS — INSIGHT PROTOCOL
+══════════════════════════════════════════════════════════════════════
+When the user asks WHY a metric has a certain value, what is DRIVING it,
+or wants EXPLANATION / INSIGHT — e.g.:
+  "What is driving X being Y?", "Why is X so high?", "Explain why X",
+  "What factors affect X?", "What caused X?", "Give me insight into X"
+
+  STEP 1 — Write 2-4 sentences of direct analysis. Reference specific dimensions
+           that are likely influencing the metric (time trend, category split,
+           status distribution, source type, geography, etc.).
+  STEP 2 — Provide 1-3 sql_execute blocks showing MEANINGFUL BREAKDOWNS:
+           • By relevant dimension (status, source, region, month, etc.)
+           • chart_type: bar_vertical, line, pie, or table — NOT "kpi"
+           • DO NOT re-query the same single aggregate — that shows no insight
+  STEP 3 — STOP.
+
+❌ WRONG for "What is driving Total Job Orders being 7,377?":
+   A single KPI card showing "7,382" — that's the same number, zero insight.
+
+✅ CORRECT for "What is driving Total Job Orders being 7,377?":
+   "Job orders have reached 7,382. Here's the breakdown by source to see what's contributing most:"
+   ```sql_execute
+   {"sql": "SELECT source AS \"Source\", COUNT(*) AS \"Count\" FROM job_orders GROUP BY source ORDER BY 2 DESC LIMIT 15", "chart_type": "bar_vertical", "title": "Job Orders by Source", "x_label": "Source", "y_label": "Count"}
+   ```
+   "And here's how they've trended over the past 12 months:"
+   ```sql_execute
+   {"sql": "SELECT DATE_TRUNC('month', created_date) AS \"Month\", COUNT(*) AS \"Count\" FROM job_orders GROUP BY 1 ORDER BY 1", "chart_type": "line", "title": "Job Orders Monthly Trend", "x_label": "Month", "y_label": "Count"}
+   ```
+
+══════════════════════════════════════════════════════════════════════
 
 WHEN THE USER MESSAGE CONTAINS AN [INTELLIGENCE REPORT] OR ╔══ BLOCK:
 The user has already provided the full pre-computed report data inline.
@@ -171,6 +203,39 @@ The user has already provided the full pre-computed report data inline.
 - Only generate SQL if the question explicitly asks for something NOT present in the provided data.
 
 TONE: Be concise, helpful, and data-focused. Reference actual values from the data. Avoid filler phrases."""
+
+_CONV_STARTERS = re.compile(
+    r"^(hi|hello|hey|thanks|thank you|ok|okay|great|sure|got it|cool|nice|awesome|"
+    r"good morning|good afternoon|good evening|what (is|are|does|do) (a|an|the)?\s*(?!data|table|column|metric)\w+\b)",
+    re.IGNORECASE,
+)
+_DASHBOARD_WORDS = re.compile(
+    r"\b(how many (chart|widget|page)|list (chart|widget|page)|rename|delete (chart|widget)|"
+    r"which page|active page|canvas structure|how is (this|the) (report|canvas|dashboard) (set up|structured|organized))\b",
+    re.IGNORECASE,
+)
+_DATA_WORDS = re.compile(
+    r"\b(what|how many|how much|which|who|when|where|show|find|list|get|give|tell|fetch|"
+    r"retrieve|calculate|compute|sum|count|total|average|top|bottom|highest|lowest|most|least|"
+    r"compare|breakdown|analyse|analyze|create|make|build|generate|add|chart|graph|kpi|table|"
+    r"pie|bar|line|visual|plot|donut|scatter|waterfall|treemap|revenue|sales|data|metric|trend)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_intent(message: str) -> Literal["conversational", "dashboard", "data"]:
+    """Route the message to one of three cost tiers.
+
+    conversational — no schema needed (greetings, concept explanations)
+    dashboard      — canvas structure questions only, no DB schema needed
+    data           — needs schema + SQL capability
+    """
+    stripped = message.strip()
+    if _CONV_STARTERS.match(stripped) and not _DATA_WORDS.search(stripped):
+        return "conversational"
+    if _DASHBOARD_WORDS.search(stripped) and not _DATA_WORDS.search(stripped):
+        return "dashboard"
+    return "data"
 
 
 def _tfidf_score(message: str, table: dict) -> float:
@@ -216,9 +281,28 @@ def _is_chart_creation_request(message: str) -> bool:
     return has_action and has_subject
 
 
+_ANALYTICAL_PATTERNS = re.compile(
+    r"\b(what is driving|what's driving|what are driving|why is|why are|why was|why were|"
+    r"what caused|what factors|what factor|what leads|what's causing|what is causing|"
+    r"explain (why|how|what)|give me insight|insight into|root cause|what contributed|"
+    r"what's behind|what is behind|analyze (why|this|the|how)|analyse (why|this|the|how)|"
+    r"dig into|break(down)? (why|the reason)|reason (for|behind|why)|understand why)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_analytical_request(message: str) -> bool:
+    """Return True for insight/explanation questions — these need narrative + breakdowns,
+    NOT a single KPI of the same number."""
+    return bool(_ANALYTICAL_PATTERNS.search(message))
+
+
 def _is_data_query_request(message: str) -> bool:
     """Return True when the message is asking a data question that requires SQL."""
     lower = message.lower()
+    # Analytical questions are handled by a different protocol — skip the forced-SQL path
+    if _is_analytical_request(lower):
+        return False
     # Question starters that imply a data lookup
     question_starters = (
         "what", "how many", "how much", "which", "who", "when", "where",
@@ -242,16 +326,16 @@ class ChatAgent:
         total_tables = len(compact)
         priority_tables = priority_tables or set()
 
-        if total_tables > 18:
-            scored = sorted(
-                compact,
-                key=lambda t: _tfidf_score(message, t)
-                + (5.0 if t.get("name", "").lower() in priority_tables else 0.0),
-                reverse=True,
-            )
-            top_tables = scored[:18]
-        else:
-            top_tables = compact
+        MAX_TABLES = 8
+        scored = sorted(
+            compact,
+            key=lambda t: _tfidf_score(message, t)
+            + (5.0 if t.get("name", "").lower() in priority_tables else 0.0),
+            reverse=True,
+        )
+        top_tables = scored[:MAX_TABLES]
+        # Only the top 3 tables get sample values — they dominate token cost
+        sample_allowed = {t.get("name") for t in top_tables[:3]}
 
         lines = [
             f"DATABASE SCHEMA ({total_tables} tables total"
@@ -287,6 +371,7 @@ class ChatAgent:
             cols = t.get("columns") or []
             col_parts = []
             sample_parts = []
+            include_samples = tname in sample_allowed
             for c in cols:
                 cname = c.get("name") or ""
                 ctype = c.get("type") or ""
@@ -295,6 +380,8 @@ class ChatAgent:
                 tag = f"[{sem_type}]" if sem_type else ""
                 col_parts.append(f"{cname}{tag} ({ctype}){': ' + cdesc if cdesc else ''}")
 
+                if not include_samples:
+                    continue
                 stats = c.get("stats") or {}
                 top_vals = stats.get("top_values") or []
                 if top_vals:
@@ -395,17 +482,22 @@ class ChatAgent:
             if not page_widgets:
                 parts.append(f"\nPage '{p['name']}' — empty")
                 continue
-            active_marker = " (ACTIVE — new charts go here)" if pid == active_page_id else ""
+            is_active = pid == active_page_id
+            active_marker = " (ACTIVE — new charts go here)" if is_active else ""
             parts.append(f"\nPage '{p['name']}'{active_marker}:")
             for w in page_widgets:
-                sql_preview = (w.get("sql_query") or "")[:180]
-                rows = (w.get("chart_data") or {}).get("rows", [])
-                sample = f" | Sample data: {rows[:1]}" if rows else ""
-                parts.append(
-                    f"  • {w['title']} [{w['chart_type']}]"
-                    + (f" | SQL: {sql_preview}" if sql_preview else "")
-                    + sample
-                )
+                if is_active:
+                    sql_preview = (w.get("sql_query") or "")[:180]
+                    rows = (w.get("chart_data") or {}).get("rows", [])
+                    sample = f" | Sample data: {rows[:1]}" if rows else ""
+                    parts.append(
+                        f"  • {w['title']} [{w['chart_type']}]"
+                        + (f" | SQL: {sql_preview}" if sql_preview else "")
+                        + sample
+                    )
+                else:
+                    # Inactive pages: name + type only — SQL omitted to save tokens
+                    parts.append(f"  • {w['title']} [{w['chart_type']}]")
 
         # Widgets not yet assigned to a page (legacy / just added)
         if unassigned:
@@ -422,7 +514,7 @@ class ChatAgent:
 
         return "\n".join(parts)
 
-    def _build_system_prompt(
+    def _build_dynamic_context(
         self,
         message: str,
         schema_doc: dict,
@@ -430,23 +522,35 @@ class ChatAgent:
         dashboard_pages: list,
         active_page_id: Optional[str],
         priority_tables: Optional[set[str]],
-        enriched: Optional["EnrichedSchema"] = None,
+        enriched: Optional["EnrichedSchema"],
+        intent: str,
     ) -> str:
-        if enriched and enriched.compact_tables:
-            schema_section = self._build_schema_section_enriched(
-                message, enriched, priority_tables
+        """Build the per-request dynamic context block (schema + canvas).
+
+        Returns an empty string for conversational intent.
+        Returns canvas-only for dashboard intent.
+        Returns schema + canvas for data intent.
+        """
+        parts: list[str] = []
+
+        if intent == "data":
+            if enriched and enriched.compact_tables:
+                schema_section = self._build_schema_section_enriched(message, enriched, priority_tables)
+            elif schema_doc:
+                schema_section = self._build_schema_section_raw(schema_doc)
+            else:
+                schema_section = ""
+            if schema_section:
+                parts.append(schema_section)
+
+        if intent in ("data", "dashboard"):
+            dashboard_context = self._build_dashboard_context(
+                dashboard_widgets, dashboard_pages, active_page_id, priority_tables
             )
-        else:
-            schema_section = self._build_schema_section_raw(schema_doc)
+            if dashboard_context:
+                parts.append(f"CANVAS REPORT STRUCTURE:\n{dashboard_context}")
 
-        dashboard_context = self._build_dashboard_context(
-            dashboard_widgets, dashboard_pages, active_page_id, priority_tables
-        )
-
-        return _SYSTEM_PROMPT_TEMPLATE.format(
-            schema_section=schema_section,
-            dashboard_context=dashboard_context,
-        )
+        return "\n\n".join(parts)
 
     async def respond(
         self,
@@ -460,35 +564,44 @@ class ChatAgent:
         enriched_schema: Optional["EnrichedSchema"] = None,
         model_override: Optional[str] = None,
     ) -> dict:
-        system_prompt = self._build_system_prompt(
+        intent = _classify_intent(message)
+        dynamic_context = self._build_dynamic_context(
             message=message,
             schema_doc=schema_doc,
-            dashboard_widgets=dashboard_widgets,
+            dashboard_widgets=dashboard_widgets or [],
             dashboard_pages=dashboard_pages or [],
             active_page_id=active_page_id,
             priority_tables=priority_tables,
             enriched=enriched_schema,
+            intent=intent,
         )
+
         messages = conversation_history[-20:] + [{"role": "user", "content": message}]
         effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else CHAT_MODEL
-        # Opus needs more tokens for deep analysis prompts
         effective_max_tokens = 8192 if model_override == "opus" else 2048
 
         print(
-            f"[chat_agent] model={effective_model.split('/')[-1]}  "
+            f"[chat_agent] intent={intent}  model={effective_model.split('/')[-1]}  "
             f"max_tokens={effective_max_tokens}  "
             f"history_turns={len(conversation_history) // 2}  "
             f"msg_len={len(message)}  "
-            f"prompt_len={len(system_prompt)}",
+            f"stable_len={len(_SYSTEM_INSTRUCTIONS)}  "
+            f"dynamic_len={len(dynamic_context)}",
             flush=True,
         )
 
-        raw = await bedrock_invoke_with_history(
+        raw, cache_info = await bedrock_invoke_with_history_cached(
             model_id=effective_model,
-            system_prompt=system_prompt,
+            system_stable=_SYSTEM_INSTRUCTIONS,
+            system_dynamic=dynamic_context,
             messages=messages,
             max_tokens=effective_max_tokens,
             temperature=0.3,
+        )
+        print(
+            f"[chat_agent] cache={'HIT' if cache_info['cache_hit'] else ('CREATED' if cache_info['cache_created'] else 'MISS')}  "
+            f"cache_read={cache_info['cache_read_tokens']}  cache_create={cache_info['cache_creation_tokens']}",
+            flush=True,
         )
 
         print(
@@ -538,7 +651,13 @@ class ChatAgent:
         # ── Auto-retry when model narrated instead of executing ───────────────
         # If the user asked a data question or chart creation but got no sql_execute,
         # send one silent retry with an ultra-strict prompt.
-        if not sqls_to_execute and (_is_chart_creation_request(message) or _is_data_query_request(message)):
+        # Analytical questions ("what is driving X", "why is X") are excluded — they
+        # should return narrative + breakdowns, not a forced single sql block.
+        needs_sql = (
+            not _is_analytical_request(message)
+            and (_is_chart_creation_request(message) or _is_data_query_request(message))
+        )
+        if not sqls_to_execute and needs_sql:
             retry_msg = (
                 "EXECUTE ONLY — output NOTHING except a single sql_execute block.\n"
                 "Do NOT write any description, acknowledgment, or explanation.\n"
@@ -547,9 +666,10 @@ class ChatAgent:
             )
             retry_messages = conversation_history[-20:] + [{"role": "user", "content": retry_msg}]
             try:
-                raw2 = await bedrock_invoke_with_history(
+                raw2, _ = await bedrock_invoke_with_history_cached(
                     model_id=CHAT_MODEL,
-                    system_prompt=system_prompt,
+                    system_stable=_SYSTEM_INSTRUCTIONS,
+                    system_dynamic=dynamic_context,
                     messages=retry_messages,
                     max_tokens=1024,
                     temperature=0.0,

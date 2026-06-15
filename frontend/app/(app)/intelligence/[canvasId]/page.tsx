@@ -374,7 +374,7 @@ function PerformerPanel({ top, bottom, label }: { top: PerformerRow[]; bottom: P
           <div key={i} className="intel-performer-row" style={{ padding: '7px 16px', display: 'flex', alignItems: 'center', gap: 10, borderBottom: i < rows.length - 1 ? '1px solid #f8fafc' : 'none' }}>
             <span style={{ width: 20, height: 20, borderRadius: '50%', background: tab === 'top' ? `${C.amber}20` : `${C.red}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 800, color: tab === 'top' ? C.amber : C.red, flexShrink: 0 }}>{r.rank}</span>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <p style={{ fontSize: 11, fontWeight: 600, color: C.navy, margin: '0 0 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.label}</p>
+              <p title={r.label} style={{ fontSize: 11, fontWeight: 600, color: C.navy, margin: '0 0 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.label}</p>
               <div style={{ height: 4, borderRadius: 2, background: '#f1f5f9', overflow: 'hidden' }}>
                 <div style={{ height: '100%', borderRadius: 2, background: tab === 'top' ? C.teal : C.red, width: `${Math.min(100, (Math.abs(r.value) / maxVal) * 100)}%`, transition: 'width 0.6s ease' }} />
               </div>
@@ -902,6 +902,20 @@ const CHART_TYPE_ICONS: Record<string, string> = {
 
 type DrillFn = (segment: string) => void
 
+// Returns the optimal chart height based on data density and chart type.
+function chartHeight(type: AgentChart['type'], dataLen: number): number {
+  if (type === 'pie') return 260
+  if (type === 'bullet') return Math.min(40 + dataLen * 52, 360)
+  if (type === 'scatter') return 280
+  if (type === 'combo' || type === 'waterfall') return dataLen > 14 ? 300 : 240
+  if (type === 'forecast') return 240
+  // bar / line / area
+  if (dataLen <= 6)  return 200
+  if (dataLen <= 12) return 240
+  if (dataLen <= 20) return 280
+  return 320
+}
+
 function AgentChartView({
   chart, colorIdx = 0,
   onDrill, onFullscreen,
@@ -914,13 +928,19 @@ function AgentChartView({
   annotations?: Record<string, string>
   onAnnotate?: (pointName: string) => void
 }) {
-  const [viewType, setViewType] = useState(chart.type)
+  // Auto-convert: pie with >8 slices → bar (too many slices are unreadable)
+  const effectiveType = chart.type === 'pie' && chart.data.length > 8 ? 'bar' : chart.type
+  const [viewType, setViewType] = useState<AgentChart['type']>(effectiveType)
   const [insightVisible, setInsightVisible] = useState(false)
   const [showRawData, setShowRawData] = useState(false)
   const switchOpts = CHART_SWITCH_OPTS[chart.type] ?? []
 
   const color = chart.color ?? PALETTE[colorIdx % PALETTE.length]
   const gid = `g${colorIdx}`
+
+  // Dense bar charts (>14 items) render better as horizontal bars
+  const useHorizontalBar = viewType === 'bar' && chart.data.length > 14
+  const chartH = chartHeight(viewType, chart.data.length)
 
   if (!chart.data?.length) {
     return (
@@ -1064,7 +1084,7 @@ function AgentChartView({
 
       {/* ── FORECAST ── */}
       {viewType === 'forecast' && (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={chartH}>
           <ComposedChart margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             <defs><linearGradient id={gid} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity={0.25} /><stop offset="100%" stopColor={color} stopOpacity={0} /></linearGradient></defs>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
@@ -1078,7 +1098,7 @@ function AgentChartView({
 
       {/* ── COMBO ── */}
       {viewType === 'combo' && (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={chartH}>
           <ComposedChart data={chart.data} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} /><Legend iconSize={8} wrapperStyle={{ fontSize: 10 }} />
             {(chart.series ?? [{ key: 'value', type: 'bar' }]).map((s, i) => {
@@ -1094,7 +1114,7 @@ function AgentChartView({
 
       {/* ── WATERFALL ── */}
       {viewType === 'waterfall' && (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={chartH}>
           <ComposedChart data={chart.data} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} formatter={(v, name) => name === 'base' ? null : v} />
             <Bar dataKey="base" stackId="wf" fill="transparent" />
@@ -1113,7 +1133,7 @@ function AgentChartView({
         const yKey = chart.y_key ?? 'y'
         const scatterData = chart.data.map(d => ({ ...d, x: Number(d[xKey] ?? d.value ?? 0), y: Number(d[yKey] ?? 0) }))
         return (
-          <ResponsiveContainer width="100%" height={240}>
+          <ResponsiveContainer width="100%" height={chartH}>
             <ScatterChart margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
               {GRID}
               <XAxis dataKey="x" type="number" name={xKey} tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} label={{ value: xKey, fill: '#94a3b8', fontSize: 9, position: 'insideBottom', offset: -2 }} />
@@ -1131,7 +1151,7 @@ function AgentChartView({
         const target = chart.target_value ?? 100
         return (
           <div style={{ padding: '8px 0', display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {chart.data.slice(0, 6).map((d, i) => {
+            {chart.data.slice(0, 8).map((d, i) => {
               const v = d.value, t = target, mx = Math.max(t * 1.2, v * 1.1)
               const vp = Math.min(100, (v / mx) * 100), tp = Math.min(100, (t / mx) * 100)
               const att = t > 0 ? (v / t) * 100 : 0
@@ -1157,9 +1177,9 @@ function AgentChartView({
         )
       })()}
 
-      {/* ── BAR — switches to ComposedChart for trend line ── */}
-      {viewType === 'bar' && (
-        <ResponsiveContainer width="100%" height={240}>
+      {/* ── BAR — horizontal when >14 items, vertical otherwise ── */}
+      {viewType === 'bar' && !useHorizontalBar && (
+        <ResponsiveContainer width="100%" height={chartH}>
           <ComposedChart data={dataWithTrend} margin={{ top: 18, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
             <Bar dataKey="value" fill={color} radius={[4, 4, 0, 0]} maxBarSize={44} opacity={0.88}
@@ -1174,10 +1194,26 @@ function AgentChartView({
           </ComposedChart>
         </ResponsiveContainer>
       )}
+      {viewType === 'bar' && useHorizontalBar && (
+        <ResponsiveContainer width="100%" height={Math.max(chartH, chart.data.length * 28)}>
+          <BarChart data={chart.data} layout="vertical" margin={{ top: 4, right: 48, bottom: 4, left: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
+            <XAxis type="number" tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false}
+              tickFormatter={(v: number) => Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v/1e3).toFixed(1)}K` : String(v)} />
+            <YAxis type="category" dataKey="name" tick={{ fontSize: 10, fill: '#374151' }} axisLine={false} tickLine={false} width={120} />
+            <Tooltip {...TTP} />
+            <Bar dataKey="value" fill={color} radius={[0, 4, 4, 0]} maxBarSize={20} opacity={0.88}
+              onClick={onDrill ? (d: { name?: string }) => onDrill(String(d?.name ?? '')) : undefined}
+              style={onDrill ? { cursor: 'pointer' } : undefined}>
+              <LabelList dataKey="value" position="right" style={{ fontSize: 9, fill: '#64748b' }} formatter={(v: number) => Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v/1e3).toFixed(1)}K` : v} />
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      )}
 
       {/* ── AREA — with trend line ── */}
       {viewType === 'area' && (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={chartH}>
           <ComposedChart data={dataWithTrend} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             <defs><linearGradient id={gid} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity={0.28} /><stop offset="100%" stopColor={color} stopOpacity={0} /></linearGradient></defs>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
@@ -1192,7 +1228,7 @@ function AgentChartView({
 
       {/* ── LINE — with trend line ── */}
       {viewType === 'line' && (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={chartH}>
           <ComposedChart data={dataWithTrend} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} />
             <Line type="monotone" dataKey="value" stroke={color} strokeWidth={2.5} dot={false} activeDot={{ r: 4, fill: color }} />
@@ -1204,9 +1240,9 @@ function AgentChartView({
         </ResponsiveContainer>
       )}
 
-      {/* ── PIE ── */}
+      {/* ── PIE (≤8 slices — auto-converts to bar if >8) ── */}
       {viewType === 'pie' && (
-        <ResponsiveContainer width="100%" height={260}>
+        <ResponsiveContainer width="100%" height={chartH}>
           <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
             <Pie
               data={chart.data} dataKey="value" nameKey="name"
@@ -1377,96 +1413,68 @@ function SectionContent({
         <InsightCards insights={section.insights} />
       )}
 
-      {/* ── Performers + Charts ── */}
-      {(hasPerformers || section.charts.length > 0) && (() => {
+      {/* ── Performers ── */}
+      {hasPerformers && (
+        <div style={{ animation: 'fadeInUp 0.3s 0.05s ease both' }}>
+          <PerformerPanel top={section.top_performers ?? []} bottom={section.bottom_performers ?? []} label={section.label} />
+        </div>
+      )}
+
+      {/* ── Charts — 6-column grid, AI controls each chart's column span ── */}
+      {section.charts.length > 0 && (() => {
+        const RESERVED = new Set(['name','value','base','total','projected','anomaly'])
         const charts = section.charts.filter(ch => {
           if ((ch.data?.length ?? 0) === 0) return false
-          // Skip charts where every single cell is null/empty (AI-generated ghosts)
           const hasAnyRealValue = ch.data.some(row =>
             Object.values(row).some(v => v !== null && v !== undefined && v !== '' && String(v).trim() !== '')
           )
           if (!hasAnyRealValue) return false
-
-          // Fix B — suppress table charts whose first-column entities are already
-          // shown by the PerformerPanel (≥50% overlap → duplicate visual)
           if (ch.type === 'table' && performerLabels.size > 0) {
             const firstKey = Object.keys(ch.data[0]).find(
               k => !['value','base','total','projected','anomaly'].includes(k.toLowerCase())
             ) ?? Object.keys(ch.data[0])[0]
-            const tableEntities = ch.data
-              .map(r => String(r[firstKey] ?? '').trim().toLowerCase())
-              .filter(Boolean)
+            const tableEntities = ch.data.map(r => String(r[firstKey] ?? '').trim().toLowerCase()).filter(Boolean)
             if (tableEntities.length > 0) {
               const matched = tableEntities.filter(e => performerLabels.has(e)).length
               if (matched / Math.min(tableEntities.length, performerLabels.size) >= 0.5) return false
             }
           }
-
           return true
         })
 
-        // A chart "needs the full row" if it's a table type OR its data rows carry
-        // more than 3 column keys beyond the standard name/value pair (e.g. multi-year
-        // revenue matrices, detail tables with 4+ dimensions). These cannot share a
-        // half-width column without truncating content.
-        const RESERVED = new Set(['name','value','base','total','projected','anomaly'])
-        const isWide = (ch: AgentChart) =>
-          ch.type === 'table' ||
-          (ch.data.length > 0 &&
-            Object.keys(ch.data[0]).filter(k => !RESERVED.has(k)).length > 2)
+        if (!charts.length) return null
 
-        const wideCharts    = charts.filter(isWide)
-        const compactCharts = charts.filter(ch => !isWide(ch))
-        const firstCompact  = compactCharts[0]
-        const restCompact   = compactCharts.slice(1)
+        const colSpan = (ch: AgentChart): number => {
+          if (ch.span === 'full') return 6
+          if (ch.span === '2/3')  return 4
+          if (ch.span === '1/2')  return 3
+          if (ch.span === '1/3')  return 2
+          if (ch.type === 'table' || ch.type === 'scatter' || ch.type === 'waterfall' || ch.type === 'forecast') return 6
+          if (ch.type === 'combo') return (ch.series?.length ?? 0) >= 3 ? 6 : 4
+          if (ch.data.length > 0) {
+            const avgLabelLen = ch.data.reduce((s, r) => s + String(r.name ?? '').length, 0) / ch.data.length
+            if (avgLabelLen > 15) return 6
+          }
+          if (ch.data.length > 12) return 6
+          if (ch.data.length > 6)  return 4
+          if (ch.data.length > 0 && Object.keys(ch.data[0]).filter(k => !RESERVED.has(k)).length > 2) return 6
+          return 3
+        }
 
         return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-
-            {/* Row 1 — performers sidebar + first compact chart */}
-            {(hasPerformers || firstCompact) && (
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: hasPerformers && firstCompact ? '260px minmax(0, 1fr)' : '1fr',
-                gap: 16, alignItems: 'start',
-              }}>
-                {hasPerformers && (
-                  <div style={{ animation: 'fadeInLeft 0.3s 0.05s ease both', minWidth: 0 }}>
-                    <PerformerPanel top={section.top_performers ?? []} bottom={section.bottom_performers ?? []} label={section.label} />
-                  </div>
-                )}
-                {firstCompact && (
-                  <div style={{ animation: 'fadeInUp 0.32s 0.08s ease both', minWidth: 0 }}>
-                    <AgentChartView {...chartProps(firstCompact, 0)} />
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Remaining compact charts — max 2 per row, responsive */}
-            {restCompact.length > 0 && (
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: restCompact.length === 1
-                  ? '1fr'
-                  : 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
-                gap: 16,
-              }}>
-                {restCompact.map((ch, i) => (
-                  <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0 }}>
-                    <AgentChartView {...chartProps(ch, i + 1)} />
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Wide charts (tables + multi-column) — always occupy the full row */}
-            {wideCharts.map((ch, i) => (
-              <div key={`wide-${i}`} style={{ animation: `fadeInUp 0.3s ${0.08 + i * 0.05}s ease both`, width: '100%', minWidth: 0 }}>
-                <AgentChartView {...chartProps(ch, compactCharts.length + i)} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 16, alignItems: 'start' }}>
+            {charts.map((ch, i) => (
+              <div
+                key={`chart-${i}`}
+                style={{
+                  gridColumn: `span ${colSpan(ch)}`,
+                  animation: `fadeInUp 0.32s ${0.06 + i * 0.06}s ease both`,
+                  minWidth: 0,
+                }}
+              >
+                <AgentChartView {...chartProps(ch, i)} />
               </div>
             ))}
-
           </div>
         )
       })()}

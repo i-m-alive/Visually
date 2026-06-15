@@ -16,7 +16,8 @@ from shared.models.dashboards import Dashboard
 from shared.models.widgets import Widget
 from shared.encryption import decrypt
 from shared.export_tokens import validate_export_token
-from agent_service.agents.chat_agent import ChatAgent
+from agent_service.agents.chat_agent import ChatAgent, _SYSTEM_INSTRUCTIONS
+from shared.bedrock_client import bedrock_invoke_with_history_cached, BEDROCK_SONNET_MODEL
 import agent_service.agents.schema_cache as _schema_cache
 
 router = APIRouter(tags=["chat"])
@@ -42,6 +43,66 @@ class ChatResponse(BaseModel):
     inline_chart: Optional[dict] = None
     dashboard_action: Optional[dict] = None
     turn_count: int
+
+
+class WarmupRequest(BaseModel):
+    session_id: str
+    project_id: Optional[str] = None
+
+
+class WarmupResponse(BaseModel):
+    status: str   # "warmed" | "already_warm"
+    session_id: str
+
+
+@router.post("/agent/chat/warmup", response_model=WarmupResponse)
+async def chat_warmup(
+    req: WarmupRequest,
+    redis=Depends(get_redis),
+):
+    """Pre-warm the Bedrock prompt cache for a session.
+
+    Fires a 1-token call with cache_control on the static instructions so subsequent
+    real calls hit the cache instead of paying the cache-creation cost.
+    Stores a Redis key with a 4-minute TTL (under Bedrock's 5-minute cache TTL).
+    """
+    fp_key = f"chat:warmed:{req.session_id}"
+
+    # Skip if already warmed within the last 4 minutes
+    if redis:
+        try:
+            existing = await redis.get(fp_key)
+            if existing:
+                return WarmupResponse(status="already_warm", session_id=req.session_id)
+        except Exception:
+            pass
+
+    try:
+        _, cache_info = await bedrock_invoke_with_history_cached(
+            model_id=BEDROCK_SONNET_MODEL,
+            system_stable=_SYSTEM_INSTRUCTIONS,
+            system_dynamic="",
+            messages=[{"role": "user", "content": "ready"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+        print(
+            f"[chat/warmup] session={req.session_id[:8]}  "
+            f"cache_created={cache_info.get('cache_created')}  "
+            f"cache_create_tokens={cache_info.get('cache_creation_tokens', 0)}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[chat/warmup] ⚠ warmup failed (non-fatal): {exc}", flush=True)
+        return WarmupResponse(status="failed", session_id=req.session_id)
+
+    if redis:
+        try:
+            await redis.setex(fp_key, 240, "1")  # 4-minute TTL
+        except Exception:
+            pass
+
+    return WarmupResponse(status="warmed", session_id=req.session_id)
 
 
 @router.post("/agent/chat", response_model=ChatResponse)

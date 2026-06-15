@@ -136,6 +136,12 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
     if (prefillMessage) { setInput(prefillMessage); setTimeout(() => textareaRef.current?.focus(), 100) }
   }, [prefillMessage])
 
+  // Pre-warm the Bedrock prompt cache as soon as the panel opens.
+  // Fire-and-forget — errors are silently swallowed; warmup is a best-effort optimisation.
+  useEffect(() => {
+    chatApi.warmup({ session_id: sessionId, project_id: projectId }).catch(() => {})
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
   const widgetRecs   = buildRecommendations(widgets, pages)
   const recommended  = suggestedQuestions?.length

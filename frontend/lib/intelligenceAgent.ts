@@ -78,6 +78,7 @@ export interface AgentChart {
   y_key?: string
   source_sql?: string      // injected post-AI from widget sql_query
   insight?: string         // 1-2 sentence finding specific to this chart's data
+  span?: 'full' | '2/3' | '1/2' | '1/3'  // grid column width in a 6-column layout
 }
 
 export interface InsightCard {
@@ -724,14 +725,24 @@ function computeDimensionBreakdowns(rows: Record<string, unknown>[], profiles: C
 // Skill 16 — ROW_RANKING
 // ═══════════════════════════════════════════════════════════════════════════════
 
+function _cleanPerformerLabel(raw: string, maxLen = 42): string {
+  if (!raw) return raw
+  // Multi-value concatenated labels (e.g. "Type A, Type B, Type C") — use first segment only
+  const first = raw.split(/,\s*/)[0].trim()
+  // Hard truncate if still too long
+  return first.length > maxLen ? first.slice(0, maxLen - 1) + '…' : first
+}
+
 function rankRows(
   rows: Record<string, unknown>[],
   metricCol: string,
   labelCol: string,
   topN = 5,
 ): { top: PerformerRow[]; bottom: PerformerRow[]; total: number } {
-  const pairs = rows.map(r => ({ label: String(r[labelCol] ?? ''), value: toNum(r[metricCol]) }))
-    .filter(p => !isNaN(p.value))
+  const pairs = rows.map(r => ({
+    label: _cleanPerformerLabel(String(r[labelCol] ?? '')),
+    value: toNum(r[metricCol]),
+  })).filter(p => !isNaN(p.value))
   if (!pairs.length) return { top: [], bottom: [], total: 0 }
   const total = pairs.reduce((s, p) => s + Math.abs(p.value), 0)
   const sorted = [...pairs].sort((a, b) => b.value - a.value)
@@ -949,6 +960,7 @@ INSTRUCTIONS:
    • recommendation: one concrete, measurable action
    • 2–3 insights[] cards — use specific values; type = positive/negative/neutral/warning
    • top_performers / bottom_performers: 3 rows each, from TOP/BOTTOM PERFORMERS data
+     LABEL RULES: Keep each label ≤ 42 characters. If a raw value contains commas (e.g. "Type A, Type B, Type C") use ONLY the text before the first comma. Never use IDs, hashes, or multi-value concatenated strings as labels.
    • 2–3 charts built from the actual data rows (bar, line, pie, combo, waterfall, scatter, bullet) — max 20 data points per chart
    • If a widget's original chart_type is "table", OR if the widget has 3+ named columns of mixed dimensional/numeric data, ALSO include one chart with type:"table" — include up to 50 rows and preserve ALL meaningful column names as keys (e.g. {"customer":"Acme","revenue":120000,"region":"West","2023":95000,"2024":120000})
 3. Extract 4–6 top-level KPIs from the most prominent metrics. For sparkline_data use the actual numeric values from the widget sample_values or column profile (max 12 values).
@@ -962,6 +974,31 @@ CHART DATA RULES — build charts from the real row data provided:
    • bullet: target_value set, each data row is an entity vs that target
    • scatter: x_key + y_key + data rows containing those fields
    • table: data rows preserving ALL column keys from the source widget, not just name/value — e.g. {"customer":"Acme","region":"West","2022":80000,"2023":95000,"2024":120000}
+
+LAYOUT RULES — every chart MUST have a "span" field. Charts sit in a 6-column CSS grid.
+   Use this DECISION TABLE — pick the FIRST matching row:
+
+   Chart type        | Condition                          | → span
+   ──────────────────|────────────────────────────────────|────────
+   table             | always                             | "full"
+   scatter           | always                             | "full"
+   waterfall         | always                             | "full"
+   forecast          | always                             | "full"
+   combo             | 3+ series                          | "full"
+   bar / line / area | category labels avg > 15 chars     | "full"
+   bar / line / area | > 12 data points                   | "full"
+   bar / line / area | 7–12 data points                   | "2/3"
+   bar / line / area | ≤ 6 data points                    | "1/2"
+   pie               | > 8 slices                         | "2/3"
+   pie               | ≤ 8 slices                         | "1/2"
+   bullet            | always                             | "1/2"
+   combo             | 2 series                           | "2/3"
+
+   GRID PACKING — all spans in a section must sum to a multiple of 6 (the row wraps at 6):
+   • 2-chart sections: "2/3" + "1/3"  OR  "1/2" + "1/2"
+   • 3-chart sections: "full" then "1/2" + "1/2"  OR  "2/3" + "1/3" then "full"
+   • NEVER two "2/3" charts together (4+4=8 breaks the row)
+   • NEVER span:"full" for a simple 3–4 bar chart — that wastes whitespace
 
 ICON LIST (use ONLY these):
 ${VALID_ICON_NAMES}
@@ -982,7 +1019,7 @@ RESPOND WITH ONLY RAW JSON — no markdown, no explanation, no trailing text:
     "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
     "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
     "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
-    "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
+    "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","span":"full|2/3|1/2|1/3","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
   }]
 }`
 }
@@ -1120,6 +1157,7 @@ function sanitizeChart(ch: AgentChart): AgentChart {
     x_key: ch.x_key ? String(ch.x_key) : undefined,
     y_key: ch.y_key ? String(ch.y_key) : undefined,
     insight: ch.insight ? String(ch.insight) : undefined,
+    span: (['full', '2/3', '1/2', '1/3'] as const).includes(ch.span as never) ? ch.span : undefined,
     data: (ch.data ?? []).slice(0, 60).map((d: AgentChartRow) => {
       const row: AgentChartRow = { name: String(d.name ?? ''), value: Number(d.value ?? 0) }
       if (d.base != null) row.base = Number(d.base)
@@ -1646,7 +1684,7 @@ Return ONLY the JSON for a single section — no other text:
   "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
   "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
   "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
-  "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}]}]
+  "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","span":"full|2/3|1/2|1/3","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}]}]
 }`
 
   onProgress?.(`Sending section prompt for "${sectionLabel}"…`)

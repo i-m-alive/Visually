@@ -181,6 +181,64 @@ async def bedrock_invoke_with_history(
     return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
 
 
+async def bedrock_invoke_with_history_cached(
+    model_id: str,
+    system_stable: str,
+    system_dynamic: str,
+    messages: list[dict],
+    max_tokens: int = 4096,
+    temperature: float = 0.3,
+) -> tuple[str, dict]:
+    """Like bedrock_invoke_with_history but splits system into a cached stable block
+    and an uncached dynamic block.  Returns (response_text, cache_info).
+    cache_info keys: cache_hit, cache_created, cache_read_tokens, cache_creation_tokens.
+    """
+    def _invoke():
+        import time
+        client = get_bedrock_client()
+        system_blocks: list[dict] = [
+            {"type": "text", "text": system_stable, "cache_control": {"type": "ephemeral"}},
+        ]
+        if system_dynamic:
+            system_blocks.append({"type": "text", "text": system_dynamic})
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system_blocks,
+            "messages": messages,
+        }
+        t0 = time.time()
+        response = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(response["body"].read())
+        usage = result.get("usage", {})
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_create = usage.get("cache_creation_input_tokens", 0)
+        cache_info = {
+            "cache_hit": cache_read > 0,
+            "cache_created": cache_create > 0,
+            "cache_read_tokens": cache_read,
+            "cache_creation_tokens": cache_create,
+        }
+        print(
+            f"[bedrock-cached] ← {time.time()-t0:.1f}s  "
+            f"cache={'hit' if cache_read > 0 else ('created' if cache_create > 0 else 'miss')}  "
+            f"cache_read={cache_read}  cache_create={cache_create}  "
+            f"input={usage.get('input_tokens', 0)}  output={usage.get('output_tokens', 0)}",
+            flush=True,
+        )
+        _track_usage(model_id, result)
+        return result["content"][0]["text"], cache_info
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+
+
 async def bedrock_invoke_with_image(
     model_id: str,
     system_prompt: str,
