@@ -1,0 +1,7 @@
+venv/
+**/__pycache__/
+**/*.pyc
+uploads/
+.schema_cache/
+*.log
+render_service/node_modules/
