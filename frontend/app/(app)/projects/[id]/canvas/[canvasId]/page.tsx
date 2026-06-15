@@ -218,8 +218,11 @@ export default function CanvasEditorPage() {
         }
       }
       if (Object.keys(seedDates).length) setActiveDateRange(seedDates)
-      const allZero = ws.every(w => (w.position_x ?? 0) === 0 && (w.position_y ?? 0) === 0)
-      const computed: GridItem[] = allZero
+      // Auto-arrange when all widgets are stacked at x=0 (fresh canvas or
+      // backend-stored default positions where y increments but x stays 0).
+      const allAtX0 = ws.every(w => (w.position_x ?? 0) === 0)
+      const shouldAutoArrange = allAtX0 && ws.length > 0
+      const computed: GridItem[] = shouldAutoArrange
         ? autoArrange(ws)
         : ws.map(w => ({
             i: w.id,
@@ -231,7 +234,7 @@ export default function CanvasEditorPage() {
             minH: 3,
           }))
       setLayout(computed)
-      if (allZero && ws.length > 0) {
+      if (shouldAutoArrange) {
         void canvasApi.updateLayout(canvasId, computed.map(l => ({
           widget_id: l.i, x: l.x, y: l.y, w: l.w, h: l.h,
         })))
@@ -533,7 +536,7 @@ export default function CanvasEditorPage() {
     } catch { showToast('Could not copy link') }
   }
 
-  const handleExportJSON = () => {
+  const handleExportJSON = async () => {
     const data = {
       canvas: { id: canvas?.id, name: canvas?.name },
       widgets: widgets.map(w => ({
@@ -543,10 +546,27 @@ export default function CanvasEditorPage() {
       layout,
     }
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const suggestedName = `${canvas?.name ?? 'canvas'}.json`
+
+    if ('showSaveFilePicker' in window) {
+      try {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName,
+          types: [{ description: 'JSON file', accept: { 'application/json': ['.json'] } }],
+        })
+        const writable = await handle.createWritable()
+        await writable.write(blob)
+        await writable.close()
+        showToast('JSON exported')
+        return
+      } catch (e: any) {
+        if (e?.name === 'AbortError') return
+      }
+    }
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${canvas?.name ?? 'canvas'}.json`
+    a.download = suggestedName
     a.click()
     URL.revokeObjectURL(url)
     showToast('JSON exported')
@@ -580,223 +600,187 @@ export default function CanvasEditorPage() {
       )}
 
       {/* Top bar */}
-      <div className="flex items-center gap-2 px-4 py-2.5 bg-white border-b border-gray-100 flex-shrink-0 flex-wrap">
+      {/* ── Ribbon ── Title bar ─────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-2 px-3 py-1.5 bg-white border-b border-gray-200 flex-shrink-0"
+        style={{ background: 'linear-gradient(180deg,#f8fafd 0%,#f1f5f9 100%)' }}>
         <button
           onClick={() => router.push(`/projects/${projectId}/canvas`)}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
+          className="p-1 text-gray-400 hover:text-gray-700 rounded hover:bg-white/80 transition-colors flex-shrink-0"
+          title="Back to canvases"
         >
-          <ChevronLeft size={18} />
+          <ChevronLeft size={16} />
         </button>
-
-        <div className="flex items-center gap-2 flex-1 min-w-0">
-          <Layers size={16} className="text-blue-600 flex-shrink-0" />
-          {editingTitle ? (
-            <input
-              autoFocus
-              value={titleValue}
-              onChange={e => setTitleValue(e.target.value)}
-              onBlur={handleTitleSave}
-              onKeyDown={e => {
-                if (e.key === 'Enter') handleTitleSave()
-                if (e.key === 'Escape') { setTitleValue(canvas?.name ?? ''); setEditingTitle(false) }
-              }}
-              className="text-sm font-semibold text-gray-900 bg-transparent border-b-2 border-blue-500 outline-none min-w-0 w-48"
-            />
-          ) : (
-            <button
-              onClick={() => { setTitleValue(canvas?.name ?? ''); setEditingTitle(true) }}
-              className="group/title flex items-center gap-1.5 text-sm font-semibold text-gray-900 hover:text-blue-600 transition-colors min-w-0"
-              title="Click to rename"
-            >
-              <span className="truncate">{canvas?.name}</span>
-              <Pencil size={12} className="text-gray-300 group-hover/title:text-blue-500 shrink-0 transition-colors" />
-            </button>
-          )}
-        </div>
-
-        {/* Save state */}
-        <div className="flex items-center gap-1.5 text-xs flex-shrink-0">
-          {saving && (
-            <span className="flex items-center gap-1 text-gray-400">
-              <Loader2 size={12} className="animate-spin" /> Saving…
-            </span>
-          )}
-          {savedOk && (
-            <span className="flex items-center gap-1 text-green-600">
-              <CheckCircle2 size={12} /> Saved
-            </span>
-          )}
+        <Layers size={14} className="text-blue-600 flex-shrink-0" />
+        {editingTitle ? (
+          <input
+            autoFocus
+            value={titleValue}
+            onChange={e => setTitleValue(e.target.value)}
+            onBlur={handleTitleSave}
+            onKeyDown={e => {
+              if (e.key === 'Enter') handleTitleSave()
+              if (e.key === 'Escape') { setTitleValue(canvas?.name ?? ''); setEditingTitle(false) }
+            }}
+            className="text-sm font-semibold text-gray-900 bg-white border border-blue-400 rounded px-1.5 outline-none min-w-0 w-44"
+          />
+        ) : (
+          <button
+            onClick={() => { setTitleValue(canvas?.name ?? ''); setEditingTitle(true) }}
+            className="group/title flex items-center gap-1 text-sm font-semibold text-gray-800 hover:text-blue-600 transition-colors min-w-0"
+            title="Click to rename"
+          >
+            <span className="truncate max-w-[200px]">{canvas?.name}</span>
+            <Pencil size={11} className="text-gray-300 group-hover/title:text-blue-500 shrink-0 transition-colors" />
+          </button>
+        )}
+        <div className="flex items-center gap-1 ml-1 flex-shrink-0 text-xs">
+          {saving && <span className="flex items-center gap-1 text-gray-400"><Loader2 size={11} className="animate-spin" /> Saving…</span>}
+          {savedOk && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 size={11} /> Saved</span>}
           {isDirty && !saving && !savedOk && (
-            <button
-              onClick={handleManualSave}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
-            >
-              <Save size={12} /> Save
+            <button onClick={handleManualSave} className="flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors">
+              <Save size={11} /> Save
             </button>
           )}
         </div>
+      </div>
 
-        {/* Undo / Redo */}
-        <button
-          onClick={handleUndo}
-          disabled={!canUndo}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-30"
-          title="Undo (Ctrl+Z)"
-        >
-          <RotateCcw size={14} />
-        </button>
-        <button
-          onClick={handleRedo}
-          disabled={!canRedo}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-30 scale-x-[-1]"
-          title="Redo (Ctrl+Y)"
-        >
-          <RotateCcw size={14} />
-        </button>
+      {/* ── Ribbon ── Command bar ───────────────────────────────────────────────── */}
+      <div className="flex items-end gap-0 px-0 bg-white border-b border-gray-200 flex-shrink-0 overflow-x-auto"
+        style={{ background: 'white' }}>
 
-        {/* Zoom controls */}
-        <button
-          onClick={() => setGridZoom(z => Math.max(0.5, z - 0.1))}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
-          title="Zoom out"
-        >
-          <ZoomOut size={14} />
-        </button>
-        <span className="text-xs text-gray-400 min-w-[2.5rem] text-center select-none">
-          {Math.round(gridZoom * 100)}%
-        </span>
-        <button
-          onClick={() => setGridZoom(z => Math.min(1.5, z + 0.1))}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
-          title="Zoom in"
-        >
-          <ZoomIn size={14} />
-        </button>
+        {/* Helper for ribbon groups */}
+        {/* Group: Edit */}
+        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
+          <div className="flex items-center gap-0.5">
+            <button onClick={handleUndo} disabled={!canUndo} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-30 transition-colors group" title="Undo (Ctrl+Z)">
+              <RotateCcw size={16} className="text-gray-600" />
+              <span className="text-[9px] text-gray-500">Undo</span>
+            </button>
+            <button onClick={handleRedo} disabled={!canRedo} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-30 transition-colors scale-x-[-1]" title="Redo (Ctrl+Y)">
+              <RotateCcw size={16} className="text-gray-600" />
+            </button>
+          </div>
+          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Edit</span>
+        </div>
 
-        {/* View-only toggle */}
-        <button
-          onClick={() => { setIsViewOnly(v => !v); showToast(!isViewOnly ? 'View-only mode on' : 'Edit mode') }}
-          className={`p-1.5 rounded-lg transition-colors ${
-            isViewOnly ? 'bg-amber-100 text-amber-600' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-100'
-          }`}
-          title={isViewOnly ? 'Exit view-only mode' : 'Enter view-only mode'}
-        >
-          {isViewOnly ? <EyeOff size={14} /> : <Eye size={14} />}
-        </button>
+        {/* Group: View */}
+        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
+          <div className="flex items-center gap-0.5">
+            <button onClick={() => setGridZoom(z => Math.max(0.5, z - 0.1))} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors" title="Zoom out">
+              <ZoomOut size={16} className="text-gray-600" />
+              <span className="text-[9px] text-gray-500">Out</span>
+            </button>
+            <span className="text-xs font-semibold text-gray-600 min-w-[36px] text-center px-1 py-1 bg-gray-50 rounded border border-gray-200 select-none" style={{ fontSize: 11 }}>
+              {Math.round(gridZoom * 100)}%
+            </span>
+            <button onClick={() => setGridZoom(z => Math.min(1.5, z + 0.1))} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors" title="Zoom in">
+              <ZoomIn size={16} className="text-gray-600" />
+              <span className="text-[9px] text-gray-500">In</span>
+            </button>
+            <button
+              onClick={() => { setIsViewOnly(v => !v); showToast(!isViewOnly ? 'View-only mode on' : 'Edit mode') }}
+              className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${isViewOnly ? 'bg-amber-50 text-amber-600' : 'hover:bg-gray-100 text-gray-600'}`}
+              title={isViewOnly ? 'Exit view-only mode' : 'Enter view-only mode'}
+            >
+              {isViewOnly ? <EyeOff size={16} /> : <Eye size={16} />}
+              <span className="text-[9px]">View</span>
+            </button>
+            <button onClick={handleRefreshAll} disabled={refreshingId === 'all'} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-50 transition-colors text-gray-600" title="Refresh all">
+              <RefreshCw size={16} className={refreshingId === 'all' ? 'animate-spin' : ''} />
+              <span className="text-[9px] text-gray-500">Refresh</span>
+            </button>
+          </div>
+          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">View</span>
+        </div>
 
-        {/* Refresh all */}
-        <button
-          onClick={handleRefreshAll}
-          disabled={refreshingId === 'all'}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-50"
-          title="Refresh all widgets"
-        >
-          <RefreshCw size={14} className={refreshingId === 'all' ? 'animate-spin' : ''} />
-        </button>
+        {/* Group: Insert */}
+        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
+          <div className="flex items-center gap-0.5">
+            {!isViewOnly && (
+              <button onClick={() => setShowChat(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-blue-50 hover:text-blue-700 transition-colors text-gray-600" title="Add chart">
+                <Plus size={16} />
+                <span className="text-[9px]">Add Chart</span>
+              </button>
+            )}
+            {widgets.length > 0 && (
+              <button onClick={handleAutoArrange} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Auto-arrange">
+                <LayoutGrid size={16} />
+                <span className="text-[9px]">Auto</span>
+              </button>
+            )}
+          </div>
+          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Insert</span>
+        </div>
 
-        {/* Copy link */}
-        <button
-          onClick={handleCopyLink}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
-          title="Copy canvas link"
-        >
-          <Link2 size={14} />
-        </button>
+        {/* Group: Share */}
+        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
+          <div className="flex items-center gap-0.5">
+            <button onClick={handleCopyLink} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Copy link">
+              <Link2 size={16} />
+              <span className="text-[9px]">Copy Link</span>
+            </button>
+            <button onClick={handleExportJSON} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Export JSON">
+              <FileJson size={16} />
+              <span className="text-[9px]">JSON</span>
+            </button>
+            <button onClick={() => vlyApi.exportVly(canvasId)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-teal-50 hover:text-teal-700 transition-colors text-gray-600" title="Export .vly">
+              <FileDown size={16} />
+              <span className="text-[9px]">Export .vly</span>
+            </button>
+          </div>
+          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Share</span>
+        </div>
 
-        {/* JSON export */}
-        <button
-          onClick={handleExportJSON}
-          className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors"
-          title="Export as JSON"
-        >
-          <FileJson size={14} />
-        </button>
+        {/* Group: Configure */}
+        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
+          <div className="flex items-center gap-0.5">
+            <button onClick={() => setShowMeasures(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-purple-50 hover:text-purple-700 transition-colors text-gray-600" title="Calculated Measures">
+              <FunctionSquare size={16} />
+              <span className="text-[9px]">Measures</span>
+            </button>
+            <button onClick={() => setShowSchedule(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-green-50 hover:text-green-700 transition-colors text-gray-600" title="Schedule Refresh">
+              <Clock size={16} />
+              <span className="text-[9px]">Schedule</span>
+            </button>
+            <button onClick={() => setShowRLS(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-orange-50 hover:text-orange-700 transition-colors text-gray-600" title="Row-Level Security">
+              <Shield size={16} />
+              <span className="text-[9px]">RLS</span>
+            </button>
+          </div>
+          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Configure</span>
+        </div>
 
-        {/* Auto-arrange */}
-        {widgets.length > 0 && (
-          <button
-            onClick={handleAutoArrange}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-            title="Auto-arrange all charts by type"
-          >
-            <LayoutGrid size={13} /> Auto
-          </button>
-        )}
-
-        {/* Add chart */}
-        {!isViewOnly && (
-          <button
-            onClick={() => setShowChat(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-            title="Add chart (N)"
-          >
-            <Plus size={13} /> Add chart
-          </button>
-        )}
-
-        {/* AI Chat toggle */}
-        <button
-          onClick={() => setShowChat(v => !v)}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
-            showChat ? 'bg-blue-600 text-white' : 'text-gray-600 bg-gray-100 hover:bg-gray-200'
-          }`}
-        >
-          <MessageSquare size={13} /> AI Chat
-        </button>
-
-        {/* Visually report */}
-        <button
-          onClick={() => setShowReport(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-lg transition-all hover:opacity-90"
-          style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
-          title="View as rich report"
-        >
-          <Sparkles size={13} /> Visually
-        </button>
-
-        {/* Intelligence */}
-        <button
-          onClick={() => router.push(`/intelligence/${canvasId}`)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-lg transition-all hover:opacity-90"
-          style={{ background: 'linear-gradient(135deg, #00a9d4, #16c0e8)' }}
-          title="Open Executive Intelligence"
-        >
-          <Zap size={13} /> Intelligence
-        </button>
-
-        {/* Tier 5 feature buttons */}
-        <div className="w-px h-4 bg-gray-200 mx-1 flex-shrink-0" />
-        <button
-          onClick={() => setShowMeasures(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-purple-50 hover:text-purple-700 transition-colors"
-          title="Calculated Measures"
-        >
-          <FunctionSquare size={13} /> Measures
-        </button>
-        <button
-          onClick={() => setShowSchedule(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-green-50 hover:text-green-700 transition-colors"
-          title="Schedule Refresh"
-        >
-          <Clock size={13} /> Schedule
-        </button>
-        <button
-          onClick={() => setShowRLS(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-orange-50 hover:text-orange-700 transition-colors"
-          title="Row-Level Security"
-        >
-          <Shield size={13} /> RLS
-        </button>
-
-        {/* .vly export */}
-        <div className="w-px h-4 bg-gray-200 mx-1 flex-shrink-0" />
-        <button
-          onClick={() => vlyApi.exportVly(canvasId)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-teal-50 hover:text-teal-700 transition-colors"
-          title="Export as .vly portable file"
-        >
-          <FileDown size={13} /> Export .vly
-        </button>
+        {/* Group: AI — primary actions, visually prominent */}
+        <div className="flex flex-col items-center px-3 py-1">
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setShowChat(v => !v)}
+              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md border transition-colors ${showChat ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-gray-600 border-gray-200 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-300'}`}
+            >
+              <MessageSquare size={17} />
+              <span className="text-[9px] font-semibold">AI Chat</span>
+            </button>
+            <button
+              onClick={() => setShowReport(true)}
+              className="flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md text-white border border-transparent transition-all hover:opacity-90"
+              style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
+              title="View as rich report"
+            >
+              <Sparkles size={17} />
+              <span className="text-[9px] font-semibold">Visually</span>
+            </button>
+            <button
+              onClick={() => router.push(`/intelligence/${canvasId}`)}
+              className="flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md text-white border border-transparent transition-all hover:opacity-90"
+              style={{ background: 'linear-gradient(135deg, #00a9d4, #16c0e8)' }}
+              title="Open Executive Intelligence"
+            >
+              <Zap size={17} />
+              <span className="text-[9px] font-semibold">Intelligence</span>
+            </button>
+          </div>
+          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">AI</span>
+        </div>
       </div>
 
       {/* Date filter bar */}

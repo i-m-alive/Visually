@@ -32,8 +32,27 @@ CHART CREATION GUIDELINES:
 - You may query any other table in the schema when the user's request requires it.
 - When creating a chart for a specific page, mention the page name in your response.
 
-WHEN TO GENERATE SQL:
-If the user asks a question that requires data not already in the canvas context, generate SQL.
+══════════════════════════════════════════════════════════════════════
+DATA QUESTIONS — MANDATORY EXECUTION PROTOCOL
+══════════════════════════════════════════════════════════════════════
+When the user asks a question that requires fetching data (e.g. "what was X",
+"how many Y", "show me Z", "find", "list", "who had the most", "total", etc.):
+
+  STEP 1 — Write one short sentence (max 12 words) acknowledging the question.
+  STEP 2 — IMMEDIATELY output a sql_execute block to fetch the answer.
+           Use chart_type "table" for row-level results, "kpi" for a single number,
+           "multi_row_card" for ranked/grouped numbers.
+  STEP 3 — STOP. Do NOT describe what the SQL does.
+
+❌ FORBIDDEN — these responses FAIL the user:
+   "I'll query the billing hours for Scarbrough Medlin in 2023."  ← no block = WRONG
+   "Let me look up that data for you."  ← no block = WRONG
+
+✅ CORRECT:
+   "Here are the billing hours for Scarbrough Medlin in 2023:"
+   ```sql_execute
+   {{"sql": "SELECT ...", "chart_type": "table", "title": "Billing Hours - Scarbrough Medlin 2023", "x_label": "", "y_label": ""}}
+   ```
 
 ══════════════════════════════════════════════════════════════════════
 CHART CREATION — MANDATORY EXECUTION PROTOCOL
@@ -85,8 +104,9 @@ Response: "Here are 2 charts:"
 ```
 
 RESPONSE FORMAT:
-For plain questions / data questions: respond in conversational English (no sql_execute needed).
-For chart/table/KPI creation: one sentence + sql_execute block(s) (see above).
+For data questions (what, how many, show, find, list, total, etc.): one sentence + sql_execute block (see DATA QUESTIONS above).
+For chart/table/KPI creation: one sentence + sql_execute block(s) (see CHART CREATION above).
+For conversational questions (greetings, explanations, "what is X concept"): plain English only, no sql_execute.
 
 ```sql_execute
 {{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
@@ -194,6 +214,20 @@ def _is_chart_creation_request(message: str) -> bool:
     has_action  = bool(words & action_words)
     has_subject = bool(words & subject_words)
     return has_action and has_subject
+
+
+def _is_data_query_request(message: str) -> bool:
+    """Return True when the message is asking a data question that requires SQL."""
+    lower = message.lower()
+    # Question starters that imply a data lookup
+    question_starters = (
+        "what", "how many", "how much", "which", "who", "when", "where",
+        "show me", "find", "list", "get me", "give me", "tell me",
+        "fetch", "retrieve", "calculate", "compute", "sum", "count",
+        "total", "average", "top", "bottom", "highest", "lowest",
+        "most", "least", "compare", "breakdown", "analyse", "analyze",
+    )
+    return any(lower.strip().startswith(s) or f" {s} " in lower for s in question_starters)
 
 
 class ChatAgent:
@@ -502,12 +536,13 @@ class ChatAgent:
             text = re.sub(r"<action>.*?</action>", "", text, flags=re.DOTALL).strip()
 
         # ── Auto-retry when model narrated instead of executing ───────────────
-        # If the user asked to create/show a chart but we got no sql_execute,
+        # If the user asked a data question or chart creation but got no sql_execute,
         # send one silent retry with an ultra-strict prompt.
-        if not sqls_to_execute and _is_chart_creation_request(message):
+        if not sqls_to_execute and (_is_chart_creation_request(message) or _is_data_query_request(message)):
             retry_msg = (
                 "EXECUTE ONLY — output NOTHING except a single sql_execute block.\n"
-                "Do NOT write any description or explanation.\n"
+                "Do NOT write any description, acknowledgment, or explanation.\n"
+                "The user is waiting for actual data — you MUST output a sql_execute block.\n"
                 f"Original request: {message}"
             )
             retry_messages = conversation_history[-20:] + [{"role": "user", "content": retry_msg}]

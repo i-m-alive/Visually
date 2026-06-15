@@ -750,7 +750,7 @@ function ListRow({ dash, idx, aiSummaries, onOpen, onExport, onShare, onDelete, 
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
       className="flex items-center gap-4 px-4 py-3 cursor-pointer transition-colors"
       style={{ background: hov ? '#F8FAFF' : 'white', animation: `slideUp .35s ${idx * 40}ms ease both` }}
-      onClick={() => onOpen(dash.id)}
+      onClick={() => onOpenIntelligence(dash.id)}
     >
       <div className="w-2 h-8 rounded-full flex-shrink-0" style={{ background: `linear-gradient(180deg, ${g.from}, ${g.to})` }} />
       <div className="flex-1 min-w-0">
@@ -828,11 +828,11 @@ function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId,
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
-      {/* Gradient header — click to open report */}
+      {/* Gradient header — click to open intelligence page */}
       <div
         className="relative px-4 pt-3.5 pb-3 flex-shrink-0 cursor-pointer"
         style={{ background: `linear-gradient(135deg, ${g.from}, ${g.to})`, minHeight: 88 }}
-        onClick={() => onOpen(dash.id)}
+        onClick={() => onOpenIntelligence(dash.id)}
       >
         {isRenaming ? (
           <input
@@ -893,11 +893,11 @@ function FlipCard({ dash, idx, aiSummaries, aiLoading, deletingId, confirmDelId,
         </div>
       </div>
 
-      {/* Body — click to open report */}
+      {/* Body — click to open intelligence page */}
       <div
         className="flex-1 px-4 pt-3 pb-3 flex flex-col gap-2"
         style={{ cursor: 'pointer' }}
-        onClick={() => onOpen(dash.id)}
+        onClick={() => onOpenIntelligence(dash.id)}
       >
         {/* AI snippet */}
         <div className="flex-1">

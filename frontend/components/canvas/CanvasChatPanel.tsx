@@ -313,6 +313,23 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
+        {/* Suggested questions rendered inline after greeting — never push greeting off screen */}
+        {showSuggestions && recommended.length > 0 && messages.length === 1 && (
+          <div className="ml-8">
+            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">Suggested</p>
+            <div className="flex flex-col gap-1.5">
+              {recommended.map((q, i) => (
+                <button
+                  key={i}
+                  onClick={() => send(q)}
+                  className="w-full text-left px-2.5 py-1.5 text-xs text-gray-600 bg-gray-50 hover:bg-blue-50 hover:text-blue-700 border border-gray-100 hover:border-blue-200 rounded-lg transition-colors leading-snug"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {messages.map((msg, i) => (
           <div key={i} className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
             <div
@@ -458,21 +475,6 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
         <div ref={endRef} />
       </div>
 
-      {/* Suggested questions — visible until user sends first message */}
-      {showSuggestions && recommended.length > 0 && (
-        <div className="px-3 py-2.5 border-t border-gray-100 flex-shrink-0 space-y-1.5">
-          <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Suggested</p>
-          {recommended.map((q, i) => (
-            <button
-              key={i}
-              onClick={() => send(q)}
-              className="w-full text-left px-2.5 py-1.5 text-xs text-gray-600 bg-gray-50 hover:bg-blue-50 hover:text-brand border border-gray-100 hover:border-blue-200 rounded-lg transition-colors leading-snug"
-            >
-              {q}
-            </button>
-          ))}
-        </div>
-      )}
 
       {/* Input */}
       <div className="px-3 py-3 border-t border-gray-100 flex-shrink-0">

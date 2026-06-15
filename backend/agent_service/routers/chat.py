@@ -72,6 +72,16 @@ async def chat(
     # connection we found via the project.
     effective_connection_id = req.connection_id or connection_id_for_schema
 
+    # Second fallback: for imported canvases the project has no DatabaseConnection,
+    # but the dashboard layout_config or widgets may have one stored at import time.
+    if not effective_connection_id and req.dashboard_id:
+        fallback_conn_id = await _get_dashboard_connection_id(req.dashboard_id, db)
+        if fallback_conn_id:
+            effective_connection_id = fallback_conn_id
+            if not schema_doc:
+                schema_doc, db_type = await _get_schema_for_connection(fallback_conn_id, db)
+            print(f"[chat] using dashboard fallback connection={fallback_conn_id[:8]}", flush=True)
+
     # Enrich the schema (L1→L2→L3 cache: usually a sub-millisecond L1 hit).
     # Falls back to schema_doc=={} gracefully when no schema is available.
     enriched = None
@@ -306,10 +316,57 @@ async def _get_dashboard_widgets_and_pages(
             "sql_query": w.sql_query,
             "chart_data": w.chart_data,
             "page_id": (w.config or {}).get("page_id"),
+            "connection_id": str(w.connection_id) if w.connection_id else None,
         }
         for w in widgets
     ]
     return widget_list, pages
+
+
+async def _get_dashboard_connection_id(dashboard_id: str, db: AsyncSession) -> str | None:
+    """
+    Fallback connection resolution for imported canvases whose project has no connection.
+    Checks layout_config.connection_id first, then the first widget with a connection_id.
+    """
+    try:
+        dash_r = await db.execute(select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id)))
+        dash = dash_r.scalar_one_or_none()
+        if dash:
+            lc_conn = (dash.layout_config or {}).get("connection_id")
+            if lc_conn:
+                return str(lc_conn)
+        wid_r = await db.execute(
+            select(Widget.connection_id)
+            .where(Widget.dashboard_id == uuid.UUID(dashboard_id))
+            .where(Widget.connection_id.isnot(None))
+            .limit(1)
+        )
+        conn = wid_r.scalar_one_or_none()
+        return str(conn) if conn else None
+    except Exception:
+        return None
+
+
+async def _get_schema_for_connection(conn_id_str: str, db: AsyncSession) -> tuple[dict, str]:
+    """Load schema_doc and db_type for a known connection UUID."""
+    try:
+        conn_r = await db.execute(
+            select(DatabaseConnection).where(DatabaseConnection.id == uuid.UUID(conn_id_str))
+        )
+        conn = conn_r.scalar_one_or_none()
+        if not conn:
+            return {}, "postgresql"
+        db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+        snap_r = await db.execute(
+            select(SchemaSnapshot)
+            .where(SchemaSnapshot.connection_id == conn.id)
+            .order_by(SchemaSnapshot.version.desc())
+            .limit(1)
+        )
+        snapshot = snap_r.scalar_one_or_none()
+        return (snapshot.schema_document if snapshot else {}), db_type
+    except Exception:
+        return {}, "postgresql"
 
 
 def _extract_priority_tables(widgets: list[dict]) -> set[str]:

@@ -95,6 +95,17 @@ _INTEL_BEDROCK_CONFIG = BotocoreConfig(
 
 
 def _get_intel_bedrock_client():
+    # Reload .env every call so rotating STS session tokens take effect
+    # without restarting the backend process.
+    # Explicit absolute path — find_dotenv can silently miss on Windows.
+    try:
+        from dotenv import load_dotenv as _ld
+        import os as _os
+        _env = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..', '..', '.env')
+        if _os.path.exists(_env):
+            _ld(_env, override=True)
+    except ImportError:
+        pass
     access_key    = os.getenv("AWS_ACCESS_KEY_ID")
     secret_key    = os.getenv("AWS_SECRET_ACCESS_KEY")
     session_token = os.getenv("AWS_SESSION_TOKEN")

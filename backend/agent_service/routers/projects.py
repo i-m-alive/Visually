@@ -256,6 +256,13 @@ async def test_connection(
                 if _parts:
                     conn_kwargs["serverless_work_group"] = _parts[0]
             if not password:
+                try:
+                    from dotenv import load_dotenv as _ld
+                    _env = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..', '..', '.env')
+                    if _os.path.exists(_env):
+                        _ld(_env, override=True)
+                except ImportError:
+                    pass
                 _ak = _os.getenv("AWS_ACCESS_KEY_ID", "")
                 _sk = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
                 _tok = _os.getenv("AWS_SESSION_TOKEN", "")

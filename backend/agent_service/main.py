@@ -96,6 +96,8 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Expose download headers so the browser JS can read the server-supplied filename
+    expose_headers=["Content-Disposition", "X-Vly-Version", "X-Vly-Canvas"],
 )
 
 
@@ -886,16 +888,22 @@ async def list_shared_with_me(
     return {
         "dashboards": [
             {
-                "id": str(d.id),
-                "name": d.name,
-                "description": d.description,
-                "theme": d.theme or "frost",
-                "project_name": project_name,
-                "project_id": str(d.project_id),
-                "created_at": d.created_at.isoformat(),
-                "updated_at": (d.updated_at or d.created_at).isoformat(),
-                "widget_count": widget_counts.get(str(d.id), 0),
-                "has_schedule": bool(d.layout_config and d.layout_config.get("schedule_enabled")),
+                "id":               str(d.id),
+                "name":             d.name,
+                "description":      d.description,
+                "theme":            d.theme or "frost",
+                "project_name":     project_name,
+                "project_id":       str(d.project_id),
+                "created_at":       d.created_at.isoformat(),
+                "updated_at":       (d.updated_at or d.created_at).isoformat(),
+                "widget_count":     widget_counts.get(str(d.id), 0),
+                "has_schedule":     bool(d.layout_config and d.layout_config.get("schedule_enabled")),
+                # Import provenance — populated by end-user/import-vly
+                "is_imported":      bool(d.layout_config and d.layout_config.get("is_imported")),
+                "imported_at":      (d.layout_config or {}).get("imported_at"),
+                "imported_by":      (d.layout_config or {}).get("imported_by"),
+                "has_intelligence": bool(d.layout_config and d.layout_config.get("has_intelligence")),
+                "connection_hint":  (d.layout_config or {}).get("connection_hint", {}),
             }
             for d, project_name in rows
         ]

@@ -41,6 +41,13 @@ def _execute_sync(
 
     # IAM auth: when password is blank, use AWS credential env vars instead of user/password
     if not password:
+        try:
+            from dotenv import load_dotenv as _ld
+            _env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '.env')
+            if os.path.exists(_env):
+                _ld(_env, override=True)
+        except ImportError:
+            pass
         conn_kwargs["iam"] = True
         conn_kwargs["aws_access_key_id"] = os.getenv("AWS_ACCESS_KEY_ID", "")
         conn_kwargs["aws_secret_access_key"] = os.getenv("AWS_SECRET_ACCESS_KEY", "")

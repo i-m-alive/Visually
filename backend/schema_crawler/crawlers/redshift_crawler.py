@@ -45,6 +45,13 @@ def _crawl_sync(
 
     # IAM auth when password is blank — use AWS credential env vars
     if not password:
+        try:
+            from dotenv import load_dotenv as _ld
+            _env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '.env')
+            if os.path.exists(_env):
+                _ld(_env, override=True)
+        except ImportError:
+            pass
         _ak = os.getenv("AWS_ACCESS_KEY_ID", "")
         _sk = os.getenv("AWS_SECRET_ACCESS_KEY", "")
         _tok = os.getenv("AWS_SESSION_TOKEN", "")

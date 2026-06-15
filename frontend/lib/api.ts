@@ -293,28 +293,63 @@ export const aiInsightsApi = {
 // ─── .vly export / import ─────────────────────────────────────────────────────
 
 export const vlyApi = {
-  /** Triggers a browser download of the .vly archive for a canvas. */
-  exportVly: (canvasId: string): void => {
+  /**
+   * Export canvas as .vly archive.
+   * - Opens a native OS "Save As" dialog (File System Access API) when supported,
+   *   so the user can rename the file and choose the save location.
+   * - Falls back to a plain <a download> on unsupported browsers.
+   * - Pass `intelligence` to bundle the AI analysis into intelligence.json.
+   */
+  exportVly: async (canvasId: string, intelligence?: object): Promise<void> => {
     const stored = typeof window !== 'undefined' ? localStorage.getItem('visually-auth') : null
     let token = ''
     if (stored) {
       try { token = JSON.parse(stored)?.state?.accessToken ?? '' } catch { /* ignore */ }
     }
-    const url = `${API_URL}/dashboards/${canvasId}/export-vly`
-    const a = document.createElement('a')
-    a.href = url
-    if (token) a.href = url  // auth header not possible via <a>, use fetch below
-    // Use fetch to carry the Bearer token, then trigger download
-    fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
-      .then(r => r.blob())
-      .then(blob => {
-        const blobUrl = URL.createObjectURL(blob)
-        const link = document.createElement('a')
-        link.href = blobUrl
-        link.download = `canvas-${canvasId.slice(0, 8)}.vly`
-        link.click()
-        URL.revokeObjectURL(blobUrl)
-      })
+    let url = `${API_URL}/dashboards/${canvasId}/export-vly`
+    if (intelligence) {
+      url += `?intelligence=${encodeURIComponent(JSON.stringify(intelligence))}`
+    }
+
+    const response = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+    if (!response.ok) throw new Error(`Export failed: ${response.status}`)
+
+    // Read server-supplied filename from the now-exposed Content-Disposition header
+    const disposition = response.headers.get('Content-Disposition') ?? ''
+    const match       = disposition.match(/filename="([^"]+)"/)
+    const canvasName  = response.headers.get('X-Vly-Canvas') ?? ''
+    // Prefer the server filename (canvas name); last-resort fallback only
+    const suggestedName = match?.[1] ?? (canvasName ? `${canvasName}.vly` : `canvas-${canvasId.slice(0, 8)}.vly`)
+
+    const blob = await response.blob()
+
+    // ── File System Access API: native Save As dialog (Chrome/Edge 86+) ──────
+    if (typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
+      try {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName,
+          types: [{
+            description: 'Visually Canvas Archive',
+            accept: { 'application/vnd.visually.canvas+zip': ['.vly'] },
+          }],
+        })
+        const writable = await handle.createWritable()
+        await writable.write(blob)
+        await writable.close()
+        return
+      } catch (e: any) {
+        if (e?.name === 'AbortError') return  // user cancelled — do nothing
+        // Any other error (permissions, etc.) — fall through to <a> download
+      }
+    }
+
+    // ── Fallback: <a download> (Firefox, Safari, older browsers) ─────────────
+    const blobUrl = URL.createObjectURL(blob)
+    const link    = document.createElement('a')
+    link.href     = blobUrl
+    link.download = suggestedName
+    link.click()
+    URL.revokeObjectURL(blobUrl)
   },
 
   /** Import a .vly file into a project. */

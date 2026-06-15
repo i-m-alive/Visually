@@ -6,6 +6,7 @@ import {
   Loader2, AlertCircle, Search, X,
   BarChart2, Clock, RefreshCw, Share2, Heart, TrendingUp, Zap,
   ChevronRight, Sparkles, UserCircle2, Link2, Upload, FileArchive,
+  Database, CheckCircle2, Package, Brain, Calendar, Wifi, WifiOff,
 } from 'lucide-react'
 
 interface DashCard {
@@ -18,6 +19,12 @@ interface DashCard {
   created_at: string
   updated_at: string
   widget_count: number
+  // import provenance
+  is_imported: boolean
+  imported_at: string | null
+  imported_by: string | null
+  has_intelligence: boolean
+  connection_hint: Record<string, string>
 }
 
 const THEME_COLORS: Record<string, { bg: string; border: string; accent: string }> = {
@@ -38,37 +45,47 @@ function computeHealthScore(widgetCount: number): number {
   return 95
 }
 
-// Extract share token from a /share/canvas/{token} URL
 function extractToken(input: string): string | null {
   const cleaned = input.trim()
   const m = cleaned.match(/\/share\/canvas\/([A-Za-z0-9_-]+)/)
   if (m) return m[1]
-  // raw token (no slashes)
   if (/^[A-Za-z0-9_-]{20,}$/.test(cleaned)) return cleaned
   return null
+}
+
+function timeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z').getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 2) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  return `${days}d ago`
 }
 
 export default function EndUserDashboardPage() {
   const router = useRouter()
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const [dashboards, setDashboards] = useState<DashCard[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [search, setSearch] = useState('')
-  const [aiSummaries, setAiSummaries] = useState<Record<string, string>>({})
-  const [aiLoading, setAiLoading] = useState<Record<string, boolean>>({})
-  const [shareToast, setShareToast] = useState<string | null>(null)
-  const loadedSummaries = useRef(new Set<string>())
+  const [dashboards, setDashboards]       = useState<DashCard[]>([])
+  const [loading, setLoading]             = useState(true)
+  const [error, setError]                 = useState<string | null>(null)
+  const [search, setSearch]               = useState('')
+  const [aiSummaries, setAiSummaries]     = useState<Record<string, string>>({})
+  const [aiLoading, setAiLoading]         = useState<Record<string, boolean>>({})
+  const [shareToast, setShareToast]       = useState<string | null>(null)
+  const loadedSummaries                   = useRef(new Set<string>())
 
   // Paste link modal
-  const [linkModal, setLinkModal] = useState(false)
-  const [linkInput, setLinkInput] = useState('')
-  const [linkError, setLinkError] = useState('')
+  const [linkModal, setLinkModal]   = useState(false)
+  const [linkInput, setLinkInput]   = useState('')
+  const [linkError, setLinkError]   = useState('')
 
-  // .vly import
-  const [importing, setImporting] = useState(false)
-  const [importError, setImportError] = useState<string | null>(null)
+  // .vly import state
+  const [importing, setImporting]         = useState(false)
+  const [importError, setImportError]     = useState<string | null>(null)
+  const [importSuccess, setImportSuccess] = useState<{ name: string; id: string; hasIntel: boolean } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -115,38 +132,35 @@ export default function EndUserDashboardPage() {
     }
   }
 
-  // Open via pasted share link
   const handleOpenLink = () => {
     setLinkError('')
     const token = extractToken(linkInput)
-    if (!token) {
-      setLinkError('Paste a share link like: …/share/canvas/TOKEN')
-      return
-    }
+    if (!token) { setLinkError('Paste a share link like: …/share/canvas/TOKEN'); return }
     setLinkModal(false)
     setLinkInput('')
     router.push(`/share/canvas/${token}`)
   }
 
-  // Import .vly file
   const handleVlyFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
     e.target.value = ''
-
     setImporting(true)
     setImportError(null)
+    setImportSuccess(null)
     try {
       const form = new FormData()
       form.append('file', file)
       const resp = await api.post('/end-user/import-vly', form, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
-      const { token } = resp.data
-      router.push(`/share/canvas/${token}`)
+      const { dashboard_id, name, has_intelligence } = resp.data
+      // Canvas is now permanently saved via CanvasCollaborator — reload the list
+      await load()
+      setImportSuccess({ name, id: dashboard_id, hasIntel: has_intelligence })
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-        ?? 'Failed to import file. Make sure it is a valid .vly file.'
+        ?? 'Failed to import. Make sure it is a valid .vly file.'
       setImportError(msg)
     } finally {
       setImporting(false)
@@ -158,6 +172,9 @@ export default function EndUserDashboardPage() {
     const q = search.toLowerCase()
     return d.name.toLowerCase().includes(q) || d.project_name.toLowerCase().includes(q)
   })
+
+  const sharedReports   = filtered.filter(d => !d.is_imported)
+  const importedReports = filtered.filter(d => d.is_imported)
 
   return (
     <div className="flex flex-col h-full" style={{ background: '#F8FAFC' }}>
@@ -178,31 +195,24 @@ export default function EndUserDashboardPage() {
                 <Link2 size={14} className="text-white" />
               </div>
               <h2 className="text-base font-bold text-gray-900">Open via Share Link</h2>
-              <button onClick={() => { setLinkModal(false); setLinkInput(''); setLinkError('') }}
-                className="ml-auto text-gray-400 hover:text-gray-600">
+              <button onClick={() => { setLinkModal(false); setLinkInput(''); setLinkError('') }} className="ml-auto text-gray-400 hover:text-gray-600">
                 <X size={16} />
               </button>
             </div>
-            <p className="text-xs text-gray-500 mb-3">
-              Paste a share link you received from your team (e.g. <span className="font-mono text-gray-700">…/share/canvas/TOKEN</span>)
-            </p>
+            <p className="text-xs text-gray-500 mb-3">Paste a share link you received from your team.</p>
             <input
-              autoFocus
-              value={linkInput}
+              autoFocus value={linkInput}
               onChange={e => { setLinkInput(e.target.value); setLinkError('') }}
               onKeyDown={e => e.key === 'Enter' && handleOpenLink()}
-              placeholder="https://app.visually.io/share/canvas/…"
+              placeholder="https://…/share/canvas/TOKEN"
               className="w-full px-3 py-2 text-sm border border-gray-200 rounded-xl bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400"
             />
             {linkError && <p className="text-xs text-red-500 mt-1.5">{linkError}</p>}
             <div className="flex gap-2 mt-4">
-              <button onClick={handleOpenLink}
-                className="flex-1 py-2 text-sm font-semibold text-white rounded-xl"
-                style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
+              <button onClick={handleOpenLink} className="flex-1 py-2 text-sm font-semibold text-white rounded-xl" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
                 Open Report
               </button>
-              <button onClick={() => { setLinkModal(false); setLinkInput(''); setLinkError('') }}
-                className="px-4 py-2 text-sm text-gray-500 border border-gray-200 rounded-xl hover:bg-gray-50">
+              <button onClick={() => { setLinkModal(false); setLinkInput(''); setLinkError('') }} className="px-4 py-2 text-sm text-gray-500 border border-gray-200 rounded-xl hover:bg-gray-50">
                 Cancel
               </button>
             </div>
@@ -210,7 +220,7 @@ export default function EndUserDashboardPage() {
         </div>
       )}
 
-      {/* Hidden file input for .vly */}
+      {/* Hidden file input */}
       <input ref={fileRef} type="file" accept=".vly" className="hidden" onChange={handleVlyFile} />
 
       {/* Header */}
@@ -218,7 +228,7 @@ export default function EndUserDashboardPage() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-lg font-bold font-display text-gray-900">My Reports</h1>
-            <p className="text-sm text-gray-500 mt-0.5">Reports shared with you by your team</p>
+            <p className="text-sm text-gray-500 mt-0.5">Reports shared with you · your imported canvases</p>
           </div>
           <button onClick={load} className="p-2 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-50 transition-colors" title="Refresh">
             <RefreshCw size={16} />
@@ -229,40 +239,43 @@ export default function EndUserDashboardPage() {
         <div className="relative mt-3 max-w-sm">
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
           <input
-            value={search}
-            onChange={e => setSearch(e.target.value)}
+            value={search} onChange={e => setSearch(e.target.value)}
             placeholder="Search reports…"
             className="w-full pl-9 pr-8 py-2 text-sm border border-gray-200 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400"
           />
-          {search && (
-            <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
-              <X size={13} />
-            </button>
-          )}
+          {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"><X size={13} /></button>}
         </div>
 
-        {/* Access methods */}
+        {/* Actions */}
         <div className="flex items-center gap-2 mt-3 flex-wrap">
-          <span className="text-xs text-gray-400 font-medium mr-1">Get access:</span>
-
-          <button
-            onClick={() => setLinkModal(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-blue-200 text-blue-600 bg-blue-50 hover:bg-blue-100 transition-colors"
-          >
+          <span className="text-xs text-gray-400 font-medium mr-1">Add report:</span>
+          <button onClick={() => setLinkModal(true)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-blue-200 text-blue-600 bg-blue-50 hover:bg-blue-100 transition-colors">
             <Link2 size={12} /> Paste share link
           </button>
-
-          <button
-            onClick={() => fileRef.current?.click()}
-            disabled={importing}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-purple-200 text-purple-600 bg-purple-50 hover:bg-purple-100 transition-colors disabled:opacity-50"
-          >
-            {importing
-              ? <><Loader2 size={12} className="animate-spin" /> Importing…</>
-              : <><Upload size={12} /> Import .vly file</>
-            }
+          <button onClick={() => fileRef.current?.click()} disabled={importing}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-purple-200 text-purple-600 bg-purple-50 hover:bg-purple-100 transition-colors disabled:opacity-50">
+            {importing ? <><Loader2 size={12} className="animate-spin" /> Importing…</> : <><Upload size={12} /> Import .vly file</>}
           </button>
         </div>
+
+        {/* Import success banner */}
+        {importSuccess && (
+          <div className="mt-3 flex items-center gap-3 px-4 py-3 rounded-xl border border-green-200 bg-green-50">
+            <CheckCircle2 size={16} className="text-green-600 flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-green-800 truncate">"{importSuccess.name}" imported successfully</p>
+              <p className="text-xs text-green-600 mt-0.5">Saved permanently to your reports · {importSuccess.hasIntel ? 'AI analysis bundled' : 'Open to run AI analysis'}</p>
+            </div>
+            <div className="flex gap-2 flex-shrink-0">
+              <button onClick={() => router.push(`/canvas/${importSuccess.id}/analyst`)}
+                className="px-3 py-1.5 text-xs font-semibold text-white rounded-lg"
+                style={{ background: 'linear-gradient(135deg, #059669, #10b981)' }}>
+                Open
+              </button>
+              <button onClick={() => setImportSuccess(null)} className="text-green-500 hover:text-green-700"><X size={14} /></button>
+            </div>
+          </div>
+        )}
 
         {/* Import error */}
         {importError && (
@@ -275,20 +288,16 @@ export default function EndUserDashboardPage() {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-auto p-6">
+      <div className="flex-1 overflow-auto p-6 space-y-8">
         {loading && (
-          <div className="flex items-center justify-center h-48">
-            <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
-          </div>
+          <div className="flex items-center justify-center h-48"><Loader2 className="w-8 h-8 text-blue-500 animate-spin" /></div>
         )}
 
         {error && !loading && (
           <div className="flex flex-col items-center justify-center h-48 gap-3">
             <AlertCircle className="w-10 h-10 text-red-400" />
             <p className="text-sm text-gray-500">{error}</p>
-            <button onClick={load} className="btn-secondary text-sm flex items-center gap-2">
-              <RefreshCw size={13} /> Retry
-            </button>
+            <button onClick={load} className="btn-secondary text-sm flex items-center gap-2"><RefreshCw size={13} /> Retry</button>
           </div>
         )}
 
@@ -296,9 +305,7 @@ export default function EndUserDashboardPage() {
           <div className="flex flex-col items-center justify-center h-64 gap-4 text-gray-400">
             <UserCircle2 className="w-12 h-12 text-gray-300" />
             <div className="text-center">
-              <p className="font-medium text-gray-600">
-                {search ? 'No reports match your search.' : 'No reports shared with you yet.'}
-              </p>
+              <p className="font-medium text-gray-600">{search ? 'No reports match your search.' : 'No reports yet.'}</p>
               {!search && (
                 <div className="mt-2 space-y-1 text-sm text-gray-400">
                   <p>Ask your builder to share a report, or:</p>
@@ -313,101 +320,209 @@ export default function EndUserDashboardPage() {
           </div>
         )}
 
-        {!loading && !error && filtered.length > 0 && (
-          <>
-            <p className="text-xs text-gray-400 mb-4 font-medium uppercase tracking-wide">
-              {filtered.length} report{filtered.length !== 1 ? 's' : ''}
-            </p>
-            <div className="grid gap-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))' }}>
-              {filtered.map(dash => {
-                const colors = THEME_COLORS[dash.theme] ?? THEME_COLORS.frost
-                const health = computeHealthScore(dash.widget_count)
-                const updatedDate = new Date(
-                  (dash.updated_at.includes('T') ? dash.updated_at : dash.updated_at.replace(' ', 'T'))
-                  + (/[Zz]|[+-]\d{2}/.test(dash.updated_at) ? '' : 'Z')
-                ).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-
-                return (
-                  <div
-                    key={dash.id}
-                    className="group relative rounded-2xl border border-gray-100 overflow-hidden bg-white hover:shadow-xl hover:-translate-y-1 transition-all duration-200"
-                  >
-                    <div className="h-20 relative flex items-end px-4 pb-3" style={{ background: `linear-gradient(135deg, ${colors.border}, ${colors.accent})` }}>
-                      <div className="flex items-center gap-1.5 opacity-60">
-                        <BarChart2 size={14} className="text-white" />
-                        <TrendingUp size={14} className="text-white" />
-                        <Zap size={12} className="text-white" />
-                      </div>
-                      <div
-                        className="absolute top-3 right-3 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
-                        style={{ background: 'rgba(0,0,0,0.4)', color: health >= 80 ? '#4ADE80' : health >= 55 ? '#FCD34D' : '#F87171' }}
-                      >
-                        <Heart size={9} fill="currentColor" />
-                        {health}
-                      </div>
-                    </div>
-
-                    <div className="p-4">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0 flex-1">
-                          <h3 className="text-sm font-bold text-gray-900 truncate">{dash.name}</h3>
-                          <p className="text-xs text-gray-500 mt-0.5 truncate">{dash.project_name}</p>
-                          <div className="flex items-center gap-2 mt-0.5">
-                            <span className="text-[10px] text-gray-400 flex items-center gap-0.5">
-                              <BarChart2 size={9} /> {dash.widget_count} charts
-                            </span>
-                            <span className="text-[10px] text-gray-400 flex items-center gap-0.5">
-                              <Clock size={9} /> {updatedDate}
-                            </span>
-                          </div>
-                        </div>
-                        <ChevronRight size={14} className="text-gray-300 group-hover:text-blue-400 transition-colors mt-1 flex-shrink-0" />
-                      </div>
-
-                      {/* AI Briefing */}
-                      <div className="mt-3 min-h-[36px]">
-                        {aiLoading[dash.id] ? (
-                          <div className="flex items-center gap-1.5 text-[11px] text-gray-400">
-                            <Loader2 size={10} className="animate-spin text-purple-400" />
-                            <span>AI briefing…</span>
-                          </div>
-                        ) : aiSummaries[dash.id] ? (
-                          <div className="flex items-start gap-1.5">
-                            <Sparkles size={11} className="text-purple-500 mt-0.5 flex-shrink-0" />
-                            <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{aiSummaries[dash.id]}</p>
-                          </div>
-                        ) : dash.description ? (
-                          <p className="text-[11px] text-gray-500 line-clamp-2">{dash.description}</p>
-                        ) : null}
-                      </div>
-
-                      {/* Actions */}
-                      <div className="flex items-center gap-2 mt-4 pt-3 border-t border-gray-50">
-                        <button
-                          onClick={() => router.push(`/canvas/${dash.id}/analyst`)}
-                          className="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-white rounded-xl transition-colors"
-                          style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
-                        >
-                          <Sparkles size={12} /> Open Report
-                        </button>
-                        <button
-                          onClick={e => { e.stopPropagation(); handleShare(dash.id) }}
-                          className="p-2 text-gray-400 hover:text-blue-500 rounded-lg hover:bg-blue-50 transition-colors border border-gray-100"
-                          title="Copy share link"
-                        >
-                          <Share2 size={14} />
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="absolute inset-0 rounded-2xl border-2 border-transparent group-hover:border-blue-400 transition-colors pointer-events-none" />
-                  </div>
-                )
-              })}
+        {/* ── Shared With Me ─────────────────────────────────────────────── */}
+        {!loading && !error && sharedReports.length > 0 && (
+          <section>
+            <div className="flex items-center gap-2 mb-4">
+              <Share2 size={14} className="text-blue-500" />
+              <h2 className="text-xs font-bold text-gray-500 uppercase tracking-wider">Shared with me</h2>
+              <span className="text-xs text-gray-400">({sharedReports.length})</span>
             </div>
-          </>
+            <ReportGrid reports={sharedReports} aiSummaries={aiSummaries} aiLoading={aiLoading} onShare={handleShare} router={router} />
+          </section>
+        )}
+
+        {/* ── Imported Reports ───────────────────────────────────────────── */}
+        {!loading && !error && importedReports.length > 0 && (
+          <section>
+            <div className="flex items-center gap-2 mb-4">
+              <Package size={14} className="text-purple-500" />
+              <h2 className="text-xs font-bold text-gray-500 uppercase tracking-wider">My Imported Canvases</h2>
+              <span className="text-xs text-gray-400">({importedReports.length})</span>
+            </div>
+            <div className="grid gap-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))' }}>
+              {importedReports.map(dash => (
+                <ImportedCard key={dash.id} dash={dash} aiSummary={aiSummaries[dash.id]} aiLoading={!!aiLoading[dash.id]} onShare={() => handleShare(dash.id)} router={router} />
+              ))}
+            </div>
+          </section>
         )}
       </div>
+    </div>
+  )
+}
+
+// ── Shared report card grid ────────────────────────────────────────────────────
+
+function ReportGrid({ reports, aiSummaries, aiLoading, onShare, router }: {
+  reports: DashCard[]
+  aiSummaries: Record<string, string>
+  aiLoading: Record<string, boolean>
+  onShare: (id: string) => void
+  router: ReturnType<typeof useRouter>
+}) {
+  return (
+    <div className="grid gap-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))' }}>
+      {reports.map(dash => {
+        const colors  = THEME_COLORS[dash.theme] ?? THEME_COLORS.frost
+        const health  = computeHealthScore(dash.widget_count)
+        const updated = new Date(
+          (dash.updated_at.includes('T') ? dash.updated_at : dash.updated_at.replace(' ', 'T'))
+          + (/[Zz]|[+-]\d{2}/.test(dash.updated_at) ? '' : 'Z')
+        ).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+
+        return (
+          <div key={dash.id} className="group relative rounded-2xl border border-gray-100 overflow-hidden bg-white hover:shadow-xl hover:-translate-y-1 transition-all duration-200">
+            <div className="h-20 relative flex items-end px-4 pb-3" style={{ background: `linear-gradient(135deg, ${colors.border}, ${colors.accent})` }}>
+              <div className="flex items-center gap-1.5 opacity-60">
+                <BarChart2 size={14} className="text-white" /><TrendingUp size={14} className="text-white" /><Zap size={12} className="text-white" />
+              </div>
+              <div className="absolute top-3 right-3 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
+                style={{ background: 'rgba(0,0,0,0.4)', color: health >= 80 ? '#4ADE80' : health >= 55 ? '#FCD34D' : '#F87171' }}>
+                <Heart size={9} fill="currentColor" />{health}
+              </div>
+            </div>
+            <div className="p-4">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-sm font-bold text-gray-900 truncate">{dash.name}</h3>
+                  <p className="text-xs text-gray-500 mt-0.5 truncate">{dash.project_name}</p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
+                    <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><Clock size={9} /> {updated}</span>
+                  </div>
+                </div>
+                <ChevronRight size={14} className="text-gray-300 group-hover:text-blue-400 transition-colors mt-1 flex-shrink-0" />
+              </div>
+              <div className="mt-3 min-h-[36px]">
+                {aiLoading[dash.id] ? (
+                  <div className="flex items-center gap-1.5 text-[11px] text-gray-400"><Loader2 size={10} className="animate-spin text-purple-400" /><span>AI briefing…</span></div>
+                ) : aiSummaries[dash.id] ? (
+                  <div className="flex items-start gap-1.5">
+                    <Sparkles size={11} className="text-purple-500 mt-0.5 flex-shrink-0" />
+                    <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{aiSummaries[dash.id]}</p>
+                  </div>
+                ) : dash.description ? (
+                  <p className="text-[11px] text-gray-500 line-clamp-2">{dash.description}</p>
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2 mt-4 pt-3 border-t border-gray-50">
+                <button onClick={() => router.push(`/canvas/${dash.id}/analyst`)}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-white rounded-xl transition-colors"
+                  style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
+                  <Sparkles size={12} /> Open Report
+                </button>
+                <button onClick={e => { e.stopPropagation(); onShare(dash.id) }}
+                  className="p-2 text-gray-400 hover:text-blue-500 rounded-lg hover:bg-blue-50 transition-colors border border-gray-100" title="Copy share link">
+                  <Share2 size={14} />
+                </button>
+              </div>
+            </div>
+            <div className="absolute inset-0 rounded-2xl border-2 border-transparent group-hover:border-blue-400 transition-colors pointer-events-none" />
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Imported canvas card ───────────────────────────────────────────────────────
+
+function ImportedCard({ dash, aiSummary, aiLoading, onShare, router }: {
+  dash: DashCard
+  aiSummary?: string
+  aiLoading: boolean
+  onShare: () => void
+  router: ReturnType<typeof useRouter>
+}) {
+  const colors    = THEME_COLORS[dash.theme] ?? THEME_COLORS.frost
+  const health    = computeHealthScore(dash.widget_count)
+  const hasDB     = !!(dash.connection_hint?.host)
+  const dbLabel   = dash.connection_hint?.db_type ? `${dash.connection_hint.db_type} · ${dash.connection_hint.database_name ?? ''}` : 'No DB linked'
+  const importedAgo = dash.imported_at ? timeAgo(dash.imported_at) : ''
+
+  return (
+    <div className="group relative rounded-2xl overflow-hidden bg-white border border-purple-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-200">
+      {/* Header band */}
+      <div className="h-20 relative flex items-end px-4 pb-3" style={{ background: `linear-gradient(135deg, #7c3aed22, #7c3aed44)` }}>
+        <div className="flex items-center gap-1.5 opacity-70">
+          <Package size={14} className="text-purple-500" />
+          <span className="text-[10px] font-bold text-purple-600 uppercase tracking-wide">Imported</span>
+        </div>
+        <div className="absolute top-3 right-3 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
+          style={{ background: 'rgba(0,0,0,0.25)', color: health >= 80 ? '#4ADE80' : health >= 55 ? '#FCD34D' : '#F87171' }}>
+          <Heart size={9} fill="currentColor" />{health}
+        </div>
+        {/* AI badge */}
+        {dash.has_intelligence && (
+          <div className="absolute top-3 left-12 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-700">
+            <Brain size={9} /> AI
+          </div>
+        )}
+      </div>
+
+      <div className="p-4">
+        {/* Title row */}
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-bold text-gray-900 truncate">{dash.name}</h3>
+            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+              <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
+              {importedAgo && <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><Calendar size={9} /> Imported {importedAgo}</span>}
+            </div>
+          </div>
+          <ChevronRight size={14} className="text-gray-300 group-hover:text-purple-400 transition-colors mt-1 flex-shrink-0" />
+        </div>
+
+        {/* DB status pill */}
+        <div className={`mt-2 flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-medium w-fit ${
+          hasDB ? 'bg-green-50 text-green-700 border border-green-100' : 'bg-amber-50 text-amber-700 border border-amber-100'
+        }`}>
+          {hasDB ? <Wifi size={9} /> : <WifiOff size={9} />}
+          <span className="truncate max-w-[180px]">{hasDB ? dbLabel : 'Cached data only — no live DB'}</span>
+        </div>
+
+        {/* AI summary */}
+        <div className="mt-3 min-h-[32px]">
+          {aiLoading ? (
+            <div className="flex items-center gap-1.5 text-[11px] text-gray-400"><Loader2 size={10} className="animate-spin text-purple-400" /><span>AI briefing…</span></div>
+          ) : aiSummary ? (
+            <div className="flex items-start gap-1.5">
+              <Sparkles size={11} className="text-purple-500 mt-0.5 flex-shrink-0" />
+              <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{aiSummary}</p>
+            </div>
+          ) : dash.description ? (
+            <p className="text-[11px] text-gray-500 line-clamp-2">{dash.description}</p>
+          ) : null}
+        </div>
+
+        {/* Action row */}
+        <div className="flex items-center gap-2 mt-4 pt-3 border-t border-gray-50">
+          <button
+            onClick={() => router.push(`/canvas/${dash.id}/analyst`)}
+            className="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-white rounded-xl"
+            style={{ background: 'linear-gradient(135deg, #7c3aed, #a855f7)' }}>
+            <Sparkles size={12} /> Open
+          </button>
+          {/* Intelligence page shortcut */}
+          <button
+            onClick={() => router.push(`/intelligence/${dash.id}`)}
+            title="Open AI Intelligence report"
+            className="p-2 rounded-lg border border-purple-100 text-purple-400 hover:text-purple-600 hover:bg-purple-50 transition-colors"
+          >
+            <Brain size={14} />
+          </button>
+          <button
+            onClick={e => { e.stopPropagation(); onShare() }}
+            title="Copy share link"
+            className="p-2 rounded-lg border border-gray-100 text-gray-400 hover:text-blue-500 hover:bg-blue-50 transition-colors"
+          >
+            <Share2 size={14} />
+          </button>
+        </div>
+      </div>
+
+      <div className="absolute inset-0 rounded-2xl border-2 border-transparent group-hover:border-purple-300 transition-colors pointer-events-none" />
     </div>
   )
 }

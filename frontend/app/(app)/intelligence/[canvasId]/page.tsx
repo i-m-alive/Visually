@@ -1,7 +1,7 @@
 'use client'
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { canvasApi, shareApi, intelligenceApi } from '@/lib/api'
+import { canvasApi, shareApi, intelligenceApi, vlyApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -200,34 +200,43 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
   const accentColor = PALETTE[idx % PALETTE.length]
   const raw = parseFloat(String(kpi.value).replace(/[^0-9.-]/g, ''))
   const prefix = String(kpi.value).match(/^[^0-9-]*/)?.[0] ?? ''
-  const suffix = String(kpi.value).match(/[^0-9.]+$/)?.[0] ?? ''
+  // Separate numeric suffix from unit suffix — keep unit short so it doesn't blow up card height
+  const rawSuffix = String(kpi.value).match(/[^0-9.]+$/)?.[0] ?? ''
+  const suffix = rawSuffix.length > 6 ? rawSuffix.slice(0, 6) : rawSuffix
   const animatable = !isNaN(raw) && isFinite(raw)
   return (
     <div className="intel-kpi-card" style={{
-      background: C.card, borderRadius: 16, padding: '16px 18px',
+      background: C.card, borderRadius: 16, padding: '14px 16px',
       border: '1px solid #e2eaf4',
       boxShadow: '0 2px 12px rgba(10,33,58,0.06)',
-      display: 'flex', flexDirection: 'column', gap: 8,
+      display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
       position: 'relative', overflow: 'hidden',
+      // Fixed height so all cards in the row are the same size
+      height: '100%', boxSizing: 'border-box', minHeight: 96,
     }}>
       {/* Colored top accent bar */}
       <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, borderRadius: '16px 16px 0 0', background: accentColor }} />
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
-        <p style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: 0 }}>{kpi.label}</p>
+      {/* Label row */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginTop: 6, gap: 4 }}>
+        <p style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: 0, lineHeight: 1.3, flex: 1 }}>{kpi.label}</p>
         {kpi.sparkline_data && kpi.sparkline_data.length > 1 && <Sparkline data={kpi.sparkline_data} color={accentColor} />}
       </div>
-      <p style={{ fontSize: 28, fontWeight: 800, color: C.ink, margin: 0, lineHeight: 1, letterSpacing: '-0.02em' }}>
-        {animatable ? <AnimatedCounter target={raw} prefix={prefix} suffix={suffix} /> : kpi.value}
+      {/* Value — capped at 24px so long values don't overflow */}
+      <p style={{ fontSize: 24, fontWeight: 800, color: C.ink, margin: '6px 0 0', lineHeight: 1.05, letterSpacing: '-0.02em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {animatable ? <AnimatedCounter target={raw} prefix={prefix} suffix={suffix} /> : String(kpi.value).slice(0, 14)}
       </p>
-      {kpi.trend_pct && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 3, background: `${tc}15`, borderRadius: 20, padding: '3px 8px' }}>
-            <TI size={10} style={{ color: tc }} />
-            <span style={{ fontSize: 11, fontWeight: 700, color: tc }}>{kpi.trend_pct}</span>
-          </div>
-          <span style={{ fontSize: 10, color: C.muted }}>vs prior period</span>
-        </div>
-      )}
+      {/* Trend pill — always occupies same space even when absent */}
+      <div style={{ marginTop: 6, minHeight: 22, display: 'flex', alignItems: 'center', gap: 5 }}>
+        {kpi.trend_pct ? (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 3, background: `${tc}15`, borderRadius: 20, padding: '3px 7px', flexShrink: 0 }}>
+              <TI size={10} style={{ color: tc }} />
+              <span style={{ fontSize: 10, fontWeight: 700, color: tc }}>{kpi.trend_pct}</span>
+            </div>
+            <span style={{ fontSize: 9, color: C.muted, whiteSpace: 'nowrap' }}>vs prior</span>
+          </>
+        ) : null}
+      </div>
     </div>
   )
 }
@@ -528,12 +537,17 @@ function TableView({ chart }: { chart: AgentChart }) {
     )
   )
 
-  // Drop columns where every value is null/empty — AI-generated phantom columns
+  // Drop columns where every value would render as "—":
+  //   • null / undefined / empty string
+  //   • numeric 0  (fmtNum returns "—" for 0)
+  // This removes phantom columns the AI creates but never populates with real data.
   const meaningfulCols = dedupedCols.filter(col =>
     chart.data.length === 0 ||
     chart.data.some(row => {
       const v = row[col]
-      return v !== null && v !== undefined && v !== '' && String(v).trim() !== ''
+      if (v === null || v === undefined || v === '' || String(v).trim() === '') return false
+      const n = Number(v)
+      return isNaN(n) || n !== 0   // non-numeric strings are always meaningful; non-zero numbers are meaningful
     })
   )
 
@@ -640,19 +654,21 @@ function TableView({ chart }: { chart: AgentChart }) {
   const cellPadH = totalVisualCols <= 4 ? 14 : totalVisualCols <= 7 ? 10 : 8
   const cellPad  = `${cellPadV}px ${cellPadH}px`
 
-  // How many rows fit comfortably before the table starts to dominate the page
-  const maxVisibleRows =
-    totalVisualCols <= 3 ? 15 :
-    totalVisualCols <= 6 ? 12 :
-    totalVisualCols <= 9 ? 8 :
-    6
+  // How many rows fit comfortably before the table starts to dominate the page.
+  // Sparkline (hasTrend) rows are taller so we show fewer of them.
+  const maxVisibleRows = hasTrend
+    ? (totalVisualCols <= 3 ? 8 : totalVisualCols <= 6 ? 7 : 5)
+    : (totalVisualCols <= 3 ? 12 : totalVisualCols <= 6 ? 10 : totalVisualCols <= 9 ? 7 : 5)
 
-  // Derive a pixel height that shows exactly maxVisibleRows rows + the sticky header
-  const rowPxH        = cellFontSize <= 10 ? 29 : cellFontSize <= 11 ? 32 : 36
-  const headerPxH     = 42
+  // Sparkline rows are ~44 px tall; plain rows scale with font size
+  const rowPxH    = hasTrend ? 44 : (cellFontSize <= 10 ? 29 : cellFontSize <= 11 ? 32 : 36)
+  const headerPxH = 42
+  // Hard caps prevent any table from consuming the full visible page.
+  // Trend tables get a tighter cap (320 px) because sparklines already communicate
+  // the data story; users scroll for the remainder.
   const tableMaxHeight = Math.min(
     maxVisibleRows * rowPxH + headerPxH,
-    totalVisualCols <= 3 ? 560 : 460,   // absolute cap per density tier
+    hasTrend ? 320 : (totalVisualCols <= 3 ? 380 : 320),
   )
 
   const thBase: React.CSSProperties = {
@@ -1174,14 +1190,42 @@ function AgentChartView({
   )
 }
 
+// ── Section content helpers ────────────────────────────────────────────────────
+
+// Normalise a KPI label so "Total Revenue ($)" and "Total Revenue" compare equal
+function normLabel(l: string): string {
+  return l.toLowerCase()
+    .replace(/\s*\(.*?\)\s*/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Drop the first sentence of a narrative if it paraphrases the section headline
+function dedupeNarrative(narrative: string | undefined, headline: string | undefined): string {
+  if (!narrative || !headline) return narrative ?? ''
+  const m = narrative.match(/^.+?[.!?](?:\s|$)/)
+  if (!m) return narrative
+  const firstSentence = m[0]
+  const keyWords = (t: string) =>
+    t.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3)
+  const headW = new Set(keyWords(headline))
+  const sentW = keyWords(firstSentence)
+  if (!headW.size || !sentW.length) return narrative
+  const overlap = sentW.filter(w => headW.has(w)).length / Math.min(sentW.length, headW.size)
+  return overlap >= 0.5 ? narrative.slice(firstSentence.length).trimStart() : narrative
+}
+
 // ── Section content ────────────────────────────────────────────────────────────
 function SectionContent({
   section, sectionIdx,
+  globalKpis,
   onRegenSection, regenning,
   onDrill, onFullscreen,
   annotations, onAnnotate,
 }: {
   section: AgentSection; sectionIdx: number
+  globalKpis?: AgentKPI[]
   onRegenSection?: () => void
   regenning?: boolean
   onDrill?: (chart: AgentChart, segment: string) => void
@@ -1190,6 +1234,15 @@ function SectionContent({
   onAnnotate?: (chartTitle: string, pointName: string) => void
 }) {
   const hasPerformers = (section.top_performers?.length ?? 0) > 0 || (section.bottom_performers?.length ?? 0) > 0
+
+  // Fix C — strip first sentence of narrative if it restates key_finding / data_story
+  const displayNarrative = dedupeNarrative(section.narrative, section.data_story ?? section.key_finding)
+
+  // Fix B — build performer label set for duplicate-table detection
+  const performerLabels = new Set([
+    ...(section.top_performers ?? []).map(p => p.label.trim().toLowerCase()),
+    ...(section.bottom_performers ?? []).map(p => p.label.trim().toLowerCase()),
+  ])
   const accentColor = PALETTE[sectionIdx % PALETTE.length]
 
   const chartProps = (ch: AgentChart, i: number) => ({
@@ -1253,20 +1306,13 @@ function SectionContent({
         )}
       </div>
 
-      {/* ── Narrative body text ── */}
-      {section.narrative && (
-        <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{section.narrative}</p>
+      {/* ── Narrative body text (Fix C: first sentence stripped if it restates headline) ── */}
+      {displayNarrative && (
+        <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{displayNarrative}</p>
       )}
 
       {/* ── Insight cards ── */}
       {section.insights && section.insights.length > 0 && <InsightCards insights={section.insights} />}
-
-      {/* ── Section KPIs ── */}
-      {section.kpis.length > 0 && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(145px, 1fr))', gap: 10 }}>
-          {section.kpis.map((k, i) => <KpiCard key={i} kpi={k} idx={sectionIdx * 4 + i} />)}
-        </div>
-      )}
 
       {/* ── Performers + Charts ── */}
       {(hasPerformers || section.charts.length > 0) && (() => {
@@ -1276,7 +1322,24 @@ function SectionContent({
           const hasAnyRealValue = ch.data.some(row =>
             Object.values(row).some(v => v !== null && v !== undefined && v !== '' && String(v).trim() !== '')
           )
-          return hasAnyRealValue
+          if (!hasAnyRealValue) return false
+
+          // Fix B — suppress table charts whose first-column entities are already
+          // shown by the PerformerPanel (≥50% overlap → duplicate visual)
+          if (ch.type === 'table' && performerLabels.size > 0) {
+            const firstKey = Object.keys(ch.data[0]).find(
+              k => !['value','base','total','projected','anomaly'].includes(k.toLowerCase())
+            ) ?? Object.keys(ch.data[0])[0]
+            const tableEntities = ch.data
+              .map(r => String(r[firstKey] ?? '').trim().toLowerCase())
+              .filter(Boolean)
+            if (tableEntities.length > 0) {
+              const matched = tableEntities.filter(e => performerLabels.has(e)).length
+              if (matched / Math.min(tableEntities.length, performerLabels.size) >= 0.5) return false
+            }
+          }
+
+          return true
         })
 
         // A chart "needs the full row" if it's a table type OR its data rows carry
@@ -1739,11 +1802,6 @@ function PresentationOverlay({
         {section.narrative && (
           <p style={{ fontSize: 15, lineHeight: 1.8, color: 'rgba(255,255,255,0.75)', margin: '0 0 24px', maxWidth: 780 }}>{section.narrative}</p>
         )}
-        {section.kpis.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 14, marginBottom: 24 }}>
-            {section.kpis.map((k, i) => <KpiCard key={i} kpi={k} idx={i} />)}
-          </div>
-        )}
         {section.charts.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 16 }}>
             {section.charts.slice(0, 4).map((ch, i) => <AgentChartView key={i} chart={ch} colorIdx={i} />)}
@@ -2139,6 +2197,7 @@ export default function IntelligenceCanvasPage() {
         // Saved analysis available — use it, skip AI run
         if (savedObj) {
           if (cancelled) return
+          setRawWidgets(widgets)   // must set before return so copilot has connection_id
           setAnalysis(savedObj); setActiveSection(savedObj.sections[0]?.id ?? '')
           setAgentStatus('done'); setHasSavedData(true)
           return
@@ -2362,6 +2421,15 @@ export default function IntelligenceCanvasPage() {
             <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Printer size={11} /> PDF
             </button>
+            {/* Export .vly — bundles AI analysis + widget data + SQL + schema */}
+            <button
+              onClick={() => vlyApi.exportVly(canvasId, analysis)}
+              title="Export as .vly — bundles AI analysis, widget data, SQL queries and schema into one portable file"
+              className="intel-hdr-btn"
+              style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${C.teal}60`, background: `${C.teal}20`, color: C.teal2, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
+            >
+              <Download size={11} /> Export .vly
+            </button>
             {/* Feature 8: share */}
             <button onClick={() => setShareModalUrl(window.location.href)} title="Share report" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Link size={11} /> Share
@@ -2417,43 +2485,40 @@ export default function IntelligenceCanvasPage() {
         <div className="print-zone" style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '22px 28px' }}>
           <div style={{ maxWidth: 1280, marginLeft: 'auto', marginRight: 'auto', width: '100%', boxSizing: 'border-box' }}>
 
-          {/* Global KPIs */}
-          {analysis.kpis.length > 0 && (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12, marginBottom: 20 }}>
-              {analysis.kpis.map((k, i) => (
-                <div key={i} className={`intel-card intel-kpi-${Math.min(i, 5)}`}>
-                  <KpiCard kpi={k} idx={i} />
+          {/* KPI bar — tab-scoped, max 6, fully remounts on tab switch */}
+          {(() => {
+            const isFirstSection = analysis.sections[0]?.id === activeSection
+            const sectionKpis   = currentSection?.kpis ?? []
+            const source =
+              sectionKpis.length > 0 ? sectionKpis
+              : isFirstSection         ? analysis.kpis
+              : []
+            const seen = new Set<string>()
+            const displayKpis: AgentKPI[] = []
+            for (const k of source) {
+              const key = normLabel(k.label)
+              if (!seen.has(key)) { seen.add(key); displayKpis.push(k) }
+            }
+            const visible  = displayKpis.slice(0, 6)
+            const overflow = displayKpis.length - visible.length
+            if (visible.length === 0) return null
+            return (
+              <div key={`kpi-bar-${activeSection}`} style={{ marginBottom: 20 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12, alignItems: 'stretch' }}>
+                  {visible.map((k, i) => (
+                    <div key={i} className={`intel-card intel-kpi-${i}`} style={{ display: 'flex' }}>
+                      <KpiCard kpi={k} idx={i} />
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
-
-          {/* Morning brief — compact collapsible */}
-          {analysis.morning_brief && (
-            <div className="intel-morning" style={{
-              borderRadius: 14, marginBottom: 20, overflow: 'hidden',
-              border: '1px solid #e2eaf4', background: 'white',
-              boxShadow: '0 1px 6px rgba(0,0,0,0.05)',
-            }}>
-              <button
-                onClick={() => setBriefExpanded(e => !e)}
-                style={{ width: '100%', padding: '11px 16px', display: 'flex', alignItems: 'center', gap: 10, background: 'transparent', border: 'none', cursor: 'pointer', textAlign: 'left' }}
-              >
-                <div style={{ width: 26, height: 26, borderRadius: 8, background: `${C.teal}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                  <Sparkles size={12} style={{ color: C.teal }} />
-                </div>
-                <span style={{ fontSize: 11, fontWeight: 700, color: C.ink, flex: 1 }}>AI Morning Brief</span>
-                <span style={{ fontSize: 9, fontWeight: 700, color: C.teal, background: `${C.teal}12`, borderRadius: 20, padding: '2px 8px', marginRight: 6 }}>OPUS</span>
-                {briefExpanded ? <ChevronUp size={12} style={{ color: '#94a3b8' }} /> : <ChevronDown size={12} style={{ color: '#94a3b8' }} />}
-              </button>
-              {briefExpanded && (
-                <div style={{ padding: '0 16px 16px' }}>
-                  <div style={{ height: 1, background: '#f1f5f9', marginBottom: 12 }} />
-                  <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{analysis.morning_brief}</p>
-                </div>
-              )}
-            </div>
-          )}
+                {overflow > 0 && (
+                  <p style={{ fontSize: 11, color: C.muted, margin: '8px 0 0', textAlign: 'right' }}>
+                    +{overflow} more KPIs in the section detail below
+                  </p>
+                )}
+              </div>
+            )
+          })()}
 
 
           {/* Active section — or side-by-side (Feature 12) */}
@@ -2461,6 +2526,7 @@ export default function IntelligenceCanvasPage() {
             <div key={currentSection.id} className={`intel-section-enter${sectionLeaving ? ' intel-section-leave' : ''}`}>
             <SectionContent
               section={currentSection} sectionIdx={sectionIdx}
+              globalKpis={analysis.kpis}
               onRegenSection={() => handleRegenSection(currentSection.id)}
               regenning={regenSection === currentSection.id}
               onDrill={(chart, seg) => {
@@ -2481,6 +2547,7 @@ export default function IntelligenceCanvasPage() {
                   <div style={{ fontSize: 10, fontWeight: 700, color: C.teal, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, padding: '4px 10px', background: `${C.teal}10`, borderRadius: 20, display: 'inline-block' }}>Primary</div>
                   <SectionContent
                     section={currentSection} sectionIdx={sectionIdx}
+                    globalKpis={analysis.kpis}
                     onRegenSection={() => handleRegenSection(currentSection.id)}
                     regenning={regenSection === currentSection.id}
                     onDrill={(chart, seg) => {
@@ -2503,6 +2570,7 @@ export default function IntelligenceCanvasPage() {
                     <div style={{ fontSize: 10, fontWeight: 700, color: C.violet, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, padding: '4px 10px', background: `${C.violet}10`, borderRadius: 20, display: 'inline-block' }}>Compare</div>
                     <SectionContent
                       section={compSec} sectionIdx={compIdx}
+                      globalKpis={analysis.kpis}
                       onFullscreen={(chart) => setFsChart({ chart, colorIdx: compIdx * 4 })}
                       annotations={annotations}
                       onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${compSec.id}|${chartTitle}|${pt}`)}
@@ -2516,34 +2584,82 @@ export default function IntelligenceCanvasPage() {
         </div>
       </div>
 
-      {/* AI Copilot — floating action button + slide-out panel */}
-      <div style={{ position: 'fixed', bottom: 28, right: 28, zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 12 }}>
-        {copilotOpen && (
+      {/* Morning Overview — sticky floating card, top-right, never affects page layout */}
+      {analysis.morning_brief && (
+        <div style={{
+          position: 'fixed',
+          top: 70,
+          right: copilotOpen ? 490 : 24,
+          zIndex: 700,
+          width: 290,
+          transition: 'right 0.3s ease',
+          borderRadius: 14,
+          border: `1px solid ${C.teal}35`,
+          background: `linear-gradient(160deg, ${C.navy}fc 0%, #0b2a54fc 100%)`,
+          boxShadow: `0 8px 32px rgba(8,33,58,0.28), 0 2px 8px ${C.teal}20`,
+          overflow: 'hidden',
+          backdropFilter: 'blur(8px)',
+        }}>
+          <button
+            onClick={() => setBriefExpanded(e => !e)}
+            style={{ width: '100%', padding: '9px 13px', display: 'flex', alignItems: 'center', gap: 8, background: 'transparent', border: 'none', cursor: 'pointer', textAlign: 'left' }}
+          >
+            <div style={{ width: 22, height: 22, borderRadius: 6, background: `${C.teal}30`, border: `1px solid ${C.teal}50`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <Sparkles size={10} style={{ color: C.teal }} />
+            </div>
+            <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.92)', flex: 1, letterSpacing: '0.01em' }}>Morning Overview</span>
+            <span style={{ fontSize: 9, fontWeight: 700, color: C.teal, background: `${C.teal}22`, border: `1px solid ${C.teal}45`, borderRadius: 20, padding: '2px 7px', flexShrink: 0 }}>AI</span>
+            {briefExpanded
+              ? <ChevronUp   size={11} style={{ color: 'rgba(255,255,255,0.4)', flexShrink: 0 }} />
+              : <ChevronDown size={11} style={{ color: 'rgba(255,255,255,0.4)', flexShrink: 0 }} />}
+          </button>
           <div style={{
-            height: 'calc(100vh - 120px)',
-            borderRadius: 16,
-            boxShadow: '0 24px 64px rgba(0,0,0,0.18), 0 8px 32px rgba(0,180,216,0.1)',
-            overflow: 'visible',   /* let CanvasChatPanel's resize handle be clickable */
-            animation: 'slideUpPanel 0.3s cubic-bezier(0.34,1.56,0.64,1)',
-            display: 'flex',
+            overflow: 'hidden',
+            maxHeight: briefExpanded ? 420 : 0,
+            transition: 'max-height 0.3s cubic-bezier(0.4,0,0.2,1)',
           }}>
-            {shareToken
-              ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
-              : <CanvasChatPanel
-                  projectId={projectId}
-                  canvasId={canvasId}
-                  widgets={rawWidgets as CanvasWidgetData[]}
-                  pages={(canvas?.layout_config as { pages?: { id: string; name: string; order: number }[] })?.pages ?? []}
-                  onClose={() => setCopilotOpen(false)}
-                  onWidgetAdded={() => {}}
-                  title="Report Copilot"
-                  subtitle="Full report context · Live DB access"
-                  initialWidth={440}
-                  suggestedQuestions={analysisSuggestions}
-                  onAddToPage={handleAddToPage}
-                />}
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.07)', margin: '0 13px' }} />
+            <p style={{ fontSize: 12, lineHeight: 1.78, color: 'rgba(255,255,255,0.70)', margin: 0, padding: '11px 13px 14px', overflowY: 'auto', maxHeight: 380 }}>
+              {analysis.morning_brief}
+            </p>
           </div>
-        )}
+        </div>
+      )}
+
+      {/* AI Copilot — chat panel, independently positioned so it never overflows viewport */}
+      {copilotOpen && (
+        <div style={{
+          position: 'fixed',
+          top: 12,           /* safe gap from top of viewport */
+          bottom: 88,        /* clears FAB (56px) + gap (20px) + bottom anchor (12px) */
+          right: 24,
+          zIndex: 1000,
+          borderRadius: 16,
+          boxShadow: '0 24px 64px rgba(0,0,0,0.18), 0 8px 32px rgba(0,180,216,0.1)',
+          overflow: 'visible',
+          animation: 'slideUpPanel 0.3s cubic-bezier(0.34,1.56,0.64,1)',
+          display: 'flex',
+        }}>
+          {shareToken
+            ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
+            : <CanvasChatPanel
+                projectId={projectId}
+                canvasId={canvasId}
+                widgets={rawWidgets as CanvasWidgetData[]}
+                pages={(canvas?.layout_config as { pages?: { id: string; name: string; order: number }[] })?.pages ?? []}
+                onClose={() => setCopilotOpen(false)}
+                onWidgetAdded={() => {}}
+                title="Report Copilot"
+                subtitle="Full report context · Live DB access"
+                initialWidth={440}
+                suggestedQuestions={analysisSuggestions}
+                onAddToPage={handleAddToPage}
+              />}
+        </div>
+      )}
+
+      {/* AI Copilot — FAB button */}
+      <div style={{ position: 'fixed', bottom: 20, right: 24, zIndex: 1001 }}>
         <button
           onClick={() => setCopilotOpen(p => !p)}
           title={copilotOpen ? 'Close AI Copilot' : 'Open AI Copilot'}

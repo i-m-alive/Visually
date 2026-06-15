@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import pathlib
 from dataclasses import dataclass, field
 from typing import Optional
 from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
@@ -31,6 +32,34 @@ _CACHE_MODEL = BEDROCK_SONNET_MODEL
 
 SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", "259200"))  # 72 h default
 _REDIS_KEY_PREFIX = "schema_cache"
+
+# ── Filesystem cache (L2 fallback when Redis is unavailable) ──────────────────
+# Read env var at call time (not module load) so .env is already loaded by then.
+def _fs_cache_dir() -> pathlib.Path:
+    return pathlib.Path(os.getenv("SCHEMA_CACHE_DIR", str(pathlib.Path(__file__).parent.parent.parent / ".schema_cache")))
+
+def _fs_cache_path(connection_id: str, schema_hash: str) -> pathlib.Path:
+    d = _fs_cache_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"schema_{connection_id}_{schema_hash}.json"
+
+def _fs_read(connection_id: str, schema_hash: str) -> Optional[str]:
+    try:
+        p = _fs_cache_path(connection_id, schema_hash)
+        if p.exists():
+            print(f"[schema_cache] reading filesystem cache  path={p}", flush=True)
+            return p.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[schema_cache] ⚠ filesystem read failed: {e}", flush=True)
+    return None
+
+def _fs_write(connection_id: str, schema_hash: str, data: str) -> None:
+    try:
+        p = _fs_cache_path(connection_id, schema_hash)
+        p.write_text(data, encoding="utf-8")
+        print(f"[schema_cache] ✓ filesystem write OK  path={p}  size={len(data)//1024}KB", flush=True)
+    except Exception as e:
+        print(f"[schema_cache] ✗ filesystem write FAILED: {e}  dir={_fs_cache_dir()}", flush=True)
 
 # ── in-process L1 cache ───────────────────────────────────────────────────────
 _store: dict[str, "EnrichedSchema"] = {}
@@ -181,13 +210,15 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
         print(f"[schema_cache] ✓ in-process hit  connection={connection_id}", flush=True)
         return _store[connection_id]
 
-    # L2: Redis
+    # L2: Redis (preferred) → filesystem (fallback when Redis is unavailable)
     schema_hash = compute_schema_hash(schema_doc)
     redis_key = f"{_REDIS_KEY_PREFIX}:{connection_id}:{schema_hash}"
+    redis_available = False
     try:
         from shared.redis_client import get_redis
         redis = await get_redis()
         if redis is not None:
+            redis_available = True
             cached_json = await redis.get(redis_key)
             if cached_json:
                 enriched = _deserialize_enriched(cached_json)
@@ -200,6 +231,18 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
     except Exception as _re:
         print(f"[schema_cache] ⚠ Redis read failed (non-fatal): {_re}", flush=True)
 
+    # L2b: filesystem cache (survives server restarts when Redis is down)
+    if not redis_available:
+        fs_json = _fs_read(connection_id, schema_hash)
+        if fs_json:
+            enriched = _deserialize_enriched(fs_json)
+            _store[connection_id] = enriched
+            print(
+                f"[schema_cache] ✓ filesystem hit  connection={connection_id}  hash={schema_hash}",
+                flush=True,
+            )
+            return enriched
+
     # L3: cold build
     print(
         f"[schema_cache] building enriched schema  connection={connection_id}"
@@ -209,20 +252,28 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
     enriched = await _build(schema_doc, db_type, connection_id)
     _store[connection_id] = enriched
 
-    # Persist to Redis
-    try:
-        from shared.redis_client import get_redis
-        redis = await get_redis()
-        if redis is not None:
-            serialized = _serialize_enriched(enriched)
-            await redis.setex(redis_key, SCHEMA_CACHE_TTL, serialized)
-            print(
-                f"[schema_cache] ✓ stored in Redis  connection={connection_id}"
-                f"  hash={schema_hash}  ttl={SCHEMA_CACHE_TTL}s  size={len(serialized)//1024}KB",
-                flush=True,
-            )
-    except Exception as _re:
-        print(f"[schema_cache] ⚠ Redis write failed (non-fatal): {_re}", flush=True)
+    # Persist to Redis if available, otherwise write to filesystem
+    serialized = _serialize_enriched(enriched)
+    if redis_available:
+        try:
+            redis = await get_redis()
+            if redis is not None:
+                await redis.setex(redis_key, SCHEMA_CACHE_TTL, serialized)
+                print(
+                    f"[schema_cache] ✓ stored in Redis  connection={connection_id}"
+                    f"  hash={schema_hash}  ttl={SCHEMA_CACHE_TTL}s  size={len(serialized)//1024}KB",
+                    flush=True,
+                )
+        except Exception as _re:
+            print(f"[schema_cache] ⚠ Redis write failed (non-fatal): {_re}", flush=True)
+    else:
+        _fs_write(connection_id, schema_hash, serialized)
+        print(
+            f"[schema_cache] ✓ stored on filesystem  connection={connection_id}"
+            f"  hash={schema_hash}  size={len(serialized)//1024}KB"
+            f"  path={_FS_CACHE_DIR}",
+            flush=True,
+        )
 
     print(
         f"[schema_cache] ✓ built  ambiguous_cols={len(enriched.ambiguous_columns)}"

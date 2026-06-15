@@ -77,6 +77,7 @@ async def end_user_import_vly(
     """
     from shared.models.projects import Project
     from shared.models.project_members import ProjectMember, MemberRole
+    from shared.models.database_connections import DatabaseConnection
 
     raw = await file.read()
     if not raw:
@@ -130,16 +131,55 @@ async def end_user_import_vly(
 
     # ── Create Dashboard ────────────────────────────────────────────────────────
     canvas_name = canvas_doc.get("name") or meta_doc.get("canvas_name") or "Imported Report"
-    layout_cfg = canvas_doc.get("layout_config") or {"pages": canvas_doc.get("pages", [])}
+    layout_cfg  = canvas_doc.get("layout_config") or {"pages": canvas_doc.get("pages", [])}
+    now_iso     = datetime.utcnow().isoformat()
 
-    # Embed schema context so the AI chat warm-starts without a DB round-trip.
-    # _get_schema_context in analyst.py will look for layout_config["embedded_schema"].
+    # Embed schema + AI context for warm-start, plus import provenance
     if schema_enriched:
         layout_cfg["embedded_schema"] = schema_enriched
     if ai_context_doc:
         layout_cfg["ai_context"] = ai_context_doc
-    if meta_doc.get("connection_hint"):
-        layout_cfg["connection_hint"] = meta_doc["connection_hint"]
+    # Try to find a matching live connection in any of the user's projects.
+    # This lets the copilot run live SQL on imported canvases without Phase-1 encryption.
+    matched_conn_id: uuid.UUID | None = None
+    hint = meta_doc.get("connection_hint") or {}
+    if hint:
+        layout_cfg["connection_hint"] = hint
+        hint_host = hint.get("host", "")
+        hint_db   = hint.get("database", "")
+        if hint_host and hint_db:
+            mc_result = await db.execute(
+                select(DatabaseConnection)
+                .join(Project, Project.id == DatabaseConnection.project_id)
+                .where(Project.owner_id == current_user.id)
+                .where(DatabaseConnection.host == hint_host)
+                .where(DatabaseConnection.database_name == hint_db)
+                .where(DatabaseConnection.is_active == True)
+                .limit(1)
+            )
+            mc = mc_result.scalar_one_or_none()
+            if mc:
+                matched_conn_id = mc.id
+                layout_cfg["connection_id"] = str(mc.id)
+
+    # Provenance flags — used by shared-with-me and the dashboard card UI
+    layout_cfg["is_imported"]     = True
+    layout_cfg["imported_at"]     = now_iso
+    layout_cfg["imported_by"]     = current_user.email
+    layout_cfg["original_name"]   = canvas_name
+    layout_cfg["export_source"]   = {
+        "exported_at":       meta_doc.get("exported_at", ""),
+        "exported_by_email": meta_doc.get("exported_by_email", ""),
+        "vly_version":       meta_doc.get("vly_version", ""),
+    }
+    # Flag whether intelligence analysis was bundled in the archive
+    intel_doc: dict = {}
+    try:
+        if "intelligence.json" in names:
+            intel_doc = json.loads(zf.read("intelligence.json"))
+    except Exception:
+        pass
+    layout_cfg["has_intelligence"] = bool(intel_doc.get("analysis"))
 
     new_dash = Dashboard(
         id=uuid.uuid4(),
@@ -155,15 +195,28 @@ async def end_user_import_vly(
     db.add(new_dash)
     await db.flush()
 
+    # ── Create permanent CanvasCollaborator row ─────────────────────────────────
+    # This is what makes the canvas appear in GET /dashboards/shared-with-me
+    # permanently — without this the canvas was invisible after the share token expired.
+    from shared.models.sharing import CanvasCollaborator as _CC
+    db.add(_CC(
+        id=uuid.uuid4(),
+        dashboard_id=new_dash.id,
+        user_id=current_user.id,
+        invited_by=current_user.id,
+        role="editor",
+        created_at=datetime.utcnow(),
+    ))
+
     # ── Create Widgets with cached chart_data ───────────────────────────────────
     widget_defs: list[dict] = canvas_doc.get("widgets", [])
     for w_def in widget_defs:
-        old_id = w_def.get("id", "")
+        old_id    = w_def.get("id", "")
         data_file = w_def.get("data_file", f"data/{old_id}.json")
         chart_data: dict = {"rows": [], "columns": []}
         if data_file in names:
             try:
-                payload = json.loads(zf.read(data_file))
+                payload    = json.loads(zf.read(data_file))
                 chart_data = payload.get("chart_data", chart_data)
             except Exception:
                 pass
@@ -175,9 +228,9 @@ async def end_user_import_vly(
             title=w_def.get("title", "Chart"),
             widget_type=w_def.get("widget_type", "chart"),
             chart_type=w_def.get("chart_type", "bar"),
-            sql_query=q_info.get("sql") or None,
+            sql_query=q_info.get("sql")     or None,
             base_sql=q_info.get("base_sql") or None,
-            connection_id=None,
+            connection_id=matched_conn_id,   # linked when host+db matched an existing connection
             position_x=w_def.get("position_x", 0),
             position_y=w_def.get("position_y", 0),
             width=w_def.get("width", 6),
@@ -194,10 +247,12 @@ async def end_user_import_vly(
     await db.refresh(new_dash)
     zf.close()
 
-    # ── Issue a 7-day analyst share token ───────────────────────────────────────
-    raw_tok = secrets.token_urlsafe(32)
+    # ── Issue a long-lived analyst share token (90 days) ───────────────────────
+    # The canvas now lives permanently in "My Reports" via CanvasCollaborator,
+    # but we also issue a token for the immediate /share/canvas/{token} redirect.
+    raw_tok    = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_tok.encode()).hexdigest()
-    expires = datetime.utcnow() + timedelta(days=7)
+    expires    = datetime.utcnow() + timedelta(days=90)
     db.add(CanvasShareToken(
         id=uuid.uuid4(),
         dashboard_id=new_dash.id,
@@ -211,10 +266,12 @@ async def end_user_import_vly(
     await db.commit()
 
     return {
-        "dashboard_id": str(new_dash.id),
-        "name": new_dash.name,
-        "widget_count": len(widget_defs),
-        "token": raw_tok,
-        "connection_hint": meta_doc.get("connection_hint", {}),
-        "expires_at": expires.isoformat(),
+        "dashboard_id":      str(new_dash.id),
+        "name":              new_dash.name,
+        "widget_count":      len(widget_defs),
+        "token":             raw_tok,
+        "connection_hint":   meta_doc.get("connection_hint", {}),
+        "has_intelligence":  layout_cfg["has_intelligence"],
+        "expires_at":        expires.isoformat(),
+        "saved_permanently": True,   # canvas is now in My Reports via CanvasCollaborator
     }

@@ -1,22 +1,35 @@
 'use client'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import { useAuthStore } from '@/stores/authStore'
 import {
   Database, MessageSquare, Settings, LogOut, BarChart2,
-  LayoutDashboard, Camera, Layers, Home, Link2,
+  LayoutDashboard, Camera, Layers, Home, Link2, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
-  const router = useRouter()
+  const router   = useRouter()
   const pathname = usePathname()
   const { user, clearAuth, _hasHydrated } = useAuthStore()
+
+  // Persist collapsed state in localStorage so it survives navigation
+  const [collapsed, setCollapsed] = useState(false)
+  useEffect(() => {
+    setCollapsed(localStorage.getItem('sidebar-collapsed') === 'true')
+  }, [])
+
+  const toggleCollapsed = () => {
+    setCollapsed(prev => {
+      const next = !prev
+      localStorage.setItem('sidebar-collapsed', String(next))
+      return next
+    })
+  }
 
   useEffect(() => {
     if (!_hasHydrated) return
     if (!user) { router.push('/login'); return }
-    // Redirect end_user away from builder-only routes
     if (user.role === 'end_user' && pathname.startsWith('/projects')) {
       router.push('/end-user/dashboard')
     }
@@ -45,73 +58,111 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     )
   }
 
+  const initials = user.full_name?.[0]?.toUpperCase() ?? '?'
+
   return (
     <div className="flex h-screen bg-gray-50">
-      {/* Sidebar */}
-      <aside className="w-56 bg-white border-r border-gray-100 flex flex-col">
-        <div className="px-4 py-4 border-b border-gray-100">
-          <Link
-            href={isBuilder ? '/projects' : '/end-user/dashboard'}
-            className="text-xl font-bold text-brand font-display"
+      {/* ── Sidebar ─────────────────────────────────────────────────────── */}
+      <aside
+        style={{ width: collapsed ? 56 : 224, transition: 'width 0.2s ease', flexShrink: 0 }}
+        className="bg-white border-r border-gray-100 flex flex-col relative overflow-hidden"
+      >
+        {/* Logo + toggle */}
+        <div className="flex items-center border-b border-gray-100 flex-shrink-0"
+          style={{ height: 52, padding: collapsed ? '0 8px' : '0 12px', justifyContent: collapsed ? 'center' : 'space-between' }}>
+          {!collapsed && (
+            <Link
+              href={isBuilder ? '/projects' : '/end-user/dashboard'}
+              className="text-xl font-bold text-brand font-display truncate"
+            >
+              Visually
+            </Link>
+          )}
+          <button
+            onClick={toggleCollapsed}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors flex-shrink-0"
           >
-            Visually
-          </Link>
+            {collapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+          </button>
         </div>
 
-        <nav className="flex-1 p-3 space-y-1">
-          {isBuilder ? (
-            // ── Builder nav ──────────────────────────────────────────
-            <>
-              {projectId && (
-                <>
-                  <NavLink href={`/projects/${projectId}/dashboard`}  icon={<LayoutDashboard size={16} />} label="Dashboards"   current={pathname} />
-                  <NavLink href={`/projects/${projectId}/canvas`}     icon={<Layers size={16} />}          label="Canvas"       current={pathname} />
-                  <NavLink href={`/projects/${projectId}/query`}      icon={<MessageSquare size={16} />}   label="Query"        current={pathname} />
-                  <NavLink href={`/projects/${projectId}/schema`}      icon={<Database size={16} />}        label="Schema"       current={pathname} />
-                  <NavLink href={`/projects/${projectId}/screenshot`}  icon={<Camera size={16} />}          label="Screenshots"  current={pathname} />
-                  <NavLink href={`/projects/${projectId}/connection`}  icon={<Link2 size={16} />}           label="Connection"   current={pathname} />
-                </>
-              )}
-              <NavLink href="/projects"    icon={<BarChart2 size={16} />} label="Projects"     current={pathname} />
-              <NavLink href="/settings"    icon={<Settings size={16} />}  label="Settings"     current={pathname} />
-            </>
-          ) : (
-            // ── End-user nav ─────────────────────────────────────────
-            <>
-              <NavLink href="/end-user/dashboard" icon={<Home size={16} />}          label="My Dashboard"   current={pathname} />
-              <NavLink href="/settings"           icon={<Settings size={16} />}      label="Settings"       current={pathname} />
-            </>
-          )}
+        {/* Nav */}
+        <nav className="flex-1 overflow-y-auto overflow-x-hidden" style={{ padding: collapsed ? '10px 6px' : '10px 8px' }}>
+          <div className="space-y-0.5">
+            {isBuilder ? (
+              <>
+                {projectId && (
+                  <>
+                    <NavLink href={`/projects/${projectId}/dashboard`} icon={<LayoutDashboard size={17} />} label="Dashboards"  current={pathname} collapsed={collapsed} />
+                    <NavLink href={`/projects/${projectId}/canvas`}    icon={<Layers size={17} />}          label="Canvas"      current={pathname} collapsed={collapsed} />
+                    <NavLink href={`/projects/${projectId}/query`}     icon={<MessageSquare size={17} />}   label="Query"       current={pathname} collapsed={collapsed} />
+                    <NavLink href={`/projects/${projectId}/schema`}    icon={<Database size={17} />}        label="Schema"      current={pathname} collapsed={collapsed} />
+                    <NavLink href={`/projects/${projectId}/screenshot`}icon={<Camera size={17} />}          label="Screenshots" current={pathname} collapsed={collapsed} />
+                    <NavLink href={`/projects/${projectId}/connection`}icon={<Link2 size={17} />}           label="Connection"  current={pathname} collapsed={collapsed} />
+                    <div style={{ height: 1, background: '#f1f5f9', margin: '6px 0' }} />
+                  </>
+                )}
+                <NavLink href="/projects" icon={<BarChart2 size={17} />} label="Projects"  current={pathname} collapsed={collapsed} />
+                <NavLink href="/settings" icon={<Settings size={17} />}  label="Settings"  current={pathname} collapsed={collapsed} />
+              </>
+            ) : (
+              <>
+                <NavLink href="/end-user/dashboard" icon={<Home size={17} />}     label="My Dashboard" current={pathname} collapsed={collapsed} />
+                <NavLink href="/settings"           icon={<Settings size={17} />} label="Settings"     current={pathname} collapsed={collapsed} />
+              </>
+            )}
+          </div>
         </nav>
 
-        <div className="p-3 border-t border-gray-100">
-          <div className="flex items-center gap-2 mb-2">
-            <div className="w-8 h-8 rounded-full bg-brand text-white text-sm flex items-center justify-center font-semibold">
-              {user.full_name[0].toUpperCase()}
+        {/* User profile */}
+        <div className="border-t border-gray-100 flex-shrink-0" style={{ padding: collapsed ? '10px 6px' : '10px 10px' }}>
+          {collapsed ? (
+            // Collapsed: show only avatar with tooltip
+            <div className="flex justify-center">
+              <div
+                title={`${user.full_name} (${user.email})`}
+                className="w-8 h-8 rounded-full bg-brand text-white text-sm flex items-center justify-center font-semibold cursor-default select-none"
+              >
+                {initials}
+              </div>
             </div>
-            <div className="min-w-0">
-              <p className="text-sm font-medium text-gray-900 truncate">{user.full_name}</p>
-              <p className="text-xs text-gray-500 truncate">{user.email}</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-1.5 mb-1">
-            <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
-              isBuilder ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'
-            }`}>
-              {isBuilder ? 'Builder' : 'Analyst'}
-            </span>
-          </div>
+          ) : (
+            // Expanded: full profile block
+            <>
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-8 h-8 rounded-full bg-brand text-white text-sm flex items-center justify-center font-semibold flex-shrink-0">
+                  {initials}
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-gray-900 truncate">{user.full_name}</p>
+                  <p className="text-xs text-gray-500 truncate">{user.email}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 mb-1.5">
+                <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                  isBuilder ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'
+                }`}>
+                  {isBuilder ? 'Builder' : 'Analyst'}
+                </span>
+              </div>
+            </>
+          )}
           <button
             onClick={handleLogout}
-            className="flex items-center gap-2 text-xs text-gray-500 hover:text-red-600 w-full px-2 py-1 rounded hover:bg-red-50 transition-colors"
+            title="Sign out"
+            className={`flex items-center text-xs text-gray-500 hover:text-red-600 w-full rounded hover:bg-red-50 transition-colors ${
+              collapsed ? 'justify-center py-2' : 'gap-2 px-2 py-1.5 mt-0.5'
+            }`}
           >
-            <LogOut size={12} /> Sign out
+            <LogOut size={13} />
+            {!collapsed && 'Sign out'}
           </button>
         </div>
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {children}
       </div>
     </div>
@@ -119,18 +170,42 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 }
 
 function NavLink({
-  href, icon, label, current,
-}: { href: string; icon: React.ReactNode; label: string; current: string }) {
+  href, icon, label, current, collapsed,
+}: {
+  href: string
+  icon: React.ReactNode
+  label: string
+  current: string
+  collapsed: boolean
+}) {
   const isActive = current === href || current.startsWith(href + '/')
   return (
     <Link
       href={href}
-      className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
-        isActive ? 'bg-brand-light text-brand font-medium' : 'text-gray-600 hover:bg-gray-50'
-      }`}
+      title={collapsed ? label : undefined}
+      className={`relative group flex items-center rounded-lg text-sm transition-colors ${
+        isActive
+          ? 'bg-blue-50 text-blue-700 font-medium'
+          : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
+      } ${collapsed ? 'justify-center p-2.5' : 'gap-2.5 px-3 py-2'}`}
     >
-      {icon}
-      {label}
+      <span className="flex-shrink-0">{icon}</span>
+      {!collapsed && <span className="truncate">{label}</span>}
+
+      {/* Floating tooltip shown in collapsed mode */}
+      {collapsed && (
+        <span
+          className="pointer-events-none absolute left-full ml-2.5 px-2.5 py-1 text-xs font-medium text-white rounded-md whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-50"
+          style={{ background: '#1e293b', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}
+        >
+          {label}
+          {/* Arrow */}
+          <span
+            className="absolute top-1/2 right-full -translate-y-1/2"
+            style={{ borderWidth: '4px', borderStyle: 'solid', borderColor: 'transparent #1e293b transparent transparent' }}
+          />
+        </span>
+      )}
     </Link>
   )
 }
