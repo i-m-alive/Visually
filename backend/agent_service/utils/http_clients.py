@@ -6,10 +6,6 @@ QUERY_EXECUTOR_URL  = os.getenv("QUERY_EXECUTOR_URL",  "http://localhost:8002")
 RENDER_SERVICE_URL  = os.getenv("RENDER_SERVICE_URL",  "http://localhost:3001")
 SCHEMA_CRAWLER_URL  = os.getenv("SCHEMA_CRAWLER_URL",  "http://localhost:8003")
 
-# connection_id prefix that routes to the in-process DuckDB executor instead of
-# the live database executor service.  Set by orchestrator.py in CSV mode.
-CSV_SESSION_PREFIX = "csv_session:"
-
 
 async def call_query_executor(
     connection_id: str,
@@ -17,12 +13,6 @@ async def call_query_executor(
     row_limit: int = 10000,
     timeout_seconds: int = 30,
 ) -> dict:
-    # CSV mode: route to the in-process DuckDB executor — no HTTP hop needed
-    if connection_id.startswith(CSV_SESSION_PREFIX):
-        session_dir = connection_id[len(CSV_SESSION_PREFIX):]
-        from agent_service.utils.csv_executor import call_csv_executor
-        return await call_csv_executor(session_dir, sql, row_limit)
-
     try:
         # Give httpx a 5s margin over the query executor's own timeout
         http_timeout = max(60.0, timeout_seconds + 5.0)

@@ -11,8 +11,12 @@ Analyze the user's message and extract structured information.
 INTENT TYPES (choose exactly one):
 - SINGLE_VIZ: User wants one chart/visualization. Signals: "show me", "chart", "graph", "visualize", metric/dimension words.
 - DASHBOARD: User wants multiple charts, a full dashboard, or an overview. Signals: "dashboard", "overview", "summary", "report", multiple different metric words in one request.
-- SCREENSHOT: User uploaded an image (file attachment detected). Always SCREENSHOT if files are present.
 - FOLLOWUP: User is referring to a prior result with pronouns. Signals: "it", "that", "this chart", "the graph", "filter", "drill", "refine", "update", "change it", "why did it".
+
+OUTPUT MODE (choose exactly one) — how the answer is best presented:
+- "chart": the answer is best SHOWN as a visualization. Signals: "trend", "over time", "by <category>", "compare", "distribution", "breakdown", "top N", "show me a chart/graph", any explicit chart_type, or any request whose result is a series of values across a dimension/time.
+- "text": the answer is best stated in WORDS, with no chart. Signals: a single fact or aggregate ("how many", "what is the total", "what's the average", "which is highest/lowest"), yes/no questions, or "explain", "summarize", "describe", "tell me about". A single number or short fact -> "text".
+When unsure, prefer "chart" if the result naturally has a dimension + a metric (something to plot); otherwise "text".
 
 ENTITY TYPES to extract:
 - metrics: numeric measure words (revenue, sales, count, orders, churn, rate, total, average)
@@ -43,6 +47,7 @@ Return ONLY valid JSON:
   "vagueness_score": 0.0,
   "followup_ref": null,
   "sub_intents": [],
+  "output_mode": "chart",
   "reasoning": "one sentence"
 }"""
 
@@ -72,6 +77,7 @@ class IntentClassifier:
                 "vagueness_score": 0.2,
                 "followup_ref": None,
                 "sub_intents": [],
+                "output_mode": "chart",
                 "reasoning": "Could not parse LLM response; defaulting to SINGLE_VIZ",
             }
 
@@ -104,4 +110,5 @@ class IntentClassifier:
             followup_ref=data.get("followup_ref"),
             sub_intents=data.get("sub_intents", []),
             reasoning=data.get("reasoning", ""),
+            output_mode=(data.get("output_mode") or "chart").lower().strip(),
         )

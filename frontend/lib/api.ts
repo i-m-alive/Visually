@@ -61,6 +61,20 @@ export const agentApi = {
     api.get(`/agent/jobs/${jobId}`),
 }
 
+// Persistent Query-feature chat history (sessions + message tree / branching)
+export const querySessionApi = {
+  list: (projectId: string) => api.get('/query/sessions', { params: { project_id: projectId } }),
+  create: (projectId: string, title?: string) => api.post('/query/sessions', { project_id: projectId, title }),
+  get: (sid: string) => api.get(`/query/sessions/${sid}`),
+  rename: (sid: string, title: string) => api.patch(`/query/sessions/${sid}`, { title }),
+  setActiveLeaf: (sid: string, active_leaf_id: string) => api.patch(`/query/sessions/${sid}`, { active_leaf_id }),
+  remove: (sid: string) => api.delete(`/query/sessions/${sid}`),
+  addMessage: (
+    sid: string,
+    body: { role: 'user' | 'assistant'; content: string; parent_id?: string | null; result?: unknown; job_id?: string },
+  ) => api.post(`/query/sessions/${sid}/messages`, body),
+}
+
 export interface ChatSendData {
   session_id?: string
   message: string
@@ -216,55 +230,6 @@ export const intelligenceApi = {
       referenced_tables: string[]
       message?: string
     }>(`/dashboards/${dashboardId}/schema-context`),
-}
-
-export const screenshotApi = {
-  upload: (data: {
-    projectId: string
-    files: File[]
-    connectionId?: string
-    /** "db" (default) or "csv" */
-    mode?: 'db' | 'csv'
-    /** Table names to use as a hint — serialized as JSON string in form data */
-    userTableHints?: string[]
-    /** CSV data files (CSV mode only) */
-    csvFiles?: File[]
-    /** Free-text description of the screenshot (Mode 3 — Guided Replication) */
-    userContext?: string
-    /** Context document files — PDF, DOCX, PPTX, TXT (Mode 3) */
-    contextFiles?: File[]
-    /** Power BI Template file (.pbit) — provides ground-truth field bindings */
-    pbitFile?: File
-    /** Per-table column selections — [{table, dimension, metric, date, group_by}] */
-    userColumnHints?: Array<{
-      table: string
-      dimension?: string
-      metric?: string
-      date?: string
-      group_by?: string
-    }>
-  }) => {
-    const form = new FormData()
-    form.append('project_id', data.projectId)
-    if (data.connectionId) form.append('connection_id', data.connectionId)
-    form.append('mode', data.mode ?? 'db')
-    if (data.userTableHints?.length)
-      form.append('user_table_hints', JSON.stringify(data.userTableHints))
-    if (data.userContext?.trim())
-      form.append('user_context', data.userContext.trim())
-    data.files.forEach((f) => form.append('files', f))
-    data.csvFiles?.forEach((f) => form.append('csv_files', f))
-    data.contextFiles?.forEach((f) => form.append('context_files', f))
-    if (data.pbitFile) form.append('pbit_file', data.pbitFile)
-    if (data.userColumnHints?.length)
-      form.append('user_column_hints', JSON.stringify(data.userColumnHints))
-    return api.post('/screenshot/upload', form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
-  },
-  getJob: (jobId: string) => api.get(`/screenshot/jobs/${jobId}`),
-  submitHint: (jobId: string, data: { hint_id: string; response: string }) =>
-    api.post(`/screenshot/jobs/${jobId}/hint`, data),
 }
 
 export const exportApi = {

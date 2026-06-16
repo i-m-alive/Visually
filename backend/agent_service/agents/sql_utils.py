@@ -57,11 +57,26 @@ def expand_table_aliases(sql: str) -> str:
 
     result = sql
     for alias, table_name in alias_map.items():
-        # Replace alias.column → table_name.column (but not inside string literals)
+        # 1. Replace alias.column → table.column, using the BARE table name (last
+        #    path segment). A schema-qualified ref like public.sales.col is a
+        #    3-level reference that Redshift rejects; "sales.col" resolves fine
+        #    against "FROM public.sales".
+        bare_table = table_name.split(".")[-1]
         result = re.sub(
             r'\b' + re.escape(alias) + r'\.([\w]+)\b',
-            table_name.replace('\\', '\\\\') + r'.\1',
+            bare_table.replace('\\', '\\\\') + r'.\1',
             result,
+        )
+        # 2. Remove the alias DEFINITION from the FROM/JOIN clause so the table is
+        #    referenced consistently by its full name. Leaving "FROM tbl alias"
+        #    while rewriting refs to "tbl.col" makes the alias the only valid
+        #    reference and causes Postgres/Redshift error 42P01
+        #    ("invalid reference to FROM-clause entry ... perhaps you meant alias").
+        result = re.sub(
+            r'(\b(?:FROM|JOIN)\s+' + re.escape(table_name) + r')\s+(?:AS\s+)?' + re.escape(alias) + r'\b',
+            r'\1',
+            result,
+            flags=re.IGNORECASE,
         )
 
     return result
