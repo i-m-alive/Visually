@@ -139,8 +139,8 @@ export function ExecutiveCopilot({ token, canvasName, pageName }: Props) {
                             <BarChart3 size={10} className="text-blue-500" />
                             <span className="text-[10px] font-semibold text-gray-700">{c.title}</span>
                           </div>
-                          <div className="h-36 p-1 bg-white">
-                            <ChartRenderer result={toResult(c)} height={undefined} />
+                          <div className="h-44 p-1 bg-white">
+                            <ChartRenderer result={toResult(c)} height={164} legend />
                           </div>
                         </div>
                       ))}
