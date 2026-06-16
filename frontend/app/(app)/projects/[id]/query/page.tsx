@@ -176,6 +176,9 @@ export default function QueryPage() {
       const r = await querySessionApi.addMessage(sid, { role: 'user', content: text, parent_id: parentId })
       userServerId = r.data.id
       setActiveLeafId(userServerId!); activeLeafRef.current = userServerId!
+      // Backend auto-titles the session from the first question — reflect it in
+      // the sidebar immediately rather than waiting for the answer to finish.
+      refreshSessions()
     } catch { /* persist best-effort */ }
     pendingParentRef.current = userServerId || null
 
