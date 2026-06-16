@@ -7,7 +7,7 @@ import {
   Loader2, AlertCircle, Search, X,
   BarChart2, Clock, RefreshCw, Share2, Heart, TrendingUp, Zap,
   ChevronRight, Sparkles, UserCircle2, Link2, Upload, FileArchive,
-  Database, CheckCircle2, Package, Brain, Calendar, Wifi, WifiOff,
+  Database, CheckCircle2, Package, Brain, Calendar, Wifi, WifiOff, Trash2,
 } from 'lucide-react'
 
 interface DashCard {
@@ -156,6 +156,23 @@ export default function EndUserDashboardPage() {
       finally { setAiLoading(prev => ({ ...prev, [d.id]: false })) }
     })
   }, [dashboards])
+
+  const handleDelete = async (id: string, name: string, isImported: boolean) => {
+    const msg = isImported
+      ? `Delete "${name}"? This permanently removes the imported report and its charts.`
+      : `Remove "${name}" from your reports? (The original stays with the person who shared it.)`
+    if (!window.confirm(msg)) return
+    // optimistic removal
+    setDashboards(prev => prev.filter(d => d.id !== id))
+    try {
+      const resp = await endUserApi.deleteReport(id)
+      setShareToast(resp.data?.mode === 'deleted' ? 'Report deleted' : 'Removed from your reports')
+    } catch {
+      setShareToast('Failed to delete — refreshing')
+      await load()
+    }
+    setTimeout(() => setShareToast(null), 2500)
+  }
 
   const handleShare = async (id: string) => {
     try {
@@ -418,7 +435,7 @@ export default function EndUserDashboardPage() {
               <h2 className="text-xs font-bold text-gray-500 uppercase tracking-wider">Shared with me</h2>
               <span className="text-xs text-gray-400">({sharedReports.length})</span>
             </div>
-            <ReportGrid reports={sharedReports} aiSummaries={aiSummaries} aiLoading={aiLoading} onShare={handleShare} router={router} />
+            <ReportGrid reports={sharedReports} aiSummaries={aiSummaries} aiLoading={aiLoading} onShare={handleShare} onDelete={handleDelete} router={router} />
           </section>
         )}
 
@@ -432,7 +449,7 @@ export default function EndUserDashboardPage() {
             </div>
             <div className="grid gap-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))' }}>
               {importedReports.map(dash => (
-                <ImportedCard key={dash.id} dash={dash} aiSummary={aiSummaries[dash.id]} aiLoading={!!aiLoading[dash.id]} onShare={() => handleShare(dash.id)} router={router} />
+                <ImportedCard key={dash.id} dash={dash} aiSummary={aiSummaries[dash.id]} aiLoading={!!aiLoading[dash.id]} onShare={() => handleShare(dash.id)} onDelete={() => handleDelete(dash.id, dash.name, true)} router={router} />
               ))}
             </div>
           </section>
@@ -444,11 +461,12 @@ export default function EndUserDashboardPage() {
 
 // ── Shared report card grid ────────────────────────────────────────────────────
 
-function ReportGrid({ reports, aiSummaries, aiLoading, onShare, router }: {
+function ReportGrid({ reports, aiSummaries, aiLoading, onShare, onDelete, router }: {
   reports: DashCard[]
   aiSummaries: Record<string, string>
   aiLoading: Record<string, boolean>
   onShare: (id: string) => void
+  onDelete: (id: string, name: string, isImported: boolean) => void
   router: ReturnType<typeof useRouter>
 }) {
   return (
@@ -506,6 +524,10 @@ function ReportGrid({ reports, aiSummaries, aiLoading, onShare, router }: {
                   className="p-2 text-gray-400 hover:text-blue-500 rounded-lg hover:bg-blue-50 transition-colors border border-gray-100" title="Copy share link">
                   <Share2 size={14} />
                 </button>
+                <button onClick={e => { e.stopPropagation(); onDelete(dash.id, dash.name, false) }}
+                  className="p-2 text-gray-400 hover:text-red-500 rounded-lg hover:bg-red-50 transition-colors border border-gray-100" title="Remove from my reports">
+                  <Trash2 size={14} />
+                </button>
               </div>
             </div>
             <div className="absolute inset-0 rounded-2xl border-2 border-transparent group-hover:border-blue-400 transition-colors pointer-events-none" />
@@ -518,11 +540,12 @@ function ReportGrid({ reports, aiSummaries, aiLoading, onShare, router }: {
 
 // ── Imported canvas card ───────────────────────────────────────────────────────
 
-function ImportedCard({ dash, aiSummary, aiLoading, onShare, router }: {
+function ImportedCard({ dash, aiSummary, aiLoading, onShare, onDelete, router }: {
   dash: DashCard
   aiSummary?: string
   aiLoading: boolean
   onShare: () => void
+  onDelete: () => void
   router: ReturnType<typeof useRouter>
 }) {
   const colors    = THEME_COLORS[dash.theme] ?? THEME_COLORS.frost
@@ -606,6 +629,13 @@ function ImportedCard({ dash, aiSummary, aiLoading, onShare, router }: {
             className="p-2 rounded-lg border border-gray-100 text-gray-400 hover:text-blue-500 hover:bg-blue-50 transition-colors"
           >
             <Share2 size={14} />
+          </button>
+          <button
+            onClick={e => { e.stopPropagation(); onDelete() }}
+            title="Delete report"
+            className="p-2 rounded-lg border border-gray-100 text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+          >
+            <Trash2 size={14} />
           </button>
         </div>
       </div>
