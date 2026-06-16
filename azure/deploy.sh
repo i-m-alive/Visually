@@ -245,7 +245,7 @@ if run backend; then
     --ingress internal --transport http --target-port 8002 \
     --min-replicas 1 --max-replicas 3 --cpu 1.0 --memory 2.0Gi \
     "${SEC[@]}" \
-    --env-vars DATABASE_URL="$DB_ASYNC" ENCRYPTION_KEY=secretref:enc-key REDSHIFT_USE_DATA_API=true "${AWS_ENV[@]}" -o none
+    --env-vars DATABASE_URL="$DB_ASYNC" ENCRYPTION_KEY=secretref:enc-key REDSHIFT_USE_DATA_API=true REDSHIFT_DATA_API_SECRET_ARN="${REDSHIFT_DATA_API_SECRET_ARN:-}" "${AWS_ENV[@]}" -o none
 
   az containerapp create -n "$APP_SCHEMA" -g "$RG" --environment "$ENV_ID" \
     --image "$ACR_LOGIN/schema-crawler:$TAG" "${REG[@]}" \

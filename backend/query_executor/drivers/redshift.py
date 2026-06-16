@@ -161,7 +161,16 @@ def _execute_data_api_sync(host: str, database: str, sql: str, row_limit: int) -
     region = parts[2] if len(parts) >= 3 else os.getenv("AWS_REGION", "us-east-1")
     try:
         client = boto3.client("redshift-data", region_name=region)
-        resp = client.execute_statement(WorkgroupName=workgroup, Database=database, Sql=sql)
+        # Authenticate as a real DB user via Secrets Manager when configured. Without
+        # this, the Data API runs as the IAM-mapped user, which often lacks grants on
+        # app schemas (e.g. "permission denied for schema staging"). The secret holds
+        # the same DB user the report was built with (e.g. svc_powerbi), which has the
+        # right permissions.
+        stmt_kwargs = {"WorkgroupName": workgroup, "Database": database, "Sql": sql}
+        secret_arn = os.getenv("REDSHIFT_DATA_API_SECRET_ARN", "").strip()
+        if secret_arn:
+            stmt_kwargs["SecretArn"] = secret_arn
+        resp = client.execute_statement(**stmt_kwargs)
         sid = resp["Id"]
         # Poll until the statement finishes. First query against a paused Serverless
         # workgroup also wakes it, so allow generous time (handled by polling, not a
