@@ -836,7 +836,7 @@ function fmtColProfile(p: ColumnProfile): string {
 function buildWidgetBlock(ctx: WidgetContext): string {
   const lines: string[] = []
   const liveTag = ctx.live_data ? ' [LIVE DATA]' : ''
-  lines.push(`WIDGET: "${ctx.title}" [${ctx.pattern} | quality ${ctx.quality_score}/100${liveTag}]`)
+  lines.push(`WIDGET: "${ctx.title}" [${ctx.pattern}${liveTag}]`)
   lines.push(`NARRATIVE: ${ctx.narrative}`)
   if (ctx.sql_query) lines.push(`SQL_QUERY: ${ctx.sql_query.slice(0, 2000)}`)
   if (ctx.table_columns?.length) lines.push(`COLUMNS: ${ctx.table_columns.join(', ')}`)
@@ -929,7 +929,6 @@ function buildPrompt(
   return `You are a senior executive intelligence analyst. Rich pre-computed statistical data is provided below — including live SQL rows, column profiles, dimension breakdowns, performer rankings, correlations, the SQL query behind each visualization, and the full database schema context. Use ALL of it to produce a deeply specific, narrative-driven executive report with real numbers and concrete findings.
 
 REPORT: "${canvasName}"
-DATA QUALITY SCORE: ${healthScore}/100 (${healthColor.toUpperCase()})
 
 ${schemaBlock || ''}
 
@@ -941,6 +940,7 @@ ${widgetBlocks}
 ━━━━━━━━━━━━━━━━━━
 
 INSTRUCTIONS:
+0. FOCUS: This is a BUSINESS intelligence report. Analyze the actual data to surface business insights — revenue, customers, trends, segments, performance, forecasts, risks, opportunities. Do NOT create a "Data Quality" section and do NOT discuss data-quality scores, data completeness, null rates, or data hygiene anywhere (including the morning_brief). The reader wants insights about their business, not about the data pipeline.
 1. Create 4–6 thematic sections — each a chapter telling one story from the data (Revenue Performance, Customer Trends, Regional Breakdown, Forecast, etc.).
 2. For every section:
    • data_story: ONE bold headline sentence with a specific number (e.g. "North region drives 61% of total revenue at $4.2M")
