@@ -5,7 +5,7 @@ import Link from 'next/link'
 import { useAuthStore } from '@/stores/authStore'
 import {
   Database, MessageSquare, Settings, LogOut, BarChart2,
-  LayoutDashboard, Camera, Layers, Home, Link2, ChevronLeft, ChevronRight,
+  LayoutDashboard, Layers, Home, Link2, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
@@ -98,7 +98,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                     <NavLink href={`/projects/${projectId}/canvas`}    icon={<Layers size={17} />}          label="Canvas"      current={pathname} collapsed={collapsed} />
                     <NavLink href={`/projects/${projectId}/query`}     icon={<MessageSquare size={17} />}   label="Query"       current={pathname} collapsed={collapsed} />
                     <NavLink href={`/projects/${projectId}/schema`}    icon={<Database size={17} />}        label="Schema"      current={pathname} collapsed={collapsed} />
-                    <NavLink href={`/projects/${projectId}/screenshot`}icon={<Camera size={17} />}          label="Screenshots" current={pathname} collapsed={collapsed} />
                     <NavLink href={`/projects/${projectId}/connection`}icon={<Link2 size={17} />}           label="Connection"  current={pathname} collapsed={collapsed} />
                     <div style={{ height: 1, background: '#f1f5f9', margin: '6px 0' }} />
                   </>

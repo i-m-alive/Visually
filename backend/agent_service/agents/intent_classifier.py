@@ -11,7 +11,6 @@ Analyze the user's message and extract structured information.
 INTENT TYPES (choose exactly one):
 - SINGLE_VIZ: User wants one chart/visualization. Signals: "show me", "chart", "graph", "visualize", metric/dimension words.
 - DASHBOARD: User wants multiple charts, a full dashboard, or an overview. Signals: "dashboard", "overview", "summary", "report", multiple different metric words in one request.
-- SCREENSHOT: User uploaded an image (file attachment detected). Always SCREENSHOT if files are present.
 - FOLLOWUP: User is referring to a prior result with pronouns. Signals: "it", "that", "this chart", "the graph", "filter", "drill", "refine", "update", "change it", "why did it".
 
 ENTITY TYPES to extract:

@@ -218,55 +218,6 @@ export const intelligenceApi = {
     }>(`/dashboards/${dashboardId}/schema-context`),
 }
 
-export const screenshotApi = {
-  upload: (data: {
-    projectId: string
-    files: File[]
-    connectionId?: string
-    /** "db" (default) or "csv" */
-    mode?: 'db' | 'csv'
-    /** Table names to use as a hint — serialized as JSON string in form data */
-    userTableHints?: string[]
-    /** CSV data files (CSV mode only) */
-    csvFiles?: File[]
-    /** Free-text description of the screenshot (Mode 3 — Guided Replication) */
-    userContext?: string
-    /** Context document files — PDF, DOCX, PPTX, TXT (Mode 3) */
-    contextFiles?: File[]
-    /** Power BI Template file (.pbit) — provides ground-truth field bindings */
-    pbitFile?: File
-    /** Per-table column selections — [{table, dimension, metric, date, group_by}] */
-    userColumnHints?: Array<{
-      table: string
-      dimension?: string
-      metric?: string
-      date?: string
-      group_by?: string
-    }>
-  }) => {
-    const form = new FormData()
-    form.append('project_id', data.projectId)
-    if (data.connectionId) form.append('connection_id', data.connectionId)
-    form.append('mode', data.mode ?? 'db')
-    if (data.userTableHints?.length)
-      form.append('user_table_hints', JSON.stringify(data.userTableHints))
-    if (data.userContext?.trim())
-      form.append('user_context', data.userContext.trim())
-    data.files.forEach((f) => form.append('files', f))
-    data.csvFiles?.forEach((f) => form.append('csv_files', f))
-    data.contextFiles?.forEach((f) => form.append('context_files', f))
-    if (data.pbitFile) form.append('pbit_file', data.pbitFile)
-    if (data.userColumnHints?.length)
-      form.append('user_column_hints', JSON.stringify(data.userColumnHints))
-    return api.post('/screenshot/upload', form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
-  },
-  getJob: (jobId: string) => api.get(`/screenshot/jobs/${jobId}`),
-  submitHint: (jobId: string, data: { hint_id: string; response: string }) =>
-    api.post(`/screenshot/jobs/${jobId}/hint`, data),
-}
-
 export const exportApi = {
   trigger: (data: {
     dashboard_id: string

@@ -39,7 +39,6 @@ from agent_service.services.ws_manager import manager, redis_listener
 from agent_service.agents.orchestrator import Orchestrator
 from agent_service.agents.intent_classifier import IntentClassifier as QuickClassifier
 from agent_service.routers import chat as chat_module
-from agent_service.routers import screenshots as screenshots_module
 from agent_service.routers import exports as exports_module
 from agent_service.routers import vly as vly_module
 from agent_service.routers import share as share_module
@@ -128,7 +127,6 @@ async def add_cors_on_error(request, call_next):
 bearer_scheme = HTTPBearer(auto_error=False)
 
 app.include_router(chat_module.router)
-app.include_router(screenshots_module.router)
 app.include_router(exports_module.router)
 app.include_router(vly_module.router)
 app.include_router(share_module.router)
@@ -395,26 +393,11 @@ async def delete_project(project_id: str, current_user: User = Depends(get_curre
         )
         widget_ids = [r[0] for r in widget_rows.all()]
 
-        # NULL out references to widgets
-        if widget_ids:
-            await db.execute(
-                sa_update(ChartReplicationState)
-                .where(ChartReplicationState.widget_id.in_(widget_ids))
-                .values(widget_id=None)
-                .execution_options(synchronize_session=False)
-            )
-
         # NULL out dashboard references
         await db.execute(
             sa_update(ChatSession)
             .where(ChatSession.dashboard_id.in_(dashboard_ids))
             .values(dashboard_id=None)
-            .execution_options(synchronize_session=False)
-        )
-        await db.execute(
-            sa_update(ScreenshotJob)
-            .where(ScreenshotJob.result_dashboard_id.in_(dashboard_ids))
-            .values(result_dashboard_id=None)
             .execution_options(synchronize_session=False)
         )
 
@@ -669,7 +652,7 @@ async def submit_intent(
     # Pre-classify to decide pipeline type
     try:
         intent_preview = await _quick_classifier.classify(req.text)
-        job_type = intent_preview.intent_type  # SINGLE_VIZ | DASHBOARD | FOLLOWUP | SCREENSHOT
+        job_type = intent_preview.intent_type  # SINGLE_VIZ | DASHBOARD | FOLLOWUP
     except Exception:
         job_type = "SINGLE_VIZ"
 
@@ -736,7 +719,6 @@ from sqlalchemy import update as sa_update, func
 from shared.models.dashboards import Dashboard
 from shared.models.widgets import Widget as WidgetModel
 from shared.models.chat_sessions import ChatSession
-from shared.models.phase3 import ScreenshotJob, ChartReplicationState
 from pydantic import BaseModel as _BM
 
 
@@ -1153,26 +1135,11 @@ async def delete_dashboard(
     )
     widget_ids = [r[0] for r in widget_rows.all()]
 
-    # NULL out FK references to widgets (chart_replication_states.widget_id is nullable)
-    if widget_ids:
-        await db.execute(
-            sa_update(ChartReplicationState)
-            .where(ChartReplicationState.widget_id.in_(widget_ids))
-            .values(widget_id=None)
-            .execution_options(synchronize_session=False)
-        )
-
     # NULL out nullable FK references to this dashboard
     await db.execute(
         sa_update(ChatSession)
         .where(ChatSession.dashboard_id == dashboard.id)
         .values(dashboard_id=None)
-        .execution_options(synchronize_session=False)
-    )
-    await db.execute(
-        sa_update(ScreenshotJob)
-        .where(ScreenshotJob.result_dashboard_id == dashboard.id)
-        .values(result_dashboard_id=None)
         .execution_options(synchronize_session=False)
     )
 

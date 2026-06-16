@@ -9,7 +9,6 @@ from .chat_sessions import ChatSession
 from .pipeline_jobs import PipelineJob
 from .refresh_tokens import RefreshToken
 from .phase2 import DashboardVersion, SchemaChangeAlert, QueryHistory
-from .phase3 import ScreenshotJob, ChartReplicationState, UploadedFile, HintQueueEntry
 from .phase4 import ExportJob, ExportToken, ExportChatSession
 from .schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
 from .sharing import CanvasShareToken, CanvasCollaborator
@@ -23,7 +22,6 @@ __all__ = [
     "SchemaSnapshot", "Dashboard", "Widget", "ChatSession",
     "PipelineJob", "RefreshToken",
     "DashboardVersion", "SchemaChangeAlert", "QueryHistory",
-    "ScreenshotJob", "ChartReplicationState", "UploadedFile", "HintQueueEntry",
     "ExportJob", "ExportToken", "ExportChatSession",
     "SchemaTableMetadata", "SchemaColumnMetadata",
     "CanvasShareToken", "CanvasCollaborator",
