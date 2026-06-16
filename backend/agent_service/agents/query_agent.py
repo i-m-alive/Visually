@@ -432,8 +432,11 @@ class QueryAgent:
             sql=data.get("sql", "SELECT 1"),
             chart_type=data.get("chart_type", "table"),
             table_used=data.get("table_used", "unknown"),
-            x_axis_label=data.get("x_axis_label", "x"),
-            y_axis_label=data.get("y_axis_label", "y"),
+            # KPI/single-value charts have no axes → LLM returns null; coerce to "".
+            # (data.get(key, default) does NOT apply the default when the key is
+            # present with a null value, so use `or` to catch None.)
+            x_axis_label=data.get("x_axis_label") or "",
+            y_axis_label=data.get("y_axis_label") or "",
             title=data.get("title", "Chart"),
             reasoning=data.get("reasoning", ""),
             db_dialect=data.get("db_dialect", "postgresql"),

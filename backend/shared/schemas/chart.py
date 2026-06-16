@@ -70,8 +70,10 @@ class QueryPlan(BaseModel):
     sql: str
     chart_type: str
     table_used: str
-    x_axis_label: str
-    y_axis_label: str
+    # KPI / single-value charts have no axes — default to "" so a null/omitted
+    # label never fails validation.
+    x_axis_label: str = ""
+    y_axis_label: str = ""
     title: str
     reasoning: str
     db_dialect: str
