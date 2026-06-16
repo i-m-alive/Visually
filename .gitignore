@@ -1,4 +1,6 @@
 .env
+azure/secrets.env
+azure/DEPLOYMENT_INFO.local.md
 *.pyc
 __pycache__/
 .venv/
