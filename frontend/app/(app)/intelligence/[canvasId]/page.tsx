@@ -1479,49 +1479,77 @@ function SectionContent({
 }
 
 // ── Left rail ──────────────────────────────────────────────────────────────────
+const RAIL_COLLAPSED = 64
+const RAIL_EXPANDED  = 256
+
 function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; active: string; onNav: (id: string) => void }) {
+  const [expanded, setExpanded] = useState(false)
   return (
-    <div style={{ background: '#071a2e', display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 14, paddingBottom: 14, gap: 4, overflowY: 'auto', overflowX: 'hidden', borderRight: '1px solid rgba(255,255,255,0.06)', scrollbarWidth: 'none' } as React.CSSProperties}>
-      {sections.map((s, idx) => {
-        const isActive = s.id === active
-        const color = PALETTE[idx % PALETTE.length]
-        const color2 = PALETTE[(idx + 2) % PALETTE.length]
-        return (
-          <button
-            key={s.id}
-            onClick={() => onNav(s.id)}
-            title={s.label}
-            className="intel-nav-item"
-            style={{
-              width: 78, flexShrink: 0,
-              background: 'transparent', border: 'none', cursor: 'pointer',
-              display: 'flex', flexDirection: 'column', alignItems: 'center',
-              gap: 5, padding: '5px 2px', outline: 'none',
-            }}
-          >
-            <div style={{
-              width: 44, height: 44, borderRadius: 13,
-              background: `linear-gradient(135deg, ${color} 0%, ${color2} 100%)`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              color: 'white',
-              boxShadow: isActive ? `0 0 0 2.5px ${C.teal}, 0 4px 16px ${color}70` : `0 2px 8px ${color}44`,
-              transform: isActive ? 'scale(1.1)' : 'scale(1)',
-              transition: 'all 0.2s ease',
-            }}>
-              <SectionIcon name={s.icon} size={17} />
-            </div>
-            <span style={{
-              fontSize: 10, fontWeight: 600, letterSpacing: '0.01em',
-              color: isActive ? C.teal2 : 'rgba(255,255,255,0.55)',
-              textAlign: 'center', lineHeight: 1.2, maxWidth: 74,
-              display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
-              overflow: 'hidden', textOverflow: 'ellipsis',
-              wordBreak: 'break-word', hyphens: 'auto',
-              transition: 'color 0.2s',
-            } as React.CSSProperties}>{s.label}</span>
-          </button>
-        )
-      })}
+    // Outer keeps a fixed 64px footprint in the grid; the nav itself is absolutely
+    // positioned so it can slide open over the content on hover without reflowing it.
+    <div style={{ position: 'relative', width: RAIL_COLLAPSED, flexShrink: 0 }}>
+      <nav
+        onMouseEnter={() => setExpanded(true)}
+        onMouseLeave={() => setExpanded(false)}
+        style={{
+          position: 'absolute', top: 0, left: 0, bottom: 0,
+          width: expanded ? RAIL_EXPANDED : RAIL_COLLAPSED,
+          background: '#071a2e',
+          borderRight: '1px solid rgba(255,255,255,0.06)',
+          boxShadow: expanded ? '8px 0 28px rgba(0,0,0,0.4)' : 'none',
+          display: 'flex', flexDirection: 'column',
+          paddingTop: 14, paddingBottom: 14, gap: 4,
+          overflowY: 'auto', overflowX: 'hidden',
+          transition: 'width 0.22s cubic-bezier(.4,0,.2,1), box-shadow 0.22s ease',
+          zIndex: 60, scrollbarWidth: 'none',
+        } as React.CSSProperties}
+      >
+        {sections.map((s, idx) => {
+          const isActive = s.id === active
+          const color = PALETTE[idx % PALETTE.length]
+          const color2 = PALETTE[(idx + 2) % PALETTE.length]
+          return (
+            <button
+              key={s.id}
+              onClick={() => onNav(s.id)}
+              title={s.label}
+              className="intel-nav-item"
+              style={{
+                position: 'relative', width: '100%', flexShrink: 0,
+                background: isActive ? 'rgba(255,255,255,0.06)' : 'transparent',
+                border: 'none', cursor: 'pointer',
+                display: 'flex', flexDirection: 'row', alignItems: 'center',
+                gap: 12, padding: '5px 0 5px 10px', outline: 'none',
+              }}
+            >
+              {/* Active accent bar on the rail's left edge */}
+              {isActive && (
+                <span style={{ position: 'absolute', left: 0, top: 9, bottom: 9, width: 3, borderRadius: '0 2px 2px 0', background: C.teal }} />
+              )}
+              <div style={{
+                width: 44, height: 44, borderRadius: 13, flexShrink: 0,
+                background: `linear-gradient(135deg, ${color} 0%, ${color2} 100%)`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color: 'white',
+                boxShadow: isActive ? `0 0 0 2.5px ${C.teal}, 0 4px 16px ${color}70` : `0 2px 8px ${color}44`,
+                transform: isActive ? 'scale(1.06)' : 'scale(1)',
+                transition: 'all 0.2s ease',
+              }}>
+                <SectionIcon name={s.icon} size={18} />
+              </div>
+              <span style={{
+                fontSize: 12.5, fontWeight: 600, letterSpacing: '0.01em',
+                color: isActive ? '#fff' : 'rgba(255,255,255,0.72)',
+                whiteSpace: 'nowrap', textAlign: 'left', flex: 1, minWidth: 0, paddingRight: 12,
+                overflow: 'hidden', textOverflow: 'ellipsis',
+                opacity: expanded ? 1 : 0,
+                transition: 'opacity 0.16s ease',
+                pointerEvents: 'none',
+              }}>{s.label}</span>
+            </button>
+          )
+        })}
+      </nav>
     </div>
   )
 }
@@ -2541,7 +2569,7 @@ export default function IntelligenceCanvasPage() {
   if (!analysis) return null
 
   return (
-    <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: '82px 1fr', overflow: 'hidden' }}>
+    <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: `${RAIL_COLLAPSED}px 1fr`, overflow: 'hidden' }}>
 
       {/* Left rail */}
       <LeftRail sections={analysis.sections} active={activeSection} onNav={handleNavSection} />
@@ -2559,8 +2587,8 @@ export default function IntelligenceCanvasPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
             <div style={{ width: 34, height: 34, borderRadius: 10, background: `linear-gradient(135deg,${C.teal},${C.teal2})`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: `0 4px 12px ${C.teal}50` }}><Zap size={15} style={{ color: 'white' }} /></div>
             <div style={{ minWidth: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <h1 style={{ fontSize: 15, fontWeight: 700, color: 'white', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{analysis.title}</h1>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap' }}>
+                <h1 style={{ fontSize: 15, fontWeight: 700, color: 'white', margin: 0, lineHeight: 1.25, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{analysis.title}</h1>
                 <span style={{ fontSize: 9, fontWeight: 700, color: C.teal2, background: `${C.teal}25`, border: `1px solid ${C.teal}50`, borderRadius: 20, padding: '2px 8px', letterSpacing: '0.06em', flexShrink: 0 }}>OPUS AI</span>
               {hasSavedData && <span style={{ fontSize: 9, fontWeight: 700, color: C.green, background: `${C.green}20`, border: `1px solid ${C.green}50`, borderRadius: 20, padding: '2px 8px', letterSpacing: '0.06em', flexShrink: 0 }}>SAVED</span>}
               </div>
@@ -3058,10 +3086,10 @@ export default function IntelligenceCanvasPage() {
 
         /* ── LeftRail nav buttons ──────────────────────────────── */
         .intel-nav-item {
-          transition: transform 0.18s cubic-bezier(.34,1.56,.64,1) !important;
+          border-radius: 12px;
+          transition: background 0.16s ease !important;
         }
-        .intel-nav-item:hover { transform: scale(1.14) !important; }
-        .intel-nav-item:active { transform: scale(0.95) !important; }
+        .intel-nav-item:hover { background: rgba(255,255,255,0.08) !important; }
 
         /* ── Header action buttons ─────────────────────────────── */
         .intel-hdr-btn {
