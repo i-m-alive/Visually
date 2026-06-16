@@ -23,7 +23,7 @@ from agent_service.agents.chat_agent import (
     _is_chart_creation_request,
 )
 import agent_service.agents.schema_cache as _schema_cache
-from shared.bedrock_client import bedrock_invoke_stream
+from shared.bedrock_client import bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL
 
 router = APIRouter(tags=["chat"])
 _agent = ChatAgent()
@@ -131,8 +131,21 @@ async def _execute_and_build_chart(
 
     exec_result = await _execute_sql(connection_id, sql_spec["sql"])
     if exec_result.get("error"):
-        print(f"[chat] ⚠ sql exec error: {str(exec_result['error'])[:200]}", flush=True)
-        return None, f"\n\n⚠️ The query failed to run: {exec_result['error']}"
+        # Self-correcting retry: a "column … does not exist" (or similar) usually means
+        # the model borrowed a column from the wrong table. Fetch the real columns and
+        # rewrite once before giving up — so a single SQL slip auto-heals.
+        print(f"[chat] ⚠ sql exec error: {str(exec_result['error'])[:200]} — attempting self-correct", flush=True)
+        fixed_sql = await _self_correct_sql(connection_id, sql_spec["sql"], str(exec_result["error"]))
+        if fixed_sql and fixed_sql.strip() != (sql_spec["sql"] or "").strip():
+            retry = await _execute_sql(connection_id, fixed_sql)
+            if not retry.get("error"):
+                print(f"[chat] ✓ self-corrected SQL ran: {fixed_sql[:160]}", flush=True)
+                sql_spec = {**sql_spec, "sql": fixed_sql}
+                exec_result = retry
+            else:
+                print(f"[chat] ✗ self-correct retry still failed: {str(retry.get('error'))[:160]}", flush=True)
+        if exec_result.get("error"):
+            return None, f"\n\n⚠️ The query failed to run: {exec_result['error']}"
     if not exec_result.get("rows"):
         print(f"[chat] ⚠ sql returned 0 rows  sql={sql_spec['sql'][:160]}", flush=True)
         return None, ("\n\n⚠️ The query ran but returned no rows — there may be no matching "
@@ -541,6 +554,70 @@ async def _get_primary_connection(project_id: str, db: AsyncSession):
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+_FROM_JOIN_RE = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', re.IGNORECASE)
+
+
+async def _fetch_table_columns(connection_id: str, schema: str, table: str) -> list[str]:
+    """Look up the REAL column names of a table/view straight from the database."""
+    sql = (
+        "SELECT column_name FROM information_schema.columns "
+        f"WHERE table_schema = '{schema}' AND table_name = '{table}' "
+        "ORDER BY ordinal_position"
+    )
+    res = await _execute_sql(connection_id, sql)
+    if res.get("error"):
+        return []
+    return [str(r.get("column_name")) for r in (res.get("rows") or []) if r.get("column_name")]
+
+
+async def _self_correct_sql(connection_id: str, failed_sql: str, error_msg: str) -> Optional[str]:
+    """When a generated query references columns that don't exist, fetch the REAL
+    columns of the tables it used and ask the model to rewrite using only those.
+    Returns corrected SQL (or None if we couldn't help). This fixes the common
+    case where the LLM borrows a column from the wrong table in a large schema."""
+    # Collect schema-qualified tables from the failed SQL (skip CTE/alias names).
+    tables: list[str] = []
+    for name in _FROM_JOIN_RE.findall(failed_sql or ""):
+        n = name.strip()
+        if "." in n and n not in tables:
+            tables.append(n)
+    col_lines: list[str] = []
+    for t in tables[:6]:
+        schema, _, table = t.partition(".")
+        cols = await _fetch_table_columns(connection_id, schema, table)
+        if cols:
+            col_lines.append(f'{t} has ONLY these columns: {", ".join(cols)}')
+    if not col_lines:
+        return None
+
+    system = (
+        "You fix broken SQL. The query failed because it referenced a column that does "
+        "not exist on the table it was used with (a common mistake is borrowing a column "
+        "from a different table). Using ONLY the real columns listed, rewrite the query so "
+        "it runs and preserves the user's intent as closely as the available columns allow. "
+        "It must remain a single read-only SELECT/WITH statement. Respond with ONLY the "
+        "corrected SQL — no markdown, no commentary."
+    )
+    user = (
+        f"The SQL failed with error: {error_msg}\n\n"
+        f"FAILED SQL:\n{failed_sql}\n\n"
+        f"REAL SCHEMA (authoritative — use only these columns):\n" + "\n".join(col_lines) +
+        "\n\nReturn only the corrected SQL."
+    )
+    try:
+        out = await bedrock_invoke(BEDROCK_SONNET_MODEL, system, user, max_tokens=1024, temperature=0.0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chat] self-correct LLM call failed: {exc}", flush=True)
+        return None
+    s = (out or "").strip()
+    s = re.sub(r'^```(?:sql)?\s*', '', s)
+    s = re.sub(r'\s*```$', '', s).strip()
+    m = re.search(r'\b(WITH|SELECT)\b', s, re.IGNORECASE)
+    if m:
+        s = s[m.start():].rstrip().rstrip(';')
+    return s or None
 
 
 async def _execute_sql(connection_id: str, sql: str) -> dict:
