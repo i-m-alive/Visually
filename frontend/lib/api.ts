@@ -344,6 +344,12 @@ export const endUserApi = {
     api.post<{ connection_id: string; project_id: string; name: string; ok: boolean }>(
       '/end-user/connections', data,
     ),
+  // Delete a report from the analyst's dashboard. Imported (owned) canvases are
+  // fully deleted; shared-with-me reports are just removed from the analyst's list.
+  deleteReport: (dashboardId: string) =>
+    api.delete<{ deleted: boolean; mode: 'deleted' | 'removed_from_list'; dashboard_id: string }>(
+      `/end-user/reports/${dashboardId}`,
+    ),
 }
 
 // ─── AI Insights (end-user) ───────────────────────────────────────────────────

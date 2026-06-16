@@ -161,7 +161,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
 
   // ── KPI ──────────────────────────────────────────────────────────────────────
   if (ct === 'kpi' || ct === 'kpi_card') {
-    const val = values[0] ?? rows[0]?.[columns[0] ?? '']
+    // Prefer chart_data.values; fall back to the first column of row 0; finally
+    // fall back to the first NUMERIC field of row 0 (covers refreshed snapshots
+    // where the metric isn't columns[0] / values wasn't populated).
+    const r0 = rows[0] as Record<string, unknown> | undefined
+    const firstNumeric = r0 ? Object.values(r0).find((v) => typeof v === 'number') : undefined
+    const val = values.find((v) => v !== null && v !== undefined)
+      ?? (r0 ? (r0[columns[0] ?? ''] ?? firstNumeric) : undefined)
     const displayVal = typeof val === 'number'
       ? val.toLocaleString(undefined, { maximumFractionDigits: 2 })
       : String(val ?? 'N/A')

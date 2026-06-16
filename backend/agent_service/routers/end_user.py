@@ -388,3 +388,65 @@ async def end_user_import_vly(
         "expires_at":        expires.isoformat(),
         "saved_permanently": True,   # canvas is now in My Reports via CanvasCollaborator
     }
+
+
+@router.delete("/end-user/reports/{dashboard_id}")
+async def delete_my_report(
+    dashboard_id: str,
+    current_user: User = Depends(_get_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a report from the analyst's dashboard, with correct semantics:
+
+    - Imported canvas (the analyst OWNS its personal project) → fully delete the
+      dashboard + widgets (DB cascades collaborators / share tokens / annotations).
+    - Shared-with-me report (owned by a builder) → only remove the analyst's
+      CanvasCollaborator link, leaving the builder's dashboard intact.
+
+    Never lets an analyst delete a builder's shared dashboard.
+    """
+    from shared.models.projects import Project
+    from shared.models.sharing import CanvasCollaborator
+    from shared.models.chat_sessions import ChatSession
+    from sqlalchemy import delete as sa_delete, update as sa_update
+
+    try:
+        did = uuid.UUID(dashboard_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid dashboard id")
+
+    dash = (await db.execute(select(Dashboard).where(Dashboard.id == did))).scalar_one_or_none()
+    if not dash:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    proj = (await db.execute(select(Project).where(Project.id == dash.project_id))).scalar_one_or_none()
+    is_owner = bool(proj and proj.owner_id == current_user.id)
+
+    if is_owner:
+        # Owned (imported) → full delete. Null nullable FKs, drop widgets, then the
+        # dashboard (collaborators/tokens/annotations/bookmarks cascade in the DB).
+        await db.execute(
+            sa_update(ChatSession).where(ChatSession.dashboard_id == did)
+            .values(dashboard_id=None).execution_options(synchronize_session=False)
+        )
+        await db.execute(
+            sa_delete(Widget).where(Widget.dashboard_id == did)
+            .execution_options(synchronize_session=False)
+        )
+        await db.delete(dash)
+        await db.commit()
+        return {"deleted": True, "mode": "deleted", "dashboard_id": dashboard_id}
+
+    # Shared with me → remove only my collaborator link.
+    collab = (await db.execute(
+        select(CanvasCollaborator).where(
+            CanvasCollaborator.dashboard_id == did,
+            CanvasCollaborator.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if collab:
+        await db.delete(collab)
+        await db.commit()
+        return {"deleted": True, "mode": "removed_from_list", "dashboard_id": dashboard_id}
+
+    raise HTTPException(status_code=403, detail="You don't have permission to delete this report")

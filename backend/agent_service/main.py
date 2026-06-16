@@ -869,6 +869,29 @@ async def list_shared_with_me(
     )
     widget_counts = {str(row.dashboard_id): row.cnt for row in wc_result.all()}
 
+    # Real live-DB status: an active bound connection on the project means the card
+    # is showing live data (not a stale import snapshot). This is what the analyst
+    # card's connection badge should reflect — NOT the import-time connection_hint.
+    project_ids = list({d.project_id for d, _ in rows})
+    live_info: dict = {}
+    if project_ids:
+        conn_rows = await db.execute(
+            select(DatabaseConnection)
+            .where(DatabaseConnection.project_id.in_(project_ids))
+            .where(DatabaseConnection.is_active == True)
+        )
+        for c in conn_rows.scalars().all():
+            synced = c.last_tested_at or c.updated_at or c.created_at
+            prev = live_info.get(c.project_id)
+            # keep the most recently synced active connection per project
+            if prev is None or (synced and prev["_ts"] and synced > prev["_ts"]):
+                label = f"{c.db_type.value} · {c.database_name}" if c.database_name else c.db_type.value
+                live_info[c.project_id] = {
+                    "label": label,
+                    "synced_at": synced.isoformat() if synced else None,
+                    "_ts": synced,
+                }
+
     return {
         "dashboards": [
             {
@@ -888,6 +911,10 @@ async def list_shared_with_me(
                 "imported_by":      (d.layout_config or {}).get("imported_by"),
                 "has_intelligence": bool(d.layout_config and d.layout_config.get("has_intelligence")),
                 "connection_hint":  (d.layout_config or {}).get("connection_hint", {}),
+                # Live-connection status (drives the "live vs cached" badge + sync check)
+                "live_connection":      d.project_id in live_info,
+                "connection_label":     live_info.get(d.project_id, {}).get("label", ""),
+                "connection_synced_at": live_info.get(d.project_id, {}).get("synced_at"),
             }
             for d, project_name in rows
         ]

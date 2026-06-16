@@ -70,10 +70,25 @@ async def run_dashboard_refresh(dashboard_id: str) -> dict:
                 try:
                     result = await call_query_executor(conn_id, sql, row_limit=500)
                     if result and not result.get("error"):
-                        w.chart_data = {
-                            "rows": result.get("rows", []),
-                            "columns": result.get("columns", []),
-                        }
+                        rows = result.get("rows", [])
+                        columns = result.get("columns", [])
+                        # Build the FULL chart_data payload (rows, columns, labels,
+                        # values, series, matrix, …) — NOT just rows/columns. Without
+                        # this a KPI loses chart_data.values and other chart types lose
+                        # their derived fields after a refresh, so they render blank.
+                        try:
+                            from agent_service.agents.orchestrator import Orchestrator
+                            payload = Orchestrator._build_chart_data_for_type(w.chart_type or "bar", rows, columns)
+                        except Exception:
+                            payload = {"rows": rows, "columns": columns}
+                        payload["chart_type"] = w.chart_type
+                        payload["title"] = w.title
+                        # Preserve axis labels already captured on the widget.
+                        prev = w.chart_data if isinstance(w.chart_data, dict) else {}
+                        for k in ("x_axis_label", "y_axis_label"):
+                            if prev.get(k) and not payload.get(k):
+                                payload[k] = prev[k]
+                        w.chart_data = payload
                         w.config = {
                             **(w.config or {}),
                             "updated_at": int(datetime.utcnow().timestamp() * 1000),
