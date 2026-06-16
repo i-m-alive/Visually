@@ -155,11 +155,15 @@ if run data || run backend || run agent || run frontend || run migrate || run ur
   ACR_USER="$(az acr credential show -n "$ACR_NAME" --query username -o tsv)"
   ACR_PASS="$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)"
 
-  # Internal service URLs (deterministic from app name + env domain)
-  QUERY_URL="http://$APP_QUERY.internal.$DOMAIN"
-  SCHEMA_URL="http://$APP_SCHEMA.internal.$DOMAIN"
-  RENDER_URL="http://$APP_RENDER.internal.$DOMAIN"
-  EXPORT_URL="http://$APP_EXPORT.internal.$DOMAIN"
+  # Internal service URLs (deterministic from app name + env domain).
+  # MUST be https:// — ACA internal ingress (allowInsecure=false) answers plain
+  # HTTP with a 301 redirect to HTTPS. Our httpx clients don't follow it, and a
+  # 301 would also strip the POST body, so http:// breaks every internal call
+  # (query-executor "Executor 301", schema crawl, render, export).
+  QUERY_URL="https://$APP_QUERY.internal.$DOMAIN"
+  SCHEMA_URL="https://$APP_SCHEMA.internal.$DOMAIN"
+  RENDER_URL="https://$APP_RENDER.internal.$DOMAIN"
+  EXPORT_URL="https://$APP_EXPORT.internal.$DOMAIN"
 
   # Platform DB = Azure managed Postgres (Flexible Server). SSL enforcement is
   # turned OFF on the server so the plain asyncpg/psycopg2 URLs work as-is.
@@ -236,7 +240,7 @@ if run backend; then
   az containerapp create -n "$APP_QUERY" -g "$RG" --environment "$ENV_ID" \
     --image "$ACR_LOGIN/query-executor:$TAG" "${REG[@]}" \
     --ingress internal --transport http --target-port 8002 \
-    --min-replicas 0 --max-replicas 1 --cpu 0.5 --memory 1.0Gi \
+    --min-replicas 1 --max-replicas 3 --cpu 1.0 --memory 2.0Gi \
     "${SEC[@]}" \
     --env-vars DATABASE_URL="$DB_ASYNC" ENCRYPTION_KEY=secretref:enc-key "${AWS_ENV[@]}" -o none
 
@@ -348,8 +352,8 @@ properties:
           - volumeName: uploads
             mountPath: /app/uploads
     scale:
-      minReplicas: 0
-      maxReplicas: 2
+      minReplicas: 1
+      maxReplicas: 3
     volumes:
       - name: uploads
         storageType: AzureFile

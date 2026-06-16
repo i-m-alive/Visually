@@ -632,7 +632,7 @@ async def _tables_from_enriched_cache(db: AsyncSession, connection_id, table_nam
 
 QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
 _ROW_LIMIT = 500          # rows per widget — enough for all 18 skills
-_QUERY_TIMEOUT = 20.0     # seconds per widget query
+_QUERY_TIMEOUT = 40.0     # seconds per widget query (warm cluster; pre-warm wakes it first)
 # Cap simultaneous widget queries. The executor opens one DB connection per
 # request, so firing all N at once (a 30+ widget dashboard) saturates the pool
 # and the slow ones time out. Run a bounded batch instead — env-overridable.
@@ -941,6 +941,24 @@ async def get_intelligence_data(
         + (f"  date_range={date_from}→{date_to}" if date_from else ""),
         flush=True,
     )
+
+    # --- pre-warm the database before fan-out ---
+    # Redshift Serverless auto-pauses; the first connect after idle takes 60–120s.
+    # Without this, all N widget queries race a cold cluster and every one hits the
+    # per-query timeout (the ReadTimeout storm seen in the logs). One warm-up SELECT 1
+    # (with a long timeout) wakes it, so the real batch runs against a warm cluster.
+    warm_conn_id = next((str(w.connection_id) for w in widgets if w.connection_id), project_conn_id)
+    if warm_conn_id and tasks:
+        try:
+            async with httpx.AsyncClient(timeout=130.0) as client:
+                await client.post(
+                    f"{QUERY_EXECUTOR_URL}/execute",
+                    json={"connection_id": warm_conn_id, "sql": "SELECT 1",
+                          "row_limit": 1, "timeout_seconds": 125},
+                )
+            print(f"[intelligence-data] pre-warm OK conn={warm_conn_id[:8]}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[intelligence-data] pre-warm failed (non-fatal): {exc}", flush=True)
 
     # --- run SQL queries with bounded concurrency ---
     # Coroutines are lazy: building the list above didn't start them; each only

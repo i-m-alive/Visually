@@ -31,7 +31,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -57,6 +57,42 @@ VLY_MIME_TYPE = "application/vnd.visually.canvas+zip"
 VLY_MAGIC     = f"VISUALLY_CANVAS_ARCHIVE\nFORMAT_VERSION={VLY_VERSION}\nCREATED_BY=Visually\n"
 
 SCHEMA_CRAWLER_URL = os.getenv("SCHEMA_CRAWLER_URL", "http://localhost:8003")
+
+
+async def _crawl_and_refresh(
+    dashboard_id: str,
+    connection_id: str,
+    project_id: str,
+    do_crawl: bool,
+    do_refresh: bool,
+) -> None:
+    """Background follow-up for bind / import.
+
+    Crawling the schema and re-running every widget's SQL can take minutes on a
+    cold backend (scale-to-zero executor + Redshift Serverless wake + dozens of
+    widget queries). Doing it inline made the HTTP request exceed the Azure
+    Container Apps gateway timeout — the aborted response carried no CORS headers,
+    so the browser reported a misleading "blocked by CORS policy" error.
+
+    The bind/import itself is already committed before this runs, so the canvas is
+    usable immediately; live data fills in here and lazily when the canvas opens.
+    """
+    if do_crawl:
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await client.post(
+                    f"{SCHEMA_CRAWLER_URL}/crawl",
+                    json={"connection_id": connection_id, "project_id": project_id},
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bg-followup] crawl failed (non-fatal): {exc}", flush=True)
+    if do_refresh:
+        try:
+            from agent_service.scheduler import run_dashboard_refresh
+            summary = await run_dashboard_refresh(dashboard_id)
+            print(f"[bg-followup] refresh done dashboard={dashboard_id[:8]}: {summary}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bg-followup] refresh failed (non-fatal): {exc}", flush=True)
 
 
 # ── auth helper ───────────────────────────────────────────────────────────────
@@ -715,6 +751,7 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
 
 @router.post("/dashboards/import-vly", status_code=201)
 async def import_vly(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     project_id: str = Form(...),
     connection_id: Optional[str] = Form(None),
@@ -867,14 +904,18 @@ async def import_vly(
 
     # Re-run every widget's SQL against the live connection so cached snapshots
     # (esp. KPI widgets whose query returned 0 rows / empty chart_data at export)
-    # are replaced with live data. Best-effort — import still succeeds if it fails.
-    refresh_summary = None
+    # are replaced with live data. Done in the BACKGROUND — running it inline made
+    # the request exceed the gateway timeout (cold executor + Redshift wake + many
+    # widget queries). Cached data shows immediately; live data fills in after.
+    refresh_scheduled = False
     if resolved_conn_id:
-        try:
-            from agent_service.scheduler import run_dashboard_refresh
-            refresh_summary = await run_dashboard_refresh(str(new_dash.id))
-        except Exception as exc:
-            print(f"[import-vly] live refresh failed (non-fatal): {exc}", flush=True)
+        background_tasks.add_task(
+            _crawl_and_refresh,
+            str(new_dash.id), str(resolved_conn_id), project_id,
+            False,  # crawl handled by the embedded-cache warm-start above
+            True,   # refresh widgets with live data
+        )
+        refresh_scheduled = True
 
     return {
         "dashboard_id":       str(new_dash.id),
@@ -885,8 +926,8 @@ async def import_vly(
         "project_id":         project_id,
         "original_name":      canvas_doc.get("name"),
         "intelligence_bundled": bool(intel_doc.get("analysis")),
-        "refreshed":          (refresh_summary or {}).get("refreshed", 0) if refresh_summary else 0,
-        "refresh_summary":    refresh_summary,
+        "refreshed":          0,
+        "refresh_status":     "in_progress" if refresh_scheduled else "skipped",
         "schema_cache_warmstarted": cache_warmstarted,
     }
 
@@ -1116,6 +1157,7 @@ class BindConnectionRequest(BaseModel):
 async def bind_connection(
     dashboard_id: str,
     body: BindConnectionRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_get_user),
 ):
@@ -1168,32 +1210,21 @@ async def bind_connection(
     dashboard.updated_at = datetime.utcnow()
     await db.commit()
 
-    # 2 — crawl schema (best-effort) so the AI copilot has the live schema
-    crawl_triggered = False
-    if body.crawl:
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(
-                    f"{SCHEMA_CRAWLER_URL}/crawl",
-                    json={"connection_id": str(conn_uuid), "project_id": str(dashboard.project_id)},
-                )
-                crawl_triggered = resp.status_code == 200
-        except Exception as exc:  # noqa: BLE001
-            print(f"[bind-connection] ⚠ schema crawl failed (non-fatal): {exc}", flush=True)
-
-    # 3 — refresh widgets with live data (best-effort)
-    refreshed = False
-    if body.refresh:
-        try:
-            from agent_service.scheduler import run_dashboard_refresh
-            await run_dashboard_refresh(dashboard_id)
-            refreshed = True
-        except Exception as exc:  # noqa: BLE001
-            print(f"[bind-connection] ⚠ live refresh failed (non-fatal): {exc}", flush=True)
+    # 2 & 3 — crawl schema + refresh widgets in the BACKGROUND. These take minutes
+    # on a cold backend; running them inline blew past the gateway timeout and the
+    # aborted response surfaced in the browser as a (misleading) CORS error. The
+    # binding above is already committed, so the canvas is live-bound immediately;
+    # schema + data fill in asynchronously (and lazily when the canvas opens).
+    if body.crawl or body.refresh:
+        background_tasks.add_task(
+            _crawl_and_refresh,
+            dashboard_id, str(conn_uuid), str(dashboard.project_id),
+            body.crawl, body.refresh,
+        )
 
     print(
         f"[bind-connection] dashboard={dashboard_id[:8]}  connection={str(conn_uuid)[:8]}  "
-        f"widgets={len(widgets)}  crawl={crawl_triggered}  refreshed={refreshed}",
+        f"widgets={len(widgets)}  crawl={body.crawl}  refresh={body.refresh}  (background)",
         flush=True,
     )
 
@@ -1202,6 +1233,7 @@ async def bind_connection(
         "dashboard_id":    dashboard_id,
         "connection_id":   str(conn_uuid),
         "widgets_bound":   len(widgets),
-        "crawl_triggered": crawl_triggered,
-        "refreshed":       refreshed,
+        "crawl_triggered": body.crawl,
+        "refreshed":       False,
+        "refresh_status":  "in_progress" if body.refresh else "skipped",
     }

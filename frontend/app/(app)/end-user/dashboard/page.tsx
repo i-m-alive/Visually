@@ -1,7 +1,7 @@
 'use client'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { api, dashboardApi, shareApi, aiInsightsApi, vlyApi, endUserApi } from '@/lib/api'
+import { api, dashboardApi, shareApi, aiInsightsApi, vlyApi, endUserApi, BACKGROUND_REQ } from '@/lib/api'
 import { ConnectionPromptModal } from '@/components/end-user/ConnectionPromptModal'
 import {
   Loader2, AlertCircle, Search, X,
@@ -134,7 +134,9 @@ export default function EndUserDashboardPage() {
   useEffect(() => {
     const t = setInterval(async () => {
       try {
-        const resp = await dashboardApi.sharedWithMe()
+        // Background poll: refresh the token silently if needed, but NEVER let a
+        // 401 here redirect — the user may be mid-way through the connect modal.
+        const resp = await dashboardApi.sharedWithMe(BACKGROUND_REQ)
         setDashboards(resp.data.dashboards ?? [])
       } catch { /* ignore */ }
     }, 30000)
@@ -150,7 +152,7 @@ export default function EndUserDashboardPage() {
       loadedSummaries.current.add(d.id)
       setAiLoading(prev => ({ ...prev, [d.id]: true }))
       try {
-        const resp = await aiInsightsApi.summary(d.id)
+        const resp = await aiInsightsApi.summary(d.id, BACKGROUND_REQ)
         setAiSummaries(prev => ({ ...prev, [d.id]: resp.data.summary }))
       } catch { /* ignore */ }
       finally { setAiLoading(prev => ({ ...prev, [d.id]: false })) }

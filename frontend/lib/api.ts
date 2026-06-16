@@ -89,7 +89,12 @@ api.interceptors.response.use(
         original.headers.Authorization = `Bearer ${newToken}`
         return api(original)
       }
-      forceReLogin()
+      // Refresh failed. For BACKGROUND calls (polling, AI summaries) we must NOT
+      // redirect — doing so would yank the user out of whatever they're doing
+      // (e.g. typing into the Connect-a-Database modal). Let those reject silently;
+      // a genuine foreground action will surface the dead session and redirect.
+      const skipRedirect = original.headers?.['X-Skip-Auth-Redirect'] === '1'
+      if (!skipRedirect) forceReLogin()
     }
     return Promise.reject(error)
   },
@@ -341,9 +346,14 @@ export const exportApi = {
   downloadUrl: (jobId: string) => `${API_URL}/export/jobs/${jobId}/download`,
 }
 
+// Header that tells the 401 interceptor to refresh-but-never-redirect, so a
+// background poll failing can't navigate the user away mid-task.
+export const BACKGROUND_REQ = { headers: { 'X-Skip-Auth-Redirect': '1' } } as const
+
 export const dashboardApi = {
   listAll: () => api.get('/dashboards/all'),
-  sharedWithMe: () => api.get('/dashboards/shared-with-me'),
+  sharedWithMe: (config?: import('axios').AxiosRequestConfig) =>
+    api.get('/dashboards/shared-with-me', config),
   list: (projectId: string) => api.get(`/dashboards?project_id=${projectId}`),
   get: (dashboardId: string) => api.get(`/dashboards/${dashboardId}`),
   updateTheme: (dashboardId: string, theme: string) =>
@@ -451,8 +461,8 @@ export const endUserApi = {
 // ─── AI Insights (end-user) ───────────────────────────────────────────────────
 
 export const aiInsightsApi = {
-  summary:   (dashboardId: string) =>
-    api.post<{ summary: string }>(`/dashboards/${dashboardId}/ai-summary`),
+  summary:   (dashboardId: string, config?: import('axios').AxiosRequestConfig) =>
+    api.post<{ summary: string }>(`/dashboards/${dashboardId}/ai-summary`, undefined, config),
   insight:   (dashboardId: string, widgetId: string) =>
     api.post<{ insight: string; widget_id: string }>(`/dashboards/${dashboardId}/ai-insight`, { widget_id: widgetId }),
   anomalies: (dashboardId: string) =>
