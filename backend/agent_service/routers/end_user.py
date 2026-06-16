@@ -160,7 +160,13 @@ async def end_user_create_connection(
     await db.refresh(conn)
 
     # Verify it actually connects — a dead connection is worse than none.
-    test = await call_query_executor(str(conn.id), "SELECT 1", row_limit=1)
+    # Redshift Serverless auto-pauses and can take 60–120s to wake on the first
+    # connect, so give the verify query a generous timeout for it; fast engines
+    # (postgres/mysql) return immediately and are unaffected.
+    _verify_timeout = 130 if body.db_type == "redshift" else 30
+    test = await call_query_executor(
+        str(conn.id), "SELECT 1", row_limit=1, timeout_seconds=_verify_timeout,
+    )
     if test.get("error"):
         await db.delete(conn)
         await db.commit()
