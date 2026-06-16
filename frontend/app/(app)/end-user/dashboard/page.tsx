@@ -26,6 +26,28 @@ interface DashCard {
   imported_by: string | null
   has_intelligence: boolean
   connection_hint: Record<string, string>
+  // Real live-DB status (from an active bound connection on the project)
+  live_connection?: boolean
+  connection_label?: string
+  connection_synced_at?: string | null
+}
+
+// Render a short AI summary as clean text — strip markdown markers (**bold**,
+// *italic*, `code`, # headings, bullets) so no raw asterisks leak into the card.
+function cleanSummary(s: string): string {
+  if (!s) return ''
+  return s
+    .replace(/```[\s\S]*?```/g, '')      // code fences
+    .replace(/`([^`]+)`/g, '$1')          // inline code
+    .replace(/\*\*([^*]+)\*\*/g, '$1')    // bold
+    .replace(/\*([^*]+)\*/g, '$1')        // italic
+    .replace(/__([^_]+)__/g, '$1')        // bold (underscores)
+    .replace(/_([^_]+)_/g, '$1')          // italic (underscores)
+    .replace(/^#{1,6}\s+/gm, '')          // headings
+    .replace(/^\s*[-*+]\s+/gm, '')        // bullet markers
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // links → text
+    .replace(/\s{2,}/g, ' ')
+    .trim()
 }
 
 const THEME_COLORS: Record<string, { bg: string; border: string; accent: string }> = {
@@ -106,6 +128,18 @@ export default function EndUserDashboardPage() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  // Continuously re-check live-DB / sync status so the card badge updates after a
+  // connection is bound or refreshed (silent — no full-page spinner).
+  useEffect(() => {
+    const t = setInterval(async () => {
+      try {
+        const resp = await dashboardApi.sharedWithMe()
+        setDashboards(resp.data.dashboards ?? [])
+      } catch { /* ignore */ }
+    }, 30000)
+    return () => clearInterval(t)
+  }, [])
 
   useEffect(() => {
     if (dashboards.length === 0) return
@@ -323,7 +357,7 @@ export default function EndUserDashboardPage() {
               <p className="text-xs text-green-600 mt-0.5">Saved permanently to your reports · {importSuccess.hasIntel ? 'AI analysis bundled' : 'Open to run AI analysis'}</p>
             </div>
             <div className="flex gap-2 flex-shrink-0">
-              <button onClick={() => router.push(`/canvas/${importSuccess.id}/analyst`)}
+              <button onClick={() => router.push(`/intelligence/${importSuccess.id}`)}
                 className="px-3 py-1.5 text-xs font-semibold text-white rounded-lg"
                 style={{ background: 'linear-gradient(135deg, #059669, #10b981)' }}>
                 Open
@@ -456,7 +490,7 @@ function ReportGrid({ reports, aiSummaries, aiLoading, onShare, router }: {
                 ) : aiSummaries[dash.id] ? (
                   <div className="flex items-start gap-1.5">
                     <Sparkles size={11} className="text-purple-500 mt-0.5 flex-shrink-0" />
-                    <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{aiSummaries[dash.id]}</p>
+                    <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{cleanSummary(aiSummaries[dash.id])}</p>
                   </div>
                 ) : dash.description ? (
                   <p className="text-[11px] text-gray-500 line-clamp-2">{dash.description}</p>
@@ -493,8 +527,12 @@ function ImportedCard({ dash, aiSummary, aiLoading, onShare, router }: {
 }) {
   const colors    = THEME_COLORS[dash.theme] ?? THEME_COLORS.frost
   const health    = computeHealthScore(dash.widget_count)
-  const hasDB     = !!(dash.connection_hint?.host)
-  const dbLabel   = dash.connection_hint?.db_type ? `${dash.connection_hint.db_type} · ${dash.connection_hint.database_name ?? ''}` : 'No DB linked'
+  // Live = an active DB connection is actually bound on the project (not the
+  // import-time hint). Falls back to the hint for older records.
+  const hasDB     = dash.live_connection ?? !!(dash.connection_hint?.host)
+  const dbLabel   = dash.connection_label
+    || (dash.connection_hint?.db_type ? `${dash.connection_hint.db_type} · ${dash.connection_hint.database_name ?? ''}` : 'Live database')
+  const syncedAgo = dash.connection_synced_at ? timeAgo(dash.connection_synced_at) : ''
   const importedAgo = dash.imported_at ? timeAgo(dash.imported_at) : ''
 
   return (
@@ -535,7 +573,9 @@ function ImportedCard({ dash, aiSummary, aiLoading, onShare, router }: {
           hasDB ? 'bg-green-50 text-green-700 border border-green-100' : 'bg-amber-50 text-amber-700 border border-amber-100'
         }`}>
           {hasDB ? <Wifi size={9} /> : <WifiOff size={9} />}
-          <span className="truncate max-w-[180px]">{hasDB ? dbLabel : 'Cached data only — no live DB'}</span>
+          <span className="truncate max-w-[200px]">
+            {hasDB ? `Live · ${dbLabel}${syncedAgo ? ` · synced ${syncedAgo}` : ''}` : 'Cached data only — no live DB'}
+          </span>
         </div>
 
         {/* AI summary */}
@@ -545,28 +585,20 @@ function ImportedCard({ dash, aiSummary, aiLoading, onShare, router }: {
           ) : aiSummary ? (
             <div className="flex items-start gap-1.5">
               <Sparkles size={11} className="text-purple-500 mt-0.5 flex-shrink-0" />
-              <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{aiSummary}</p>
+              <p className="text-[11px] text-gray-600 leading-relaxed line-clamp-2">{cleanSummary(aiSummary)}</p>
             </div>
           ) : dash.description ? (
             <p className="text-[11px] text-gray-500 line-clamp-2">{dash.description}</p>
           ) : null}
         </div>
 
-        {/* Action row */}
+        {/* Action row — Open goes to the AI Intelligence page */}
         <div className="flex items-center gap-2 mt-4 pt-3 border-t border-gray-50">
           <button
-            onClick={() => router.push(`/canvas/${dash.id}/analyst`)}
+            onClick={() => router.push(`/intelligence/${dash.id}`)}
             className="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-white rounded-xl"
             style={{ background: 'linear-gradient(135deg, #7c3aed, #a855f7)' }}>
-            <Sparkles size={12} /> Open
-          </button>
-          {/* Intelligence page shortcut */}
-          <button
-            onClick={() => router.push(`/intelligence/${dash.id}`)}
-            title="Open AI Intelligence report"
-            className="p-2 rounded-lg border border-purple-100 text-purple-400 hover:text-purple-600 hover:bg-purple-50 transition-colors"
-          >
-            <Brain size={14} />
+            <Brain size={12} /> Open
           </button>
           <button
             onClick={e => { e.stopPropagation(); onShare() }}
