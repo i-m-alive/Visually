@@ -651,6 +651,14 @@ _DATE_COL_RE = re.compile(
 class IntelligenceRequest(BaseModel):
     date_from: Optional[str] = None   # "YYYY-MM-DD"
     date_to: Optional[str] = None     # "YYYY-MM-DD"
+    force: bool = False               # bypass the cached result and re-query live
+
+
+# Cached intelligence-data lives this long. Running 32 live aggregation queries
+# on a small Redshift Serverless cluster takes minutes; caching the assembled
+# result means only the FIRST load (or an explicit force-refresh) pays that cost,
+# every subsequent page view / re-open is instant. Env-overridable.
+_INTEL_DATA_CACHE_TTL = int(os.getenv("INTELLIGENCE_DATA_CACHE_TTL", "900"))  # 15 min
 
 
 def _inject_date_range(sql: str, date_from: str, date_to: str) -> str:
@@ -870,6 +878,22 @@ async def get_intelligence_data(
     """
     date_from = body.date_from if body else None
     date_to = body.date_to if body else None
+    force = bool(body.force) if body else False
+
+    # --- cache check (Redis) ---
+    # Assembling this result runs ~32 live Redshift queries (minutes on a cold
+    # Serverless cluster). Cache the assembled payload so only the first load /
+    # explicit force-refresh pays that cost; repeat opens are instant.
+    cache_key = f"intel_data:{dashboard_id}:{date_from or '*'}:{date_to or '*'}"
+    _redis = await get_redis()
+    if _redis is not None and not force:
+        try:
+            cached = await _redis.get(cache_key)
+            if cached:
+                print(f"[intelligence-data] cache HIT {cache_key}", flush=True)
+                return json.loads(cached)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[intelligence-data] cache read failed (non-fatal): {exc}", flush=True)
 
     # --- load dashboard + widgets ---
     try:
@@ -1016,4 +1040,17 @@ async def get_intelligence_data(
             flush=True,
         )
 
-    return {"widget_data": results + skipped}
+    payload = {"widget_data": results + skipped}
+
+    # Cache the assembled result so repeat opens skip the live-query cost. Only
+    # cache when at least one widget returned real (non-fallback) live data, so we
+    # never pin a page of pure cached-fallback values as if it were fresh.
+    has_live = any(r.get("ok") and r.get("source") != "chart_data_cache" for r in results)
+    if _redis is not None and has_live:
+        try:
+            await _redis.set(cache_key, json.dumps(payload, default=str), ex=_INTEL_DATA_CACHE_TTL)
+            print(f"[intelligence-data] cached {cache_key} ttl={_INTEL_DATA_CACHE_TTL}s", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[intelligence-data] cache write failed (non-fatal): {exc}", flush=True)
+
+    return payload
