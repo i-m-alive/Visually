@@ -226,25 +226,25 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
           } else {
             // Existing single-chart pipeline behaviour
             updated.steps.validate = 'done'
-            const chartData = event.chart_data as Record<string, unknown>
+            // event.chart_data is the whole final_result; the actual chart arrays
+            // (rows/columns/labels/values + series/matrix/etc.) live one level
+            // deeper under final_result.chart_data. Pass that nested payload
+            // through whole so every chart type renders.
+            const fr = event.chart_data as Record<string, unknown>
+            const cd = ((fr?.chart_data as Record<string, unknown>) || fr)
             updated.chartResult = {
-              chart_type: chartData?.chart_type as string,
-              title: chartData?.title as string,
-              chart_data: {
-                rows: (chartData?.rows as Record<string, unknown>[]) || [],
-                columns: (chartData?.columns as string[]) || [],
-                labels: (chartData?.labels as string[]) || [],
-                values: (chartData?.values as number[]) || [],
-              },
-              sql: chartData?.sql as string,
+              chart_type: (fr?.chart_type ?? cd?.chart_type) as string,
+              title: (fr?.title ?? cd?.title) as string,
+              chart_data: cd as ChartResult['chart_data'],
+              sql: fr?.sql as string,
               score: event.score as number,
               low_confidence: event.low_confidence as boolean,
-              x_axis_label: chartData?.x_axis_label as string,
-              y_axis_label: chartData?.y_axis_label as string,
-              table_used: chartData?.table_used as string,
-              validation_details: chartData?.validation_details as Record<string, unknown>,
-              output_mode: (chartData?.output_mode as string) || 'chart',
-              narrative: (chartData?.narrative as string) || '',
+              x_axis_label: (fr?.x_axis_label ?? cd?.x_axis_label) as string,
+              y_axis_label: (fr?.y_axis_label ?? cd?.y_axis_label) as string,
+              table_used: fr?.table_used as string,
+              validation_details: fr?.validation_details as Record<string, unknown>,
+              output_mode: (fr?.output_mode as string) || 'chart',
+              narrative: (fr?.narrative as string) || '',
             }
           }
           break
