@@ -42,9 +42,19 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const projectId = projectIdMatch?.[1]
 
   const handleLogout = () => {
-    clearAuth()
-    document.cookie = 'visually-role=; path=/; max-age=0'
-    router.push('/login')
+    // Clear store + persisted auth so the request interceptor (which reads the
+    // token from localStorage on every call) can no longer authenticate.
+    try {
+      clearAuth()
+      localStorage.removeItem('visually-auth')
+    } catch { /* ignore */ }
+    // Clear the role cookie (path must match the one set at login in login/page.tsx).
+    document.cookie = 'visually-role=; path=/; max-age=0; SameSite=Lax'
+    // HARD navigation (not router.push): fully tears down in-memory state — the
+    // zustand singleton, the axios refresh single-flight, and any page/SWR caches —
+    // so no stale session or another user's cached data survives into the next login.
+    // Mirrors forceReLogin() in lib/api.ts, which is why the 401-path logout is reliable.
+    window.location.href = '/login'
   }
 
   const isBuilder = user.role !== 'end_user'

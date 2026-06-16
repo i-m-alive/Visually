@@ -184,17 +184,26 @@ def _dsn_template(conn_hint: dict) -> str:
 
 class ExportVlyBody(BaseModel):
     intelligence: Optional[Any] = None
+    # Embed the baked schema cache + metadata so the importing environment skips the
+    # cold build (crawl + LLM enrichment). Set False to exclude DB values from the file.
+    include_schema_cache: bool = True
 
 
 @router.get("/dashboards/{dashboard_id}/export-vly")
 async def export_vly(
     dashboard_id: str,
     intelligence: Optional[str] = Query(None, description="JSON-encoded intelligence analysis"),
+    include_schema_cache: bool = Query(
+        True,
+        description="Embed baked schema cache + metadata so import skips the cold build",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_get_user),
 ):
     """Stream a .vly archive (GET — for the small / no-intelligence case)."""
-    return await _generate_vly(dashboard_id, intelligence, db, current_user)
+    return await _generate_vly(
+        dashboard_id, intelligence, db, current_user, include_schema_cache
+    )
 
 
 @router.post("/dashboards/{dashboard_id}/export-vly")
@@ -210,7 +219,9 @@ async def export_vly_post(
     if passed as a query string — so the frontend POSTs it here instead.
     """
     intel_str = json.dumps(body.intelligence, default=str) if body.intelligence is not None else None
-    return await _generate_vly(dashboard_id, intel_str, db, current_user)
+    return await _generate_vly(
+        dashboard_id, intel_str, db, current_user, body.include_schema_cache
+    )
 
 
 async def _generate_vly(
@@ -218,6 +229,7 @@ async def _generate_vly(
     intelligence: Optional[str],   # JSON string (or None)
     db: AsyncSession,
     current_user: User,
+    include_schema_cache: bool = True,
 ):
     """Build and stream the .vly archive for a canvas."""
     dash_result = await db.execute(
@@ -337,9 +349,22 @@ async def _generate_vly(
         snap = snap_result.scalar_one_or_none()
         if snap and snap.schema_document:
             full_schema = snap.schema_document
-            all_tables: dict = full_schema.get("tables", {}) if isinstance(full_schema, dict) else {}
+            # crawlers emit tables as a LIST ([{name, schema, columns,...}]); tolerate a
+            # dict shape too for forward/backward compatibility.
+            raw_tables = full_schema.get("tables", []) if isinstance(full_schema, dict) else []
+            if isinstance(raw_tables, dict):
+                table_items = list(raw_tables.items())
+            else:
+                table_items = [
+                    (
+                        (f"{t.get('schema')}.{t.get('name')}" if t.get("schema") else t.get("name", "")),
+                        t,
+                    )
+                    for t in raw_tables
+                    if isinstance(t, dict) and t.get("name")
+                ]
             filtered_tables = {
-                tbl: info for tbl, info in all_tables.items()
+                tbl: info for tbl, info in table_items
                 if tbl.lower() in used_tables_lower or tbl.split(".")[-1].lower() in used_tables_lower
             }
             schema_enriched_doc = {
@@ -355,6 +380,110 @@ async def _generate_vly(
                     },
                 },
             }
+
+    # ── schema_cache.json + schema_metadata.json ──────────────────────────────
+    # Embed the fully-baked enriched schema cache (column map, LLM disambiguation,
+    # table semantics, example values, confirmed FK graph) AND the durable DB
+    # metadata rows. On import this lets the AI copilot skip the cold build entirely
+    # (no crawl, no LLM) — it is warm before the user types their first question.
+    schema_cache_doc: dict = {}
+    schema_metadata_doc: dict = {}
+    if include_schema_cache and sample_conn_id:
+        try:
+            from shared.models.schema_snapshots import SchemaSnapshot
+            from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
+            from agent_service.agents import schema_cache as _sc
+
+            cache_snap_result = await db.execute(
+                select(SchemaSnapshot)
+                .where(SchemaSnapshot.connection_id == sample_conn_id)
+                .order_by(SchemaSnapshot.version.desc())
+                .limit(1)
+            )
+            cache_snap = cache_snap_result.scalar_one_or_none()
+
+            if cache_snap and cache_snap.schema_document:
+                db_type_str = conn_hint.get("db_type") or "postgresql"
+                enriched_json = await _sc.export_cache_for_connection(
+                    str(sample_conn_id), cache_snap.schema_document, db_type_str
+                )
+                if enriched_json:
+                    schema_cache_doc = {
+                        "vly_version":           VLY_VERSION,
+                        "cache_format_version":  1,
+                        "db_type":               db_type_str,
+                        "schema_hash":           _sc.compute_schema_hash(cache_snap.schema_document),
+                        "snapshot_version":      cache_snap.version,
+                        "connection_fingerprint": conn_hint,
+                        "exported_at":           now_iso,
+                        # nested object (human-readable in the zip); re-serialized on import
+                        "enriched":              json.loads(enriched_json),
+                    }
+
+                # Approach C — durable LLM metadata rows (warms future re-builds too)
+                tbl_meta_rows = (await db.execute(
+                    select(SchemaTableMetadata)
+                    .where(SchemaTableMetadata.connection_id == sample_conn_id)
+                )).scalars().all()
+                col_meta_rows = (await db.execute(
+                    select(SchemaColumnMetadata)
+                    .where(SchemaColumnMetadata.connection_id == sample_conn_id)
+                )).scalars().all()
+
+                if tbl_meta_rows or col_meta_rows:
+                    schema_metadata_doc = {
+                        "vly_version":          VLY_VERSION,
+                        "cache_format_version": 1,
+                        "snapshot_version":     cache_snap.version,
+                        "exported_at":          now_iso,
+                        "tables": [
+                            {
+                                "schema_snapshot_version": r.schema_snapshot_version,
+                                "table_name":              r.table_name,
+                                "business_name":           r.business_name,
+                                "description":             r.description,
+                                "grain":                   r.grain,
+                                "is_fact_table":           r.is_fact_table,
+                                "use_for":                 r.use_for,
+                                "never_use_for":           r.never_use_for,
+                                "key_metric_cols":         r.key_metric_cols,
+                                "key_dimension_cols":      r.key_dimension_cols,
+                                "key_date_cols":           r.key_date_cols,
+                                "generation_method":       r.generation_method,
+                            }
+                            for r in tbl_meta_rows
+                        ],
+                        "columns": [
+                            {
+                                "schema_snapshot_version": r.schema_snapshot_version,
+                                "table_name":              r.table_name,
+                                "column_name":             r.column_name,
+                                "business_name":           r.business_name,
+                                "description":             r.description,
+                                "semantic_type":           r.semantic_type,
+                                "fk_target_table":         r.fk_target_table,
+                                "fk_target_column":        r.fk_target_column,
+                                "fk_confirmed":            r.fk_confirmed,
+                                "fk_confirmation_score":   r.fk_confirmation_score,
+                                "example_values":          r.example_values,
+                                "is_kpi_metric":           r.is_kpi_metric,
+                                "is_dimension":            r.is_dimension,
+                                "is_filter_eligible":      r.is_filter_eligible,
+                                "generation_method":       r.generation_method,
+                            }
+                            for r in col_meta_rows
+                        ],
+                    }
+                print(
+                    f"[vly-export] embedded schema cache "
+                    f"(cache={'yes' if schema_cache_doc else 'no'}, "
+                    f"tbl_meta={len(tbl_meta_rows)}, col_meta={len(col_meta_rows)})",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[vly-export] schema cache embed failed (non-fatal): {exc}", flush=True)
+            schema_cache_doc = {}
+            schema_metadata_doc = {}
 
     # ── ai_context.json ───────────────────────────────────────────────────────
     ai_context_doc = {
@@ -477,6 +606,8 @@ Use the Canvas → Import button and select this `.vly` file.
 | `queries.json` | All SQL queries keyed by widget ID |
 | `schema.json` | Table/column hints extracted from SQL |
 | `schema_enriched.json` | Full DDL snapshot for used tables |
+| `schema_cache.json` | Baked enriched schema cache — lets the AI copilot skip the cold build on import |
+| `schema_metadata.json` | LLM-generated table/column metadata (semantics, FKs, example values) |
 | `ai_context.json` | AI-ready report context for warm-start |
 | `intelligence.json` | AI analysis: KPIs, sections, morning brief |
 | `data/<id>.json` | Cached chart data (Visually native format) |
@@ -528,6 +659,8 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
             {"path": "queries.json",        "type": "queries",            "required": False, "description": "SQL queries per widget"},
             {"path": "schema.json",         "type": "schema_hints",       "required": False, "description": "Table/column hints from SQL"},
             {"path": "schema_enriched.json","type": "schema_full",        "required": False, "description": "Full DDL snapshot for used tables"},
+            *([{"path": "schema_cache.json",   "type": "schema_cache",    "required": False, "description": "Baked enriched schema cache — import skips the cold build"}] if schema_cache_doc else []),
+            *([{"path": "schema_metadata.json","type": "schema_metadata", "required": False, "description": "LLM-generated table/column metadata rows"}] if schema_metadata_doc else []),
             {"path": "ai_context.json",     "type": "ai_context",         "required": False, "description": "AI warm-start context"},
             {"path": "intelligence.json",   "type": "intelligence",       "required": False, "description": "AI analysis: KPIs, sections, brief"},
             *all_data_entries,
@@ -550,6 +683,10 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
         zf.writestr("intelligence.json", json.dumps(intelligence_doc,  ensure_ascii=False, indent=2, default=str))
         if schema_enriched_doc:
             zf.writestr("schema_enriched.json", json.dumps(schema_enriched_doc, ensure_ascii=False, indent=2, default=str))
+        if schema_cache_doc:
+            zf.writestr("schema_cache.json", json.dumps(schema_cache_doc, ensure_ascii=False, indent=2, default=str))
+        if schema_metadata_doc:
+            zf.writestr("schema_metadata.json", json.dumps(schema_metadata_doc, ensure_ascii=False, indent=2, default=str))
         for path, content in data_files:
             zf.writestr(path, content)
         for path, content in csv_files:
@@ -711,6 +848,21 @@ async def import_vly(
 
     await db.commit()
     await db.refresh(new_dash)
+
+    # ── warm-start the AI copilots from the embedded schema cache + metadata ───
+    # If the .vly carries a baked schema cache and/or LLM metadata rows and we
+    # resolved a live connection, restore them so both the chat copilot (enriched
+    # cache) and the intelligence page (metadata rows) are warm with ZERO cold build
+    # (no crawl, no LLM). Safe & idempotent — see _restore_schema_warmstart.
+    cache_warmstarted = False
+    if resolved_conn_id and ("schema_cache.json" in names or "schema_metadata.json" in names):
+        try:
+            cache_warmstarted = await _restore_schema_warmstart(
+                db, resolved_conn_id, zf, names
+            )
+        except Exception as exc:
+            print(f"[import-vly] schema cache warm-start failed (non-fatal): {exc}", flush=True)
+
     zf.close()
 
     # Re-run every widget's SQL against the live connection so cached snapshots
@@ -735,7 +887,221 @@ async def import_vly(
         "intelligence_bundled": bool(intel_doc.get("analysis")),
         "refreshed":          (refresh_summary or {}).get("refreshed", 0) if refresh_summary else 0,
         "refresh_summary":    refresh_summary,
+        "schema_cache_warmstarted": cache_warmstarted,
     }
+
+
+async def _restore_metadata_rows(
+    db: AsyncSession,
+    resolved_conn_id: uuid.UUID,
+    zf: zipfile.ZipFile,
+    names: list[str],
+    default_version: int,
+) -> int:
+    """
+    Insert the embedded LLM metadata rows (schema_metadata.json) for this connection.
+    These are what the Intelligence page reads directly (SchemaTableMetadata /
+    SchemaColumnMetadata), so restoring them warms the analyst's briefing without a crawl.
+
+    Caller is responsible for ensuring no rows already exist for this connection
+    (this function does NOT dedupe). Returns the number of table-rows inserted
+    (0 if nothing was embedded / unreadable). Does not commit.
+    """
+    if "schema_metadata.json" not in names:
+        return 0
+    from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
+    try:
+        meta_doc = json.loads(zf.read("schema_metadata.json"))
+    except Exception as exc:
+        print(f"[import-vly] schema_metadata.json unreadable (non-fatal): {exc}", flush=True)
+        return 0
+
+    tbl_defs = meta_doc.get("tables", []) or []
+    col_defs = meta_doc.get("columns", []) or []
+
+    for t in tbl_defs:
+        db.add(SchemaTableMetadata(
+            id=uuid.uuid4(),
+            connection_id=resolved_conn_id,
+            schema_snapshot_version=int(t.get("schema_snapshot_version") or default_version),
+            table_name=t.get("table_name") or "",
+            business_name=t.get("business_name"),
+            description=t.get("description"),
+            grain=t.get("grain"),
+            is_fact_table=t.get("is_fact_table"),
+            use_for=t.get("use_for"),
+            never_use_for=t.get("never_use_for"),
+            key_metric_cols=t.get("key_metric_cols"),
+            key_dimension_cols=t.get("key_dimension_cols"),
+            key_date_cols=t.get("key_date_cols"),
+            generation_method=t.get("generation_method") or "llm_sample_rows",
+            generated_at=datetime.utcnow(),
+        ))
+    for c in col_defs:
+        db.add(SchemaColumnMetadata(
+            id=uuid.uuid4(),
+            connection_id=resolved_conn_id,
+            schema_snapshot_version=int(c.get("schema_snapshot_version") or default_version),
+            table_name=c.get("table_name") or "",
+            column_name=c.get("column_name") or "",
+            business_name=c.get("business_name"),
+            description=c.get("description"),
+            semantic_type=c.get("semantic_type"),
+            fk_target_table=c.get("fk_target_table"),
+            fk_target_column=c.get("fk_target_column"),
+            fk_confirmed=bool(c.get("fk_confirmed")),
+            fk_confirmation_score=c.get("fk_confirmation_score"),
+            example_values=c.get("example_values"),
+            is_kpi_metric=c.get("is_kpi_metric"),
+            is_dimension=c.get("is_dimension"),
+            is_filter_eligible=c.get("is_filter_eligible"),
+            generation_method=c.get("generation_method") or "llm_sample_rows",
+            generated_at=datetime.utcnow(),
+        ))
+    return len(tbl_defs)
+
+
+async def _restore_schema_warmstart(
+    db: AsyncSession,
+    resolved_conn_id: uuid.UUID,
+    zf: zipfile.ZipFile,
+    names: list[str],
+) -> bool:
+    """
+    Restore the embedded schema cache + LLM metadata for a freshly-imported connection
+    so both AI surfaces skip the cold build (crawl + LLM enrichment):
+      • chat copilot       → the enriched cache (schema_cache.json)
+      • intelligence page  → the metadata rows  (schema_metadata.json)
+
+    Returns True if anything useful was restored, False otherwise.
+
+    Three states (the gate is the presence of METADATA ROWS, not just a snapshot —
+    a snapshot can exist while metadata extraction failed, leaving intelligence cold):
+
+      1. No snapshot yet                → full warm-start: write snapshot, restore
+                                           metadata rows, install enriched cache.
+      2. Snapshot exists, no metadata   → backfill ONLY the metadata rows (don't touch
+                                           the existing snapshot/cache — they belong to
+                                           that connection's own crawl and key under a
+                                           different schema_hash).
+      3. Snapshot AND metadata present  → already warm → no-op.
+    """
+    from shared.models.schema_snapshots import SchemaSnapshot
+    from shared.models.schema_metadata import SchemaTableMetadata
+    from agent_service.agents import schema_cache as _sc
+
+    existing_snap = (await db.execute(
+        select(SchemaSnapshot)
+        .where(SchemaSnapshot.connection_id == resolved_conn_id)
+        .order_by(SchemaSnapshot.version.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    has_metadata = (await db.execute(
+        select(SchemaTableMetadata.id)
+        .where(SchemaTableMetadata.connection_id == resolved_conn_id)
+        .limit(1)
+    )).first() is not None
+
+    # ── State 3: already fully warm ───────────────────────────────────────────
+    if existing_snap is not None and has_metadata:
+        print(
+            f"[import-vly] connection {str(resolved_conn_id)[:8]} already warm "
+            f"(snapshot + metadata rows) — skipping",
+            flush=True,
+        )
+        return False
+
+    # ── State 2: snapshot exists but metadata rows are missing → backfill only ─
+    if existing_snap is not None and not has_metadata:
+        restored = await _restore_metadata_rows(
+            db, resolved_conn_id, zf, names, default_version=existing_snap.version
+        )
+        if restored:
+            await db.commit()
+            print(
+                f"[import-vly] ✓ backfilled {restored} table metadata row(s) for existing "
+                f"snapshot  connection={str(resolved_conn_id)[:8]} (intelligence page warm)",
+                flush=True,
+            )
+            return True
+        print(
+            f"[import-vly] connection {str(resolved_conn_id)[:8]} has a snapshot but no "
+            f"embedded metadata to backfill — leaving as-is",
+            flush=True,
+        )
+        return False
+
+    # ── State 1: no snapshot → full warm-start ────────────────────────────────
+    if "schema_cache.json" not in names:
+        # No baked enriched cache. Without a snapshot the chat copilot can't resolve a
+        # schema_doc anyway, so the most we can do is restore the metadata rows that the
+        # intelligence page reads directly.
+        restored = await _restore_metadata_rows(
+            db, resolved_conn_id, zf, names, default_version=1
+        )
+        if restored:
+            await db.commit()
+            print(
+                f"[import-vly] ✓ restored {restored} table metadata row(s) (no enriched "
+                f"cache embedded)  connection={str(resolved_conn_id)[:8]}",
+                flush=True,
+            )
+            return True
+        return False
+
+    try:
+        cache_doc = json.loads(zf.read("schema_cache.json"))
+    except Exception as exc:
+        print(f"[import-vly] schema_cache.json unreadable: {exc}", flush=True)
+        return False
+
+    if cache_doc.get("cache_format_version") != 1:
+        print(
+            f"[import-vly] unsupported cache_format_version="
+            f"{cache_doc.get('cache_format_version')} — skipping warm-start",
+            flush=True,
+        )
+        return False
+
+    enriched_obj = cache_doc.get("enriched") or {}
+    schema_document = enriched_obj.get("schema_doc") or {}
+    if not schema_document.get("tables"):
+        print("[import-vly] embedded cache has no schema_doc tables — skipping", flush=True)
+        return False
+
+    tables = schema_document.get("tables") or []
+    table_count = len(tables) if isinstance(tables, (list, dict)) else 0
+    snap_version = int(cache_doc.get("snapshot_version") or 1)
+
+    # 1) SchemaSnapshot — so chat's _get_schema_context() finds the schema and
+    #    get_or_build() computes a hash that matches the installed cache key.
+    snap = SchemaSnapshot(
+        id=uuid.uuid4(),
+        connection_id=resolved_conn_id,
+        version=snap_version,
+        schema_document=schema_document,
+        table_count=table_count,
+        crawl_duration_seconds=None,
+        created_at=datetime.utcnow(),
+    )
+    db.add(snap)
+
+    # 2) Restore LLM metadata rows (Approach C) — warms the intelligence page.
+    await _restore_metadata_rows(db, resolved_conn_id, zf, names, default_version=snap_version)
+
+    await db.commit()
+
+    # 3) Install the baked enriched cache across L1 / filesystem / Redis, re-keyed
+    #    onto the new connection. Hash derives from schema_document → matches step 1.
+    enriched_json = json.dumps(enriched_obj, ensure_ascii=False, default=str)
+    schema_hash = await _sc.install_imported_cache(str(resolved_conn_id), enriched_json)
+    print(
+        f"[import-vly] ✓ warm-started copilot from embedded cache  "
+        f"connection={str(resolved_conn_id)[:8]}  hash={schema_hash}  tables={table_count}",
+        flush=True,
+    )
+    return True
 
 
 # ── POST /dashboards/{id}/bind-connection ─────────────────────────────────────

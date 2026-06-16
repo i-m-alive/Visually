@@ -1,4 +1,5 @@
-import axios from 'axios'
+import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios'
+import { useAuthStore } from '@/stores/authStore'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001'
 
@@ -17,6 +18,82 @@ api.interceptors.request.use((config) => {
   }
   return config
 })
+
+// ─── Auto-refresh on 401 ──────────────────────────────────────────────────────
+// Access tokens are short-lived (15 min). Without this, the first request after
+// expiry returns 401 and every subsequent call keeps 401-ing — the user appears
+// "logged out" / loses their DB connection mid-task (e.g. during a .vly import).
+// Here we transparently exchange the 30-day refresh token for a fresh access
+// token, retry the original request once, and only bounce to /login if the
+// refresh itself fails (expired/revoked refresh token, or JWT secret change).
+//
+// A single-flight promise ensures that a burst of concurrent 401s triggers just
+// ONE refresh, then all retry with the new token.
+let refreshPromise: Promise<string | null> | null = null
+
+async function refreshAccessToken(): Promise<string | null> {
+  const refreshToken = useAuthStore.getState().refreshToken
+  if (!refreshToken) return null
+  try {
+    // Bare axios (not `api`) so this call skips the interceptors and can't recurse.
+    const resp = await axios.post(`${API_URL}/auth/refresh`, { refresh_token: refreshToken })
+    const d = resp.data as {
+      access_token: string; refresh_token: string
+      user_id: string; email: string; full_name: string; role: 'builder' | 'end_user'
+    }
+    // Persist BOTH new tokens — the backend rotates (revokes) the refresh token,
+    // so reusing the old one on the next refresh would fail.
+    useAuthStore.getState().setAuth(
+      { id: d.user_id, email: d.email, full_name: d.full_name, role: d.role },
+      d.access_token,
+      d.refresh_token,
+    )
+    return d.access_token
+  } catch {
+    return null
+  }
+}
+
+/** Single-flight wrapper: a burst of concurrent 401s triggers exactly ONE refresh. */
+function getRefreshedToken(): Promise<string | null> {
+  if (!refreshPromise) {
+    refreshPromise = refreshAccessToken().finally(() => { refreshPromise = null })
+  }
+  return refreshPromise
+}
+
+/** The session is genuinely dead — clear it and bounce to the login page. */
+function forceReLogin(): void {
+  useAuthStore.getState().clearAuth()
+  if (typeof window !== 'undefined') {
+    document.cookie = 'visually-role=; path=/; max-age=0'
+    if (!window.location.pathname.startsWith('/login')) {
+      window.location.href = '/login'
+    }
+  }
+}
+
+api.interceptors.response.use(
+  (resp) => resp,
+  async (error: AxiosError) => {
+    const original = error.config as (InternalAxiosRequestConfig & { _retry?: boolean }) | undefined
+    const status = error.response?.status
+    const url = original?.url ?? ''
+    const isAuthCall =
+      url.includes('/auth/refresh') || url.includes('/auth/login') || url.includes('/auth/register')
+
+    if (status === 401 && original && !original._retry && !isAuthCall) {
+      original._retry = true
+      const newToken = await getRefreshedToken()
+      if (newToken) {
+        original.headers.Authorization = `Bearer ${newToken}`
+        return api(original)
+      }
+      forceReLogin()
+    }
+    return Promise.reject(error)
+  },
+)
 
 export const authApi = {
   register: (data: { email: string; password: string; full_name: string; role?: string }) =>
@@ -109,23 +186,42 @@ export async function streamChat(
   handlers: StreamChatHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
-  let token: string | undefined
-  if (typeof window !== 'undefined') {
+  // This uses raw fetch (axios can't read a streaming body), so it bypasses the
+  // axios 401-refresh interceptor — we replicate that logic here so an expired
+  // access token doesn't silently break the chat copilot mid-session.
+  const readToken = (): string | undefined => {
+    if (typeof window === 'undefined') return undefined
     try {
       const stored = localStorage.getItem('visually-auth')
-      if (stored) token = JSON.parse(stored)?.state?.accessToken
+      if (stored) return JSON.parse(stored)?.state?.accessToken
     } catch {}
+    return undefined
   }
 
-  const resp = await fetch(`${API_URL}/agent/chat/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(data),
-    signal,
-  })
+  const doFetch = (token: string | undefined) =>
+    fetch(`${API_URL}/agent/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(data),
+      signal,
+    })
+
+  let resp = await doFetch(readToken())
+
+  // On 401, transparently refresh the token and retry once.
+  if (resp.status === 401) {
+    const newToken = await getRefreshedToken()
+    if (newToken) {
+      resp = await doFetch(newToken)
+    } else {
+      forceReLogin()
+      handlers.onError('Session expired — please sign in again.')
+      return
+    }
+  }
 
   if (!resp.ok || !resp.body) {
     handlers.onError(`Stream request failed (${resp.status})`)
