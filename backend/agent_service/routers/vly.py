@@ -713,6 +713,17 @@ async def import_vly(
     await db.refresh(new_dash)
     zf.close()
 
+    # Re-run every widget's SQL against the live connection so cached snapshots
+    # (esp. KPI widgets whose query returned 0 rows / empty chart_data at export)
+    # are replaced with live data. Best-effort — import still succeeds if it fails.
+    refresh_summary = None
+    if resolved_conn_id:
+        try:
+            from agent_service.scheduler import run_dashboard_refresh
+            refresh_summary = await run_dashboard_refresh(str(new_dash.id))
+        except Exception as exc:
+            print(f"[import-vly] live refresh failed (non-fatal): {exc}", flush=True)
+
     return {
         "dashboard_id":       str(new_dash.id),
         "name":               new_dash.name,
@@ -722,6 +733,8 @@ async def import_vly(
         "project_id":         project_id,
         "original_name":      canvas_doc.get("name"),
         "intelligence_bundled": bool(intel_doc.get("analysis")),
+        "refreshed":          (refresh_summary or {}).get("refreshed", 0) if refresh_summary else 0,
+        "refresh_summary":    refresh_summary,
     }
 
 
