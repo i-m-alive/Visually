@@ -2601,10 +2601,10 @@ export default function IntelligenceCanvasPage() {
             <button onClick={() => setShowDatePicker(p => !p)} title="Filter by date range" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${showDatePicker ? C.teal : 'rgba(255,255,255,0.2)'}`, background: showDatePicker ? `${C.teal}30` : 'rgba(255,255,255,0.1)', color: showDatePicker ? C.teal2 : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <CalendarRange size={11} />{appliedDateRange ? `${appliedDateRange.from.slice(5)} → ${appliedDateRange.to.slice(5)}` : 'Date'}
             </button>
-            {/* Feature 6: present */}
-            <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+            {/* Feature 6: present — temporarily disabled (re-enable later) */}
+            {/* <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Play size={11} /> Present
-            </button>
+            </button> */}
             {/* Feature 7: print/PDF */}
             <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Printer size={11} /> PDF
@@ -2627,10 +2627,10 @@ export default function IntelligenceCanvasPage() {
               {saved ? <BookmarkCheck size={11} /> : <Bookmark size={11} />}
               {saved ? 'Saved!' : hasSavedData ? 'Re-save' : 'Save'}
             </button>
-            {/* Compare (moved from section tabs) */}
-            <button onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }} title="Side-by-side compare" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${compareMode ? C.violet + '80' : 'rgba(255,255,255,0.2)'}`, background: compareMode ? `${C.violet}30` : 'rgba(255,255,255,0.1)', color: compareMode ? '#c4b5fd' : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
+            {/* Compare (moved from section tabs) — temporarily disabled (re-enable later) */}
+            {/* <button onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }} title="Side-by-side compare" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${compareMode ? C.violet + '80' : 'rgba(255,255,255,0.2)'}`, background: compareMode ? `${C.violet}30` : 'rgba(255,255,255,0.1)', color: compareMode ? '#c4b5fd' : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
               <Columns size={11} /> Compare
-            </button>
+            </button> */}
             {/* ── Sync split-button ── */}
             <div ref={syncMenuRef} style={{ position: 'relative', display: 'flex' }}>
               {/* Left: Sync Now */}
