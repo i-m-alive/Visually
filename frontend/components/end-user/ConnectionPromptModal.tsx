@@ -96,12 +96,14 @@ export function ConnectionPromptModal({ fileName, connectionHint, onConnect, onC
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm"
-      onClick={onClose}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
     >
+      {/* NOTE: intentionally NO onClick={onClose} on the backdrop. This is a
+          credential-entry form — a stray click outside (or a tall modal that
+          overflows so the "outside" sits under your cursor) must NOT dismiss it
+          mid-typing. Close only via the explicit X / Cancel buttons. */}
       <div
-        className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6"
-        onClick={e => e.stopPropagation()}
+        className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 max-h-[90vh] overflow-y-auto"
       >
         <div className="flex items-start justify-between mb-4">
           <div className="flex items-center gap-2.5">
