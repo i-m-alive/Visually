@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { authApi } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
+import { Layers, BarChart2 } from 'lucide-react'
 
 export default function RegisterPage() {
   const router = useRouter()
@@ -12,6 +13,7 @@ export default function RegisterPage() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
+  const [role, setRole] = useState<'builder' | 'end_user'>('builder')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -22,14 +24,18 @@ export default function RegisterPage() {
     if (password.length < 8) { setError('Password must be at least 8 characters'); return }
     setLoading(true)
     try {
-      const resp = await authApi.register({ email, password, full_name: fullName })
+      const resp = await authApi.register({ email, password, full_name: fullName, role })
       const data = resp.data
+      const resolvedRole: 'builder' | 'end_user' = data.role === 'end_user' ? 'end_user' : 'builder'
       setAuth(
-        { id: data.user_id, email: data.email, full_name: data.full_name },
+        { id: data.user_id, email: data.email, full_name: data.full_name, role: resolvedRole },
         data.access_token,
         data.refresh_token,
       )
-      router.push('/projects/new')
+      document.cookie = `visually-role=${resolvedRole}; path=/; SameSite=Lax`
+      // Mark as onboarded — they just selected their role during registration
+      localStorage.setItem(`visually-onboarded-${data.user_id}`, '1')
+      router.push(resolvedRole === 'end_user' ? '/end-user/dashboard' : '/projects')
     } catch (err: unknown) {
       const e = err as { response?: { data?: { detail?: unknown } } }
       const detail = e.response?.data?.detail
@@ -73,6 +79,43 @@ export default function RegisterPage() {
         <label className="block text-sm font-medium text-gray-700 mb-1">Confirm password</label>
         <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)}
           className="input-field" placeholder="••••••••" required />
+      </div>
+
+      {/* Role selection */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-2">I am a…</label>
+        <div className="grid grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={() => setRole('builder')}
+            className={`flex flex-col items-center gap-2 p-3 rounded-xl border-2 transition-colors text-left ${
+              role === 'builder'
+                ? 'border-brand bg-brand-light text-brand'
+                : 'border-gray-200 text-gray-500 hover:border-gray-300'
+            }`}
+          >
+            <Layers size={20} />
+            <div>
+              <p className="text-xs font-semibold">Builder</p>
+              <p className="text-[10px] leading-tight opacity-70">Build reports & dashboards</p>
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setRole('end_user')}
+            className={`flex flex-col items-center gap-2 p-3 rounded-xl border-2 transition-colors text-left ${
+              role === 'end_user'
+                ? 'border-brand bg-brand-light text-brand'
+                : 'border-gray-200 text-gray-500 hover:border-gray-300'
+            }`}
+          >
+            <BarChart2 size={20} />
+            <div>
+              <p className="text-xs font-semibold">Analyst</p>
+              <p className="text-[10px] leading-tight opacity-70">View & analyse reports</p>
+            </div>
+          </button>
+        </div>
       </div>
 
       <button type="submit" disabled={loading} className="btn-primary w-full">

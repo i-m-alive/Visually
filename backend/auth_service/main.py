@@ -54,11 +54,13 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already registered")
 
+    role = getattr(req, "role", "builder") or "builder"
     user = User(
         id=uuid.uuid4(),
         email=req.email,
         hashed_password=hash_password(req.password),
         full_name=req.full_name,
+        role=role,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
@@ -66,8 +68,8 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(user)
 
-    access_token = create_access_token({"sub": str(user.id)})
-    refresh_token = create_refresh_token({"sub": str(user.id)})
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token = create_refresh_token({"sub": str(user.id), "role": user.role})
 
     rt = RefreshToken(
         id=uuid.uuid4(),
@@ -85,6 +87,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
         user_id=str(user.id),
         email=user.email,
         full_name=user.full_name,
+        role=user.role,
     )
 
 
@@ -99,8 +102,8 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive")
 
-    access_token = create_access_token({"sub": str(user.id)})
-    refresh_token = create_refresh_token({"sub": str(user.id)})
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token = create_refresh_token({"sub": str(user.id), "role": user.role})
 
     rt = RefreshToken(
         id=uuid.uuid4(),
@@ -118,6 +121,7 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
         user_id=str(user.id),
         email=user.email,
         full_name=user.full_name,
+        role=user.role,
     )
 
 
@@ -147,8 +151,8 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    new_access = create_access_token({"sub": str(user.id)})
-    new_refresh = create_refresh_token({"sub": str(user.id)})
+    new_access = create_access_token({"sub": str(user.id), "role": user.role})
+    new_refresh = create_refresh_token({"sub": str(user.id), "role": user.role})
 
     rt = RefreshToken(
         id=uuid.uuid4(),
@@ -166,6 +170,7 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
         user_id=str(user.id),
         email=user.email,
         full_name=user.full_name,
+        role=user.role,
     )
 
 
@@ -176,4 +181,5 @@ async def me(current_user: User = Depends(get_current_user)):
         email=current_user.email,
         full_name=current_user.full_name,
         is_active=current_user.is_active,
+        role=current_user.role,
     )

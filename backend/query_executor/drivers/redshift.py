@@ -19,16 +19,35 @@ def _execute_sync(
 ) -> dict:
     start = time.monotonic()
 
+    is_serverless = "redshift-serverless" in (host or "")
+    # Serverless workgroups auto-pause; allow 120s for them to wake up on first connect
+    _timeout = 120 if is_serverless else 60
+
     conn_kwargs: dict[str, Any] = {
         "host": host,
         "port": port,
         "database": database,
         "ssl": ssl,
-        "timeout": 60,
+        "timeout": _timeout,
     }
+    if is_serverless:
+        conn_kwargs["is_serverless"] = True
+        # Host format: <workgroup>.<account>.<region>.redshift-serverless.amazonaws.com
+        _parts = (host or "").split(".")
+        if len(_parts) >= 3:
+            conn_kwargs["region"] = _parts[2]
+        if _parts:
+            conn_kwargs["serverless_work_group"] = _parts[0]
 
     # IAM auth: when password is blank, use AWS credential env vars instead of user/password
     if not password:
+        try:
+            from dotenv import load_dotenv as _ld
+            _env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '.env')
+            if os.path.exists(_env):
+                _ld(_env, override=True)
+        except ImportError:
+            pass
         conn_kwargs["iam"] = True
         conn_kwargs["aws_access_key_id"] = os.getenv("AWS_ACCESS_KEY_ID", "")
         conn_kwargs["aws_secret_access_key"] = os.getenv("AWS_SECRET_ACCESS_KEY", "")

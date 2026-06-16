@@ -6,7 +6,9 @@ import {
   RefreshCw, StickyNote, Lock, Unlock, Copy, RotateCcw
 } from 'lucide-react'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
+import SlicerWidget from '@/components/canvas/SlicerWidget'
 import type { ChartResult } from '@/stores/pipelineStore'
+import type { FilterItem } from '@/lib/api'
 
 const CHART_TYPES = [
   { key: 'bar_vertical',           label: 'Bar' },
@@ -51,6 +53,7 @@ const CHART_TYPES = [
   { key: 'org_chart',              label: 'Org Chart' },
   { key: 'marimekko',              label: 'Marimekko' },
   { key: 'choropleth',             label: 'Choropleth' },
+  { key: 'slicer',                 label: 'Slicer' },
 ]
 
 export const COLOR_PALETTES: Record<string, string[]> = {
@@ -97,12 +100,17 @@ interface Props {
   onToggleLock?: (widgetId: string) => void
   isLocked?: boolean
   isRefreshing?: boolean
+  // Slicer support (optional; only provided in view/share mode)
+  token?: string
+  filterValue?: FilterItem | null
+  onFilterChange?: (filter: FilterItem | null) => void
 }
 
 export function CanvasWidget({
   widget, onDelete, onUpdate, onZoom,
   onDuplicate, onRefresh, onToggleLock,
   isLocked = false, isRefreshing = false,
+  token, filterValue = null, onFilterChange,
 }: Props) {
   const [isEditingTitle, setIsEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState(widget.title)
@@ -523,7 +531,26 @@ export function CanvasWidget({
         ref={chartAreaRef}
         className="flex-1 overflow-hidden min-h-0 p-2 relative"
       >
-        {widget.chart_data ? (
+        {widget.chart_type === 'slicer' ? (
+          token ? (
+            <SlicerWidget
+              token={token}
+              widgetId={widget.id}
+              title=""
+              slicerColumn={(widget.config?.slicer_column as string) || ''}
+              slicerType={(widget.config?.slicer_type as 'dropdown' | 'checkbox' | 'date_range') || 'dropdown'}
+              filterValue={filterValue}
+              onFilterChange={onFilterChange ?? (() => {})}
+              isEditMode={isLocked}
+            />
+          ) : (
+            <div className="h-full flex flex-col items-center justify-center gap-1 text-gray-400">
+              <span className="text-[11px] font-medium">{(widget.config?.slicer_type as string) || 'dropdown'} slicer</span>
+              <span className="text-[10px]">{(widget.config?.slicer_column as string) || 'column'}</span>
+              <span className="text-[10px] text-gray-300">Active in live view</span>
+            </div>
+          )
+        ) : widget.chart_data ? (
           <ChartRenderer
             result={result}
             colors={colors}

@@ -33,15 +33,32 @@ interface Props {
 export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
 
-  // Table sort state — must be declared before any early return (React rules of hooks)
+  // Table sort + search state — must be declared before any early return (React rules of hooks)
   const [sortCol, setSortCol] = React.useState<string | null>(null)
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
+  const [tableSearch, setTableSearch] = React.useState('')
 
-  // sortedRows must live at the top level — moving it inside the if(ct==='table') block
-  // would violate the Rules of Hooks (hook count changes between renders).
+  // Measure container width so the table can adapt font + padding to available space
+  const tableContainerRef = React.useRef<HTMLDivElement>(null)
+  const [tableWidth, setTableWidth] = React.useState(0)
+  React.useEffect(() => {
+    const el = tableContainerRef.current
+    if (!el) return
+    const obs = new ResizeObserver(entries => {
+      setTableWidth(entries[0]?.contentRect.width ?? 0)
+    })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [])
+
+  // sortedRows must live at the top level — Rules of Hooks.
   const _rawRows = result?.chart_data?.rows as Record<string, unknown>[] | undefined
   const sortedRows = React.useMemo(() => {
-    const rows = _rawRows ?? []
+    let rows = _rawRows ?? []
+    if (tableSearch.trim()) {
+      const q = tableSearch.trim().toLowerCase()
+      rows = rows.filter(r => Object.values(r).some(v => String(v ?? '').toLowerCase().includes(q)))
+    }
     if (!sortCol) return rows
     return [...rows].sort((a, b) => {
       const av = a[sortCol], bv = b[sortCol]
@@ -53,7 +70,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
         ? String(av ?? '').localeCompare(String(bv ?? ''))
         : String(bv ?? '').localeCompare(String(av ?? ''))
     })
-  }, [_rawRows, sortCol, sortDir])
+  }, [_rawRows, sortCol, sortDir, tableSearch])
 
   if (!result) return null
   const { chart_type, title, x_axis_label, y_axis_label, chart_data } = result
@@ -103,9 +120,37 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   }
 
   // recharts data array from rows (or from labels/values if rows is empty)
-  const rechartData = rows.length > 0
+  const rawRechartData = rows.length > 0
     ? rows
     : labels.map((l, i) => ({ [xKey]: l, [yKey]: values[i] }))
+
+  // Strip trailing all-zero rows (SQL often returns future months with 0 values)
+  const lastNonZeroIdx = (() => {
+    for (let i = rawRechartData.length - 1; i >= 0; i--) {
+      const v = Number(rawRechartData[i][yKey] ?? 0)
+      if (!isNaN(v) && v !== 0) return i
+    }
+    return rawRechartData.length - 1
+  })()
+  const trimmedData = rawRechartData.slice(0, lastNonZeroIdx + 1)
+
+  // Format ISO datetime labels to a readable short form (e.g. "2026-03-01T00:00:00" → "Mar 2026")
+  const formatXLabel = (val: unknown): string => {
+    const s = String(val ?? '')
+    // Matches ISO datetime: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD 00:00:00
+    const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ]/)
+    if (isoMatch) {
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+      const mon = months[parseInt(isoMatch[2], 10) - 1] ?? isoMatch[2]
+      return `${mon} ${isoMatch[1]}`
+    }
+    return s
+  }
+
+  const rechartData = trimmedData.map(row => ({
+    ...row,
+    [xKey]: formatXLabel(row[xKey]),
+  }))
 
   // ── Shared computed values (used by ref-line, labels, comparison) ──────────
   const numYVals = rechartData.map(r => Number(r[yKey] ?? 0)).filter(n => !isNaN(n) && isFinite(n))
@@ -134,17 +179,17 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     const kpis = rows.length > 0
       ? rows.map(r => ({ name: String(r[columns[0]] ?? ''), val: r[columns[1]] }))
       : labels.map((l, i) => ({ name: l, val: values[i] }))
+    const fmtVal = (v: unknown) =>
+      typeof v === 'number'
+        ? (Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : v.toLocaleString(undefined, { maximumFractionDigits: 2 }))
+        : String(v ?? '—')
     return (
       <div className="w-full overflow-auto" style={{ height }}>
-        <div className="grid grid-cols-2 gap-3 p-1">
+        <div className="flex flex-col divide-y divide-gray-100">
           {kpis.map((k, i) => (
-            <div key={i} className="flex flex-col items-center justify-center rounded-xl bg-blue-50 border border-blue-100 p-3">
-              <p className="text-xs text-gray-500 text-center leading-tight mb-1">{k.name}</p>
-              <p className="text-lg font-bold text-blue-700">
-                {typeof k.val === 'number'
-                  ? k.val.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                  : String(k.val ?? '—')}
-              </p>
+            <div key={i} className="flex items-center justify-between px-3 py-2 hover:bg-gray-50 transition-colors">
+              <span className="text-xs font-medium text-gray-500 truncate max-w-[55%]">{k.name}</span>
+              <span className="text-sm font-bold text-blue-700 tabular-nums">{fmtVal(k.val)}</span>
             </div>
           ))}
         </div>
@@ -155,7 +200,18 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   // ── Table ─────────────────────────────────────────────────────────────────────
   if (ct === 'table' || ct === 'data_table') {
     const cols = columns.length ? columns : (rows[0] ? Object.keys(rows[0]) : [])
-    // sortedRows is hoisted to the top of the component (Rules of Hooks)
+
+    // Adaptive sizing — tier based on measured container width
+    const tw = tableWidth || 600
+    const tSz: 'xs' | 'sm' | 'md' | 'lg' = tw < 280 ? 'xs' : tw < 420 ? 'sm' : tw < 650 ? 'md' : 'lg'
+    const T = {
+      font:   { xs: 9,  sm: 10, md: 11, lg: 12 }[tSz],
+      padX:   { xs: 4,  sm: 6,  md: 8,  lg: 12 }[tSz],
+      padY:   { xs: 2,  sm: 3,  md: 4,  lg: 6  }[tSz],
+      colMin: { xs: 70, sm: 90, md: 110, lg: 140 }[tSz],
+      numMin: { xs: 50, sm: 60, md: 72,  lg: 90  }[tSz],
+      barW:   { xs: 36, sm: 44, md: 52,  lg: 64  }[tSz],
+    }
 
     // Heatmap: per-column min/max for numeric columns
     const colStats: Record<string, { min: number; max: number; isNum: boolean }> = {}
@@ -167,7 +223,6 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
         ? { min: Math.min(...nums), max: Math.max(...nums), isNum: true }
         : { min: 0, max: 0, isNum: false }
     })
-    // Mini-bar: use the first numeric column
     const primaryNumCol = cols.find(c => colStats[c]?.isNum) ?? null
     const primaryMax = primaryNumCol && colStats[primaryNumCol] ? colStats[primaryNumCol].max : 1
 
@@ -187,71 +242,131 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       color: 'var(--dash-text-muted, #6B7280)',
       borderColor: 'var(--dash-table-border, #E5E7EB)',
     }
+
     return (
-      <div className="overflow-auto w-full" style={{ height }}>
-        <table className="w-full text-xs border-collapse">
-          <thead className="sticky top-0 z-10">
-            <tr>
-              {cols.map(c => (
-                <th
-                  key={c}
-                  className="px-3 py-2 text-left font-semibold border-b whitespace-nowrap select-none cursor-pointer hover:opacity-80"
-                  style={thStyle}
-                  onClick={() => {
-                    if (sortCol === c) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-                    else { setSortCol(c); setSortDir('asc') }
-                  }}
-                >
-                  {c}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                </th>
-              ))}
-              {primaryNumCol && (
-                <th className="px-2 py-2 border-b" style={{ ...thStyle, width: 68, minWidth: 68 }} title="Value bar" />
-              )}
-            </tr>
-          </thead>
-          <tbody>
-            {sortedRows.map((row, i) => {
-              const rowBg = i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)'
-              const barVal = primaryNumCol ? (typeof row[primaryNumCol] === 'number' ? row[primaryNumCol] as number : parseFloat(String(row[primaryNumCol] ?? 0))) : 0
-              const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, (barVal as number) / primaryMax)) : 0
-              return (
-                <tr
-                  key={i}
-                  className={onDataPointClick ? 'cursor-pointer hover:opacity-80' : ''}
-                  style={{ background: rowBg }}
-                  onClick={() => onDataPointClick && cols[0] && onDataPointClick(cols[0], row[cols[0]])}
-                >
-                  {cols.map(c => {
-                    const heat = heatmapBg(c, row[c])
-                    return (
-                      <td
-                        key={c}
-                        className="px-3 py-1.5 border-b whitespace-nowrap"
-                        style={{
-                          color: 'var(--dash-row-text, #374151)',
-                          borderColor: 'var(--dash-table-border, #E5E7EB)',
-                          background: heat ?? undefined,
-                          fontWeight: colStats[c]?.isNum ? 500 : undefined,
-                        }}
-                      >
-                        {String(row[c] ?? '')}
-                      </td>
-                    )
-                  })}
-                  {primaryNumCol && (
-                    <td className="px-2 py-1.5 border-b" style={{ borderColor: 'var(--dash-table-border, #E5E7EB)', background: rowBg }}>
-                      <svg width={60} height={10}>
-                        <rect x={0} y={1} width={60} height={8} rx={3} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
-                        <rect x={0} y={1} width={Math.max(3, barPct * 60)} height={8} rx={3} fill={COLORS[0]} opacity={0.75} />
-                      </svg>
-                    </td>
-                  )}
+      <div ref={tableContainerRef} className="flex flex-col w-full min-h-0" style={{ height: height ?? '100%', fontSize: T.font }}>
+
+        {/* Search bar */}
+        <div
+          className="flex items-center gap-1 border-b border-gray-100 bg-white flex-shrink-0"
+          style={{ padding: `${T.padY}px ${T.padX}px` }}
+        >
+          <svg className="flex-shrink-0 text-gray-400" style={{ width: T.font, height: T.font }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" />
+          </svg>
+          <input
+            value={tableSearch}
+            onChange={e => setTableSearch(e.target.value)}
+            placeholder="Search…"
+            className="flex-1 outline-none placeholder-gray-400 bg-transparent"
+            style={{ fontSize: T.font }}
+          />
+          {tableSearch && (
+            <button onClick={() => setTableSearch('')} className="text-gray-300 hover:text-gray-500 leading-none" style={{ fontSize: T.font }}>✕</button>
+          )}
+        </div>
+
+        {/* Scrollable table — auto layout, min-width per col */}
+        <div className="overflow-auto flex-1 min-h-0">
+          <table className="border-collapse" style={{ tableLayout: 'auto', minWidth: '100%', fontSize: T.font }}>
+            <colgroup>
+              {cols.map(c => <col key={c} style={{ minWidth: colStats[c]?.isNum ? T.numMin : T.colMin }} />)}
+              {primaryNumCol && <col style={{ width: T.barW, minWidth: T.barW }} />}
+            </colgroup>
+            <thead className="sticky top-0 z-10">
+              <tr>
+                {cols.map(c => (
+                  <th
+                    key={c}
+                    className="text-left font-semibold border-b select-none cursor-pointer hover:opacity-80"
+                    style={{ ...thStyle, padding: `${T.padY}px ${T.padX}px`, whiteSpace: 'nowrap' }}
+                    title={c}
+                    onClick={() => {
+                      if (sortCol === c) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                      else { setSortCol(c); setSortDir('asc') }
+                    }}
+                  >
+                    {c}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                  </th>
+                ))}
+                {primaryNumCol && (
+                  <th className="border-b" style={{ ...thStyle, width: T.barW, padding: `${T.padY}px ${T.padX}px` }} />
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {sortedRows.length === 0 ? (
+                <tr>
+                  <td colSpan={cols.length + (primaryNumCol ? 1 : 0)} className="text-center text-gray-400" style={{ padding: `${T.padY * 3}px ${T.padX}px` }}>
+                    No results
+                  </td>
                 </tr>
-              )
-            })}
-          </tbody>
-        </table>
+              ) : sortedRows.map((row, i) => {
+                const rowBg = i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)'
+                const barVal = primaryNumCol ? (typeof row[primaryNumCol] === 'number' ? row[primaryNumCol] as number : parseFloat(String(row[primaryNumCol] ?? 0))) : 0
+                const barValSafe = isNaN(barVal as number) ? 0 : barVal as number
+                const barPct = primaryMax > 0 ? Math.max(0, Math.min(1, barValSafe / primaryMax)) : 0
+                return (
+                  <tr
+                    key={i}
+                    className={onDataPointClick ? 'cursor-pointer hover:opacity-80' : ''}
+                    style={{ background: rowBg }}
+                    onClick={() => onDataPointClick && cols[0] && onDataPointClick(cols[0], row[cols[0]])}
+                  >
+                    {cols.map(c => {
+                      const heat = heatmapBg(c, row[c])
+                      return (
+                        <td
+                          key={c}
+                          className="border-b"
+                          title={String(row[c] ?? '')}
+                          style={{
+                            padding: `${T.padY}px ${T.padX}px`,
+                            color: 'var(--dash-row-text, #374151)',
+                            borderColor: 'var(--dash-table-border, #E5E7EB)',
+                            background: heat ?? undefined,
+                            fontWeight: colStats[c]?.isNum ? 500 : undefined,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {String(row[c] ?? '')}
+                        </td>
+                      )
+                    })}
+                    {primaryNumCol && (
+                      <td
+                        className="border-b"
+                        style={{ padding: `${T.padY}px ${T.padX}px`, borderColor: 'var(--dash-table-border, #E5E7EB)', background: rowBg, width: T.barW }}
+                      >
+                        {(T.barW ?? 0) > 8 && (
+                          <svg width={T.barW - 8} height={8}>
+                            <rect x={0} y={0} width={T.barW - 8} height={8} rx={2} fill="var(--dash-row-alt, #F3F4F6)" opacity={0.5} />
+                            <rect x={0} y={0} width={Math.max(2, barPct * (T.barW - 8))} height={8} rx={2} fill={COLORS[0]} opacity={0.75} />
+                          </svg>
+                        )}
+                      </td>
+                    )}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Footer */}
+        {sortedRows.length > 0 && (
+          <div
+            className="text-gray-400 border-t border-gray-100 flex-shrink-0 flex items-center justify-between"
+            style={{ padding: `${T.padY}px ${T.padX}px`, fontSize: Math.max(9, T.font - 1) }}
+          >
+            <span>
+              {tableSearch
+                ? `${sortedRows.length} of ${(_rawRows ?? []).length} rows`
+                : `${sortedRows.length} row${sortedRows.length !== 1 ? 's' : ''}`}
+            </span>
+            <span>{cols.length} col{cols.length !== 1 ? 's' : ''}</span>
+          </div>
+        )}
       </div>
     )
   }
@@ -274,46 +389,50 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       color: 'var(--dash-text-muted, #6B7280)',
       borderColor: 'var(--dash-table-border, #E5E7EB)',
     }
-    return (
-      <div className="overflow-auto w-full" style={{ height }}>
-        <table className="w-full text-xs border-collapse">
-          <thead className="sticky top-0 z-10">
-            <tr>
-              <th className="px-2 py-1.5 border text-left font-semibold" style={thStyle}>{rowDimKey}</th>
-              {colValues.map(cv => (
-                <th key={cv} className="px-2 py-1.5 border text-right font-semibold" style={thStyle}>{cv}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rowValues.map((rv, i) => (
-              <tr
-                key={rv}
-                style={{
-                  background: i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)',
-                }}
-              >
-                <td
-                  className="px-2 py-1.5 border font-medium"
-                  style={{ color: 'var(--dash-row-text, #374151)', borderColor: 'var(--dash-table-border, #E5E7EB)' }}
-                >
-                  {rv}
-                </td>
-                {colValues.map(cv => (
-                  <td
-                    key={cv}
-                    className="px-2 py-1.5 border text-right"
-                    style={{ color: 'var(--dash-row-text, #374151)', borderColor: 'var(--dash-table-border, #E5E7EB)' }}
-                  >
-                    {lookup[rv]?.[cv] != null ? String(lookup[rv][cv]) : '—'}
-                  </td>
+    return (() => {
+        const ptw = tableWidth || 600
+        const pSz: 'xs'|'sm'|'md'|'lg' = ptw < 280 ? 'xs' : ptw < 420 ? 'sm' : ptw < 650 ? 'md' : 'lg'
+        const pF  = { xs: 9, sm: 10, md: 11, lg: 12 }[pSz]
+        const pPX = { xs: 4, sm: 6,  md: 8,  lg: 12 }[pSz]
+        const pPY = { xs: 2, sm: 3,  md: 4,  lg: 6  }[pSz]
+        const pLabelMin = { xs: 70, sm: 90, md: 110, lg: 140 }[pSz]
+        const pValMin   = { xs: 48, sm: 60, md: 72,  lg: 90  }[pSz]
+        const cellStyle = (align: 'left'|'right', isHead = false): React.CSSProperties => ({
+          padding: `${pPY}px ${pPX}px`,
+          whiteSpace: 'nowrap',
+          textAlign: align,
+          background: isHead ? 'var(--dash-th-bg, #F3F4F6)' : undefined,
+          color: isHead ? 'var(--dash-text-muted, #6B7280)' : 'var(--dash-row-text, #374151)',
+          borderColor: 'var(--dash-table-border, #E5E7EB)',
+          fontWeight: isHead ? 600 : undefined,
+        })
+        return (
+          <div ref={tableContainerRef} className="overflow-auto w-full" style={{ height, fontSize: pF }}>
+            <table className="border-collapse" style={{ minWidth: '100%', tableLayout: 'auto', fontSize: pF }}>
+              <thead className="sticky top-0 z-10">
+                <tr>
+                  <th className="border" style={{ ...cellStyle('left', true), minWidth: pLabelMin }}>{rowDimKey}</th>
+                  {colValues.map(cv => (
+                    <th key={cv} className="border" style={{ ...cellStyle('right', true), minWidth: pValMin }}>{cv}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rowValues.map((rv, i) => (
+                  <tr key={rv} style={{ background: i % 2 === 1 ? 'var(--dash-row-alt, #F9FAFB)' : 'var(--dash-card-bg, #FFFFFF)' }}>
+                    <td className="border font-medium" style={cellStyle('left')}>{rv}</td>
+                    {colValues.map(cv => (
+                      <td key={cv} className="border" style={cellStyle('right')}>
+                        {lookup[rv]?.[cv] != null ? String(lookup[rv][cv]) : '—'}
+                      </td>
+                    ))}
+                  </tr>
                 ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    )
+              </tbody>
+            </table>
+          </div>
+        )
+      })()
   }
 
   // ── Pie / Donut ────────────────────────────────────────────────────────────────

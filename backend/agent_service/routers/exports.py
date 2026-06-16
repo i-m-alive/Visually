@@ -69,7 +69,7 @@ async def _get_user_id(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> str:
-    if DEV_MODE:
+    if DEV_MODE and credentials is None:
         # In dev mode return a stable dev user, creating it if needed
         dev_uuid = uuid.UUID(DEV_USER_ID)
         result = await db.execute(select(User).where(User.id == dev_uuid))

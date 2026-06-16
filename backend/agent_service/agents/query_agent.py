@@ -173,9 +173,14 @@ CHART TYPE SQL PATTERNS:
 - line: SELECT date_trunc('month', date_col) AS period, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 1
 - bar_vertical: SELECT dim AS category, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 20
 - bar_horizontal: same as bar_vertical
+- waterfall: SELECT step_name AS category, delta_value AS value FROM table ORDER BY step_order LIMIT 20
+  [Each row is one step: positive value = gain (green bar), negative = loss (red bar), last row labelled "Total"/"Net" becomes the summary bar.
+   For derived waterfalls (no dedicated waterfall table): SELECT period AS category, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 1 LIMIT 20]
 - pie: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 8
 - donut: same as pie
 - kpi: SELECT {agg}(metric) AS value FROM table  [CRITICAL: NO WHERE, NO GROUP BY — must return exactly 1 row]
+- multi_row_card: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 20
+  [Use when the user wants a KPI broken down by a category — produces label/value pairs like "TAO: 231 / VCS: 6531"]
 - scatter: SELECT x_col AS x, y_col AS y FROM table LIMIT 1000
 - table: SELECT relevant_cols FROM table ORDER BY sort_col DESC LIMIT 100
 - area: SELECT date_trunc('month', date_col) AS period, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 1
@@ -201,6 +206,10 @@ CHART TYPE SQL PATTERNS:
 - org_chart: SELECT id_col, name_col, parent_id_col FROM table ORDER BY 1 LIMIT 200
 - marimekko: SELECT category_col, segment_col, SUM(value_metric) AS value FROM table GROUP BY 1, 2 ORDER BY 1
 - choropleth: SELECT region_col AS region, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC
+- slicer: SELECT DISTINCT filter_col FROM table WHERE filter_col IS NOT NULL ORDER BY 1 LIMIT 300
+  [Slicer is a FILTER CONTROL widget — the SQL must return one column of distinct values for the dropdown/checkbox.
+   Set slicer_type: "dropdown" (single value), "checkbox" (multi-select), or "date_range" (date picker).
+   Set slicer_column to the exact column name that will be filtered in other widgets' queries.]
 
 KPI ABSOLUTE RULES (when chart_type is "kpi"):
 - SELECT exactly ONE aggregate — SUM(col), COUNT(*), AVG(col), or COUNT(DISTINCT col)
@@ -268,10 +277,27 @@ PIE CHART (proportional breakdown):
          FROM sales
          GROUP BY region ORDER BY 2 DESC LIMIT 8
 
+GROUPED KPI / MULTI-ROW CARD (multiple metric values broken down by a category):
+  Chart: "Job Count by Source", groups=[TAO, VCS]
+  SQL:   SELECT source AS "Source", COUNT(*) AS "Jobs"
+         FROM bullhorn_core_job_order
+         GROUP BY source ORDER BY 2 DESC LIMIT 20
+
+WATERFALL CHART (bridge / variance decomposition — positive=gain, negative=loss, last row=total):
+  Chart: "Revenue Bridge Q1→Q2", steps=cost categories
+  SQL:   SELECT step_name AS "Category", delta AS "Change"
+         FROM revenue_bridge
+         ORDER BY step_order LIMIT 20
+  If no dedicated bridge table, derive month-over-month deltas:
+  SQL:   SELECT TO_CHAR(DATE_TRUNC('month', sale_date), 'Mon YYYY') AS "Month",
+                SUM(revenue) - LAG(SUM(revenue)) OVER (ORDER BY DATE_TRUNC('month', sale_date)) AS "Change"
+         FROM sales
+         GROUP BY 1 ORDER BY DATE_TRUNC('month', sale_date) LIMIT 20
+
 Return ONLY valid JSON:
 {
   "sql": "SELECT ...",
-  "chart_type": "line|bar_vertical|bar_horizontal|pie|donut|kpi|scatter|table|area|stacked_bar|grouped_bar|funnel|gauge|treemap|pivot_table|radar|ribbon|bullet|scorecard|dot_plot|box_plot|sankey|chord|network|gantt|timeline|calendar_heatmap|word_cloud|org_chart|marimekko|choropleth",
+  "chart_type": "line|bar_vertical|bar_horizontal|pie|donut|kpi|multi_row_card|scatter|table|area|stacked_bar|grouped_bar|funnel|gauge|treemap|pivot_table|radar|ribbon|bullet|scorecard|dot_plot|box_plot|sankey|chord|network|gantt|timeline|calendar_heatmap|word_cloud|org_chart|marimekko|choropleth|waterfall",
   "table_used": "table_name",
   "x_axis_label": "...",
   "y_axis_label": "...",

@@ -144,6 +144,75 @@ async def add_connection(
     )
 
 
+@router.get("/{project_id}/connections", response_model=list[ConnectionResponse])
+async def list_connections(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+        ).order_by(DatabaseConnection.created_at.asc())
+    )
+    conns = result.scalars().all()
+    return [
+        ConnectionResponse(
+            id=str(c.id), project_id=str(c.project_id), name=c.name,
+            db_type=c.db_type.value, host=c.host, port=c.port,
+            database_name=c.database_name, username=c.username,
+            ssl_enabled=c.ssl_enabled, is_active=c.is_active,
+            last_tested_at=c.last_tested_at.isoformat() if c.last_tested_at else None,
+            created_at=c.created_at.isoformat(),
+        )
+        for c in conns
+    ]
+
+
+@router.patch("/{project_id}/connections/{conn_id}", response_model=ConnectionResponse)
+async def update_connection(
+    project_id: str,
+    conn_id: str,
+    req: ConnectionCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update an existing database connection (e.g. to fix a username or password typo)."""
+    result = await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.id == uuid.UUID(conn_id),
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+        )
+    )
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    conn.name = req.name
+    conn.db_type = DbType(req.db_type)
+    conn.host = req.host
+    conn.port = req.port
+    conn.database_name = req.database_name
+    conn.username = req.username
+    if req.password is not None:
+        # empty string = clear password (switch to IAM auth); non-empty = update password
+        conn.encrypted_password = encrypt(req.password) if req.password else None
+    conn.ssl_enabled = req.ssl_enabled
+    conn.connection_options = req.connection_options
+    conn.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(conn)
+    return ConnectionResponse(
+        id=str(conn.id), project_id=str(conn.project_id), name=conn.name,
+        db_type=conn.db_type.value, host=conn.host, port=conn.port,
+        database_name=conn.database_name, username=conn.username,
+        ssl_enabled=conn.ssl_enabled, is_active=conn.is_active,
+        last_tested_at=conn.last_tested_at.isoformat() if conn.last_tested_at else None,
+        created_at=conn.created_at.isoformat(),
+    )
+
+
 @router.post("/{project_id}/connections/{conn_id}/test", response_model=ConnectionTestResult)
 async def test_connection(
     project_id: str,
@@ -165,16 +234,69 @@ async def test_connection(
     if conn.encrypted_password:
         password = decrypt(conn.encrypted_password)
 
-    import time
+    import time, asyncio as _asyncio
     start = time.monotonic()
     try:
-        if conn.db_type.value in ("postgresql", "redshift"):
+        if conn.db_type.value == "redshift":
+            import redshift_connector as _rsc, os as _os
+            _host = conn.host or ""
+            _is_serverless = "redshift-serverless" in _host
+            # Serverless workgroups auto-pause; allow 90s for them to wake up
+            _timeout = 90 if _is_serverless else 20
+            conn_kwargs: dict = {
+                "host": _host, "port": conn.port or 5439,
+                "database": conn.database_name or "", "ssl": True, "timeout": _timeout,
+            }
+            if _is_serverless:
+                conn_kwargs["is_serverless"] = True
+                # Host format: <workgroup>.<account>.<region>.redshift-serverless.amazonaws.com
+                _parts = _host.split(".")
+                if len(_parts) >= 3:
+                    conn_kwargs["region"] = _parts[2]
+                if _parts:
+                    conn_kwargs["serverless_work_group"] = _parts[0]
+            if not password:
+                try:
+                    from dotenv import load_dotenv as _ld
+                    _env = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..', '..', '.env')
+                    if _os.path.exists(_env):
+                        _ld(_env, override=True)
+                except ImportError:
+                    pass
+                _ak = _os.getenv("AWS_ACCESS_KEY_ID", "")
+                _sk = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
+                _tok = _os.getenv("AWS_SESSION_TOKEN", "")
+                _region = conn_kwargs.get("region", "us-east-1")
+                # Pre-validate credentials — expired STS tokens cause a confusing fallback error
+                try:
+                    import boto3 as _boto3
+                    _sts = _boto3.client("sts", aws_access_key_id=_ak, aws_secret_access_key=_sk,
+                                         aws_session_token=_tok or None, region_name=_region)
+                    _sts.get_caller_identity()
+                except Exception as _ce:
+                    raise Exception(
+                        f"AWS credentials invalid or expired: {_ce}. "
+                        "Run: aws sts get-session-token  then update .env and restart."
+                    )
+                conn_kwargs["iam"] = True
+                conn_kwargs["aws_access_key_id"] = _ak
+                conn_kwargs["aws_secret_access_key"] = _sk
+                if _tok:
+                    conn_kwargs["aws_session_token"] = _tok
+                conn_kwargs["database_user"] = conn.username or "awsuser"
+            else:
+                conn_kwargs["user"] = conn.username or ""
+                conn_kwargs["password"] = password
+            def _sync_test():
+                rc = _rsc.connect(**conn_kwargs)
+                rc.close()
+            await _asyncio.get_event_loop().run_in_executor(None, _sync_test)
+        elif conn.db_type.value == "postgresql":
             import asyncpg
             pg_conn = await asyncpg.connect(
                 host=conn.host, port=conn.port or 5432,
                 database=conn.database_name, user=conn.username,
-                password=password,
-                command_timeout=10,
+                password=password, command_timeout=10,
             )
             await pg_conn.close()
         elif conn.db_type.value == "mysql":
@@ -203,6 +325,10 @@ async def trigger_schema_crawl(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid project ID: {project_id!r}")
     result = await db.execute(
         select(DatabaseConnection).where(
             DatabaseConnection.project_id == uuid.UUID(project_id),
@@ -230,6 +356,10 @@ async def get_schema(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid project ID: {project_id!r}")
     conn_result = await db.execute(
         select(DatabaseConnection).where(
             DatabaseConnection.project_id == uuid.UUID(project_id),
