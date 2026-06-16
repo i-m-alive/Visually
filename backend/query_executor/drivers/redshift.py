@@ -71,9 +71,10 @@ def _execute_sync(
     # Serverless workgroups pause when idle; the FIRST connect to a cold cluster
     # triggers a wake that can take ~60–120s and may itself time out or get reset
     # mid-wake. Retry so the follow-up attempt lands on an awake cluster instead of
-    # surfacing "connection time out" to the user. Provisioned clusters don't pause,
-    # so a single attempt is enough there.
-    _max_attempts = 3 if is_serverless else 1
+    # surfacing "connection time out" to the user. This is the Redshift driver, so
+    # ALWAYS retry — when reached via a tunnel (e.g. ngrok for a demo) the host won't
+    # contain "redshift-serverless", so we can't rely on is_serverless to decide.
+    _max_attempts = 3
     conn = None
     last_exc: Exception | None = None
     for _attempt in range(1, _max_attempts + 1):
