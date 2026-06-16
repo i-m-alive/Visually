@@ -544,11 +544,16 @@ async def _get_primary_connection(project_id: str, db: AsyncSession):
 
 
 async def _execute_sql(connection_id: str, sql: str) -> dict:
+    # Redshift Serverless can take 60–120s to wake from idle, and heavy aggregations
+    # (e.g. SUM over a multi-year timesheet table) run well past 20s. The old 20s
+    # query timeout cancelled those mid-flight — the executor returned 0 rows, which
+    # the chat reported as "no matching data" even though the data was there. Give it
+    # a real budget so the query completes instead of being killed.
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=130.0) as client:
             resp = await client.post(
                 f"{QUERY_EXECUTOR_URL}/execute",
-                json={"connection_id": connection_id, "sql": sql, "row_limit": 1000, "timeout_seconds": 20},
+                json={"connection_id": connection_id, "sql": sql, "row_limit": 1000, "timeout_seconds": 120},
             )
             if resp.status_code == 200:
                 return resp.json()
