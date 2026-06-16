@@ -20,8 +20,12 @@ def _execute_sync(
     start = time.monotonic()
 
     is_serverless = "redshift-serverless" in (host or "")
-    # Serverless workgroups auto-pause; allow 120s for them to wake up on first connect
-    _timeout = 120 if is_serverless else 60
+    # Serverless workgroups auto-pause. We RETRY the connect (see below), so use a
+    # shorter per-attempt timeout: the first attempt kicks off the wake, and a later
+    # attempt lands on the now-awake cluster. Shorter per-attempt timeouts mean the
+    # retries fit inside the caller's overall request budget instead of one long
+    # attempt eating it all.
+    _timeout = 60 if is_serverless else 60
 
     conn_kwargs: dict[str, Any] = {
         "host": host,
@@ -64,15 +68,31 @@ def _execute_sync(
         conn_kwargs["iam"] = True
         conn_kwargs["iam_role_arn"] = iam_role_arn
 
-    try:
-        conn = redshift_connector.connect(**conn_kwargs)
-    except Exception as exc:
-        print(f"[redshift] ✗ connect failed: {exc}", flush=True)
+    # Serverless workgroups pause when idle; the FIRST connect to a cold cluster
+    # triggers a wake that can take ~60–120s and may itself time out or get reset
+    # mid-wake. Retry so the follow-up attempt lands on an awake cluster instead of
+    # surfacing "connection time out" to the user. Provisioned clusters don't pause,
+    # so a single attempt is enough there.
+    _max_attempts = 3 if is_serverless else 1
+    conn = None
+    last_exc: Exception | None = None
+    for _attempt in range(1, _max_attempts + 1):
+        try:
+            conn = redshift_connector.connect(**conn_kwargs)
+            if _attempt > 1:
+                print(f"[redshift] ✓ connected on attempt {_attempt} (cluster was waking)", flush=True)
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"[redshift] ✗ connect attempt {_attempt}/{_max_attempts} failed: {exc}", flush=True)
+            if _attempt < _max_attempts:
+                time.sleep(3)  # brief pause; the prior attempt already kicked off the wake
+    if conn is None:
         return {
             "rows": [], "row_count": 0, "columns": [],
             "duration_ms": (time.monotonic() - start) * 1000,
             "truncated": False,
-            "error": str(exc),
+            "error": str(last_exc) if last_exc else "connect failed",
         }
 
     try:
