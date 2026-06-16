@@ -272,7 +272,23 @@ export default function QueryPage() {
                           </button>
                         </div>
                       </div>
-                      <ChartRenderer result={msg.chartResult} />
+
+                      {msg.chartResult.output_mode === 'text' ? (
+                        msg.chartResult.narrative ? (
+                          <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-line">{msg.chartResult.narrative}</p>
+                        ) : (
+                          <ChartRenderer result={msg.chartResult} />
+                        )
+                      ) : (
+                        <>
+                          <ChartRenderer result={msg.chartResult} />
+                          {msg.chartResult.narrative && (
+                            <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">
+                              {msg.chartResult.narrative}
+                            </p>
+                          )}
+                        </>
+                      )}
                     </div>
                   )}
 

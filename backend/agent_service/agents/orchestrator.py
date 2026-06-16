@@ -124,6 +124,8 @@ class Orchestrator:
             _MAX_SINGLE_VIZ_ATTEMPTS = 4
             # Extract user-requested chart type (None if user didn't specify one)
             expected_chart_type: Optional[str] = getattr(intent.entities, "chart_type", None)
+            # How the user wants the answer presented: "chart" (visualize) or "text" (prose answer)
+            output_mode: str = (getattr(intent, "output_mode", "chart") or "chart").lower()
 
             for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1):
                 # Step 3: Generate query — pass attempt so temperature scales on retries
@@ -175,13 +177,16 @@ class Orchestrator:
                 })
                 await set_pipeline_state(redis, job_id, "step", "query_executed")
 
-                # Step 5: Render chart
-                render_result = await self._render_chart(query_plan, execute_result)
-                await emit({
-                    "type": "chart.rendered",
-                    "job_id": job_id,
-                    "chart_type": query_plan.chart_type,
-                })
+                # Step 5: Render chart — only when the answer is meant to be a chart
+                if output_mode == "chart":
+                    render_result = await self._render_chart(query_plan, execute_result)
+                    await emit({
+                        "type": "chart.rendered",
+                        "job_id": job_id,
+                        "chart_type": query_plan.chart_type,
+                    })
+                else:
+                    render_result = {}
                 await set_pipeline_state(redis, job_id, "step", "chart_rendered")
 
                 # Step 6: Validate — pass expected_chart_type so type comparison is accurate
@@ -240,6 +245,22 @@ class Orchestrator:
                     "y_axis_label": query_plan.y_axis_label,
                     "validation_details": {},
                 }
+
+            # Narrate the result: a concise chart caption, or a prose answer for text mode.
+            narrative = ""
+            try:
+                from agent_service.agents.result_narrator import narrate as _narrate
+                narrative = await _narrate(user_text, query_plan, execute_result, output_mode)
+            except Exception as _ne:
+                print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
+            final_result["output_mode"] = output_mode
+            final_result["narrative"] = narrative
+            await emit({
+                "type": "result.narrated",
+                "job_id": job_id,
+                "output_mode": output_mode,
+                "narrative": narrative,
+            })
 
             await emit({
                 "type": "chart.confirmed",

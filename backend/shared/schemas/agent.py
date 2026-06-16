@@ -34,6 +34,8 @@ class IntentResult(BaseModel):
     followup_ref: Optional[str] = None
     sub_intents: List[str] = []
     reasoning: str
+    # How the answer should be presented: "chart" (visualize) or "text" (prose answer).
+    output_mode: str = "chart"
 
 
 class SchemaResolved(BaseModel):

@@ -21,6 +21,10 @@ export interface ChartResult {
   validation_details?: Record<string, unknown>
   // Extra metadata passed through for slicer widgets
   extra_config?: Record<string, unknown>
+  // How to present the answer: "chart" (visualize) or "text" (prose answer only)
+  output_mode?: string
+  // Human-facing explanation: a chart caption, or the prose answer for text mode
+  narrative?: string
 }
 
 interface PipelineSteps {
@@ -239,6 +243,8 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
               y_axis_label: chartData?.y_axis_label as string,
               table_used: chartData?.table_used as string,
               validation_details: chartData?.validation_details as Record<string, unknown>,
+              output_mode: (chartData?.output_mode as string) || 'chart',
+              narrative: (chartData?.narrative as string) || '',
             }
           }
           break
