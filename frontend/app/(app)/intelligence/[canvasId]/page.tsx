@@ -1493,10 +1493,10 @@ function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; activ
             title={s.label}
             className="intel-nav-item"
             style={{
-              width: 52, flexShrink: 0,
+              width: 78, flexShrink: 0,
               background: 'transparent', border: 'none', cursor: 'pointer',
               display: 'flex', flexDirection: 'column', alignItems: 'center',
-              gap: 5, padding: '5px 0', outline: 'none',
+              gap: 5, padding: '5px 2px', outline: 'none',
             }}
           >
             <div style={{
@@ -1511,12 +1511,14 @@ function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; activ
               <SectionIcon name={s.icon} size={17} />
             </div>
             <span style={{
-              fontSize: 8, fontWeight: 600, letterSpacing: '0.01em',
-              color: isActive ? C.teal2 : 'rgba(255,255,255,0.38)',
-              textAlign: 'center', lineHeight: 1.2, maxWidth: 54,
-              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              fontSize: 10, fontWeight: 600, letterSpacing: '0.01em',
+              color: isActive ? C.teal2 : 'rgba(255,255,255,0.55)',
+              textAlign: 'center', lineHeight: 1.2, maxWidth: 74,
+              display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+              overflow: 'hidden', textOverflow: 'ellipsis',
+              wordBreak: 'break-word', hyphens: 'auto',
               transition: 'color 0.2s',
-            }}>{s.label.length > 9 ? s.label.slice(0, 9) : s.label}</span>
+            } as React.CSSProperties}>{s.label}</span>
           </button>
         )
       })}
@@ -2539,7 +2541,7 @@ export default function IntelligenceCanvasPage() {
   if (!analysis) return null
 
   return (
-    <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: '62px 1fr', overflow: 'hidden' }}>
+    <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: '82px 1fr', overflow: 'hidden' }}>
 
       {/* Left rail */}
       <LeftRail sections={analysis.sections} active={activeSection} onNav={handleNavSection} />

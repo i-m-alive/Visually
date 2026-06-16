@@ -19,6 +19,28 @@ const DEFAULT_COLORS = [
   '#6366F1', '#F59E0B', '#10B981', '#8B5CF6', '#EF4444',
 ]
 
+// Compact swatch legend rendered beneath a chart. Used in chat where recharts'
+// built-in legend either can't represent per-category colours (single-series
+// bars) or is hidden at small heights. Fixed height + overflow:hidden so it
+// never pushes the chart past its allotted box.
+function SwatchLegend({ items, colors, height: h = 24 }: { items: string[]; colors: string[]; height?: number }) {
+  return (
+    <div style={{
+      height: h, overflow: 'hidden',
+      display: 'flex', flexWrap: 'wrap', alignContent: 'flex-start',
+      gap: '3px 12px', justifyContent: 'center', padding: '4px 8px 0',
+      fontSize: 10, lineHeight: 1.2,
+    }}>
+      {items.map((label, i) => (
+        <span key={label + i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--dash-text-muted, #6B7280)', maxWidth: 130 }}>
+          <span style={{ width: 9, height: 9, borderRadius: 2, background: colors[i % colors.length], flexShrink: 0 }} />
+          <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
 interface Props {
   result: ChartResult | null | undefined
   compact?: boolean
@@ -28,9 +50,13 @@ interface Props {
   anomalyIndices?: number[]
   /** Cross-filter callback — fired when user clicks a bar/slice/row */
   onDataPointClick?: (column: string, value: unknown) => void
+  /** When true, render per-category colours + a swatch legend on single-series
+   *  charts and force pie/donut legends to show. Opt-in for chat surfaces so
+   *  dashboard widgets keep their existing single-colour look. */
+  legend?: boolean
 }
 
-export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick }: Props) {
+export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick, legend = false }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
 
   // Table sort + search state — must be declared before any early return (React rules of hooks)
@@ -158,6 +184,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   const fmtAvg = avgY !== null
     ? (Math.abs(avgY) >= 1e6 ? `Avg ${(avgY / 1e6).toFixed(1)}M` : Math.abs(avgY) >= 1e3 ? `Avg ${(avgY / 1e3).toFixed(1)}K` : `Avg ${Math.round(avgY)}`)
     : ''
+
+  // Time-series axes (dates / months) should stay single-colour — a rainbow of
+  // months reads as noise. Categorical axes get one colour per category.
+  const xIsTime =
+    trimmedData.some(r => /^\d{4}-\d{2}-\d{2}[T ]/.test(String(r[xKey] ?? ''))) ||
+    /\b(date|month|year|day|time|week|quarter|qtr|period|fy)\b/i.test(String(xKey))
+  const metricName = y_axis_label || yKey
 
   // ── KPI ──────────────────────────────────────────────────────────────────────
   if (ct === 'kpi' || ct === 'kpi_card') {
@@ -456,7 +489,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       pieData = [...top, { name: `Other (${rawPie.length - MAX_SLICES + 1})`, value: otherSum }]
     }
     const manySlices = pieData.length > 7
-    const showLegend = height > 160
+    const showLegend = legend ? height > 110 : height > 160
     // Only show inline labels when the card is tall enough to give the labels room.
     // Below 300px rely on the legend + tooltip — labels overflow card edges at smaller heights.
     const showInlineLabels = !manySlices && height >= 300
@@ -587,48 +620,56 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   // ── Line ──────────────────────────────────────────────────────────────────────
   if (ct === 'line') {
     const anomalySet = new Set(anomalyIndices)
+    const legH = legend ? 22 : 0
     return (
-      <ResponsiveContainer width="100%" height={height}>
-        <LineChart data={rechartData}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey={xKey} label={{ value: x_axis_label, position: 'insideBottom', offset: -5 }} tick={{ fontSize: 11 }} />
-          <YAxis label={{ value: y_axis_label, angle: -90, position: 'insideLeft' }} tick={{ fontSize: 11 }} />
-          <Tooltip />
-          {avgY !== null && (
-            <ReferenceLine y={avgY} stroke="#F59E0B" strokeDasharray="4 2"
-              label={{ value: fmtAvg, position: 'insideTopRight', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
-          )}
-          <Line type="monotone" dataKey={yKey} stroke={COLORS[0]} strokeWidth={2}
-            dot={showAnomalies ? (props: Record<string, unknown>) => {
-              const idx = props.index as number
-              if (!anomalySet.has(idx)) return <circle key={idx} cx={props.cx as number} cy={props.cy as number} r={0} fill="none" />
-              return <circle key={idx} cx={props.cx as number} cy={props.cy as number} r={5} fill="#EF4444" stroke="white" strokeWidth={1.5} />
-            } : false}
-          />
-        </LineChart>
-      </ResponsiveContainer>
+      <div style={{ height }}>
+        <ResponsiveContainer width="100%" height={height - legH}>
+          <LineChart data={rechartData}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey={xKey} label={{ value: x_axis_label, position: 'insideBottom', offset: -5 }} tick={{ fontSize: 11 }} />
+            <YAxis label={{ value: y_axis_label, angle: -90, position: 'insideLeft' }} tick={{ fontSize: 11 }} />
+            <Tooltip />
+            {avgY !== null && (
+              <ReferenceLine y={avgY} stroke="#F59E0B" strokeDasharray="4 2"
+                label={{ value: fmtAvg, position: 'insideTopRight', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
+            )}
+            <Line type="monotone" dataKey={yKey} name={metricName} stroke={COLORS[0]} strokeWidth={2}
+              dot={showAnomalies ? (props: Record<string, unknown>) => {
+                const idx = props.index as number
+                if (!anomalySet.has(idx)) return <circle key={idx} cx={props.cx as number} cy={props.cy as number} r={0} fill="none" />
+                return <circle key={idx} cx={props.cx as number} cy={props.cy as number} r={5} fill="#EF4444" stroke="white" strokeWidth={1.5} />
+              } : false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+        {legend && <SwatchLegend items={[metricName]} colors={[COLORS[0]]} height={legH} />}
+      </div>
     )
   }
 
   // ── Area ──────────────────────────────────────────────────────────────────────
   if (ct === 'area') {
+    const legH = legend ? 22 : 0
     return (
-      <ResponsiveContainer width="100%" height={height}>
-        <AreaChart data={rechartData}>
-          <defs>
-            <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={COLORS[0]} stopOpacity={0.3} />
-              <stop offset="95%" stopColor={COLORS[0]} stopOpacity={0.02} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey={xKey} tick={{ fontSize: 11 }} />
-          <YAxis tick={{ fontSize: 11 }} />
-          <Tooltip />
-          <Area type="monotone" dataKey={yKey} stroke={COLORS[0]} strokeWidth={2}
-            fill="url(#areaGrad)" dot={false} />
-        </AreaChart>
-      </ResponsiveContainer>
+      <div style={{ height }}>
+        <ResponsiveContainer width="100%" height={height - legH}>
+          <AreaChart data={rechartData}>
+            <defs>
+              <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={COLORS[0]} stopOpacity={0.3} />
+                <stop offset="95%" stopColor={COLORS[0]} stopOpacity={0.02} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey={xKey} tick={{ fontSize: 11 }} />
+            <YAxis tick={{ fontSize: 11 }} />
+            <Tooltip />
+            <Area type="monotone" dataKey={yKey} name={metricName} stroke={COLORS[0]} strokeWidth={2}
+              fill="url(#areaGrad)" dot={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+        {legend && <SwatchLegend items={[metricName]} colors={[COLORS[0]]} height={legH} />}
+      </div>
     )
   }
 
@@ -1909,9 +1950,11 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
               <ReferenceLine x={avgY} stroke="#F59E0B" strokeDasharray="4 2"
                 label={{ value: fmtAvg, position: 'top', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
             )}
-            <Bar dataKey={yKey} fill={`url(#${gradId})`} radius={[0, 3, 3, 0]} maxBarSize={22}
+            <Bar dataKey={yKey} name={metricName} fill={legend ? undefined : `url(#${gradId})`} radius={[0, 3, 3, 0]} maxBarSize={22}
               onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data[xKey]) : undefined}>
-              {showAnomalies && capped.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null)}
+              {legend
+                ? capped.map((_, i) => <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />)
+                : (showAnomalies && capped.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null))}
               <LabelList dataKey={yKey} position="right" style={{ fontSize: 9, fill: 'var(--dash-text-muted, #6B7280)' }}
                 formatter={(v: number) => isNaN(v) ? '' : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v)} />
             </Bar>
@@ -1920,8 +1963,14 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
       </div>
     )
   }
-  return (
-    <ResponsiveContainer width="100%" height={height}>
+  // Categorical bars get one colour per category + a swatch legend in chat mode;
+  // time-series stay single-colour with just a metric legend so months don't turn
+  // into a rainbow.
+  const barCategories = rechartData.map(r => String(r[xKey] ?? ''))
+  const barMultiColor = legend && !xIsTime && barCategories.length <= 16
+  const barLegH = legend ? 24 : 0
+  const barChart = (
+    <ResponsiveContainer width="100%" height={legend ? height - barLegH : height}>
       <BarChart data={rechartData} style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
         <defs>
           <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
@@ -1937,13 +1986,26 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
           <ReferenceLine y={avgY} stroke="#F59E0B" strokeDasharray="4 2"
             label={{ value: fmtAvg, position: 'insideTopRight', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
         )}
-        <Bar dataKey={yKey} fill={`url(#${gradId})`} radius={[3, 3, 0, 0]}
+        <Bar dataKey={yKey} name={metricName} fill={barMultiColor ? undefined : `url(#${gradId})`} radius={[3, 3, 0, 0]}
           onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data[xKey]) : undefined}>
-          {showAnomalies && rechartData.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null)}
+          {barMultiColor
+            ? rechartData.map((_, i) => <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />)
+            : (showAnomalies && rechartData.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null))}
           <LabelList dataKey={yKey} position="top" style={{ fontSize: 9, fill: 'var(--dash-text-muted, #6B7280)' }}
             formatter={(v: number) => isNaN(v) ? '' : Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v)} />
         </Bar>
       </BarChart>
     </ResponsiveContainer>
+  )
+  if (!legend) return barChart
+  return (
+    <div style={{ height }}>
+      {barChart}
+      <SwatchLegend
+        items={barMultiColor ? barCategories : [metricName]}
+        colors={barMultiColor ? COLORS : [COLORS[0]]}
+        height={barLegH}
+      />
+    </div>
   )
 }

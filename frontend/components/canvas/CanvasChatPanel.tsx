@@ -359,7 +359,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                   // Single chart — compact preview
                   <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
                     <p className="text-xs font-semibold text-gray-700 mb-2">{msg.inlineCharts[0].title}</p>
-                    <ChartRenderer result={msg.inlineCharts[0]} height={150} />
+                    <ChartRenderer result={msg.inlineCharts[0]} height={172} legend />
                     <div className="mt-2.5">
                       {onAddToPage ? (
                         <button
@@ -403,7 +403,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                           <span className="text-xs font-semibold text-gray-700 truncate flex-1">{chart.title}</span>
                           <span className="text-[10px] text-gray-400 shrink-0 bg-gray-100 px-1.5 py-0.5 rounded">{chart.chart_type}</span>
                         </label>
-                        <ChartRenderer result={chart} height={110} />
+                        <ChartRenderer result={chart} height={134} legend />
                       </div>
                     ))}
                     <div className="px-3 py-2.5 bg-white">
