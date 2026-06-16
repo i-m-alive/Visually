@@ -2445,10 +2445,11 @@ export default function IntelligenceCanvasPage() {
     setHasSavedData(false)
     setRerunning(true); setAgentStatus('running'); setAgentError(null); setAiFallbackWarning(false)
     try {
-      // Re-fetch live data on regenerate too
+      // Re-fetch live data on regenerate too — force a cache bypass so the user
+      // gets genuinely fresh rows, not the cached intelligence-data payload.
       let widgets = rawWidgets
       try {
-        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, appliedDateRange ?? undefined)
+        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, appliedDateRange ?? undefined, true)
         widgets = mergeWidgetData(rawWidgets, liveResp.data?.widget_data ?? [])
         setRawWidgets(widgets)
         setLastFetchedAt(new Date())

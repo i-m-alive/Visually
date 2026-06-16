@@ -277,6 +277,7 @@ export const intelligenceApi = {
   fetchWidgetData: (
     dashboardId: string,
     dateRange?: { from: string; to: string } | null,
+    force = false,
   ) =>
     api.post<{
       widget_data: Array<{
@@ -290,7 +291,10 @@ export const intelligenceApi = {
       }>
     }>(
       `/dashboards/${dashboardId}/intelligence-data`,
-      dateRange ? { date_from: dateRange.from, date_to: dateRange.to } : {},
+      {
+        ...(dateRange ? { date_from: dateRange.from, date_to: dateRange.to } : {}),
+        force,
+      },
     ),
 
   /**
