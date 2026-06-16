@@ -16,6 +16,7 @@ from .tier5 import RLSPolicy
 from .annotations import DashboardAnnotation
 from .bookmarks import DashboardBookmark
 from .snapshot_schedules import SnapshotSchedule
+from .query_chat import QuerySession, QueryMessage
 
 __all__ = [
     "User", "Project", "ProjectMember", "DatabaseConnection",
@@ -27,4 +28,5 @@ __all__ = [
     "CanvasShareToken", "CanvasCollaborator",
     "RLSPolicy",
     "DashboardAnnotation", "DashboardBookmark", "SnapshotSchedule",
+    "QuerySession", "QueryMessage",
 ]

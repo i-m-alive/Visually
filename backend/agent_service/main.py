@@ -40,6 +40,7 @@ from agent_service.agents.orchestrator import Orchestrator
 from agent_service.agents.intent_classifier import IntentClassifier as QuickClassifier
 from agent_service.routers import chat as chat_module
 from agent_service.routers import exports as exports_module
+from agent_service.routers import query_sessions as query_sessions_module
 from agent_service.routers import vly as vly_module
 from agent_service.routers import share as share_module
 from agent_service.routers import public_canvas as public_canvas_module
@@ -128,6 +129,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 app.include_router(chat_module.router)
 app.include_router(exports_module.router)
+app.include_router(query_sessions_module.router)
 app.include_router(vly_module.router)
 app.include_router(share_module.router)
 app.include_router(public_canvas_module.router)

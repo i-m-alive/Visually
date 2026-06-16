@@ -61,6 +61,20 @@ export const agentApi = {
     api.get(`/agent/jobs/${jobId}`),
 }
 
+// Persistent Query-feature chat history (sessions + message tree / branching)
+export const querySessionApi = {
+  list: (projectId: string) => api.get('/query/sessions', { params: { project_id: projectId } }),
+  create: (projectId: string, title?: string) => api.post('/query/sessions', { project_id: projectId, title }),
+  get: (sid: string) => api.get(`/query/sessions/${sid}`),
+  rename: (sid: string, title: string) => api.patch(`/query/sessions/${sid}`, { title }),
+  setActiveLeaf: (sid: string, active_leaf_id: string) => api.patch(`/query/sessions/${sid}`, { active_leaf_id }),
+  remove: (sid: string) => api.delete(`/query/sessions/${sid}`),
+  addMessage: (
+    sid: string,
+    body: { role: 'user' | 'assistant'; content: string; parent_id?: string | null; result?: unknown; job_id?: string },
+  ) => api.post(`/query/sessions/${sid}/messages`, body),
+}
+
 export interface ChatSendData {
   session_id?: string
   message: string
