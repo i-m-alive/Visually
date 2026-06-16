@@ -169,8 +169,11 @@ if run data || run backend || run agent || run frontend || run migrate || run ur
   # turned OFF on the server so the plain asyncpg/psycopg2 URLs work as-is.
   DB_ASYNC="postgresql+asyncpg://${PG_FLEX_USER}:${PG_FLEX_PASSWORD}@${PG_FLEX_HOST}:5432/${PG_DB_NAME}"
   DB_SYNC="postgresql://${PG_FLEX_USER}:${PG_FLEX_PASSWORD}@${PG_FLEX_HOST}:5432/${PG_DB_NAME}"
-  # Redis still runs as a container (internal TCP ingress).
-  REDIS_URL_VAL="redis://$APP_REDIS.internal.$DOMAIN:6379"
+  # Redis runs as a container with internal TCP ingress. IMPORTANT: use the short
+  # app name, NOT the full .internal.<domain> FQDN. ACA routes HTTP internal traffic
+  # via the FQDN fine, but TCP internal traffic over the FQDN times out — the
+  # intra-environment short name resolves and connects correctly for TCP.
+  REDIS_URL_VAL="redis://$APP_REDIS:6379"
 
   REG=( --registry-server "$ACR_LOGIN" --registry-username "$ACR_USER" --registry-password "$ACR_PASS" )
 
