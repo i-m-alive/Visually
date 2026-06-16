@@ -348,6 +348,84 @@ def import_cache_json(connection_id: str, json_str: str) -> EnrichedSchema:
     return enriched
 
 
+async def export_cache_for_connection(
+    connection_id: str, schema_doc: dict, db_type: str
+) -> Optional[str]:
+    """
+    Ensure the enriched cache for this connection is warm (build it from schema_doc if
+    it isn't already cached), then return the serialized JSON.
+
+    Used by .vly export to embed a fully-baked schema cache so the importing
+    environment can skip the cold build (crawl + LLM enrichment) entirely.
+
+    Returns None if no cache could be produced (e.g. empty schema_doc).
+    """
+    if not connection_id or not schema_doc or not schema_doc.get("tables"):
+        return None
+    try:
+        # get_or_build populates _store (L1) — hitting Redis/filesystem if already warm,
+        # cold-building once otherwise. Either way the result is exportable afterwards.
+        await get_or_build(connection_id, schema_doc, db_type)
+    except Exception as exc:
+        print(f"[schema_cache] ⚠ export_cache_for_connection build failed: {exc}", flush=True)
+        return None
+    return export_cache_json(connection_id)
+
+
+async def install_imported_cache(connection_id: str, enriched_json: str) -> Optional[str]:
+    """
+    Install a cache that was exported elsewhere (e.g. embedded in a .vly archive) so a
+    freshly-resolved connection is warm with ZERO cold build.
+
+    Re-keys the cache onto `connection_id` and persists it across all tiers:
+      • L1 in-process (_store)
+      • filesystem  (survives restarts)
+      • Redis       (shared across workers, when available)
+
+    The cache key is derived from the embedded schema_doc's hash, so it matches the
+    hash that get_or_build() computes from the SchemaSnapshot written at import time.
+
+    Returns the schema_hash used, or None on failure (non-fatal — caller falls back to
+    a normal crawl/cold build).
+    """
+    try:
+        enriched = _deserialize_enriched(enriched_json)
+    except Exception as exc:
+        print(f"[schema_cache] ⚠ install_imported_cache deserialize failed: {exc}", flush=True)
+        return None
+
+    _store[connection_id] = enriched
+    schema_hash = compute_schema_hash(enriched.schema_doc)
+    # Re-serialize canonically so the persisted form matches what _serialize_enriched
+    # would write (the incoming string may carry foreign whitespace / key order).
+    serialized = _serialize_enriched(enriched)
+
+    _fs_write(connection_id, schema_hash, serialized)
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            await redis.setex(
+                f"{_REDIS_KEY_PREFIX}:{connection_id}:{schema_hash}",
+                SCHEMA_CACHE_TTL,
+                serialized,
+            )
+            print(
+                f"[schema_cache] ✓ installed imported cache in Redis  connection={connection_id}"
+                f"  hash={schema_hash}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[schema_cache] ⚠ install_imported_cache Redis write failed (non-fatal): {exc}", flush=True)
+
+    print(
+        f"[schema_cache] ✓ imported cache installed  connection={connection_id}"
+        f"  hash={schema_hash}  tables={len(enriched.compact_tables)}",
+        flush=True,
+    )
+    return schema_hash
+
+
 # ── Internal builder ──────────────────────────────────────────────────────────
 
 async def _load_db_metadata(connection_id: str) -> dict:

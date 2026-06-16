@@ -431,7 +431,29 @@ async def get_intelligence_schema_context(
     if not connection_id:
         return {"tables": [], "message": "No database connection found"}
 
-    # --- fetch table metadata ---
+    # --- prefer the enriched schema cache (same warm path as the chat copilot) ---
+    # It folds in LLM table semantics, the SQL-confirmed FK graph, and example values,
+    # and is instantly warm after a .vly import (no crawl/LLM). Falls back to the raw
+    # metadata rows below when no snapshot/cache is available or no table matches.
+    try:
+        enriched_tables = await _tables_from_enriched_cache(db, connection_id, table_names)
+    except Exception as exc:
+        enriched_tables = None
+        print(f"[intelligence/schema-context] enriched path failed (non-fatal): {exc}", flush=True)
+    if enriched_tables:
+        print(
+            f"[intelligence/schema-context] dashboard={dashboard_id[:8]}  "
+            f"tables_referenced={len(table_names)}  tables_found={len(enriched_tables)}  "
+            f"source=enriched_cache",
+            flush=True,
+        )
+        return {
+            "tables": enriched_tables,
+            "referenced_tables": sorted(table_names),
+            "source": "enriched_cache",
+        }
+
+    # --- fetch table metadata (raw-row fallback) ---
     tbl_rows = (await db.execute(
         select(SchemaTableMetadata)
         .where(SchemaTableMetadata.connection_id == connection_id)
@@ -499,7 +521,114 @@ async def get_intelligence_schema_context(
     return {
         "tables": tables,
         "referenced_tables": sorted(table_names),
+        "source": "metadata_rows",
     }
+
+
+def _project_enriched_tables(enriched, table_names: set) -> list:
+    """
+    Project an EnrichedSchema down to just the report's referenced tables, in the EXACT
+    shape the intelligence prompt builder (frontend buildSchemaContextBlock) expects.
+
+    Preserves the report-table prioritization (only tables in widget SQL) and recovers
+    per-column FK targets from the relationship graph's edge conditions.
+    """
+    ref_full = {t.lower() for t in table_names}
+    ref_bare = {t.split(".")[-1].lower() for t in table_names}
+
+    # column → fk_target map, parsed from relationship-graph edge conditions
+    # ("a.col = b.tcol"). Both directions are recorded so either endpoint resolves.
+    fk_map: dict = {}
+    edges = getattr(enriched.relationship_graph, "edges", {}) or {}
+    seen_conditions: set = set()
+    for _src, neighbors in edges.items():
+        for _tgt, cond in (neighbors or {}).items():
+            if not cond or cond in seen_conditions:
+                continue
+            seen_conditions.add(cond)
+            m = re.match(r"\s*([\w.]+)\.(\w+)\s*=\s*([\w.]+)\.(\w+)\s*", cond)
+            if not m:
+                continue
+            lt, lc, rt, rc = m.groups()
+            fk_map.setdefault(lt, {}).setdefault(lc, f"{rt}.{rc}")
+            fk_map.setdefault(rt, {}).setdefault(rc, f"{lt}.{lc}")
+
+    out: list = []
+    for ct in (enriched.compact_tables or []):
+        qname = ct.get("name") or ""
+        if not (qname.lower() in ref_full or qname.split(".")[-1].lower() in ref_bare):
+            continue
+        sem = (enriched.table_semantics or {}).get(qname, {}) or {}
+        tbl_fk = fk_map.get(qname, {})
+
+        columns: list = []
+        for c in (ct.get("columns") or []):
+            cname = c.get("name") or ""
+            st = c.get("semantic_type")
+            top_values = (c.get("stats") or {}).get("top_values") or []
+            examples: list = []
+            for row in top_values:
+                if isinstance(row, dict):
+                    examples.extend(row.values())
+                else:
+                    examples.append(row)
+            columns.append({
+                "name": cname,
+                "business_name": None,
+                "description": c.get("description"),
+                "type": st,
+                "is_metric": st == "metric",
+                "is_dimension": st == "dimension",
+                "fk_target": tbl_fk.get(cname),
+                "examples": examples[:5],
+            })
+
+        out.append({
+            "name": qname,
+            "business_name": sem.get("business_name"),
+            "description": sem.get("purpose") or ct.get("description"),
+            "grain": sem.get("grain"),
+            "is_fact": sem.get("is_fact_table"),
+            "key_metrics": sem.get("key_metric_cols") or [],
+            "key_dimensions": sem.get("key_dimension_cols") or [],
+            "key_dates": sem.get("key_date_cols") or [],
+            "columns": columns,
+        })
+    return out
+
+
+async def _tables_from_enriched_cache(db: AsyncSession, connection_id, table_names: set):
+    """
+    Build report-scoped schema context from the warm enriched cache (get_or_build).
+    Returns a list of table dicts, or None when there is no snapshot/cache or no
+    referenced table matches — in which case the caller falls back to raw metadata rows.
+    """
+    from shared.models.schema_snapshots import SchemaSnapshot
+    from agent_service.agents import schema_cache as _sc
+
+    snap = (await db.execute(
+        select(SchemaSnapshot)
+        .where(SchemaSnapshot.connection_id == connection_id)
+        .order_by(SchemaSnapshot.version.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if not snap or not snap.schema_document:
+        return None
+
+    conn = (await db.execute(
+        select(DatabaseConnection).where(DatabaseConnection.id == connection_id)
+    )).scalar_one_or_none()
+    db_type = "postgresql"
+    if conn is not None:
+        db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+
+    enriched = await _sc.get_or_build(str(connection_id), snap.schema_document, db_type)
+    if not enriched or not getattr(enriched, "compact_tables", None):
+        return None
+
+    projected = _project_enriched_tables(enriched, table_names)
+    return projected or None
+
 
 QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
 _ROW_LIMIT = 500          # rows per widget — enough for all 18 skills
