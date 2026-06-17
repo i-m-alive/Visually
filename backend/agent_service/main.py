@@ -305,6 +305,31 @@ async def update_me(
                        role=current_user.role)
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password", status_code=200)
+async def change_password(
+    req: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not verify_password(req.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=422, detail="New password must be at least 8 characters")
+    if verify_password(req.new_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="New password must be different from your current password")
+
+    current_user.hashed_password = hash_password(req.new_password)
+    current_user.updated_at = datetime.utcnow()
+    await db.commit()
+
+    return {"status": "ok", "message": "Password updated"}
+
+
 # ─── PROJECT ROUTES ──────────────────────────────────────────────────────────
 
 from shared.models.projects import Project
