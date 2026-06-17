@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_, func
 
 from shared.database import get_db
 from shared.models.users import User
@@ -54,10 +54,20 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already registered")
 
+    username = (req.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=422, detail="User ID is required")
+    existing = await db.execute(
+        select(User).where(func.lower(User.username) == username.lower())
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="User ID already taken")
+
     role = getattr(req, "role", "builder") or "builder"
     user = User(
         id=uuid.uuid4(),
         email=req.email,
+        username=username,
         hashed_password=hash_password(req.password),
         full_name=req.full_name,
         role=role,
@@ -86,6 +96,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
         refresh_token=refresh_token,
         user_id=str(user.id),
         email=user.email,
+        username=user.username,
         full_name=user.full_name,
         role=user.role,
     )
@@ -93,7 +104,15 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == req.email))
+    identifier = (req.identifier or "").strip()
+    result = await db.execute(
+        select(User).where(
+            or_(
+                func.lower(User.email) == identifier.lower(),
+                func.lower(User.username) == identifier.lower(),
+            )
+        )
+    )
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(req.password, user.hashed_password):
@@ -120,6 +139,7 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
         refresh_token=refresh_token,
         user_id=str(user.id),
         email=user.email,
+        username=user.username,
         full_name=user.full_name,
         role=user.role,
     )
@@ -169,6 +189,7 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
         refresh_token=new_refresh,
         user_id=str(user.id),
         email=user.email,
+        username=user.username,
         full_name=user.full_name,
         role=user.role,
     )
@@ -179,6 +200,7 @@ async def me(current_user: User = Depends(get_current_user)):
     return UserResponse(
         id=str(current_user.id),
         email=current_user.email,
+        username=current_user.username,
         full_name=current_user.full_name,
         is_active=current_user.is_active,
         role=current_user.role,

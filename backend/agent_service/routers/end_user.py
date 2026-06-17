@@ -42,7 +42,7 @@ async def _get_user(
         result = await db.execute(select(User).where(User.id == dev_id))
         user = result.scalar_one_or_none()
         if not user:
-            user = User(id=dev_id, email="dev@visually.local",
+            user = User(id=dev_id, email="dev@visually.local", username="dev",
                         hashed_password=_hp("dev-password"), full_name="Dev User",
                         is_active=True, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
             db.add(user)

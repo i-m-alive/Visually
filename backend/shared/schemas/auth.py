@@ -3,13 +3,15 @@ from pydantic import BaseModel, EmailStr
 
 class RegisterRequest(BaseModel):
     email: EmailStr
+    username: str
     password: str
     full_name: str
     role: str = "builder"
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    # Accepts either an email address or a username (User ID).
+    identifier: str
     password: str
 
 
@@ -19,6 +21,7 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user_id: str
     email: str
+    username: str
     full_name: str
     role: str = "builder"
 
@@ -30,6 +33,7 @@ class RefreshRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
+    username: str
     full_name: str
     is_active: bool
     role: str = "builder"
