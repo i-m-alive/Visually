@@ -1,5 +1,5 @@
 'use client'
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthStore } from '@/stores/authStore'
 import { authApi } from '@/lib/api'
@@ -55,21 +55,39 @@ export default function SettingsPage() {
 // ─── Profile Tab ──────────────────────────────────────────────────────────────
 function ProfileTab({ user, updateUser, router }: any) {
   const nameRef = useRef<HTMLInputElement>(null)
+  const [username, setUsername] = useState<string>(user?.username ?? '')
   const [selectedRole, setSelectedRole] = useState<'builder' | 'end_user'>(user?.role ?? 'builder')
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const roleChanged = selectedRole !== user?.role
 
+  // Older sessions (created before User IDs existed) may not have the username
+  // cached locally — pull it from the server so the field is always populated.
+  useEffect(() => {
+    if (user?.username) { setUsername(user.username); return }
+    authApi.me().then((resp) => {
+      const u = resp.data
+      if (u?.username) {
+        setUsername(u.username)
+        updateUser({ username: u.username })
+      }
+    }).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const handleSave = async () => {
     setSaving(true); setError('')
     const newName = nameRef.current?.value.trim() || user?.full_name
+    const newUsername = username.trim()
+    if (!newUsername) { setError('User ID cannot be empty.'); setSaving(false); return }
     try {
       await authApi.updateMe({
         full_name: newName,
+        username: newUsername,
         role: selectedRole,
       })
-      updateUser({ full_name: newName, role: selectedRole })
+      updateUser({ full_name: newName, username: newUsername, role: selectedRole })
       // Update cookie so middleware sees new role immediately
       document.cookie = `visually-role=${selectedRole}; path=/; SameSite=Lax`
       setSaved(true); setTimeout(() => setSaved(false), 2500)
@@ -77,8 +95,9 @@ function ProfileTab({ user, updateUser, router }: any) {
       if (roleChanged) {
         setTimeout(() => router.push(selectedRole === 'end_user' ? '/end-user/dashboard' : '/projects'), 800)
       }
-    } catch {
-      setError('Failed to save changes. Please try again.')
+    } catch (e) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setError(detail ?? 'Failed to save changes. Please try again.')
     } finally {
       setSaving(false)
     }
@@ -92,6 +111,12 @@ function ProfileTab({ user, updateUser, router }: any) {
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Full name</label>
           <input ref={nameRef} className="input-field" defaultValue={user?.full_name ?? ''} placeholder="Your name" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">User ID</label>
+          <input className="input-field" value={username} onChange={(e) => setUsername(e.target.value)}
+            placeholder="Your User ID" />
+          <p className="text-xs text-gray-400 mt-1">You can sign in with this User ID or your email.</p>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>

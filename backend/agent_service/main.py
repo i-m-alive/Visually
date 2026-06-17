@@ -309,6 +309,7 @@ async def me(current_user: User = Depends(get_current_user)):
 
 class UpdateMeRequest(BaseModel):
     full_name: str | None = None
+    username: str | None = None
     role: str | None = None
 
 
@@ -320,6 +321,20 @@ async def update_me(
 ):
     if req.full_name is not None:
         current_user.full_name = req.full_name.strip() or current_user.full_name
+    if req.username is not None:
+        new_username = req.username.strip()
+        if not new_username:
+            raise HTTPException(status_code=422, detail="User ID cannot be empty")
+        if new_username.lower() != current_user.username.lower():
+            taken = await db.execute(
+                select(User).where(
+                    func.lower(User.username) == new_username.lower(),
+                    User.id != current_user.id,
+                )
+            )
+            if taken.scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="User ID already taken")
+        current_user.username = new_username
     if req.role is not None and req.role in ("builder", "end_user"):
         current_user.role = req.role
     current_user.updated_at = datetime.utcnow()

@@ -39,12 +39,12 @@ async function refreshAccessToken(): Promise<string | null> {
     const resp = await axios.post(`${API_URL}/auth/refresh`, { refresh_token: refreshToken })
     const d = resp.data as {
       access_token: string; refresh_token: string
-      user_id: string; email: string; full_name: string; role: 'builder' | 'end_user'
+      user_id: string; email: string; username: string; full_name: string; role: 'builder' | 'end_user'
     }
     // Persist BOTH new tokens — the backend rotates (revokes) the refresh token,
     // so reusing the old one on the next refresh would fail.
     useAuthStore.getState().setAuth(
-      { id: d.user_id, email: d.email, full_name: d.full_name, role: d.role },
+      { id: d.user_id, email: d.email, username: d.username, full_name: d.full_name, role: d.role },
       d.access_token,
       d.refresh_token,
     )
@@ -109,7 +109,7 @@ export const authApi = {
   refresh: (data: { refresh_token: string }) =>
     api.post('/auth/refresh', data),
   me: () => api.get('/auth/me'),
-  updateMe: (data: { full_name?: string; role?: string }) =>
+  updateMe: (data: { full_name?: string; username?: string; role?: string }) =>
     api.patch('/auth/me', data),
   changePassword: (data: { current_password: string; new_password: string }) =>
     api.post('/auth/change-password', data),

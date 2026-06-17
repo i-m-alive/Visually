@@ -28,7 +28,7 @@ export default function RegisterPage() {
       const data = resp.data
       const resolvedRole: 'builder' | 'end_user' = data.role === 'end_user' ? 'end_user' : 'builder'
       setAuth(
-        { id: data.user_id, email: data.email, full_name: data.full_name, role: resolvedRole },
+        { id: data.user_id, email: data.email, username: data.username, full_name: data.full_name, role: resolvedRole },
         data.access_token,
         data.refresh_token,
       )
