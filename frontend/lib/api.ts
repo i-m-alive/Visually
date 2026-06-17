@@ -110,6 +110,8 @@ export const authApi = {
   me: () => api.get('/auth/me'),
   updateMe: (data: { full_name?: string; role?: string }) =>
     api.patch('/auth/me', data),
+  changePassword: (data: { current_password: string; new_password: string }) =>
+    api.post('/auth/change-password', data),
 }
 
 export const projectApi = {

@@ -217,25 +217,63 @@ function ApiKeysTab() {
 
 // ─── Security Tab ─────────────────────────────────────────────────────────────
 function SecurityTab() {
+  const [current, setCurrent] = useState('')
+  const [next, setNext] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = async () => {
+    setError(null)
+    if (!current || !next || !confirm) { setError('Please fill in all fields.'); return }
+    if (next.length < 8) { setError('New password must be at least 8 characters.'); return }
+    if (next !== confirm) { setError('New password and confirmation do not match.'); return }
+    if (next === current) { setError('New password must be different from your current password.'); return }
+
+    setSaving(true)
+    try {
+      await authApi.changePassword({ current_password: current, new_password: next })
+      setSaved(true)
+      setCurrent(''); setNext(''); setConfirm('')
+      setTimeout(() => setSaved(false), 2500)
+    } catch (e) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setError(detail ?? 'Could not update password. Please try again.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <h3 className="text-base font-semibold text-gray-900 mb-4">Security</h3>
       <div className="space-y-4">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Current password</label>
-          <input type="password" className="input-field" placeholder="••••••••" />
+          <input type="password" className="input-field" placeholder="••••••••"
+            value={current} onChange={e => setCurrent(e.target.value)} autoComplete="current-password" />
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">New password</label>
-          <input type="password" className="input-field" placeholder="Min. 8 characters" />
+          <input type="password" className="input-field" placeholder="Min. 8 characters"
+            value={next} onChange={e => setNext(e.target.value)} autoComplete="new-password" />
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Confirm new password</label>
-          <input type="password" className="input-field" placeholder="••••••••" />
+          <input type="password" className="input-field" placeholder="••••••••"
+            value={confirm} onChange={e => setConfirm(e.target.value)} autoComplete="new-password"
+            onKeyDown={e => { if (e.key === 'Enter') submit() }} />
         </div>
-        <button onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 2000) }} className="btn-primary flex items-center gap-2">
-          {saved ? <><Check size={14} /> Updated!</> : 'Update password'}
+        {error && (
+          <div className="flex items-center gap-2 text-sm text-red-600">
+            <AlertCircle size={14} /> {error}
+          </div>
+        )}
+        <button onClick={submit} disabled={saving} className="btn-primary flex items-center gap-2 disabled:opacity-60">
+          {saving ? <><Loader2 size={14} className="animate-spin" /> Updating…</>
+            : saved ? <><Check size={14} /> Updated!</>
+            : 'Update password'}
         </button>
       </div>
     </div>
