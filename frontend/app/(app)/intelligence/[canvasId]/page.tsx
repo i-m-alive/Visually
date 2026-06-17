@@ -969,7 +969,7 @@ function AgentChartView({
     : []
 
   return (
-    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)', width: '100%', minWidth: 0, boxSizing: 'border-box' }}>
+    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)', width: '100%', height: '100%', minWidth: 0, boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
       <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: `linear-gradient(180deg, ${color}, ${color}70)`, flexShrink: 0 }} />
         <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{cleanChartTitle(chart.title)}</p>
@@ -1057,7 +1057,7 @@ function AgentChartView({
           ))}
         </div>
       )}
-      <div ref={chartRef}>
+      <div ref={chartRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
 
       {/* ── TABLE ── */}
       {viewType === 'table' && <TableView chart={chart} />}
@@ -1206,21 +1206,23 @@ function AgentChartView({
 
       {/* ── PIE ── */}
       {viewType === 'pie' && (
-        <ResponsiveContainer width="100%" height={300}>
-          <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+        <ResponsiveContainer width="100%" height={240}>
+          <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
             <Pie
               data={chart.data} dataKey="value" nameKey="name"
-              cx="50%" cy="48%" outerRadius="62%" innerRadius="34%"
+              cx="50%" cy="50%" outerRadius="82%" innerRadius="50%"
               labelLine={false}
-              label={({ cx: pcx, cy: pcy, midAngle, outerRadius: or, percent }) => {
-                if (percent < 0.07) return null
+              // % labels sit inside the ring so the donut can fill the card
+              // without outside labels clipping at the card edges.
+              label={({ cx: pcx, cy: pcy, midAngle, innerRadius: ir, outerRadius: or, percent }) => {
+                if (percent < 0.06) return null
                 const RADIAN = Math.PI / 180
-                const r = (or as number) + 18
+                const r = ((ir as number) + (or as number)) / 2
                 const x = (pcx as number) + r * Math.cos(-midAngle * RADIAN)
                 const y = (pcy as number) + r * Math.sin(-midAngle * RADIAN)
                 return (
-                  <text x={x} y={y} fill="#374151" textAnchor={x > (pcx as number) ? 'start' : 'end'}
-                    dominantBaseline="central" fontSize={10} fontWeight={600}>
+                  <text x={x} y={y} fill="#fff" textAnchor="middle"
+                    dominantBaseline="central" fontSize={10} fontWeight={700}>
                     {`${(percent * 100).toFixed(0)}%`}
                   </text>
                 )
@@ -1450,13 +1452,18 @@ function SectionContent({
                 gridTemplateColumns: restCompact.length === 1
                   ? '1fr'
                   : 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
-                gap: 16,
+                gap: 16, alignItems: 'stretch',
               }}>
-                {restCompact.map((ch, i) => (
-                  <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0 }}>
-                    <AgentChartView {...chartProps(ch, i + 1)} />
-                  </div>
-                ))}
+                {restCompact.map((ch, i) => {
+                  // A lone trailing chart (odd count) would otherwise leave an
+                  // empty second column — span it across the full row instead.
+                  const isLoneTrailing = i === restCompact.length - 1 && restCompact.length % 2 === 1
+                  return (
+                    <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0, gridColumn: isLoneTrailing ? '1 / -1' : undefined }}>
+                      <AgentChartView {...chartProps(ch, i + 1)} />
+                    </div>
+                  )
+                })}
               </div>
             )}
 
