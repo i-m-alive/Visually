@@ -945,7 +945,7 @@ INSTRUCTIONS:
 2. For every section:
    • data_story: ONE bold headline sentence with a specific number (e.g. "North region drives 61% of total revenue at $4.2M")
    • key_finding: single most important metric fact from the widget data
-   • narrative: 2–3 sentences citing exact numbers from PROFILES, BREAKDOWNS, TOP/BOTTOM PERFORMERS
+   • narrative: 2–3 sentences that ADD supporting detail — do NOT restate the data_story or key_finding. Skip the top-line recap and instead break down the secondary numbers (segment/dimension splits, geography, sub-categories, parent groupings, averages) from PROFILES, BREAKDOWNS, TOP/BOTTOM PERFORMERS. Each sentence must introduce NEW figures not already in data_story/key_finding.
    • recommendation: one concrete, measurable action
    • 2–3 insights[] cards — use specific values; type = positive/negative/neutral/warning
    • top_performers / bottom_performers: 3 rows each, from TOP/BOTTOM PERFORMERS data
@@ -976,7 +976,7 @@ RESPOND WITH ONLY RAW JSON — no markdown, no explanation, no trailing text:
     "id": "sec_1", "label": "...", "icon": "<from icon list>",
     "data_story": "<bold headline with specific number>",
     "key_finding": "<1 sentence with exact metric>",
-    "narrative": "<2–3 sentences with real numbers>",
+    "narrative": "<2–3 sentences of ADDITIONAL breakdown detail — new numbers only, must not repeat data_story/key_finding>",
     "recommendation": "<concrete action>",
     "insights": [{"icon":"<icon>","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning","confidence":4}],
     "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
@@ -1640,7 +1640,7 @@ Return ONLY the JSON for a single section — no other text:
   "icon": "<from icon list: overview|trending_up|trending_down|users|bar_chart|pie_chart|lightbulb|target|activity|dollar_sign|shopping_cart|building|globe|database|calendar|award|shield|zap>",
   "data_story": "<bold headline with specific number>",
   "key_finding": "<1 sentence with exact metric>",
-  "narrative": "<2-3 sentences with real numbers>",
+  "narrative": "<2-3 sentences of ADDITIONAL breakdown detail — new numbers only, must not repeat data_story/key_finding>",
   "recommendation": "<concrete action>",
   "insights": [{"icon":"lightbulb","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning","confidence":4}],
   "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
