@@ -211,14 +211,18 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
       boxShadow: '0 2px 12px rgba(10,33,58,0.06)',
       display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
       position: 'relative', overflow: 'hidden',
-      // Fixed height so all cards in the row are the same size
-      height: '100%', boxSizing: 'border-box', minHeight: 96,
+      // Fill the grid cell (both axes) so every card is the same size
+      width: '100%', height: '100%', boxSizing: 'border-box', minHeight: 104,
     }}>
       {/* Colored top accent bar */}
       <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, borderRadius: '16px 16px 0 0', background: accentColor }} />
-      {/* Label row */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginTop: 6, gap: 4 }}>
-        <p style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', margin: 0, lineHeight: 1.3, flex: 1 }}>{kpi.label}</p>
+      {/* Label row — reserve 2 lines so the value/trend align across cards regardless of label length */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginTop: 6, gap: 4, minHeight: 26 }}>
+        <p style={{
+          fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em',
+          margin: 0, lineHeight: 1.3, flex: 1,
+          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+        } as React.CSSProperties}>{kpi.label}</p>
         {kpi.sparkline_data && kpi.sparkline_data.length > 1 && <Sparkline data={kpi.sparkline_data} color={accentColor} />}
       </div>
       {/* Value — capped at 24px so long values don't overflow */}
@@ -969,7 +973,7 @@ function AgentChartView({
     : []
 
   return (
-    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)', width: '100%', minWidth: 0, boxSizing: 'border-box' }}>
+    <div className="intel-chart-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px 12px', border: '1px solid #e2eaf4', boxShadow: '0 2px 10px rgba(10,33,58,0.05)', width: '100%', height: '100%', minWidth: 0, boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
       <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: `linear-gradient(180deg, ${color}, ${color}70)`, flexShrink: 0 }} />
         <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: 0, flex: 1 }}>{cleanChartTitle(chart.title)}</p>
@@ -1057,7 +1061,7 @@ function AgentChartView({
           ))}
         </div>
       )}
-      <div ref={chartRef}>
+      <div ref={chartRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
 
       {/* ── TABLE ── */}
       {viewType === 'table' && <TableView chart={chart} />}
@@ -1206,21 +1210,23 @@ function AgentChartView({
 
       {/* ── PIE ── */}
       {viewType === 'pie' && (
-        <ResponsiveContainer width="100%" height={300}>
-          <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+        <ResponsiveContainer width="100%" height={240}>
+          <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
             <Pie
               data={chart.data} dataKey="value" nameKey="name"
-              cx="50%" cy="48%" outerRadius="62%" innerRadius="34%"
+              cx="50%" cy="50%" outerRadius="82%" innerRadius="50%"
               labelLine={false}
-              label={({ cx: pcx, cy: pcy, midAngle, outerRadius: or, percent }) => {
-                if (percent < 0.07) return null
+              // % labels sit inside the ring so the donut can fill the card
+              // without outside labels clipping at the card edges.
+              label={({ cx: pcx, cy: pcy, midAngle, innerRadius: ir, outerRadius: or, percent }) => {
+                if (percent < 0.06) return null
                 const RADIAN = Math.PI / 180
-                const r = (or as number) + 18
+                const r = ((ir as number) + (or as number)) / 2
                 const x = (pcx as number) + r * Math.cos(-midAngle * RADIAN)
                 const y = (pcy as number) + r * Math.sin(-midAngle * RADIAN)
                 return (
-                  <text x={x} y={y} fill="#374151" textAnchor={x > (pcx as number) ? 'start' : 'end'}
-                    dominantBaseline="central" fontSize={10} fontWeight={600}>
+                  <text x={x} y={y} fill="#fff" textAnchor="middle"
+                    dominantBaseline="central" fontSize={10} fontWeight={700}>
                     {`${(percent * 100).toFixed(0)}%`}
                   </text>
                 )
@@ -1262,19 +1268,61 @@ function normLabel(l: string): string {
     .trim()
 }
 
-// Drop the first sentence of a narrative if it paraphrases the section headline
-function dedupeNarrative(narrative: string | undefined, headline: string | undefined): string {
-  if (!narrative || !headline) return narrative ?? ''
-  const m = narrative.match(/^.+?[.!?](?:\s|$)/)
-  if (!m) return narrative
-  const firstSentence = m[0]
-  const keyWords = (t: string) =>
-    t.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3)
-  const headW = new Set(keyWords(headline))
-  const sentW = keyWords(firstSentence)
-  if (!headW.size || !sentW.length) return narrative
-  const overlap = sentW.filter(w => headW.has(w)).length / Math.min(sentW.length, headW.size)
-  return overlap >= 0.5 ? narrative.slice(firstSentence.length).trimStart() : narrative
+const _kfKeyWords = (t: string) =>
+  t.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3)
+
+// Strip ALL leading sentences of the narrative that merely restate the section
+// headline / key finding, so the body adds new detail instead of repeating it.
+// (Fix 2 — stronger client-side dedup vs both data_story and key_finding.)
+function dedupeNarrative(narrative: string | undefined, ...headlines: (string | undefined)[]): string {
+  if (!narrative) return ''
+  const refs = headlines.filter(Boolean).join(' ')
+  if (!refs) return narrative.trim()
+  const headW = new Set(_kfKeyWords(refs))
+  if (!headW.size) return narrative.trim()
+  const sentences = narrative.match(/[^.!?]+[.!?]+(\s|$)/g) ?? [narrative]
+  let i = 0
+  while (i < sentences.length) {
+    const sw = _kfKeyWords(sentences[i])
+    if (sw.length) {
+      const overlap = sw.filter(w => headW.has(w)).length / Math.min(sw.length, headW.size)
+      if (overlap < 0.45) break          // first genuinely-new sentence — stop here
+    }
+    i++
+  }
+  // Never strip everything: if the whole body echoed the headline, drop just the lead.
+  if (i >= sentences.length) i = Math.min(1, sentences.length - 1)
+  return sentences.slice(i).join('').trim() || narrative.trim()
+}
+
+// Pull the figure-bearing clauses out of a narrative as scannable bullets.
+// (Fix 4 — present supporting numbers as a structured list, not repeated prose.)
+function extractKeyFigures(text: string, max = 6): string[] {
+  if (!text) return []
+  const figurePattern = /\d[\d,]*(?:\.\d+)?\s*%|\(\s*\d{1,3}\s*%\s*\)|\$[\d,]+(?:\.\d+)?|\b\d[\d,]{2,}\b/
+  const out: string[] = []
+  const seen = new Set<string>()
+  text.replace(/\s+/g, ' ')
+    .split(/[,;:]\s+|\.\s+/)
+    .map(c => c.trim().replace(/^(and|but|while|with|the|a|an|also)\s+/i, '').replace(/[.;:,]+$/, '').trim())
+    .forEach(c => {
+      if (out.length >= max) return
+      if (c.length < 6 || c.length > 90) return
+      if (!figurePattern.test(c)) return
+      const key = c.toLowerCase()
+      if (seen.has(key)) return
+      seen.add(key)
+      out.push(c)
+    })
+  return out
+}
+
+// Render text with numeric / percent tokens emphasised.
+function boldFigures(text: string): React.ReactNode[] {
+  return text.split(/(\$?\d[\d,]*(?:\.\d+)?\s*%?(?:\s*\(\s*\d{1,3}\s*%\s*\))?)/g)
+    .map((p, i) => /\d/.test(p)
+      ? <strong key={i} style={{ color: C.ink, fontWeight: 700 }}>{p}</strong>
+      : <React.Fragment key={i}>{p}</React.Fragment>)
 }
 
 // ── Section content ────────────────────────────────────────────────────────────
@@ -1295,9 +1343,13 @@ function SectionContent({
   onAnnotate?: (chartTitle: string, pointName: string) => void
 }) {
   const hasPerformers = (section.top_performers?.length ?? 0) > 0 || (section.bottom_performers?.length ?? 0) > 0
+  const [showFullNarrative, setShowFullNarrative] = useState(false)
 
-  // Fix C — strip first sentence of narrative if it restates key_finding / data_story
-  const displayNarrative = dedupeNarrative(section.narrative, section.data_story ?? section.key_finding)
+  // Fix 2 — strip leading sentences of the narrative that restate the headline.
+  const displayNarrative = dedupeNarrative(section.narrative, section.data_story, section.key_finding)
+  // Fix 4 — surface the supporting numbers as a scannable list.
+  const keyFigures = extractKeyFigures(displayNarrative)
+  const hasKeyFigures = keyFigures.length >= 2
 
   // Fix B — build performer label set for duplicate-table detection
   const performerLabels = new Set([
@@ -1367,9 +1419,38 @@ function SectionContent({
         )}
       </div>
 
-      {/* ── Narrative body text (Fix C: first sentence stripped if it restates headline) ── */}
+      {/* ── Supporting detail ──────────────────────────────────────────────── */}
+      {/* Fix 4: scannable key-figure bullets instead of a paragraph that echoes the headline. */}
+      {hasKeyFigures && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(248px, 1fr))', gap: '7px 22px' }}>
+          {keyFigures.map((f, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 9, fontSize: 12.5, lineHeight: 1.5, color: '#4a5568' }}>
+              <span style={{ width: 5, height: 5, borderRadius: '50%', background: accentColor, marginTop: 7, flexShrink: 0 }} />
+              <span>{boldFigures(f)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Fix 1: full prose narrative is demoted behind a disclosure when figures are shown;
+          shown directly only when there's nothing scannable to stand in for it. */}
       {displayNarrative && (
-        <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{displayNarrative}</p>
+        hasKeyFigures ? (
+          <div>
+            <button
+              onClick={() => setShowFullNarrative(v => !v)}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 600, color: C.slate, background: 'none', border: 'none', padding: '2px 0', cursor: 'pointer' }}
+            >
+              {showFullNarrative ? 'Hide full analysis' : 'Show full analysis'}
+              {showFullNarrative ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+            </button>
+            {showFullNarrative && (
+              <p style={{ fontSize: 13, lineHeight: 1.78, color: '#64748b', margin: '8px 0 0' }}>{displayNarrative}</p>
+            )}
+          </div>
+        ) : (
+          <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{displayNarrative}</p>
+        )
       )}
 
       {/* ── Insight cards ── */}
@@ -1450,13 +1531,18 @@ function SectionContent({
                 gridTemplateColumns: restCompact.length === 1
                   ? '1fr'
                   : 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
-                gap: 16,
+                gap: 16, alignItems: 'stretch',
               }}>
-                {restCompact.map((ch, i) => (
-                  <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0 }}>
-                    <AgentChartView {...chartProps(ch, i + 1)} />
-                  </div>
-                ))}
+                {restCompact.map((ch, i) => {
+                  // A lone trailing chart (odd count) would otherwise leave an
+                  // empty second column — span it across the full row instead.
+                  const isLoneTrailing = i === restCompact.length - 1 && restCompact.length % 2 === 1
+                  return (
+                    <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0, gridColumn: isLoneTrailing ? '1 / -1' : undefined }}>
+                      <AgentChartView {...chartProps(ch, i + 1)} />
+                    </div>
+                  )
+                })}
               </div>
             )}
 
@@ -2789,7 +2875,9 @@ export default function IntelligenceCanvasPage() {
             if (visible.length === 0) return null
             return (
               <div key={`kpi-bar-${activeSection}`} style={{ marginBottom: 20 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12, alignItems: 'stretch' }}>
+                {/* auto-fill + a capped max track (190–240px) so cards stay a uniform,
+                    comfortable size — they never balloon when there are only 2–3 of them. */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 240px))', gap: 12, alignItems: 'stretch' }}>
                   {visible.map((k, i) => (
                     <div key={i} className={`intel-card intel-kpi-${i}`} style={{ display: 'flex' }}>
                       <KpiCard kpi={k} idx={i} />
