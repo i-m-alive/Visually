@@ -8,7 +8,7 @@ import { useAuthStore } from '@/stores/authStore'
 export default function LoginPage() {
   const router = useRouter()
   const setAuth = useAuthStore((s) => s.setAuth)
-  const [email, setEmail] = useState('')
+  const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -18,7 +18,7 @@ export default function LoginPage() {
     setError('')
     setLoading(true)
     try {
-      const resp = await authApi.login({ email, password })
+      const resp = await authApi.login({ identifier, password })
       const data = resp.data
       const role: 'builder' | 'end_user' = data.role === 'end_user' ? 'end_user' : 'builder'
       setAuth(
@@ -56,9 +56,10 @@ export default function LoginPage() {
       )}
 
       <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-        <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
-          className="input-field" placeholder="you@example.com" required />
+        <label className="block text-sm font-medium text-gray-700 mb-1">Email or User ID</label>
+        <input type="text" value={identifier} onChange={(e) => setIdentifier(e.target.value)}
+          className="input-field" placeholder="you@example.com or your User ID" required />
+        <p className="mt-1 text-xs text-gray-400">You can sign in with either your email or your User ID.</p>
       </div>
 
       <div>

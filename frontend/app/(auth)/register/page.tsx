@@ -11,6 +11,7 @@ export default function RegisterPage() {
   const setAuth = useAuthStore((s) => s.setAuth)
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [role, setRole] = useState<'builder' | 'end_user'>('builder')
@@ -21,10 +22,9 @@ export default function RegisterPage() {
     e.preventDefault()
     setError('')
     if (password !== confirm) { setError('Passwords do not match'); return }
-    if (password.length < 8) { setError('Password must be at least 8 characters'); return }
     setLoading(true)
     try {
-      const resp = await authApi.register({ email, password, full_name: fullName, role })
+      const resp = await authApi.register({ email, username, password, full_name: fullName, role })
       const data = resp.data
       const resolvedRole: 'builder' | 'end_user' = data.role === 'end_user' ? 'end_user' : 'builder'
       setAuth(
@@ -70,9 +70,15 @@ export default function RegisterPage() {
       </div>
 
       <div>
+        <label className="block text-sm font-medium text-gray-700 mb-1">User ID</label>
+        <input type="text" value={username} onChange={(e) => setUsername(e.target.value)}
+          className="input-field" placeholder="Choose a unique User ID" required />
+      </div>
+
+      <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
         <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-          className="input-field" placeholder="Min. 8 characters" required />
+          className="input-field" placeholder="Enter a password" required />
       </div>
 
       <div>

@@ -79,6 +79,7 @@ async def _get_user_id(
             user = User(
                 id=dev_uuid,
                 email=os.getenv("DEV_USER_EMAIL", "dev@visually.local"),
+                username=os.getenv("DEV_USER_EMAIL", "dev@visually.local").split("@")[0],
                 hashed_password=hash_password("dev-password"),
                 full_name="Dev User",
                 is_active=True,

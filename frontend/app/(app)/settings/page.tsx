@@ -227,7 +227,6 @@ function SecurityTab() {
   const submit = async () => {
     setError(null)
     if (!current || !next || !confirm) { setError('Please fill in all fields.'); return }
-    if (next.length < 8) { setError('New password must be at least 8 characters.'); return }
     if (next !== confirm) { setError('New password and confirmation do not match.'); return }
     if (next === current) { setError('New password must be different from your current password.'); return }
 
@@ -256,7 +255,7 @@ function SecurityTab() {
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">New password</label>
-          <input type="password" className="input-field" placeholder="Min. 8 characters"
+          <input type="password" className="input-field" placeholder="Enter a new password"
             value={next} onChange={e => setNext(e.target.value)} autoComplete="new-password" />
         </div>
         <div>

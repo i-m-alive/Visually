@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete as sa_delete
+from sqlalchemy import select, delete as sa_delete, or_, func
 
 from shared.database import get_db
 from shared.redis_client import get_redis
@@ -157,6 +157,7 @@ async def _get_or_create_dev_user(db: AsyncSession) -> User:
         user = User(
             id=dev_id,
             email=DEV_USER_EMAIL,
+            username=DEV_USER_EMAIL.split("@")[0],
             hashed_password=hash_password("dev-password"),
             full_name="Dev User",
             is_active=True,
@@ -201,9 +202,20 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == req.email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already registered")
+
+    username = (req.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=422, detail="User ID is required")
+    # User IDs are matched case-insensitively, so enforce uniqueness the same way.
+    existing = await db.execute(
+        select(User).where(func.lower(User.username) == username.lower())
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="User ID already taken")
+
     role = getattr(req, "role", "builder") or "builder"
     user = User(
-        id=uuid.uuid4(), email=req.email,
+        id=uuid.uuid4(), email=req.email, username=username,
         hashed_password=hash_password(req.password),
         full_name=req.full_name,
         role=role,
@@ -221,12 +233,22 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     ))
     await db.commit()
     return TokenResponse(access_token=access_token, refresh_token=refresh_token,
-                        user_id=str(user.id), email=user.email, full_name=user.full_name, role=user.role)
+                        user_id=str(user.id), email=user.email, username=user.username,
+                        full_name=user.full_name, role=user.role)
 
 
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == req.email))
+    # The identifier may be either an email address or a username (User ID).
+    identifier = (req.identifier or "").strip()
+    result = await db.execute(
+        select(User).where(
+            or_(
+                func.lower(User.email) == identifier.lower(),
+                func.lower(User.username) == identifier.lower(),
+            )
+        )
+    )
     user = result.scalar_one_or_none()
     if not user or not verify_password(req.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -241,7 +263,8 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     ))
     await db.commit()
     return TokenResponse(access_token=access_token, refresh_token=refresh_token,
-                        user_id=str(user.id), email=user.email, full_name=user.full_name, role=user.role)
+                        user_id=str(user.id), email=user.email, username=user.username,
+                        full_name=user.full_name, role=user.role)
 
 
 @app.post("/auth/refresh", response_model=TokenResponse)
@@ -272,12 +295,14 @@ async def refresh_token_endpoint(req: RefreshRequest, db: AsyncSession = Depends
     ))
     await db.commit()
     return TokenResponse(access_token=new_access, refresh_token=new_refresh,
-                        user_id=str(user.id), email=user.email, full_name=user.full_name, role=user.role)
+                        user_id=str(user.id), email=user.email, username=user.username,
+                        full_name=user.full_name, role=user.role)
 
 
 @app.get("/auth/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return UserResponse(id=str(current_user.id), email=current_user.email,
+                       username=current_user.username,
                        full_name=current_user.full_name, is_active=current_user.is_active,
                        role=current_user.role)
 
@@ -301,6 +326,7 @@ async def update_me(
     await db.commit()
     await db.refresh(current_user)
     return UserResponse(id=str(current_user.id), email=current_user.email,
+                       username=current_user.username,
                        full_name=current_user.full_name, is_active=current_user.is_active,
                        role=current_user.role)
 
@@ -318,8 +344,6 @@ async def change_password(
 ):
     if not verify_password(req.current_password, current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-    if len(req.new_password) < 8:
-        raise HTTPException(status_code=422, detail="New password must be at least 8 characters")
     if verify_password(req.new_password, current_user.hashed_password):
         raise HTTPException(status_code=400, detail="New password must be different from your current password")
 
