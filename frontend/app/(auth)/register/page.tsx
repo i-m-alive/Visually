@@ -33,8 +33,6 @@ export default function RegisterPage() {
         data.refresh_token,
       )
       document.cookie = `visually-role=${resolvedRole}; path=/; SameSite=Lax`
-      // Mark as onboarded — they just selected their role during registration
-      localStorage.setItem(`visually-onboarded-${data.user_id}`, '1')
       router.push(resolvedRole === 'end_user' ? '/end-user/dashboard' : '/projects')
     } catch (err: unknown) {
       const e = err as { response?: { data?: { detail?: unknown } } }
