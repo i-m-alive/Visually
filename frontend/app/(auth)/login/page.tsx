@@ -27,13 +27,8 @@ export default function LoginPage() {
         data.refresh_token,
       )
       document.cookie = `visually-role=${role}; path=/; SameSite=Lax`
-      // First-time login → show role onboarding
-      const onboarded = localStorage.getItem(`visually-onboarded-${data.user_id}`)
-      if (!onboarded) {
-        router.push('/onboarding')
-      } else {
-        router.push(role === 'end_user' ? '/end-user/dashboard' : '/projects')
-      }
+      // Role is chosen once during sign-up, so go straight to the role's home.
+      router.push(role === 'end_user' ? '/end-user/dashboard' : '/projects')
     } catch (err: unknown) {
       const e = err as { response?: { data?: { detail?: unknown } } }
       const detail = e.response?.data?.detail
