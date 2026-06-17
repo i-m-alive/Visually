@@ -22,7 +22,7 @@ export default function LoginPage() {
       const data = resp.data
       const role: 'builder' | 'end_user' = data.role === 'end_user' ? 'end_user' : 'builder'
       setAuth(
-        { id: data.user_id, email: data.email, full_name: data.full_name, role },
+        { id: data.user_id, email: data.email, username: data.username, full_name: data.full_name, role },
         data.access_token,
         data.refresh_token,
       )
