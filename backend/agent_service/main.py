@@ -670,11 +670,14 @@ async def get_schema_tables(
         raise HTTPException(status_code=404, detail="No connection found for this project/canvas")
 
     import agent_service.agents.schema_cache as _sc
+    import time as _time
+    _t0 = _time.perf_counter()
+    _ms = lambda: int((_time.perf_counter() - _t0) * 1000)
 
-    # 0) tiny precomputed list cache → instant on repeat opens
+    # 0) tiny precomputed list cache → instant on repeat opens (survives --reload)
     cached_list = await _sc.get_table_list_cached(str(conn_id))
     if cached_list is not None:
-        print(f"[schema-tables] from list-cache tables={len(cached_list)}", flush=True)
+        print(f"[schema-tables] HIT list-cache  tables={len(cached_list)}  {_ms()}ms", flush=True)
         return {"tables": cached_list, "total": len(cached_list), "version": 0}
 
     out: list[dict] = []
@@ -684,6 +687,7 @@ async def get_schema_tables(
     # 1) prefer the warm enriched cache (in-process → Redis → fs) — avoids loading
     #    the multi-MB schema_document from Postgres on the hot path.
     out = await _sc.get_cached_table_names(str(conn_id)) or []
+    _t_fetch = _ms()
 
     # 2) fall back to the durable snapshot only if the cache is cold
     if not out:
@@ -705,12 +709,16 @@ async def get_schema_tables(
                         out.append({"name": name, "columns": len(t.get("columns") or [])})
 
     if not out:
-        print(f"[schema-tables] no enriched cache AND no snapshot for conn={str(conn_id)[:8]}", flush=True)
+        print(f"[schema-tables] MISS — no enriched cache AND no snapshot for conn={str(conn_id)[:8]}  {_ms()}ms", flush=True)
         raise HTTPException(status_code=404, detail="No schema available for this connection yet. Crawl the schema first.")
 
     out.sort(key=lambda x: x["name"].lower())
     await _sc.set_table_list_cached(str(conn_id), out)  # warm the tiny cache for next time
-    print(f"[schema-tables] from {source} tables={len(out)} (list-cache warmed)", flush=True)
+    print(
+        f"[schema-tables] MISS list-cache → built from {source}  tables={len(out)}  "
+        f"fetch={_t_fetch}ms  total={_ms()}ms (list-cache warmed)",
+        flush=True,
+    )
     return {"tables": out, "total": len(out), "version": version}
 
 

@@ -338,6 +338,21 @@ async def get_cached_table_names(connection_id: str) -> Optional[list[dict]]:
     if enr and enr.compact_tables:
         return _names(enr)
 
+    # Lightweight: pluck names straight from the serialized JSON without rebuilding
+    # the full EnrichedSchema (relationship graph, column_map, etc.) — much faster
+    # for big schemas where the enriched blob is multiple MB.
+    def _names_from_json(raw: str) -> Optional[list[dict]]:
+        try:
+            data = json.loads(raw)
+            cts = data.get("compact_tables") or []
+            names = [
+                {"name": t.get("name", ""), "columns": len(t.get("columns") or [])}
+                for t in cts if t.get("name")
+            ]
+            return names or None
+        except Exception:
+            return None
+
     # L2 Redis (any schema_hash for this connection)
     try:
         from shared.redis_client import get_redis
@@ -346,9 +361,9 @@ async def get_cached_table_names(connection_id: str) -> Optional[list[dict]]:
             async for key in redis.scan_iter(f"{_REDIS_KEY_PREFIX}:{connection_id}:*"):
                 cached = await redis.get(key)
                 if cached:
-                    e = _deserialize_enriched(cached)
-                    if e.compact_tables:
-                        return _names(e)
+                    names = _names_from_json(cached)
+                    if names:
+                        return names
     except Exception as _e:
         print(f"[schema_cache] ⚠ get_cached_table_names Redis read failed: {_e}", flush=True)
 
@@ -356,12 +371,9 @@ async def get_cached_table_names(connection_id: str) -> Optional[list[dict]]:
     try:
         import glob as _glob
         for p in _glob.glob(str(_fs_cache_dir() / f"schema_{connection_id}_*.json")):
-            try:
-                e = _deserialize_enriched(pathlib.Path(p).read_text(encoding="utf-8"))
-                if e.compact_tables:
-                    return _names(e)
-            except Exception:
-                continue
+            names = _names_from_json(pathlib.Path(p).read_text(encoding="utf-8"))
+            if names:
+                return names
     except Exception as _e:
         print(f"[schema_cache] ⚠ get_cached_table_names filesystem read failed: {_e}", flush=True)
 

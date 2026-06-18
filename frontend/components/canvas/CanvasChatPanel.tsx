@@ -1,10 +1,12 @@
 'use client'
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Bot, Loader2, X, Plus, Sparkles, Search, Database, FileText, Check, ChevronDown, Table2, AlertCircle } from 'lucide-react'
-import { streamChat, canvasApi, projectApi, type WidgetCreate } from '@/lib/api'
+import { Send, Bot, Loader2, X, Plus, Sparkles } from 'lucide-react'
+import { streamChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
+import { TableScopePicker } from '@/components/canvas/TableScopePicker'
+import { useTableScopeStore, DEFAULT_SCOPE } from '@/stores/tableScopeStore'
 
 type InlineChart = ChartResult & { selected: boolean }
 
@@ -124,18 +126,10 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   const [sending, setSending]   = useState(false)
   const [sessionId]             = useState(() => `canvas-${canvasId}-${Date.now()}`)
   const [showSuggestions, setShowSuggestions] = useState(true)
-  // ── Schema scope (builder) ──────────────────────────────────────────────────
-  // 'selected' (default): the builder picks tables; the copilot is limited to those
-  // + their N-hop FK neighbours. 'database': full schema (query anything).
-  const [scope, setScope]               = useState<'selected' | 'database'>('selected')
-  const [selectedTables, setSelectedTables] = useState<string[]>([])
-  const [selectedHops, setSelectedHops] = useState<0 | 1 | 2>(2)
-  const [schemaTables, setSchemaTables] = useState<{ name: string; columns: number }[]>([])
-  const [schemaLoading, setSchemaLoading] = useState(false)
-  const [schemaError, setSchemaError]   = useState(false)
-  const [pickerOpen, setPickerOpen]     = useState(false)
-  const [tableSearch, setTableSearch]   = useState('')
-  const schemaFetchedRef        = useRef(false)  // guards against duplicate schema fetches
+  // ── Schema scope (builder) — shared via the store with the canvas toolbar picker,
+  // so a selection in either place reflects in both. The table list is fetched once
+  // on canvas load (see the canvas page), not here.
+  const { scope, selectedTables, selectedHops } = useTableScopeStore((s) => s.byCanvas[canvasId]) ?? DEFAULT_SCOPE
   const endRef                  = useRef<HTMLDivElement>(null)
   const textareaRef             = useRef<HTMLTextAreaElement>(null)
   const [panelWidth, setPanelWidth] = useState(initialWidth ?? 320)
@@ -148,28 +142,6 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
     if (prefillMessage) { setInput(prefillMessage); setTimeout(() => textareaRef.current?.focus(), 100) }
   }, [prefillMessage])
 
-  // Lazily load the project's table list (lightweight names + column counts) the
-  // first time the builder needs the picker.
-  useEffect(() => {
-    if (scope !== 'selected' || schemaTables.length || schemaFetchedRef.current) return
-    schemaFetchedRef.current = true  // set synchronously so a double-invoke can't double-fetch
-    let cancelled = false
-    setSchemaLoading(true)
-    setSchemaError(false)
-    const connId = widgets.find(w => w.connection_id)?.connection_id
-    projectApi.getSchemaTables(projectId, connId, canvasId)
-      .then(resp => {
-        if (cancelled) return
-        setSchemaTables((resp.data?.tables ?? []).filter(t => t.name))
-      })
-      .catch(() => {
-        if (cancelled) return
-        setSchemaTables([]); setSchemaError(true)
-        schemaFetchedRef.current = false  // allow a retry later
-      })
-      .finally(() => { if (!cancelled) setSchemaLoading(false) })
-    return () => { cancelled = true }
-  }, [scope, projectId, canvasId])
 
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
   const widgetRecs   = buildRecommendations(widgets, pages)
@@ -349,154 +321,9 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
         </button>
       </div>
 
-      {/* Scope bar — Selected tables (builder picks) vs Full DB */}
-      <div className="px-3 py-2.5 border-b border-gray-100 flex-shrink-0" style={{ background: 'linear-gradient(180deg,#f8fafc,#f1f5f9)' }}>
-        {/* Mode segmented control */}
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-0.5 p-0.5 rounded-lg flex-shrink-0" style={{ background: '#e6ecf3', border: '1px solid #dbe3ec' }}>
-            <button
-              onClick={() => setScope('selected')}
-              title="Limit the assistant to tables you pick (plus their related tables). Faster, more focused, cheaper."
-              className="flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold transition-all"
-              style={scope === 'selected'
-                ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 4px rgba(10,33,58,0.14)' }
-                : { background: 'transparent', color: '#64748b' }}
-            >
-              <FileText size={11} /> Selected tables
-            </button>
-            <button
-              onClick={() => { setScope('database'); setPickerOpen(false) }}
-              title="Give the assistant the full database schema — it can query any table or view."
-              className="flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold transition-all"
-              style={scope === 'database'
-                ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 4px rgba(10,33,58,0.14)' }
-                : { background: 'transparent', color: '#64748b' }}
-            >
-              <Database size={11} /> Full DB
-            </button>
-          </div>
-          {scope === 'database' && (
-            <span className="text-[10px] text-gray-400 truncate">Whole database in context</span>
-          )}
-        </div>
-
-        {scope === 'selected' && (
-          <div className="mt-2 flex flex-col gap-2">
-            {/* Table selector (button + overlay dropdown) */}
-            <div className="relative">
-              <button
-                onClick={() => setPickerOpen(o => !o)}
-                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-white transition-colors"
-                style={{ border: `1px solid ${pickerOpen ? '#93c5fd' : '#dbe3ec'}` }}
-              >
-                <Table2 size={13} className="flex-shrink-0" style={{ color: '#2563EB' }} />
-                <span className="flex-1 text-left text-[11px] font-semibold truncate" style={{ color: selectedTables.length ? '#1e293b' : '#94a3b8' }}>
-                  {selectedTables.length
-                    ? `${selectedTables.length} table${selectedTables.length !== 1 ? 's' : ''} selected`
-                    : 'Choose tables to focus on…'}
-                </span>
-                <ChevronDown size={13} className="text-gray-400 flex-shrink-0" style={{ transform: pickerOpen ? 'rotate(180deg)' : 'none', transition: 'transform .2s' }} />
-              </button>
-
-              {pickerOpen && (
-                <div className="absolute left-0 right-0 top-full mt-1 z-40 rounded-xl bg-white overflow-hidden" style={{ border: '1px solid #e2e8f0', boxShadow: '0 12px 32px rgba(10,33,58,0.16)' }}>
-                  <div className="flex items-center gap-1.5 px-2.5 py-2 border-b border-gray-100">
-                    <Search size={12} className="text-gray-400 flex-shrink-0" />
-                    <input
-                      autoFocus
-                      value={tableSearch}
-                      onChange={e => setTableSearch(e.target.value)}
-                      placeholder="Search tables…"
-                      className="flex-1 bg-transparent text-[11px] outline-none text-gray-700 placeholder-gray-400"
-                    />
-                    {selectedTables.length > 0 && (
-                      <button onClick={() => setSelectedTables([])} className="text-[10px] font-semibold text-gray-400 hover:text-red-500 flex-shrink-0 transition-colors">Clear all</button>
-                    )}
-                  </div>
-                  <div className="max-h-56 overflow-y-auto py-1">
-                    {schemaLoading ? (
-                      <div className="flex items-center gap-2 px-2.5 py-4 text-[11px] text-gray-400">
-                        <Loader2 size={12} className="animate-spin" /> Loading tables…
-                      </div>
-                    ) : schemaError ? (
-                      <div className="flex items-center gap-2 px-2.5 py-4 text-[11px] text-red-400">
-                        <AlertCircle size={12} /> Couldn’t load tables. Crawl the schema first.
-                      </div>
-                    ) : (() => {
-                      const q = tableSearch.trim().toLowerCase()
-                      const list = q ? schemaTables.filter(t => t.name.toLowerCase().includes(q)) : schemaTables
-                      if (!list.length) {
-                        return <div className="px-2.5 py-4 text-[11px] text-gray-400">{schemaTables.length ? 'No matching tables' : 'No tables found'}</div>
-                      }
-                      return list.slice(0, 300).map(t => {
-                        const checked = selectedTables.includes(t.name)
-                        return (
-                          <button
-                            key={t.name}
-                            onClick={() => setSelectedTables(prev => checked ? prev.filter(x => x !== t.name) : [...prev, t.name])}
-                            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-blue-50"
-                          >
-                            <span className="w-3.5 h-3.5 rounded flex items-center justify-center flex-shrink-0 transition-colors" style={checked ? { background: '#2563EB' } : { border: '1.5px solid #cbd5e1' }}>
-                              {checked && <Check size={9} className="text-white" />}
-                            </span>
-                            <span className="flex-1 text-[11px] font-mono truncate" style={{ color: checked ? '#1e293b' : '#475569' }}>{t.name}</span>
-                            <span className="text-[9px] text-gray-400 flex-shrink-0">{t.columns} cols</span>
-                          </button>
-                        )
-                      })
-                    })()}
-                  </div>
-                  <div className="flex items-center justify-between px-2.5 py-1.5 border-t border-gray-100" style={{ background: '#f8fafc' }}>
-                    <span className="text-[10px] text-gray-400">
-                      {schemaLoading ? '…' : `${schemaTables.length} tables · ${selectedTables.length} selected`}
-                    </span>
-                    <button onClick={() => setPickerOpen(false)} className="text-[10px] font-semibold text-blue-600 hover:text-blue-800">Done</button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Selected chips */}
-            {selectedTables.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {selectedTables.map(t => (
-                  <span key={t} className="inline-flex items-center gap-1 text-[10px] pl-2 pr-1 py-0.5 rounded-full font-mono" style={{ background: '#eef2ff', color: '#3730a3', border: '1px solid #c7d2fe' }}>
-                    {t.split('.').pop()}
-                    <button onClick={() => setSelectedTables(prev => prev.filter(x => x !== t))} className="rounded-full p-0.5 hover:bg-indigo-200/60 transition-colors" title="Remove">
-                      <X size={9} />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-
-            {/* Hop selector + caption */}
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-gray-400 mr-0.5">Related:</span>
-                {([[0, 'None'], [1, '+1 hop'], [2, '+2 hops']] as const).map(([h, label]) => (
-                  <button
-                    key={h}
-                    onClick={() => setSelectedHops(h)}
-                    title={h === 0 ? 'Only the tables you picked' : `Also include tables within ${h} join-hop(s)`}
-                    className="text-[10px] font-semibold px-2 py-0.5 rounded-full transition-colors"
-                    style={selectedHops === h
-                      ? { background: '#0d3060', color: '#fff' }
-                      : { background: '#fff', color: '#64748b', border: '1px solid #dbe3ec' }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {selectedTables.length === 0 && !pickerOpen && (
-              <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
-                Pick tables to focus the assistant — otherwise it falls back to the full database.
-              </span>
-            )}
-          </div>
-        )}
+      {/* Scope bar — shared with the canvas toolbar picker via tableScopeStore */}
+      <div className="border-b border-gray-100 flex-shrink-0">
+        <TableScopePicker canvasId={canvasId} />
       </div>
 
       {/* Messages */}

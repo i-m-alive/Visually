@@ -1,5 +1,6 @@
 'use client'
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { useParams, useRouter } from 'next/navigation'
 import { Responsive, WidthProvider } from 'react-grid-layout/legacy'
 import type { Layout, LayoutItem } from 'react-grid-layout/legacy'
@@ -9,12 +10,14 @@ import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
   Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
-  FunctionSquare, Clock, Shield, FileDown, Zap,
+  FunctionSquare, Clock, Shield, FileDown, Zap, Table2,
 } from 'lucide-react'
 import { canvasApi, widgetApi, vlyApi, scheduleApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import { ZoomModal } from '@/components/canvas/ZoomModal'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
+import { TableScopePicker } from '@/components/canvas/TableScopePicker'
+import { useTableScopeStore } from '@/stores/tableScopeStore'
 import { VisuallReport } from '@/components/canvas/VisuallReport'
 import { CanvasPageTabs, type CanvasPage } from '@/components/canvas/CanvasPageTabs'
 import { MeasuresPanel } from '@/components/canvas/MeasuresPanel'
@@ -144,6 +147,9 @@ export default function CanvasEditorPage() {
   const [saving, setSaving]           = useState(false)
   const [savedOk, setSavedOk]         = useState(false)
   const [showChat, setShowChat]       = useState(false)
+  const [showTablePicker, setShowTablePicker] = useState(false)
+  const [tablesPopPos, setTablesPopPos] = useState<{ top: number; right: number } | null>(null)
+  const tablesBtnRef = useRef<HTMLButtonElement>(null)
   const [showReport, setShowReport]   = useState(false)
   const [zoomTarget, setZoomTarget]   = useState<{ widget: CanvasWidgetData; colors: string[] } | null>(null)
   const [isDirty, setIsDirty]         = useState(false)
@@ -183,8 +189,8 @@ export default function CanvasEditorPage() {
     try { await canvasApi.updateLayoutConfig(canvasId, { pages: newPages }) } catch { /* ignore */ }
   }, [canvasId])
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     setError(null)
     try {
       const resp = await canvasApi.get(canvasId)
@@ -242,11 +248,20 @@ export default function CanvasEditorPage() {
     } catch {
       setError('Failed to load canvas')
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [canvasId])
 
   useEffect(() => { load() }, [load])
+
+  // Preload the project's table list once on canvas open, into the shared store,
+  // so the Canvas Assistant + toolbar table picker are instant (no re-fetch).
+  const loadTables = useTableScopeStore((s) => s.loadTables)
+  useEffect(() => {
+    if (!canvasId || !projectId) return
+    const connId = widgets.find(w => w.connection_id)?.connection_id
+    loadTables(canvasId, projectId, connId, canvasId)
+  }, [canvasId, projectId, widgets, loadTables])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -780,6 +795,40 @@ export default function CanvasEditorPage() {
               <MessageSquare size={17} />
               <span className="text-[9px] font-semibold">AI Chat</span>
             </button>
+            {/* Table scope — same control as in the chat, shared via the store.
+                Rendered in a portal (below) so it can't be hidden behind the canvas grid. */}
+            <button
+              ref={tablesBtnRef}
+              onClick={() => {
+                const r = tablesBtnRef.current?.getBoundingClientRect()
+                if (r) setTablesPopPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) })
+                setShowTablePicker(v => !v)
+              }}
+              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md border transition-colors ${showTablePicker ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-gray-600 border-gray-200 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-300'}`}
+              title="Choose which tables the AI assistant focuses on"
+            >
+              <Table2 size={17} />
+              <span className="text-[9px] font-semibold">Tables</span>
+            </button>
+            {showTablePicker && typeof document !== 'undefined' && createPortal(
+              <>
+                <div style={{ position: 'fixed', inset: 0, zIndex: 9998 }} onClick={() => setShowTablePicker(false)} />
+                <div style={{
+                  position: 'fixed',
+                  top: tablesPopPos?.top ?? 64,
+                  right: tablesPopPos?.right ?? 12,
+                  width: 320,
+                  zIndex: 9999,
+                  borderRadius: 12,
+                  background: '#fff',
+                  border: '1px solid #e2e8f0',
+                  boxShadow: '0 16px 40px rgba(10,33,58,0.18)',
+                }}>
+                  <TableScopePicker canvasId={canvasId} />
+                </div>
+              </>,
+              document.body,
+            )}
             <button
               onClick={() => setShowReport(true)}
               className="flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md text-white border border-transparent transition-all hover:opacity-90"
@@ -981,7 +1030,7 @@ export default function CanvasEditorPage() {
               pages={pages}
               activePageId={activePageId}
               onClose={() => setShowChat(false)}
-              onWidgetAdded={load}
+              onWidgetAdded={() => load(true)}
             />
           </div>
         )}
