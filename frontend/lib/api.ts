@@ -135,6 +135,14 @@ export const projectApi = {
     api.get(`/projects/${projectId}/schema/crawl/${jobId}`),
   getSchema: (projectId: string) =>
     api.get(`/projects/${projectId}/schema`),
+  // Lightweight: table names + column counts only (few KB) — for table pickers.
+  // Pass connectionId/dashboardId so imported canvases (no project-level connection)
+  // still resolve their bound connection's schema.
+  getSchemaTables: (projectId: string, connectionId?: string, dashboardId?: string) =>
+    api.get<{ tables: { name: string; columns: number }[]; total: number; version: number }>(
+      `/projects/${projectId}/schema/tables`,
+      { params: { ...(connectionId ? { connection_id: connectionId } : {}), ...(dashboardId ? { dashboard_id: dashboardId } : {}) } },
+    ),
   getSchemaMetadata: (projectId: string) =>
     api.get(`/projects/${projectId}/schema/metadata`),
 }
@@ -168,6 +176,12 @@ export interface ChatSendData {
   connection_id?: string
   active_page_id?: string
   model_preference?: 'opus' | 'sonnet'
+  // Builder schema scope for the Canvas Assistant:
+  //   'database' → full enriched schema
+  //   'selected' → only selected_tables + their selected_hops-hop FK neighbours
+  scope?: 'database' | 'selected'
+  selected_tables?: string[]
+  selected_hops?: number  // 0 = only picked, 1 = +1-hop, 2 = +2-hop
 }
 
 export const chatApi = {
@@ -220,6 +234,110 @@ export async function streamChat(
   let resp = await doFetch(readToken())
 
   // On 401, transparently refresh the token and retry once.
+  if (resp.status === 401) {
+    const newToken = await getRefreshedToken()
+    if (newToken) {
+      resp = await doFetch(newToken)
+    } else {
+      forceReLogin()
+      handlers.onError('Session expired — please sign in again.')
+      return
+    }
+  }
+
+  if (!resp.ok || !resp.body) {
+    handlers.onError(`Stream request failed (${resp.status})`)
+    return
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+
+  const handle = (evt: {
+    type?: string; delta?: string; chart?: Record<string, unknown>;
+    action?: Record<string, unknown>; message?: string;
+    session_id?: string; turn_count?: number
+  }) => {
+    switch (evt.type) {
+      case 'text':   handlers.onText(evt.delta ?? ''); break
+      case 'chart':  if (evt.chart) handlers.onChart(evt.chart); break
+      case 'action': if (evt.action) handlers.onAction?.(evt.action); break
+      case 'error':  handlers.onError(evt.message ?? 'stream error'); break
+      case 'done':   handlers.onDone?.({ session_id: evt.session_id ?? '', turn_count: evt.turn_count ?? 0 }); break
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let sep: number
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const chunk = buf.slice(0, sep)
+      buf = buf.slice(sep + 2)
+      const line = chunk.split('\n').find(l => l.startsWith('data:'))
+      if (!line) continue
+      try { handle(JSON.parse(line.slice(5).trim())) } catch { /* skip malformed frame */ }
+    }
+  }
+}
+
+// ─── Intelligence Report Copilot (forked from the canvas chat transport) ──────
+// Dedicated transport for the "Report Copilot" on the intelligence page. It hits
+// the forked backend endpoints (/intelligence/chat*) so the Report Copilot path
+// is fully independent of the Canvas Assistant's /agent/chat path, even though
+// the request/response shapes are intentionally identical for now.
+
+export interface IntelChatSendData {
+  session_id?: string
+  message: string
+  project_id: string
+  dashboard_id?: string
+  connection_id?: string
+  active_page_id?: string
+  model_preference?: 'opus' | 'sonnet'
+  // 'report'  → schema scoped to the report's tables + 2-hop FK neighbours (default)
+  // 'database' → full enriched schema (the copilot can query any table/view)
+  scope?: 'report' | 'database'
+}
+
+export const intelligenceChatApi = {
+  send: (data: IntelChatSendData) => api.post('/intelligence/chat', data),
+  clear: (sessionId: string) => api.delete(`/intelligence/chat/${sessionId}`),
+}
+
+/**
+ * Consume the /intelligence/chat/stream SSE endpoint (Report Copilot).
+ * Mirrors streamChat() but targets the forked intelligence-copilot backend.
+ */
+export async function streamIntelligenceChat(
+  data: IntelChatSendData,
+  handlers: StreamChatHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const readToken = (): string | undefined => {
+    if (typeof window === 'undefined') return undefined
+    try {
+      const stored = localStorage.getItem('visually-auth')
+      if (stored) return JSON.parse(stored)?.state?.accessToken
+    } catch {}
+    return undefined
+  }
+
+  const doFetch = (token: string | undefined) =>
+    fetch(`${API_URL}/intelligence/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(data),
+      signal,
+    })
+
+  let resp = await doFetch(readToken())
+
   if (resp.status === 401) {
     const newToken = await getRefreshedToken()
     if (newToken) {

@@ -147,6 +147,30 @@ def _extract_table_names(sql: str) -> list[str]:
     })
 
 
+# How many FK hops out from the report's tables count as "related" in the export.
+# Matches the copilot's report-scoped mode (INTEL_SCOPE_HOPS) so an imported report
+# carries the same neighbour context the live copilot would compute.
+VLY_SCOPE_HOPS = int(os.getenv("INTEL_SCOPE_HOPS", "2"))
+
+
+def _nhop_neighbors(edges: dict, seed: set, hops: int) -> set:
+    """BFS the FK adjacency graph `edges` outward from `seed` up to `hops` levels.
+    Returns reachable nodes EXCLUDING the seed. Mirrors the copilot's graph walk."""
+    visited = set(seed)
+    frontier = set(seed)
+    for _ in range(max(0, hops)):
+        nxt = set()
+        for node in frontier:
+            for neighbor in (edges.get(node) or {}):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    nxt.add(neighbor)
+        frontier = nxt
+        if not frontier:
+            break
+    return visited - set(seed)
+
+
 def _build_schema_hints(widgets: list[Widget]) -> list[dict]:
     tables: dict[str, set] = {}
     for w in widgets:
@@ -400,9 +424,42 @@ async def _generate_vly(
                     for t in raw_tables
                     if isinstance(t, dict) and t.get("name")
                 ]
+            # 2-hop related-table expansion via the FK relationship graph, so the
+            # report-scoped copilot mode has joinable neighbour tables in the bundle
+            # (matches the live copilot's INTEL_SCOPE_HOPS reach). Gated on
+            # include_schema_cache so we never force a cold enrichment build when the
+            # exporter chose to exclude DB-derived values.
+            related_lower: set[str] = set()
+            related_qualified: list[str] = []
+            if include_schema_cache:
+                try:
+                    from agent_service.agents import schema_cache as _sc
+                    _enr = await _sc.get_or_build(
+                        str(sample_conn_id), full_schema, conn_hint.get("db_type") or "postgresql"
+                    )
+                    edges = _enr.relationship_graph.edges or {}
+                    seed_nodes = {
+                        n for n in edges.keys()
+                        if n.lower() in used_tables_lower
+                        or n.split(".")[-1].lower() in used_tables_lower
+                    }
+                    related_nodes = _nhop_neighbors(edges, seed_nodes, VLY_SCOPE_HOPS)
+                    related_qualified = sorted(related_nodes)
+                    for n in related_nodes:
+                        related_lower.add(n.lower())
+                        related_lower.add(n.split(".")[-1].lower())
+                    print(
+                        f"[vly-export] schema_enriched: used={len(used_tables_lower)} "
+                        f"related_{VLY_SCOPE_HOPS}hop={len(related_qualified)}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[vly-export] neighbour expansion failed (non-fatal): {exc}", flush=True)
+
+            scope_lower = used_tables_lower | related_lower
             filtered_tables = {
                 tbl: info for tbl, info in table_items
-                if tbl.lower() in used_tables_lower or tbl.split(".")[-1].lower() in used_tables_lower
+                if tbl.lower() in scope_lower or tbl.split(".")[-1].lower() in scope_lower
             }
             schema_enriched_doc = {
                 "db_type":               conn_hint.get("db_type", ""),
@@ -411,6 +468,8 @@ async def _generate_vly(
                 "tables":                filtered_tables,
                 "prioritized": {
                     "tables": sorted(used_tables_lower),
+                    "related_tables": related_qualified,   # 2-hop FK neighbours of the report's tables
+                    "scope_hops": VLY_SCOPE_HOPS,
                     "columns_by_widget": {
                         str(w.id): _extract_table_names(w.sql_query or w.base_sql or "")
                         for w in widgets

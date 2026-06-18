@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
-import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
+import { IntelligenceCopilotPanel } from '@/components/report/IntelligenceCopilotPanel'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import {
   runIntelligenceAgent, buildFallbackAnalysis, runSectionAgent,
@@ -1729,8 +1729,8 @@ function AgentLoader({ step, canvasName }: { step: string; canvasName: string })
   )
 }
 
-// ── Inline copilot replaced by CanvasChatPanel ─────────────────────────────────
-// (InlineCopilot removed — CanvasChatPanel is used directly in the FAB)
+// ── Inline copilot replaced by IntelligenceCopilotPanel ────────────────────────
+// (InlineCopilot removed — IntelligenceCopilotPanel is used directly in the FAB)
 
 function buildReportContext_UNUSED(analysis: ExecutiveAnalysis, canvasName: string): string {
   const kpiLines = analysis.kpis.slice(0, 10).map(k =>
@@ -3015,7 +3015,7 @@ export default function IntelligenceCanvasPage() {
         }}>
           {shareToken
             ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
-            : <CanvasChatPanel
+            : <IntelligenceCopilotPanel
                 projectId={projectId}
                 canvasId={canvasId}
                 widgets={rawWidgets as CanvasWidgetData[]}

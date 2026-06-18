@@ -285,6 +285,89 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
     return enriched
 
 
+# Tiny precomputed table-name list cache (just [{name, columns}]) — keeps the
+# picker instant after the first open without re-reading the multi-MB snapshot.
+_TABLE_LIST_PREFIX = "schema_tables_list"
+_TABLE_LIST_TTL = int(os.getenv("SCHEMA_TABLE_LIST_TTL", "3600"))  # 1 h
+
+
+async def get_table_list_cached(connection_id: str) -> Optional[list[dict]]:
+    """Return a previously-cached lightweight table list, or None."""
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            raw = await redis.get(f"{_TABLE_LIST_PREFIX}:{connection_id}")
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return data
+    except Exception as _e:
+        print(f"[schema_cache] ⚠ get_table_list_cached failed: {_e}", flush=True)
+    return None
+
+
+async def set_table_list_cached(connection_id: str, tables: list[dict]) -> None:
+    """Cache a lightweight table list for fast repeat picker opens."""
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            await redis.setex(
+                f"{_TABLE_LIST_PREFIX}:{connection_id}",
+                _TABLE_LIST_TTL,
+                json.dumps(tables),
+            )
+    except Exception as _e:
+        print(f"[schema_cache] ⚠ set_table_list_cached failed: {_e}", flush=True)
+
+
+async def get_cached_table_names(connection_id: str) -> Optional[list[dict]]:
+    """Return [{name, columns}] for a connection from ANY warm enriched-cache tier
+    (in-process → Redis → filesystem) WITHOUT rebuilding. Used by lightweight table
+    pickers when no SchemaSnapshot row exists but the enriched cache is warm
+    (common for imported .vly canvases). Returns None if nothing is cached."""
+    def _names(enriched: "EnrichedSchema") -> list[dict]:
+        return [
+            {"name": t.get("name", ""), "columns": len(t.get("columns") or [])}
+            for t in (enriched.compact_tables or []) if t.get("name")
+        ]
+
+    # L1 in-process
+    enr = _store.get(connection_id)
+    if enr and enr.compact_tables:
+        return _names(enr)
+
+    # L2 Redis (any schema_hash for this connection)
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            async for key in redis.scan_iter(f"{_REDIS_KEY_PREFIX}:{connection_id}:*"):
+                cached = await redis.get(key)
+                if cached:
+                    e = _deserialize_enriched(cached)
+                    if e.compact_tables:
+                        return _names(e)
+    except Exception as _e:
+        print(f"[schema_cache] ⚠ get_cached_table_names Redis read failed: {_e}", flush=True)
+
+    # L3 filesystem
+    try:
+        import glob as _glob
+        for p in _glob.glob(str(_fs_cache_dir() / f"schema_{connection_id}_*.json")):
+            try:
+                e = _deserialize_enriched(pathlib.Path(p).read_text(encoding="utf-8"))
+                if e.compact_tables:
+                    return _names(e)
+            except Exception:
+                continue
+    except Exception as _e:
+        print(f"[schema_cache] ⚠ get_cached_table_names filesystem read failed: {_e}", flush=True)
+
+    return None
+
+
 def invalidate(connection_id: str) -> None:
     """
     Evict all cached data for this connection from in-process cache and Redis.

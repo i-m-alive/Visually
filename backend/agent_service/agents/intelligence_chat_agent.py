@@ -1,23 +1,44 @@
+"""Intelligence Report Copilot agent — intelligence_chat_agent.py
+
+FORKED FROM agent_service/agents/chat_agent.py on 2026-06-18.
+
+This is a deliberate, standalone copy of ChatAgent that powers ONLY the
+"Report Copilot" on the intelligence page. The Canvas Assistant keeps using
+chat_agent.ChatAgent. They started byte-identical so functionality matches
+exactly; this fork exists so the Report Copilot's prompt / chart rules /
+behaviour can diverge later WITHOUT touching the canvas builder.
+
+What is intentionally NOT forked (shared infrastructure, imported as-is):
+  • shared.bedrock_client      — LLM transport (streaming + non-streaming)
+  • agent_service.agents.schema_cache — enriched schema cache
+  • query_executor / render_service    — via the router's httpx calls
+
+Isolation from the canvas chat:
+  • Redis history namespace:  intel_chat:history:{session_id}  (NOT chat:history:)
+  • Distinct log prefix:      [intel_chat_agent]
+"""
 import json
 import os
 import re
 from typing import Optional, TYPE_CHECKING
 from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL, BEDROCK_OPUS_MODEL
-from agent_service.agents import schema_scope as _scope
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
 
-CHAT_MODEL = BEDROCK_SONNET_MODEL
-CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
-# Default FK reach for builder-selected "Selected tables" scope when the request
-# omits an explicit hop count.
-CHAT_SELECTED_HOPS_DEFAULT = int(os.getenv("CHAT_SELECTED_HOPS_DEFAULT", "2"))
+INTEL_CHAT_MODEL = BEDROCK_SONNET_MODEL
+INTEL_CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
+# Separate Redis namespace so Report-Copilot conversations never collide with
+# the Canvas Assistant's. Grep the logs for this to confirm the forked path runs.
+INTEL_HISTORY_PREFIX = "intel_chat:history:"
 
-# In-memory fallback when Redis is unavailable
-_memory_history: dict[str, list[dict]] = {}
+# In-memory fallback when Redis is unavailable (separate dict from chat_agent's).
+_intel_memory_history: dict[str, list[dict]] = {}
 
-_SYSTEM_PROMPT_TEMPLATE = """You are a conversational data analyst embedded in a BI platform called Visually.
+print("[intel_chat_agent] module loaded — Report Copilot agent (forked from chat_agent)", flush=True)
+
+# ─── System prompt (forked copy — safe to diverge from the canvas builder) ─────
+_SYSTEM_PROMPT_TEMPLATE = """You are the Report Copilot, a conversational data analyst embedded in the intelligence report view of a BI platform called Visually.
 You have full access to the user's live database and their complete multi-page canvas report.
 The DATABASE SCHEMA and your CURRENT CANVAS REPORT are supplied as additional context blocks below — read them before answering.
 
@@ -224,17 +245,9 @@ TONE: Clear, helpful, and data-focused. For charts/tables/KPIs, always explain t
 # examples without substituting anything (there are no placeholders left).
 _INSTRUCTIONS = _SYSTEM_PROMPT_TEMPLATE.format()
 
-# Sample values shown per categorical column. The detailed schema is now cached
-# (message-independent), so we can afford richer samples without per-turn cost —
-# this is what lets the model match exact filter values and avoid empty/N-A results.
-_SAMPLE_VALUE_LIMIT = int(os.getenv("CHAT_SAMPLE_VALUE_LIMIT", "5"))
-
-# The cached schema keeps EVERY table and column (for accuracy), but the long
-# LLM-generated descriptions are the bulk of its size. Clipping them keeps the
-# column visible (name/type/samples) while pulling the cached prefix well back
-# from the model's context ceiling. Set to 0 to keep full descriptions.
-_COL_DESC_MAX = int(os.getenv("CHAT_COL_DESC_MAX", "80"))
-_TABLE_DESC_MAX = int(os.getenv("CHAT_TABLE_DESC_MAX", "160"))
+_SAMPLE_VALUE_LIMIT = int(os.getenv("INTEL_CHAT_SAMPLE_VALUE_LIMIT", "5"))
+_COL_DESC_MAX = int(os.getenv("INTEL_CHAT_COL_DESC_MAX", "80"))
+_TABLE_DESC_MAX = int(os.getenv("INTEL_CHAT_TABLE_DESC_MAX", "160"))
 
 
 def _clip(text: str, limit: int) -> str:
@@ -244,10 +257,10 @@ def _clip(text: str, limit: int) -> str:
         return text
     return text[:limit].rstrip() + "…"
 
-# Memoised zone-2 schema maps, keyed by (connection_id, schema_hash). The map is
-# byte-identical across sessions for a given schema, so caching it here keeps the
-# cached prefix stable and skips re-formatting on every request.
-_schema_map_cache: dict[str, str] = {}
+
+# Memoised zone-2 schema maps, keyed by (connection_id, schema_hash). Distinct
+# dict from chat_agent's so the two forks never share mutable state.
+_intel_schema_map_cache: dict[str, str] = {}
 
 
 def _is_categorical_col(c: dict) -> bool:
@@ -270,45 +283,20 @@ def _is_categorical_col(c: dict) -> bool:
     return True  # unknown type → keep samples (favour accuracy)
 
 
-def _tfidf_score(message: str, table: dict) -> float:
-    query_words: set[str] = set()
-    for w in re.sub(r"[^a-z0-9_]", " ", message.lower()).split():
-        if len(w) > 2:
-            query_words.add(w)
-            if len(w) > 5:
-                query_words.add(w[:5])
-    if not query_words:
-        return 0.0
-
-    target_words: set[str] = set()
-    for src in [
-        table.get("name", ""),
-        table.get("description", ""),
-        " ".join(table.get("all_column_names") or []),
-    ]:
-        for w in re.sub(r"[^a-z0-9_]", " ", (src or "").lower()).split():
-            if len(w) > 2:
-                target_words.add(w)
-                if len(w) > 5:
-                    target_words.add(w[:5])
-
-    overlap = len(query_words & target_words)
-    return overlap / len(query_words) if query_words else 0.0
-
-
 _CHART_CREATION_KEYWORDS = {
     "create", "make", "build", "generate", "add", "show", "give",
     "chart", "graph", "pie", "bar", "line", "kpi", "table", "visual",
     "plot", "donut", "scatter", "funnel", "treemap", "waterfall",
 }
 
+
 def _is_chart_creation_request(message: str) -> bool:
     """Return True when the message is asking for chart/viz creation."""
     words = set(re.sub(r"[^a-z0-9 ]", " ", message.lower()).split())
-    action_words  = {"create", "make", "build", "generate", "add", "give", "draw", "produce"}
+    action_words = {"create", "make", "build", "generate", "add", "give", "draw", "produce"}
     subject_words = {"chart", "graph", "pie", "bar", "kpi", "table", "visual",
                      "visualization", "plot", "donut", "scatter", "funnel", "treemap", "waterfall"}
-    has_action  = bool(words & action_words)
+    has_action = bool(words & action_words)
     has_subject = bool(words & subject_words)
     return has_action and has_subject
 
@@ -316,7 +304,6 @@ def _is_chart_creation_request(message: str) -> bool:
 def _is_data_query_request(message: str) -> bool:
     """Return True when the message is asking a data question that requires SQL."""
     lower = message.lower()
-    # Question starters that imply a data lookup
     question_starters = (
         "what", "how many", "how much", "which", "who", "when", "where",
         "show me", "find", "list", "get me", "give me", "tell me",
@@ -327,101 +314,219 @@ def _is_data_query_request(message: str) -> bool:
     return any(lower.strip().startswith(s) or f" {s} " in lower for s in question_starters)
 
 
-class ChatAgent:
-    def _build_cached_schema(
-        self,
-        enriched: "EnrichedSchema",
-    ) -> str:
-        """ZONE 2 (cached) — FULL detailed schema for EVERY table, in deterministic
-        (alphabetical) order so the block is byte-stable and message-INDEPENDENT.
-        Because it is cached after the first message, we can afford rich detail
-        (all columns, types, descriptions, sample values, grain, joins, disambiguation).
-        This is what restores the accuracy that per-turn compression had to sacrifice:
-        the model sees every table and real sample values, so it can match exact
-        filter columns/values instead of guessing. Priority/canvas hints stay in the
-        dynamic (uncached) zone to keep this block stable."""
-        compact = sorted(enriched.compact_tables or [], key=lambda x: x.get("name", ""))
+# Default reach for report-scoped mode: how many FK hops out from the report's
+# own tables we still consider "related" and worth surfacing to the copilot.
+INTEL_SCOPE_HOPS = int(os.getenv("INTEL_SCOPE_HOPS", "2"))
 
+
+def _nhop_neighbors(edges: dict, seed: set, hops: int) -> set:
+    """BFS the FK adjacency graph `edges` outward from `seed` up to `hops` levels.
+    Returns the reachable nodes EXCLUDING the seed itself. Used by report-scoped
+    mode to pull in tables joinable to the report's own tables."""
+    visited = set(seed)
+    frontier = set(seed)
+    for _ in range(max(0, hops)):
+        nxt = set()
+        for node in frontier:
+            for neighbor in (edges.get(node) or {}):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    nxt.add(neighbor)
+        frontier = nxt
+        if not frontier:
+            break
+    return visited - set(seed)
+
+
+class IntelligenceChatAgent:
+    """Standalone Report-Copilot agent. Mirrors ChatAgent's public surface
+    (prepare / respond / parse_raw / retry_for_sql / *_history) so the
+    intelligence_chat router can drive it exactly like chat.py drives ChatAgent."""
+
+    def _dialect_label(self, enriched: "EnrichedSchema") -> str:
         dialect = (enriched.db_type or "").lower()
-        dialect_label = {
+        return {
             "postgresql": "PostgreSQL", "postgres": "PostgreSQL",
             "redshift": "Amazon Redshift", "mysql": "MySQL",
         }.get(dialect, enriched.db_type or "SQL")
 
+    def _render_table_detail(self, enriched: "EnrichedSchema", t: dict) -> list[str]:
+        """Full per-table detail block (description, grain, columns, sample values).
+        Shared by the full-DB builder and the report-scoped builder so both render a
+        table identically."""
+        lines: list[str] = []
+        tname = t.get("name", "")
+        desc = _clip(t.get("description") or "", _TABLE_DESC_MAX)
+        row_count = t.get("row_count")
+        row_hint = f"  ~{row_count:,} rows" if row_count else ""
+        lines.append(f"\n[{tname}]{row_hint}")
+        if desc:
+            lines.append(f"  {desc}")
+
+        sem = enriched.table_semantics.get(tname, {})
+        grain = sem.get("grain") or ""
+        use_for = sem.get("use_for") or []
+        never_use = sem.get("never_use_for") or []
+        if grain:
+            lines.append(f"  Grain: {grain}")
+        if use_for:
+            lines.append(f"  Use for: {', '.join(use_for)}")
+        if never_use:
+            lines.append(f"  Never use for: {', '.join(never_use)}")
+
+        cols = t.get("columns") or []
+        col_parts: list[str] = []
+        sample_parts: list[str] = []
+        for c in cols:
+            cname = c.get("name") or ""
+            ctype = c.get("type") or ""
+            cdesc = _clip(c.get("description") or "", _COL_DESC_MAX)
+            sem_type = c.get("semantic_type") or ""
+            tag = f"[{sem_type}]" if sem_type else ""
+            col_parts.append(f"{cname}{tag} ({ctype}){': ' + cdesc if cdesc else ''}")
+
+            stats = c.get("stats") or {}
+            top_vals = stats.get("top_values") or []
+            if top_vals and _is_categorical_col(c):
+                sample_strs = []
+                for rv in top_vals[:_SAMPLE_VALUE_LIMIT]:
+                    if isinstance(rv, dict):
+                        val = rv.get(cname) or next(iter(rv.values()), None)
+                    else:
+                        val = rv
+                    if val is not None:
+                        sample_strs.append(str(val))
+                if sample_strs:
+                    sample_parts.append(f"{cname}: [{', '.join(sample_strs)}]")
+
+        if col_parts:
+            lines.append(f"  Columns: {' | '.join(col_parts)}")
+        if sample_parts:
+            lines.append(f"  Sample values: {' | '.join(sample_parts)}")
+        return lines
+
+    def _join_condition_lines(
+        self, enriched: "EnrichedSchema", only: Optional[set] = None
+    ) -> list[str]:
+        """Deduplicated JOIN CONDITIONS block. When `only` is given, keep an edge
+        only if BOTH endpoints are in that set (used by report-scoped mode)."""
+        join_hints: list[str] = []
+        seen_edges: set[frozenset] = set()
+        for tbl_a in sorted(enriched.relationship_graph.edges.keys()):
+            for tbl_b, condition in enriched.relationship_graph.edges[tbl_a].items():
+                if only is not None and (tbl_a not in only or tbl_b not in only):
+                    continue
+                edge_key = frozenset([tbl_a, tbl_b])
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    join_hints.append(f"  {condition}")
+        if not join_hints:
+            return []
+        return ["\nJOIN CONDITIONS:", *join_hints]
+
+    def _build_cached_schema(self, enriched: "EnrichedSchema") -> str:
+        """ZONE 2 (cached) — FULL detailed schema for EVERY table, in deterministic
+        (alphabetical) order so the block is byte-stable and message-INDEPENDENT.
+        Used by FULL-DB ("database") scope."""
+        compact = sorted(enriched.compact_tables or [], key=lambda x: x.get("name", ""))
+
+        dialect_label = self._dialect_label(enriched)
         lines = [
             f"SQL DIALECT: {dialect_label} — every query you write MUST be valid {dialect_label} SQL.",
             f"DATABASE SCHEMA — {len(compact)} tables (the complete database; "
             f"you may query any of them):",
         ]
-
         for t in compact:
-            tname = t.get("name", "")
-            desc = _clip(t.get("description") or "", _TABLE_DESC_MAX)
-            row_count = t.get("row_count")
-            row_hint = f"  ~{row_count:,} rows" if row_count else ""
-            lines.append(f"\n[{tname}]{row_hint}")
-            if desc:
-                lines.append(f"  {desc}")
+            lines.extend(self._render_table_detail(enriched, t))
 
-            sem = enriched.table_semantics.get(tname, {})
-            grain = sem.get("grain") or ""
-            use_for = sem.get("use_for") or []
-            never_use = sem.get("never_use_for") or []
-            if grain:
-                lines.append(f"  Grain: {grain}")
-            if use_for:
-                lines.append(f"  Use for: {', '.join(use_for)}")
-            if never_use:
-                lines.append(f"  Never use for: {', '.join(never_use)}")
-
-            cols = t.get("columns") or []
-            col_parts = []
-            sample_parts = []
-            for c in cols:
-                cname = c.get("name") or ""
-                ctype = c.get("type") or ""
-                cdesc = _clip(c.get("description") or "", _COL_DESC_MAX)
-                sem_type = c.get("semantic_type") or ""
-                tag = f"[{sem_type}]" if sem_type else ""
-                col_parts.append(f"{cname}{tag} ({ctype}){': ' + cdesc if cdesc else ''}")
-
-                # Sample values matter most for categorical/low-cardinality columns —
-                # they let the model write correct WHERE filters (avoiding empty/N-A).
-                stats = c.get("stats") or {}
-                top_vals = stats.get("top_values") or []
-                if top_vals and _is_categorical_col(c):
-                    sample_strs = []
-                    for rv in top_vals[:_SAMPLE_VALUE_LIMIT]:
-                        if isinstance(rv, dict):
-                            val = rv.get(cname) or next(iter(rv.values()), None)
-                        else:
-                            val = rv
-                        if val is not None:
-                            sample_strs.append(str(val))
-                    if sample_strs:
-                        sample_parts.append(f"{cname}: [{', '.join(sample_strs)}]")
-
-            if col_parts:
-                lines.append(f"  Columns: {' | '.join(col_parts)}")
-            if sample_parts:
-                lines.append(f"  Sample values: {' | '.join(sample_parts)}")
-
-        # Full join graph, deterministic order.
-        join_hints = []
-        seen_edges: set[frozenset] = set()
-        for tbl_a in sorted(enriched.relationship_graph.edges.keys()):
-            for tbl_b, condition in enriched.relationship_graph.edges[tbl_a].items():
-                edge_key = frozenset([tbl_a, tbl_b])
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    join_hints.append(f"  {condition}")
-        if join_hints:
-            lines.append("\nJOIN CONDITIONS:")
-            lines.extend(join_hints)
+        lines.extend(self._join_condition_lines(enriched))
 
         disambig = enriched.get_disambiguation_text()
         if disambig and disambig != "COLUMN DISAMBIGUATION (same column name, different meanings per table):":
             lines.append(f"\n{disambig}")
+
+        return "\n".join(lines)
+
+    # ── Report-scoped mode (default on the intelligence page) ──────────────────
+
+    def resolve_scope_tables(
+        self,
+        enriched: "EnrichedSchema",
+        priority_tables: Optional[set],
+        hops: int = INTEL_SCOPE_HOPS,
+    ) -> tuple[set, set]:
+        """Map the report's own tables (priority_tables, derived from widget SQL) onto
+        the enriched schema's qualified table names, then walk the FK graph `hops`
+        levels out to collect related neighbours.
+
+        Returns (seed_qualified, neighbor_qualified) — both restricted to tables that
+        actually exist in compact_tables. seed is empty when nothing matched (caller
+        then falls back to the full schema)."""
+        pri = {p.lower() for p in (priority_tables or set())}
+        compact_names = [t.get("name", "") for t in (enriched.compact_tables or []) if t.get("name")]
+        compact_set = set(compact_names)
+
+        def _matches(qn: str) -> bool:
+            return qn.lower() in pri or qn.split(".")[-1].lower() in pri
+
+        seed = {qn for qn in compact_names if _matches(qn)}
+        if not seed:
+            return set(), set()
+
+        edges = enriched.relationship_graph.edges or {}
+        neighbors = _nhop_neighbors(edges, seed, hops)
+        neighbors = {n for n in neighbors if n in compact_set} - seed
+        return seed, neighbors
+
+    def _build_scoped_schema(
+        self,
+        enriched: "EnrichedSchema",
+        seed: set,
+        neighbors: set,
+    ) -> str:
+        """ZONE 2 (cached) for REPORT scope. Two detail tiers:
+          • seed tables (used by the report)  → FULL detail (cols, samples, semantics)
+          • neighbour tables (≤N FK hops away) → LIGHTWEIGHT (name + purpose + 1 join)
+        Keeps the prompt small while still telling the model which other tables exist
+        and how to reach them."""
+        compact_by_name = {
+            t.get("name", ""): t for t in (enriched.compact_tables or []) if t.get("name")
+        }
+        dialect_label = self._dialect_label(enriched)
+        lines = [
+            f"SQL DIALECT: {dialect_label} — every query you write MUST be valid {dialect_label} SQL.",
+            "SCOPE: REPORT — answer using the tables/views that build THIS report. "
+            "RELATED TABLES (listed after) are joinable and may be queried only when the "
+            "question genuinely needs data beyond what the report tables hold.",
+            f"\nREPORT TABLES — {len(seed)} table(s) used by this report's charts:",
+        ]
+        for tname in sorted(seed):
+            t = compact_by_name.get(tname)
+            if t:
+                lines.extend(self._render_table_detail(enriched, t))
+
+        if neighbors:
+            lines.append(
+                f"\nRELATED TABLES — {len(neighbors)} table(s) within "
+                f"{INTEL_SCOPE_HOPS} join-hop(s) of the report's tables (names + how to join only):"
+            )
+            for tname in sorted(neighbors):
+                t = compact_by_name.get(tname)
+                sem = enriched.table_semantics.get(tname, {})
+                purpose = sem.get("purpose") or (_clip(t.get("description") or "", _TABLE_DESC_MAX) if t else "") or ""
+                lines.append(f"\n[{tname}]{(' ' + purpose) if purpose else ''}")
+                # one join path back toward the report's own tables (or any scoped table)
+                cond = None
+                for s in sorted(seed):
+                    cond = enriched.relationship_graph.get_join_condition(tname, s)
+                    if cond:
+                        break
+                if cond:
+                    lines.append(f"  Join: {cond}")
+
+        # JOIN CONDITIONS limited to the scoped set (seed + neighbours)
+        scoped = set(seed) | set(neighbors)
+        lines.extend(self._join_condition_lines(enriched, only=scoped))
 
         return "\n".join(lines)
 
@@ -448,11 +553,8 @@ class ChatAgent:
             return "Canvas is empty — no charts yet."
 
         priority_tables = priority_tables or set()
-
-        # Build page name map
         pages_map: dict[str, str] = {p["id"]: p["name"] for p in dashboard_pages if "id" in p}
 
-        # Group widgets by page_id
         by_page: dict[str, list[dict]] = {}
         unassigned: list[dict] = []
         for w in dashboard_widgets:
@@ -464,7 +566,6 @@ class ChatAgent:
 
         parts: list[str] = []
 
-        # Page summary header
         if dashboard_pages:
             page_summary = []
             for p in sorted(dashboard_pages, key=lambda x: x.get("order", 0)):
@@ -477,7 +578,6 @@ class ChatAgent:
                 + " | ".join(page_summary)
             )
 
-        # Per-page widget detail
         ordered_pages = sorted(dashboard_pages, key=lambda x: x.get("order", 0))
         for p in ordered_pages:
             pid = p["id"]
@@ -494,13 +594,11 @@ class ChatAgent:
                     + (f" | SQL: {sql_preview}" if sql_preview else "")
                 )
 
-        # Widgets not yet assigned to a page (legacy / just added)
         if unassigned:
             parts.append(f"\nUnassigned widgets ({len(unassigned)}):")
             for w in unassigned:
                 parts.append(f"  • {w['title']} [{w['chart_type']}]")
 
-        # Priority tables extracted from existing SQL
         if priority_tables:
             parts.append(
                 f"\nPRIORITY TABLES (used by existing charts — prefer these when building new ones): "
@@ -509,22 +607,18 @@ class ChatAgent:
 
         return "\n".join(parts)
 
-    def _get_cached_schema(
-        self, enriched: "EnrichedSchema", connection_id: Optional[str]
-    ) -> str:
-        """Memoise the zone-2 full schema per (connection_id, schema_hash). Skips
-        re-formatting and guarantees a byte-identical cached prefix across requests
-        for the same schema (so Bedrock's prefix cache actually hits)."""
+    def _get_cached_schema(self, enriched: "EnrichedSchema", connection_id: Optional[str]) -> str:
+        """Memoise the zone-2 full schema per (connection_id, schema_hash)."""
         try:
             from agent_service.agents.schema_cache import compute_schema_hash
             key = f"{connection_id or '_'}:{compute_schema_hash(enriched.schema_doc)}"
         except Exception:
             key = None
-        if key and key in _schema_map_cache:
-            return _schema_map_cache[key]
+        if key and key in _intel_schema_map_cache:
+            return _intel_schema_map_cache[key]
         schema = self._build_cached_schema(enriched)
         if key:
-            _schema_map_cache[key] = schema
+            _intel_schema_map_cache[key] = schema
         return schema
 
     def _build_dynamic_context(
@@ -534,66 +628,10 @@ class ChatAgent:
         active_page_id: Optional[str],
         priority_tables: Optional[set[str]],
     ) -> str:
-        """ZONE 3 — the per-turn tail (UNCACHED): just the current canvas state and
-        which tables it already uses. Small, so re-sending it every turn is cheap.
-        The schema now lives entirely in the cached zone 2."""
         dashboard_context = self._build_dashboard_context(
             dashboard_widgets, dashboard_pages, active_page_id, priority_tables
         )
         return "CURRENT CANVAS REPORT:\n" + dashboard_context
-
-    def _build_selected_schema(
-        self,
-        enriched: "EnrichedSchema",
-        selected_tables: list[str],
-        selected_hops: int,
-        connection_id: Optional[str],
-        total: int,
-    ) -> str:
-        """Report-scoped schema for the builder's "Selected tables" mode: the chosen
-        tables (full detail) + their `selected_hops`-hop FK neighbours (lightweight).
-        Any failure or empty match degrades to the full schema so a turn never breaks."""
-        try:
-            seed, neighbors = _scope.resolve_scope_tables(
-                enriched, set(selected_tables or []), selected_hops
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[chat] ⚠ resolve_scope_tables failed ({exc!r}) — full schema", flush=True)
-            return self._get_cached_schema(enriched, connection_id)
-
-        if not seed:
-            print(
-                f"[chat] scope=selected picked={len(selected_tables or [])} seed=0 — "
-                f"no tables matched, falling back to FULL schema ({total} tables)",
-                flush=True,
-            )
-            return self._get_cached_schema(enriched, connection_id)
-
-        try:
-            schema = _scope.render_scoped_schema(
-                enriched, seed, neighbors, selected_hops,
-                col_desc_max=_COL_DESC_MAX, table_desc_max=_TABLE_DESC_MAX,
-                sample_limit=_SAMPLE_VALUE_LIMIT,
-                scope_intro=(
-                    "SCOPE: SELECTED TABLES — the builder chose these tables to focus on. "
-                    "Build queries from the SELECTED TABLES below; RELATED TABLES are joinable "
-                    "and may be used only when the request genuinely needs them."
-                ),
-                seed_header=f"SELECTED TABLES — {len(seed)} table(s) you are focusing on:",
-                related_header_fmt=(
-                    "RELATED TABLES — {n} table(s) within {hops} join-hop(s) of the "
-                    "selected tables (names + how to join only):"
-                ),
-            )
-            print(
-                f"[chat] scope=selected picked={len(selected_tables or [])} seed={len(seed)} "
-                f"related={len(neighbors)} hops={selected_hops} (of {total} total) — scoped schema built",
-                flush=True,
-            )
-            return schema
-        except Exception as exc:  # noqa: BLE001
-            print(f"[chat] ⚠ scoped build failed ({exc!r}) — full schema", flush=True)
-            return self._get_cached_schema(enriched, connection_id)
 
     def _build_system_blocks(
         self,
@@ -605,39 +643,51 @@ class ChatAgent:
         enriched: Optional["EnrichedSchema"] = None,
         connection_id: Optional[str] = None,
         scope: str = "database",
-        selected_tables: Optional[list[str]] = None,
-        selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
     ) -> list[dict]:
-        """Assemble the system prompt as Bedrock content blocks with a cache
-        breakpoint at the end of the schema. Zones 1+2 (instructions + schema)
-        are cached; only zone 3 (the small canvas tail) is re-sent each turn.
-
-        scope:
-          "database" → full enriched schema (every table) — the default.
-          "selected" → only the builder-picked tables (`selected_tables`) plus their
-                        `selected_hops`-hop FK neighbours, via schema_scope. Falls back
-                        to the full schema when nothing matches."""
         dynamic = self._build_dynamic_context(
             dashboard_widgets, dashboard_pages, active_page_id, priority_tables,
         )
 
         if enriched and enriched.compact_tables:
             total = len(enriched.compact_tables)
-            if scope == "selected":
-                schema = self._build_selected_schema(
-                    enriched, selected_tables or [], selected_hops, connection_id, total
-                )
+            if scope == "report":
+                try:
+                    seed, neighbors = self.resolve_scope_tables(enriched, priority_tables)
+                except Exception as exc:  # noqa: BLE001 — never let scoping break a turn
+                    seed, neighbors = set(), set()
+                    print(f"[intel_chat_agent] ⚠ resolve_scope_tables failed ({exc!r}) — full schema", flush=True)
+                if seed:
+                    try:
+                        schema = self._build_scoped_schema(enriched, seed, neighbors)
+                        print(
+                            f"[intel_chat_agent] scope=report  seed_tables={len(seed)}  "
+                            f"related_tables={len(neighbors)}  (of {total} total) — scoped schema built",
+                            flush=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        schema = self._get_cached_schema(enriched, connection_id)
+                        print(f"[intel_chat_agent] ⚠ scoped build failed ({exc!r}) — full schema", flush=True)
+                else:
+                    # No report tables matched (e.g. widgets have no parseable SQL) →
+                    # fall back to the full schema so the copilot is never blind.
+                    schema = self._get_cached_schema(enriched, connection_id)
+                    print(
+                        f"[intel_chat_agent] scope=report  seed_tables=0 — no report tables "
+                        f"matched, falling back to FULL schema ({total} tables)",
+                        flush=True,
+                    )
             else:
                 schema = self._get_cached_schema(enriched, connection_id)
-                print(f"[chat] scope=database — full schema ({total} tables)", flush=True)
+                print(
+                    f"[intel_chat_agent] scope=database — full schema ({total} tables)",
+                    flush=True,
+                )
             return [
                 {"type": "text", "text": _INSTRUCTIONS},
                 {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": dynamic},
             ]
 
-        # No enriched schema → fall back to the raw doc. Cache instructions + raw
-        # schema together (still stable per schema); canvas stays in the tail.
         raw_schema = self._build_schema_section_raw(schema_doc)
         return [
             {"type": "text", "text": _INSTRUCTIONS + "\n\n" + raw_schema,
@@ -658,11 +708,8 @@ class ChatAgent:
         model_override: Optional[str] = None,
         connection_id: Optional[str] = None,
         scope: str = "database",
-        selected_tables: Optional[list[str]] = None,
-        selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
     ) -> tuple[list[dict], list[dict], str, int]:
-        """Build everything needed for a model call: (system_blocks, messages,
-        model_id, max_tokens). Shared by both respond() and the streaming path."""
+        """Build (system_blocks, messages, model_id, max_tokens)."""
         system_blocks = self._build_system_blocks(
             schema_doc=schema_doc,
             dashboard_widgets=dashboard_widgets,
@@ -672,17 +719,15 @@ class ChatAgent:
             enriched=enriched_schema,
             connection_id=connection_id,
             scope=scope,
-            selected_tables=selected_tables,
-            selected_hops=selected_hops,
         )
         messages = conversation_history[-20:] + [{"role": "user", "content": message}]
-        effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else CHAT_MODEL
-        effective_max_tokens = 8192 if model_override == "opus" else 2048  # Opus needs more
+        effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else INTEL_CHAT_MODEL
+        effective_max_tokens = 8192 if model_override == "opus" else 2048
 
         cached_len = sum(len(b["text"]) for b in system_blocks if "cache_control" in b)
         dynamic_len = sum(len(b["text"]) for b in system_blocks if "cache_control" not in b)
         print(
-            f"[chat_agent] model={effective_model.split('/')[-1]}  "
+            f"[intel_chat_agent] model={effective_model.split('/')[-1]}  "
             f"max_tokens={effective_max_tokens}  "
             f"history_turns={len(conversation_history) // 2}  "
             f"msg_len={len(message)}  scope={scope}  "
@@ -693,8 +738,8 @@ class ChatAgent:
 
     @staticmethod
     def parse_raw(raw: str) -> dict:
-        """Split a raw model response into prose text + executable sql_execute specs
-        + a dashboard_action. No model calls — pure parsing."""
+        """Split a raw model response into prose text + sql_execute specs +
+        a dashboard_action. No model calls — pure parsing."""
         sqls_to_execute: list[dict] = []
         dashboard_action = None
         text = raw
@@ -718,7 +763,6 @@ class ChatAgent:
                     pass
             text = re.sub(r"```dashboard_action\n.*?\n```", "", text, flags=re.DOTALL).strip()
 
-        # Legacy <action> block support
         if "<action>" in raw and not sql_to_execute:
             match = re.search(r"<action>(.*?)</action>", raw, re.DOTALL)
             if match:
@@ -749,9 +793,10 @@ class ChatAgent:
             f"Original request: {message}"
         )
         retry_messages = conversation_history[-20:] + [{"role": "user", "content": retry_msg}]
+        print("[intel_chat_agent] retry_for_sql — model narrated without a sql block, retrying", flush=True)
         try:
             raw2 = await bedrock_invoke_with_history(
-                model_id=CHAT_MODEL,
+                model_id=INTEL_CHAT_MODEL,
                 system_prompt=system_blocks,
                 messages=retry_messages,
                 max_tokens=1024,
@@ -759,7 +804,7 @@ class ChatAgent:
             )
             return self.parse_raw(raw2)["sqls_to_execute"]
         except Exception:
-            return []  # retry failed — caller falls back to original narration
+            return []
 
     async def respond(
         self,
@@ -774,14 +819,11 @@ class ChatAgent:
         model_override: Optional[str] = None,
         connection_id: Optional[str] = None,
         scope: str = "database",
-        selected_tables: Optional[list[str]] = None,
-        selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
             dashboard_pages, active_page_id, priority_tables, enriched_schema,
-            model_override, connection_id,
-            scope=scope, selected_tables=selected_tables, selected_hops=selected_hops,
+            model_override, connection_id, scope=scope,
         )
 
         raw = await bedrock_invoke_with_history(
@@ -793,7 +835,7 @@ class ChatAgent:
         )
 
         print(
-            f"[chat_agent] response_len={len(raw)}  "
+            f"[intel_chat_agent] response_len={len(raw)}  "
             f"has_sql={'yes' if '```sql_execute' in raw else 'no'}  "
             f"has_action={'yes' if '```dashboard_action' in raw else 'no'}",
             flush=True,
@@ -801,7 +843,6 @@ class ChatAgent:
 
         parsed = self.parse_raw(raw)
 
-        # Auto-retry when the model narrated a data/chart request without a sql block.
         if not parsed["sqls_to_execute"] and (
             _is_chart_creation_request(message) or _is_data_query_request(message)
         ):
@@ -815,8 +856,8 @@ class ChatAgent:
     @staticmethod
     async def load_history(session_id: str, redis) -> list[dict]:
         if redis is None:
-            return list(_memory_history.get(session_id, []))
-        raw = await redis.get(f"chat:history:{session_id}")
+            return list(_intel_memory_history.get(session_id, []))
+        raw = await redis.get(f"{INTEL_HISTORY_PREFIX}{session_id}")
         if raw:
             try:
                 data = json.loads(raw)
@@ -829,17 +870,17 @@ class ChatAgent:
     async def save_history(session_id: str, messages: list[dict], redis) -> None:
         trimmed = messages[-40:]
         if redis is None:
-            _memory_history[session_id] = trimmed
+            _intel_memory_history[session_id] = trimmed
             return
         await redis.setex(
-            f"chat:history:{session_id}",
-            CONVERSATION_TTL_SECONDS,
+            f"{INTEL_HISTORY_PREFIX}{session_id}",
+            INTEL_CONVERSATION_TTL_SECONDS,
             json.dumps({"messages": trimmed}),
         )
 
     @staticmethod
     async def clear_history(session_id: str, redis) -> None:
         if redis is None:
-            _memory_history.pop(session_id, None)
+            _intel_memory_history.pop(session_id, None)
             return
-        await redis.delete(f"chat:history:{session_id}")
+        await redis.delete(f"{INTEL_HISTORY_PREFIX}{session_id}")

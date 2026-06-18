@@ -2,7 +2,8 @@ import uuid
 import os
 from datetime import datetime
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -12,6 +13,8 @@ from shared.models.projects import Project
 from shared.models.project_members import ProjectMember, MemberRole
 from shared.models.database_connections import DatabaseConnection, DbType
 from shared.models.schema_snapshots import SchemaSnapshot
+from shared.models.dashboards import Dashboard
+from shared.models.widgets import Widget
 from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata
 from shared.encryption import encrypt, decrypt
 from shared.schemas.projects import (
@@ -387,6 +390,129 @@ async def get_schema(
         "created_at": snapshot.created_at.isoformat(),
         "schema": snapshot.schema_document,
     }
+
+
+async def _resolve_connection_id_for_tables(
+    project_id: str,
+    connection_id: Optional[str],
+    dashboard_id: Optional[str],
+    db: AsyncSession,
+) -> Optional[uuid.UUID]:
+    """Resolve which connection's schema to list, mirroring the chat's resolution:
+    explicit connection_id → project's active connection → the dashboard's bound
+    connection (layout_config.connection_id, then any widget). Imported canvases
+    often have no project-level connection, only a dashboard/widget binding —
+    hence the dashboard fallback (without it this 404s for imported reports)."""
+    # 1) explicit connection_id (the canvas panel already knows it from its widgets)
+    if connection_id:
+        try:
+            return uuid.UUID(connection_id)
+        except ValueError:
+            pass
+    # 2) project's active connection
+    try:
+        proj_uuid = uuid.UUID(project_id)
+    except ValueError:
+        return None
+    conn = (await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.project_id == proj_uuid,
+            DatabaseConnection.is_active == True,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if conn:
+        return conn.id
+    # 3) dashboard fallback (imported canvases bind the connection here)
+    if dashboard_id:
+        try:
+            dash_uuid = uuid.UUID(dashboard_id)
+        except ValueError:
+            return None
+        dash = (await db.execute(
+            select(Dashboard).where(Dashboard.id == dash_uuid)
+        )).scalar_one_or_none()
+        if dash:
+            lc_conn = (dash.layout_config or {}).get("connection_id")
+            if lc_conn:
+                try:
+                    return uuid.UUID(str(lc_conn))
+                except ValueError:
+                    pass
+        wid_conn = (await db.execute(
+            select(Widget.connection_id)
+            .where(Widget.dashboard_id == dash_uuid)
+            .where(Widget.connection_id.isnot(None))
+            .limit(1)
+        )).scalar_one_or_none()
+        if wid_conn:
+            return wid_conn
+    return None
+
+
+@router.get("/{project_id}/schema/tables")
+async def get_schema_tables(
+    project_id: str,
+    connection_id: Optional[str] = Query(None),
+    dashboard_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lightweight table-name list for pickers (e.g. the Canvas Assistant's
+    'Selected tables' mode). Reads the latest cached snapshot but returns ONLY
+    table names + column counts — a few KB, versus the multi-MB full
+    schema_document returned by GET /schema. No crawl, no live DB hit.
+
+    Resolves the connection via connection_id → project active → dashboard binding,
+    so it works for imported canvases that have no project-level connection."""
+    conn_id = await _resolve_connection_id_for_tables(project_id, connection_id, dashboard_id, db)
+    print(
+        f"[schema-tables] project={project_id[:8]} conn_param={'y' if connection_id else 'n'} "
+        f"dash_param={'y' if dashboard_id else 'n'} → resolved_conn={str(conn_id)[:8] if conn_id else None}",
+        flush=True,
+    )
+    if not conn_id:
+        raise HTTPException(status_code=404, detail="No connection found for this project/canvas")
+
+    snap_result = await db.execute(
+        select(SchemaSnapshot)
+        .where(SchemaSnapshot.connection_id == conn_id)
+        .order_by(SchemaSnapshot.version.desc())
+        .limit(1)
+    )
+    snapshot = snap_result.scalar_one_or_none()
+
+    out: list[dict] = []
+    version = 0
+    if snapshot and snapshot.schema_document:
+        version = snapshot.version
+        raw = snapshot.schema_document or {}
+        raw_tables = raw.get("tables", []) if isinstance(raw, dict) else []
+        if isinstance(raw_tables, dict):
+            for name, t in raw_tables.items():
+                out.append({"name": name, "columns": len((t or {}).get("columns") or [])})
+        else:
+            for t in raw_tables:
+                if isinstance(t, dict) and t.get("name"):
+                    name = f"{t['schema']}.{t['name']}" if t.get("schema") else t["name"]
+                    out.append({"name": name, "columns": len(t.get("columns") or [])})
+        print(f"[schema-tables] from snapshot v{version}  tables={len(out)}", flush=True)
+    else:
+        # No durable snapshot (common for imported .vly canvases) → read the warm
+        # enriched cache the copilot already uses.
+        from agent_service.agents import schema_cache as _sc
+        cached = await _sc.get_cached_table_names(str(conn_id))
+        if cached:
+            out = cached
+            print(f"[schema-tables] from enriched cache  tables={len(out)}", flush=True)
+        else:
+            print(f"[schema-tables] no snapshot AND no enriched cache for conn={str(conn_id)[:8]}", flush=True)
+            raise HTTPException(
+                status_code=404,
+                detail="No schema available for this connection yet. Crawl the schema first.",
+            )
+
+    out.sort(key=lambda x: x["name"].lower())
+    return {"tables": out, "total": len(out), "version": version}
 
 
 @router.get("/{project_id}/schema/metadata")
