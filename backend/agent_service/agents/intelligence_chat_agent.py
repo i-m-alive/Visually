@@ -154,6 +154,15 @@ translate them to SQL equivalents:
   [Measure] * [Other]        → col * other_col
 If the user specifies column aliases like "Name : name", use AS "Name" in SELECT.
 For multi-table requests: use JOIN. Match columns to their tables by name.
+
+COLUMN LABELS — PRESERVE THE REAL COLUMN NAME (do NOT invent new names):
+  When you SELECT an existing column, alias it to the SAME column name, cleaned ONLY for display —
+  convert snake_case / camelCase / lowercase to spaced Title Case and fix capitalization & obvious
+  spelling. KEEP the original words; never substitute a different business term or concept.
+    ✅ first_name → AS "First Name"   ✅ clientcorporationid → AS "Client Corporation Id"   ✅ city → AS "City"
+    ❌ region → AS "Sales Territory"   ❌ status → AS "Pipeline Stage"   ❌ amount → AS "Revenue"
+  Aggregates are labelled by the operation on the cleaned column name — SUM(amount) AS "Total Amount",
+  AVG(rate) AS "Average Rate", COUNT(*) AS "Count". Use a DIFFERENT alias only when the user explicitly asks for it.
 ══════════════════════════════════════════════════════════════════════
 
 MULTI-CHART RESPONSES:
