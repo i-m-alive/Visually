@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, BackgroundTasks, status
+from fastapi import FastAPI, Depends, HTTPException, Request, Query, WebSocket, BackgroundTasks, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -49,6 +49,7 @@ from agent_service.routers import ai_insights as ai_insights_module
 from agent_service.routers import analyst as analyst_module
 from agent_service.routers import end_user as end_user_module
 from agent_service.routers import intelligence as intelligence_module
+from agent_service.routers import intelligence_chat as intelligence_chat_module
 
 from contextlib import asynccontextmanager
 
@@ -138,6 +139,7 @@ app.include_router(ai_insights_module.router)
 app.include_router(analyst_module.router)
 app.include_router(end_user_module.router)
 app.include_router(intelligence_module.router)
+app.include_router(intelligence_chat_module.router)
 
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
@@ -606,6 +608,118 @@ async def get_schema(project_id: str, current_user: User = Depends(get_current_u
     return {"connection_id": str(conn.id), "snapshot_id": str(snapshot.id),
             "version": snapshot.version, "created_at": snapshot.created_at.isoformat(),
             "schema": snapshot.schema_document}
+
+
+@app.get("/projects/{project_id}/schema/tables")
+async def get_schema_tables(
+    project_id: str,
+    connection_id: str | None = Query(None),
+    dashboard_id: str | None = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lightweight table-name list (names + column counts) for table pickers, e.g.
+    the Canvas Assistant's 'Selected tables' mode — a few KB versus the multi-MB
+    full schema_document from GET /schema. Resolves the connection via
+    connection_id → project active → dashboard binding, and falls back to the warm
+    enriched cache when no SchemaSnapshot row exists (common for imported .vly
+    canvases). No crawl, no live DB hit."""
+    from shared.models.dashboards import Dashboard
+    from shared.models.widgets import Widget as _Widget
+
+    # ── resolve connection (mirror chat's resolution) ──
+    conn_id = None
+    if connection_id:
+        try:
+            conn_id = uuid.UUID(connection_id)
+        except ValueError:
+            conn_id = None
+    if conn_id is None:
+        conn = (await db.execute(select(DatabaseConnection).where(
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+            DatabaseConnection.is_active == True).limit(1))).scalar_one_or_none()
+        if conn:
+            conn_id = conn.id
+    if conn_id is None and dashboard_id:
+        try:
+            dash_uuid = uuid.UUID(dashboard_id)
+        except ValueError:
+            dash_uuid = None
+        if dash_uuid:
+            dash = (await db.execute(select(Dashboard).where(Dashboard.id == dash_uuid))).scalar_one_or_none()
+            if dash:
+                lc = (dash.layout_config or {}).get("connection_id")
+                if lc:
+                    try:
+                        conn_id = uuid.UUID(str(lc))
+                    except ValueError:
+                        pass
+            if conn_id is None:
+                wc = (await db.execute(select(_Widget.connection_id)
+                    .where(_Widget.dashboard_id == dash_uuid)
+                    .where(_Widget.connection_id.isnot(None)).limit(1))).scalar_one_or_none()
+                if wc:
+                    conn_id = wc
+
+    print(
+        f"[schema-tables] project={project_id[:8]} conn_param={'y' if connection_id else 'n'} "
+        f"dash_param={'y' if dashboard_id else 'n'} → resolved_conn={str(conn_id)[:8] if conn_id else None}",
+        flush=True,
+    )
+    if conn_id is None:
+        raise HTTPException(status_code=404, detail="No connection found for this project/canvas")
+
+    import agent_service.agents.schema_cache as _sc
+    import time as _time
+    _t0 = _time.perf_counter()
+    _ms = lambda: int((_time.perf_counter() - _t0) * 1000)
+
+    # 0) tiny precomputed list cache → instant on repeat opens (survives --reload)
+    cached_list = await _sc.get_table_list_cached(str(conn_id))
+    if cached_list is not None:
+        print(f"[schema-tables] HIT list-cache  tables={len(cached_list)}  {_ms()}ms", flush=True)
+        return {"tables": cached_list, "total": len(cached_list), "version": 0}
+
+    out: list[dict] = []
+    version = 0
+    source = "enriched"
+
+    # 1) prefer the warm enriched cache (in-process → Redis → fs) — avoids loading
+    #    the multi-MB schema_document from Postgres on the hot path.
+    out = await _sc.get_cached_table_names(str(conn_id)) or []
+    _t_fetch = _ms()
+
+    # 2) fall back to the durable snapshot only if the cache is cold
+    if not out:
+        snapshot = (await db.execute(select(SchemaSnapshot)
+            .where(SchemaSnapshot.connection_id == conn_id)
+            .order_by(SchemaSnapshot.version.desc()).limit(1))).scalar_one_or_none()
+        if snapshot and snapshot.schema_document:
+            version = snapshot.version
+            source = "snapshot"
+            raw = snapshot.schema_document or {}
+            raw_tables = raw.get("tables", []) if isinstance(raw, dict) else []
+            if isinstance(raw_tables, dict):
+                for name, t in raw_tables.items():
+                    out.append({"name": name, "columns": len((t or {}).get("columns") or [])})
+            else:
+                for t in raw_tables:
+                    if isinstance(t, dict) and t.get("name"):
+                        name = f"{t['schema']}.{t['name']}" if t.get("schema") else t["name"]
+                        out.append({"name": name, "columns": len(t.get("columns") or [])})
+
+    if not out:
+        print(f"[schema-tables] MISS — no enriched cache AND no snapshot for conn={str(conn_id)[:8]}  {_ms()}ms", flush=True)
+        raise HTTPException(status_code=404, detail="No schema available for this connection yet. Crawl the schema first.")
+
+    out.sort(key=lambda x: x["name"].lower())
+    await _sc.set_table_list_cached(str(conn_id), out)  # warm the tiny cache for next time
+    print(
+        f"[schema-tables] MISS list-cache → built from {source}  tables={len(out)}  "
+        f"fetch={_t_fetch}ms  total={_ms()}ms (list-cache warmed)",
+        flush=True,
+    )
+    return {"tables": out, "total": len(out), "version": version}
 
 
 @app.get("/projects/{project_id}/schema/metadata")

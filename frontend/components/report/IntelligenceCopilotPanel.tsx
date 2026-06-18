@@ -1,12 +1,21 @@
 'use client'
+/**
+ * IntelligenceCopilotPanel — the "Report Copilot" on the intelligence page.
+ *
+ * FORKED FROM components/canvas/CanvasChatPanel.tsx on 2026-06-18.
+ *
+ * Functionally identical to the Canvas Assistant, but a standalone component so
+ * the Report Copilot's UI/UX can diverge without touching the canvas builder.
+ * The one wiring difference: it streams from streamIntelligenceChat() →
+ * /intelligence/chat/stream (the forked backend) instead of the canvas
+ * /agent/chat/stream, and uses an `intel-` session-id prefix.
+ */
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Bot, Loader2, X, Plus, Sparkles } from 'lucide-react'
-import { streamChat, canvasApi, type WidgetCreate } from '@/lib/api'
+import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database } from 'lucide-react'
+import { streamIntelligenceChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
-import { TableScopePicker } from '@/components/canvas/TableScopePicker'
-import { useTableScopeStore, DEFAULT_SCOPE } from '@/stores/tableScopeStore'
 
 type InlineChart = ChartResult & { selected: boolean }
 
@@ -44,7 +53,7 @@ interface Props {
   activePageId?: string
   onClose: () => void
   onWidgetAdded: () => void
-  // optional overrides for embedding contexts (e.g. intelligence page)
+  // optional overrides — the intelligence page passes a "Report Copilot" identity
   title?: string
   subtitle?: string
   suggestedQuestions?: string[]
@@ -115,21 +124,21 @@ function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]):
   return Array.from(new Set(qs)).slice(0, 5)
 }
 
-export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage }: Props) {
+export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([{
     role: 'assistant',
     content: title
       ? `Hi! I'm your **${title}**. I have full access to your report data and live database. Ask me anything about the data, explore trends, or generate new charts.`
-      : 'Hi! I have full access to your canvas report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
+      : 'Hi! I have full access to your intelligence report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
   }])
   const [input, setInput]     = useState('')
   const [sending, setSending]   = useState(false)
-  const [sessionId]             = useState(() => `canvas-${canvasId}-${Date.now()}`)
+  // `intel-` prefix keeps Report-Copilot sessions distinct from canvas chat sessions.
+  const [sessionId]             = useState(() => `intel-${canvasId}-${Date.now()}`)
   const [showSuggestions, setShowSuggestions] = useState(true)
-  // ── Schema scope (builder) — shared via the store with the canvas toolbar picker,
-  // so a selection in either place reflects in both. The table list is fetched once
-  // on canvas load (see the canvas page), not here.
-  const { scope, selectedTables, selectedHops } = useTableScopeStore((s) => s.byCanvas[canvasId]) ?? DEFAULT_SCOPE
+  // Scope toggle — 'report' (default) limits the copilot to this report's tables +
+  // their 2-hop FK neighbours; 'database' opens the full schema for free exploration.
+  const [scope, setScope]       = useState<'report' | 'database'>('report')
   const endRef                  = useRef<HTMLDivElement>(null)
   const textareaRef             = useRef<HTMLTextAreaElement>(null)
   const [panelWidth, setPanelWidth] = useState(initialWidth ?? 320)
@@ -141,7 +150,6 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   useEffect(() => {
     if (prefillMessage) { setInput(prefillMessage); setTimeout(() => textareaRef.current?.focus(), 100) }
   }, [prefillMessage])
-
 
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
   const widgetRecs   = buildRecommendations(widgets, pages)
@@ -175,7 +183,6 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
     setSending(true)
     setShowSuggestions(false)
 
-    // Push the user turn + an empty assistant placeholder we stream into.
     setMessages(prev => [
       ...prev,
       { role: 'user', content: text },
@@ -201,7 +208,6 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       }
     }
 
-    // Mutate the most recent assistant message (the placeholder above).
     const updateAssistant = (mut: (m: ChatMsg) => ChatMsg) => {
       setMessages(prev => {
         const next = [...prev]
@@ -214,7 +220,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
 
     let acc = ''
     try {
-      await streamChat(
+      await streamIntelligenceChat(
         {
           session_id:     sessionId,
           message:        text,
@@ -223,21 +229,19 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
           connection_id:  connectionId,
           active_page_id: activePageId || undefined,
           scope,
-          selected_tables: scope === 'selected' ? selectedTables : undefined,
-          selected_hops:   scope === 'selected' ? selectedHops : undefined,
         },
         {
           onText: (delta) => { acc += delta; updateAssistant(m => ({ ...m, content: acc })) },
           onChart: (chart) => { updateAssistant(m => ({ ...m, inlineCharts: [toInlineChart(chart)] })) },
-          onError: () => {
+          onError: (message) => {
+            const detail = message && message !== 'stream error' ? message : 'Sorry, something went wrong. Please try again.'
             updateAssistant(m => ({
               ...m,
-              content: (m.content || '') + (m.content ? '\n\n' : '') + 'Sorry, something went wrong. Please try again.',
+              content: (m.content || '') + (m.content ? '\n\n' : '') + detail,
             }))
           },
         },
       )
-      // If the model produced no prose and no chart, leave a friendly fallback.
       updateAssistant(m =>
         (!m.content && !m.inlineCharts)
           ? { ...m, content: 'I could not generate a response.' }
@@ -248,7 +252,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
     } finally {
       setSending(false)
     }
-  }, [input, sending, sessionId, projectId, canvasId, connectionId, activePageId, scope, selectedTables, selectedHops])
+  }, [input, sending, sessionId, projectId, canvasId, connectionId, activePageId, scope])
 
   const handleAddWidgets = useCallback(async (srcs: Array<ChartResult | ChatMsg['newWidget']>) => {
     if (!srcs.length) return
@@ -272,7 +276,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       }))
       onWidgetAdded()
       const names = srcs.filter(Boolean).map(s => `"${s!.title}"`).join(', ')
-      setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added ${names}${pageLabel} to your canvas!` }])
+      setMessages(prev => [...prev, { role: 'assistant', content: `✓ Added ${names}${pageLabel} to your report!` }])
     } catch {
       setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to add charts. Please try again.' }])
     }
@@ -310,7 +314,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
             <Sparkles size={13} className="text-white" />
           </div>
           <div>
-            <span className="text-sm font-semibold text-white">{title ?? 'Canvas Assistant'}</span>
+            <span className="text-sm font-semibold text-white">{title ?? 'Report Copilot'}</span>
             {subtitle && <p className="text-[10px] leading-tight" style={{ color: 'rgba(255,255,255,0.45)', margin: 0 }}>{subtitle}</p>}
           </div>
         </div>
@@ -321,9 +325,35 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
         </button>
       </div>
 
-      {/* Scope bar — shared with the canvas toolbar picker via tableScopeStore */}
-      <div className="border-b border-gray-100 flex-shrink-0">
-        <TableScopePicker canvasId={canvasId} />
+      {/* Scope toggle — Report (this report's tables) vs Full DB (whole schema) */}
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
+        <div className="flex items-center gap-1 p-0.5 rounded-lg flex-shrink-0" style={{ background: '#eef2f7', border: '1px solid #e2eaf4' }}>
+          <button
+            onClick={() => setScope('report')}
+            title="Answer using only the tables/views that build this report (+ closely related ones). Faster and more focused."
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
+            style={scope === 'report'
+              ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
+              : { background: 'transparent', color: '#64748b' }}
+          >
+            <FileText size={11} /> Report
+          </button>
+          <button
+            onClick={() => setScope('database')}
+            title="Open the full database schema — the copilot can query any table or view, not just the report's."
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
+            style={scope === 'database'
+              ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
+              : { background: 'transparent', color: '#64748b' }}
+          >
+            <Database size={11} /> Full DB
+          </button>
+        </div>
+        <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
+          {scope === 'report'
+            ? 'Scoped to this report’s tables + related ones'
+            : 'Full database — query any table or view'}
+        </span>
       </div>
 
       {/* Messages */}
@@ -382,7 +412,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                           className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors"
                           style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
                         >
-                          <Plus size={11} /> Add to Page
+                          <Plus size={11} /> Add to Section
                         </button>
                       ) : (
                         <button
@@ -390,7 +420,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                           className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
                           style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
                         >
-                          <Plus size={11} /> Add to Canvas
+                          <Plus size={11} /> Add to Report
                         </button>
                       )}
                     </div>
@@ -429,7 +459,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                           className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold rounded-lg disabled:opacity-40"
                           style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
                         >
-                          <Plus size={10} /> Add to Page ({msg.inlineCharts.filter(c => c.selected).length})
+                          <Plus size={10} /> Add to Section ({msg.inlineCharts.filter(c => c.selected).length})
                         </button>
                       ) : (
                         <button
@@ -438,7 +468,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                           className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-white rounded-lg disabled:opacity-40 transition-opacity"
                           style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
                         >
-                          <Plus size={10} /> Add to Canvas ({msg.inlineCharts.filter(c => c.selected).length})
+                          <Plus size={10} /> Add to Report ({msg.inlineCharts.filter(c => c.selected).length})
                         </button>
                       )}
                     </div>
@@ -454,14 +484,14 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg self-start"
                     style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
                   >
-                    <Plus size={12} /> Add to Page
+                    <Plus size={12} /> Add to Section
                   </button>
                 ) : (
                   <button
                     onClick={() => handleAddWidgets([msg.newWidget!])}
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-brand bg-brand/10 rounded-lg hover:bg-brand/20 transition-colors self-start"
                   >
-                    <Plus size={12} /> Add to Canvas
+                    <Plus size={12} /> Add to Report
                   </button>
                 )
               )}
@@ -479,9 +509,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
           </div>
         ))}
 
-        {/* "More coming" indicator — shown only after prose has started streaming
-            (the empty placeholder bubble carries its own spinner before then),
-            so it signals that the chart is still being executed/rendered. */}
+        {/* "More coming" indicator — shown only after prose has started streaming */}
         {sending && messages[messages.length - 1]?.role === 'assistant' && !!messages[messages.length - 1]?.content && (
           <div className="flex gap-2">
             <div className="w-6 h-6 rounded-full flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
@@ -508,7 +536,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
               e.target.style.height = Math.min(e.target.scrollHeight, 80) + 'px'
             }}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
-            placeholder="Ask about your data or create a chart…"
+            placeholder="Ask about your report or create a chart…"
             rows={1}
             className="flex-1 bg-transparent text-xs text-gray-800 placeholder-gray-400 outline-none resize-none leading-relaxed"
             style={{ maxHeight: 80, overflowY: 'auto' }}
@@ -522,13 +550,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
             <Send size={12} />
           </button>
         </div>
-        <p className="text-xs text-gray-400 mt-1.5 text-center">
-          {scope === 'selected'
-            ? (selectedTables.length
-                ? `${selectedTables.length} table${selectedTables.length !== 1 ? 's' : ''}${selectedHops ? ` +${selectedHops}-hop` : ''} · All pages · Enter to send`
-                : 'Full DB (no tables picked) · All pages · Enter to send')
-            : 'Full DB access · All pages · Enter to send'}
-        </p>
+        <p className="text-xs text-gray-400 mt-1.5 text-center">Full DB access · All pages · Enter to send</p>
       </div>
       </div>{/* end overflow:hidden inner panel */}
     </div>

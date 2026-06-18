@@ -1,10 +1,33 @@
+"""Intelligence Report Copilot router — intelligence_chat.py
+
+FORKED FROM agent_service/routers/chat.py on 2026-06-18.
+
+Serves ONLY the "Report Copilot" on the intelligence page. The Canvas Assistant
+keeps using /agent/chat and /agent/chat/stream (chat.py). This router is a
+self-contained copy so the Report Copilot pipeline can evolve independently.
+
+Endpoints:
+  POST   /intelligence/chat            — blocking
+  POST   /intelligence/chat/stream     — SSE streaming
+  DELETE /intelligence/chat/{session}  — clear conversation history
+
+Shared infrastructure (imported, NOT forked):
+  • shared.bedrock_client, shared.redis_client, shared.database, shared.models
+  • agent_service.agents.schema_cache  (enriched schema cache)
+  • query_executor / render_service     (via httpx)
+
+Every log line is prefixed [intel_chat] so you can confirm — by grepping the
+service logs — that the Report Copilot is exercising THIS forked path and not
+the canvas chat router.
+"""
 import uuid
 import json
 import re
 import os
+import traceback
 from typing import Optional
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,24 +38,25 @@ from shared.models.schema_snapshots import SchemaSnapshot
 from shared.models.database_connections import DatabaseConnection
 from shared.models.dashboards import Dashboard
 from shared.models.widgets import Widget
-from shared.encryption import decrypt
-from shared.export_tokens import validate_export_token
-from agent_service.agents.chat_agent import (
-    ChatAgent,
+from agent_service.agents.intelligence_chat_agent import (
+    IntelligenceChatAgent,
     _is_data_query_request,
     _is_chart_creation_request,
 )
 import agent_service.agents.schema_cache as _schema_cache
 from shared.bedrock_client import bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL
 
-router = APIRouter(tags=["chat"])
-_agent = ChatAgent()
+router = APIRouter(tags=["intelligence-chat"])
+_agent = IntelligenceChatAgent()
 
 QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://localhost:3001")
 
+print("[intel_chat] router loaded — Report Copilot endpoints registered "
+      "(/intelligence/chat, /intelligence/chat/stream)", flush=True)
 
-class ChatRequest(BaseModel):
+
+class IntelChatRequest(BaseModel):
     message: str
     project_id: str
     dashboard_id: Optional[str] = None
@@ -40,15 +64,12 @@ class ChatRequest(BaseModel):
     connection_id: Optional[str] = None
     active_page_id: Optional[str] = None
     model_preference: Optional[str] = None  # 'opus' for deeper analysis
-    # Schema scope for the builder's Canvas Assistant:
-    #   "database" → full enriched schema (default; legacy behaviour)
-    #   "selected" → only `selected_tables` + their `selected_hops`-hop FK neighbours
-    scope: Optional[str] = "database"
-    selected_tables: Optional[list[str]] = None
-    selected_hops: Optional[int] = 2
+    # "report"  → schema scoped to the report's tables + 2-hop FK neighbours (default)
+    # "database" → full enriched schema (query anything in the DB)
+    scope: Optional[str] = "report"
 
 
-class ChatResponse(BaseModel):
+class IntelChatResponse(BaseModel):
     session_id: str
     text: str
     inline_chart: Optional[dict] = None
@@ -56,38 +77,36 @@ class ChatResponse(BaseModel):
     turn_count: int
 
 
-async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> dict:
-    """Resolve everything a chat turn needs: session, history, schema, enrichment,
-    widgets, pages, priority tables, the effective connection, and model preference.
-    Shared by the blocking /agent/chat and the streaming /agent/chat/stream paths.
+async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis) -> dict:
+    """Resolve everything a Report-Copilot turn needs: session, history, schema,
+    enrichment, widgets, pages, priority tables, connection, model preference.
     All DB access lives here so the streaming generator never touches the session."""
     session_id = req.session_id or str(uuid.uuid4())
     print(
-        f"[chat] session={session_id[:8]}  project={req.project_id[:8]}  "
-        f"dashboard={'yes' if req.dashboard_id else 'no'}  "
+        f"[intel_chat] ▶ turn  session={session_id[:8]}  project={req.project_id[:8]}  "
+        f"dashboard={'yes' if req.dashboard_id else 'no'}  scope={req.scope or 'report'}  "
         f"model_pref={req.model_preference or 'default'}  msg_len={len(req.message)}",
         flush=True,
     )
 
-    history = await ChatAgent.load_history(session_id, redis)
+    history = await IntelligenceChatAgent.load_history(session_id, redis)
     schema_doc, connection_id_for_schema, db_type = await _get_schema_context(req.project_id, db)
     effective_connection_id = req.connection_id or connection_id_for_schema
 
-    # Fallback for imported canvases whose project has no DatabaseConnection.
     if not effective_connection_id and req.dashboard_id:
         fallback_conn_id = await _get_dashboard_connection_id(req.dashboard_id, db)
         if fallback_conn_id:
             effective_connection_id = fallback_conn_id
             if not schema_doc:
                 schema_doc, db_type = await _get_schema_for_connection(fallback_conn_id, db)
-            print(f"[chat] using dashboard fallback connection={fallback_conn_id[:8]}", flush=True)
+            print(f"[intel_chat] using dashboard fallback connection={fallback_conn_id[:8]}", flush=True)
 
     enriched = None
     if schema_doc and effective_connection_id:
         try:
             enriched = await _schema_cache.get_or_build(effective_connection_id, schema_doc, db_type)
         except Exception as _e:
-            print(f"[chat] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
+            print(f"[intel_chat] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
 
     dashboard_widgets: list[dict] = []
     dashboard_pages: list[dict] = []
@@ -95,7 +114,7 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
         dashboard_widgets, dashboard_pages = await _get_dashboard_widgets_and_pages(req.dashboard_id, db)
         sql_widget_count = sum(1 for w in dashboard_widgets if w.get("sql_query"))
         print(
-            f"[chat] dashboard loaded  widgets={len(dashboard_widgets)}  "
+            f"[intel_chat] dashboard loaded  widgets={len(dashboard_widgets)}  "
             f"with_sql={sql_widget_count}  pages={len(dashboard_pages)}",
             flush=True,
         )
@@ -105,7 +124,7 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
     effective_model_pref = req.model_preference
     if not effective_model_pref and len(req.message) > 8000:
         effective_model_pref = "opus"
-        print(f"[chat] auto-upgraded to opus (msg_len={len(req.message)} > 8000)", flush=True)
+        print(f"[intel_chat] auto-upgraded to opus (msg_len={len(req.message)} > 8000)", flush=True)
 
     return {
         "session_id": session_id,
@@ -124,12 +143,11 @@ async def _execute_and_build_chart(
     sql_spec: dict, connection_id: Optional[str]
 ) -> tuple[Optional[dict], Optional[str]]:
     """Run a sql_execute spec and build the inline_chart payload.
-    Returns (inline_chart | None, warning_text | None). The warning is appended to
-    the assistant text so a failed/empty query never produces a silent blank."""
+    Returns (inline_chart | None, warning_text | None)."""
     if sql_spec.get("sql"):
-        print(f"[chat] generated SQL: {sql_spec['sql'][:400]}", flush=True)
+        print(f"[intel_chat] generated SQL: {sql_spec['sql'][:400]}", flush=True)
     if not connection_id:
-        print("[chat] ⚠ no connection available to execute SQL", flush=True)
+        print("[intel_chat] ⚠ no connection available to execute SQL", flush=True)
         return None, ("\n\n⚠️ I couldn't run the query: no active database connection "
                       "is available for this report.")
     if not sql_spec.get("sql"):
@@ -137,23 +155,20 @@ async def _execute_and_build_chart(
 
     exec_result = await _execute_sql(connection_id, sql_spec["sql"])
     if exec_result.get("error"):
-        # Self-correcting retry: a "column … does not exist" (or similar) usually means
-        # the model borrowed a column from the wrong table. Fetch the real columns and
-        # rewrite once before giving up — so a single SQL slip auto-heals.
-        print(f"[chat] ⚠ sql exec error: {str(exec_result['error'])[:200]} — attempting self-correct", flush=True)
+        print(f"[intel_chat] ⚠ sql exec error: {str(exec_result['error'])[:200]} — attempting self-correct", flush=True)
         fixed_sql = await _self_correct_sql(connection_id, sql_spec["sql"], str(exec_result["error"]))
         if fixed_sql and fixed_sql.strip() != (sql_spec["sql"] or "").strip():
             retry = await _execute_sql(connection_id, fixed_sql)
             if not retry.get("error"):
-                print(f"[chat] ✓ self-corrected SQL ran: {fixed_sql[:160]}", flush=True)
+                print(f"[intel_chat] ✓ self-corrected SQL ran: {fixed_sql[:160]}", flush=True)
                 sql_spec = {**sql_spec, "sql": fixed_sql}
                 exec_result = retry
             else:
-                print(f"[chat] ✗ self-correct retry still failed: {str(retry.get('error'))[:160]}", flush=True)
+                print(f"[intel_chat] ✗ self-correct retry still failed: {str(retry.get('error'))[:160]}", flush=True)
         if exec_result.get("error"):
             return None, f"\n\n⚠️ The query failed to run: {exec_result['error']}"
     if not exec_result.get("rows"):
-        print(f"[chat] ⚠ sql returned 0 rows  sql={sql_spec['sql'][:160]}", flush=True)
+        print(f"[intel_chat] ⚠ sql returned 0 rows  sql={sql_spec['sql'][:160]}", flush=True)
         return None, ("\n\n⚠️ The query ran but returned no rows — there may be no matching "
                       "data, or a name/date filter didn't match. Try rephrasing or broadening it.")
 
@@ -161,8 +176,6 @@ async def _execute_and_build_chart(
     columns = exec_result.get("columns", [])
     rows = exec_result.get("rows", [])
     labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
-    # Single-column results (KPI scalars) → that column is the value;
-    # multi-column → column[0] is the label, column[1] is the value.
     if len(columns) > 1:
         values = [r.get(columns[1]) for r in rows]
     elif len(columns) == 1:
@@ -178,6 +191,7 @@ async def _execute_and_build_chart(
         "sql": sql_spec["sql"],
         "image_base64": render_result.get("image_base64"),
     }
+    print(f"[intel_chat] ✓ chart built  type={inline_chart['chart_type']}  rows={len(rows)}  cols={len(columns)}", flush=True)
     return inline_chart, None
 
 
@@ -186,9 +200,9 @@ def _no_sql_note() -> str:
             "the table/columns you'd like me to use.")
 
 
-@router.post("/agent/chat", response_model=ChatResponse)
-async def chat(
-    req: ChatRequest,
+@router.post("/intelligence/chat", response_model=IntelChatResponse)
+async def intel_chat(
+    req: IntelChatRequest,
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -205,14 +219,12 @@ async def chat(
         enriched_schema=ctx["enriched"],
         model_override=ctx["model_pref"],
         connection_id=ctx["connection_id"],
-        scope=req.scope or "database",
-        selected_tables=req.selected_tables,
-        selected_hops=req.selected_hops if req.selected_hops is not None else 2,
+        scope=req.scope or "report",
     )
 
     sql_spec = result.get("sql_to_execute")
     print(
-        f"[chat] agent done  text_len={len(result.get('text', ''))}  "
+        f"[intel_chat] agent done  text_len={len(result.get('text', ''))}  "
         f"sql_returned={'yes' if sql_spec else 'no'}  "
         f"action={'yes' if result.get('dashboard_action') else 'no'}",
         flush=True,
@@ -225,15 +237,16 @@ async def chat(
             result["text"] = (result.get("text") or "").rstrip() + warning
     elif _is_data_query_request(req.message) or _is_chart_creation_request(req.message):
         result["text"] = (result.get("text") or "").rstrip() + _no_sql_note()
-        print("[chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
+        print("[intel_chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
 
     updated_history = ctx["history"] + [
         {"role": "user", "content": req.message},
         {"role": "assistant", "content": result["text"]},
     ]
-    await ChatAgent.save_history(ctx["session_id"], updated_history, redis)
+    await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis)
+    print(f"[intel_chat] ✔ turn complete  session={ctx['session_id'][:8]}  turns={len(updated_history) // 2}", flush=True)
 
-    return ChatResponse(
+    return IntelChatResponse(
         session_id=ctx["session_id"],
         text=result["text"],
         inline_chart=inline_chart,
@@ -242,38 +255,51 @@ async def chat(
     )
 
 
-@router.post("/agent/chat/stream")
-async def chat_stream(
-    req: ChatRequest,
+@router.post("/intelligence/chat/stream")
+async def intel_chat_stream(
+    req: IntelChatRequest,
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
-    """Streaming variant of /agent/chat (Server-Sent Events).
-
-    Streams the assistant's prose as it is generated, then runs the sql_execute
-    block server-side and emits a final `chart` event. Event types: `text`
-    (incremental prose delta), `chart` (rendered inline chart), `action`
-    (dashboard action), `error`, and `done`. All DB access happens up front in
-    _collect_chat_context, so the generator only touches Redis + httpx."""
-    ctx = await _collect_chat_context(req, db, redis)
-    system_blocks, messages, model_id, max_tokens = _agent.prepare(
-        message=req.message,
-        conversation_history=ctx["history"],
-        schema_doc=ctx["schema_doc"],
-        dashboard_widgets=ctx["dashboard_widgets"],
-        dashboard_pages=ctx["dashboard_pages"],
-        active_page_id=req.active_page_id,
-        priority_tables=ctx["priority_tables"],
-        enriched_schema=ctx["enriched"],
-        model_override=ctx["model_pref"],
-        connection_id=ctx["connection_id"],
-        scope=req.scope or "database",
-        selected_tables=req.selected_tables,
-        selected_hops=req.selected_hops if req.selected_hops is not None else 2,
-    )
-
+    """Streaming variant of /intelligence/chat (Server-Sent Events).
+    Event types: text, chart, action, error, done. All DB access happens up
+    front in _collect_chat_context, so the generator only touches Redis + httpx."""
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
+
+    # Setup (DB access + prompt build) must happen here, before the generator, while
+    # the request-scoped DB session is alive. If anything throws, surface the REAL
+    # reason (logged with a traceback, and streamed as an error event) instead of a
+    # bare 500 that the UI can only render as "something went wrong".
+    try:
+        ctx = await _collect_chat_context(req, db, redis)
+        system_blocks, messages, model_id, max_tokens = _agent.prepare(
+            message=req.message,
+            conversation_history=ctx["history"],
+            schema_doc=ctx["schema_doc"],
+            dashboard_widgets=ctx["dashboard_widgets"],
+            dashboard_pages=ctx["dashboard_pages"],
+            active_page_id=req.active_page_id,
+            priority_tables=ctx["priority_tables"],
+            enriched_schema=ctx["enriched"],
+            model_override=ctx["model_pref"],
+            connection_id=ctx["connection_id"],
+            scope=req.scope or "report",
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[intel_chat] ✗ stream setup failed: {exc!r}", flush=True)
+        traceback.print_exc()
+        detail = f"{type(exc).__name__}: {exc}"
+
+        async def _err_gen():
+            yield _sse({"type": "error", "message": f"Copilot setup failed — {detail}"})
+            yield _sse({"type": "done", "session_id": req.session_id or "", "turn_count": 0})
+
+        return StreamingResponse(
+            _err_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     async def event_gen():
         raw = ""
@@ -286,20 +312,19 @@ async def chat_stream(
         ):
             if kind == "text":
                 raw += payload
-                # Stream prose only up to the first code fence — the sql_execute
-                # block is parsed and executed server-side, never shown as raw text.
                 if not fence_found:
                     idx = raw.find("```")
                     if idx != -1:
                         fence_found = True
                         safe = raw[:idx]
                     else:
-                        safe = raw[:-2] if len(raw) > 2 else ""  # hold back a partial fence
+                        safe = raw[:-2] if len(raw) > 2 else ""
                     if len(safe) > prose_emitted:
                         yield _sse({"type": "text", "delta": safe[prose_emitted:]})
                         prose_emitted = len(safe)
             elif kind == "error":
                 errored = True
+                print(f"[intel_chat] ⚠ stream error: {str(payload)[:200]}", flush=True)
                 yield _sse({"type": "error", "message": payload})
 
         if errored:
@@ -307,12 +332,11 @@ async def chat_stream(
                         "turn_count": len(ctx["history"]) // 2})
             return
 
-        # No fence at all → flush whatever prose remains.
         if not fence_found and len(raw) > prose_emitted:
             yield _sse({"type": "text", "delta": raw[prose_emitted:]})
 
         print(
-            f"[chat] stream parsed  response_len={len(raw)}  "
+            f"[intel_chat] stream parsed  response_len={len(raw)}  "
             f"has_sql={'yes' if '```sql_execute' in raw else 'no'}",
             flush=True,
         )
@@ -320,7 +344,6 @@ async def chat_stream(
         parsed = _agent.parse_raw(raw)
         sql_spec = parsed["sql_to_execute"]
 
-        # Silent retry when a data/chart request produced no sql block.
         if not parsed["sqls_to_execute"] and (
             _is_data_query_request(req.message) or _is_chart_creation_request(req.message)
         ):
@@ -341,7 +364,7 @@ async def chat_stream(
             note = _no_sql_note()
             final_text = (final_text or "").rstrip() + note
             yield _sse({"type": "text", "delta": note})
-            print("[chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
+            print("[intel_chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
 
         if parsed.get("dashboard_action"):
             yield _sse({"type": "action", "action": parsed["dashboard_action"]})
@@ -350,7 +373,8 @@ async def chat_stream(
             {"role": "user", "content": req.message},
             {"role": "assistant", "content": final_text},
         ]
-        await ChatAgent.save_history(ctx["session_id"], updated_history, redis)
+        await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis)
+        print(f"[intel_chat] ✔ stream complete  session={ctx['session_id'][:8]}  turns={len(updated_history) // 2}", flush=True)
 
         yield _sse({"type": "done", "session_id": ctx["session_id"],
                     "turn_count": len(updated_history) // 2})
@@ -362,81 +386,17 @@ async def chat_stream(
     )
 
 
-# ─── Export Chat endpoint ─────────────────────────────────────────────────────
-
-class ExportChatRequest(BaseModel):
-    message: str
-    history: list[dict] = []
-
-
-class ExportChatResponse(BaseModel):
-    text: str
-    session_id: str
-
-
-@router.post("/agent/export-chat", response_model=ExportChatResponse)
-async def export_chat(
-    req: ExportChatRequest,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Stateless chat endpoint for embedded AI panel in HTML exports.
-    Authenticates via a short-lived export token passed as a Bearer token.
-    Dashboard modification actions are disabled — read-only mode only.
-    """
-    # Extract bearer token from Authorization header
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    raw_token = auth_header[len("Bearer "):].strip()
-    export_token_record = await validate_export_token(db, raw_token, required_scope="chat:read")
-    if not export_token_record:
-        raise HTTPException(status_code=401, detail="Invalid, expired, or revoked export token")
-
-    # Load schema for this export's project so the AI has context
-    export_enriched = None
-    export_schema_doc = {}
-    export_conn_id = None
-    try:
-        export_schema_doc, export_conn_id, export_db_type = await _get_schema_context(
-            str(export_token_record.project_id), db
-        )
-        if export_schema_doc and export_conn_id:
-            export_enriched = await _schema_cache.get_or_build(
-                export_conn_id, export_schema_doc, export_db_type
-            )
-    except Exception as _e:
-        print(f"[export-chat] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
-
-    # Respond using ChatAgent in read-only mode (no dashboard actions)
-    result = await _agent.respond(
-        message=req.message,
-        conversation_history=req.history[-20:],
-        schema_doc=export_schema_doc,
-        dashboard_widgets=[],
-        enriched_schema=export_enriched,
-        connection_id=export_conn_id,
-    )
-
-    # Strip any dashboard actions — export chat is read-only
-    text = result.get("text", "")
-    session_id = str(export_token_record.id)
-
-    return ExportChatResponse(text=text, session_id=session_id)
-
-
-@router.delete("/agent/chat/{session_id}")
-async def clear_chat(
+@router.delete("/intelligence/chat/{session_id}")
+async def clear_intel_chat(
     session_id: str,
     redis=Depends(get_redis),
 ):
-    await ChatAgent.clear_history(session_id, redis)
+    await IntelligenceChatAgent.clear_history(session_id, redis)
+    print(f"[intel_chat] cleared history  session={session_id[:8]}", flush=True)
     return {"status": "cleared", "session_id": session_id}
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers (forked copy from chat.py — kept local so this path is standalone) ──
 
 async def _get_schema_context(
     project_id: str, db: AsyncSession
@@ -500,10 +460,7 @@ async def _get_dashboard_widgets_and_pages(
 
 
 async def _get_dashboard_connection_id(dashboard_id: str, db: AsyncSession) -> str | None:
-    """
-    Fallback connection resolution for imported canvases whose project has no connection.
-    Checks layout_config.connection_id first, then the first widget with a connection_id.
-    """
+    """Fallback connection resolution for imported canvases whose project has no connection."""
     try:
         dash_r = await db.execute(select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id)))
         dash = dash_r.scalar_one_or_none()
@@ -558,16 +515,6 @@ def _extract_priority_tables(widgets: list[dict]) -> set[str]:
     return tables
 
 
-async def _get_primary_connection(project_id: str, db: AsyncSession):
-    result = await db.execute(
-        select(DatabaseConnection)
-        .where(DatabaseConnection.project_id == uuid.UUID(project_id))
-        .where(DatabaseConnection.is_active == True)
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
-
-
 _FROM_JOIN_RE = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', re.IGNORECASE)
 
 
@@ -586,10 +533,7 @@ async def _fetch_table_columns(connection_id: str, schema: str, table: str) -> l
 
 async def _self_correct_sql(connection_id: str, failed_sql: str, error_msg: str) -> Optional[str]:
     """When a generated query references columns that don't exist, fetch the REAL
-    columns of the tables it used and ask the model to rewrite using only those.
-    Returns corrected SQL (or None if we couldn't help). This fixes the common
-    case where the LLM borrows a column from the wrong table in a large schema."""
-    # Collect schema-qualified tables from the failed SQL (skip CTE/alias names).
+    columns of the tables it used and ask the model to rewrite using only those."""
     tables: list[str] = []
     for name in _FROM_JOIN_RE.findall(failed_sql or ""):
         n = name.strip()
@@ -621,7 +565,7 @@ async def _self_correct_sql(connection_id: str, failed_sql: str, error_msg: str)
     try:
         out = await bedrock_invoke(BEDROCK_SONNET_MODEL, system, user, max_tokens=1024, temperature=0.0)
     except Exception as exc:  # noqa: BLE001
-        print(f"[chat] self-correct LLM call failed: {exc}", flush=True)
+        print(f"[intel_chat] self-correct LLM call failed: {exc}", flush=True)
         return None
     s = (out or "").strip()
     s = re.sub(r'^```(?:sql)?\s*', '', s)
@@ -633,11 +577,6 @@ async def _self_correct_sql(connection_id: str, failed_sql: str, error_msg: str)
 
 
 async def _execute_sql(connection_id: str, sql: str) -> dict:
-    # Redshift Serverless can take 60–120s to wake from idle, and heavy aggregations
-    # (e.g. SUM over a multi-year timesheet table) run well past 20s. The old 20s
-    # query timeout cancelled those mid-flight — the executor returned 0 rows, which
-    # the chat reported as "no matching data" even though the data was there. Give it
-    # a real budget so the query completes instead of being killed.
     try:
         async with httpx.AsyncClient(timeout=130.0) as client:
             resp = await client.post(

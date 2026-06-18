@@ -360,13 +360,22 @@ async def analyst_chat(
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
-    from agent_service.agents.chat_agent import ChatAgent
+    # Report Copilot, share-token context: this surface is the share-link
+    # rendering of the intelligence-page copilot, so it runs on the forked
+    # IntelligenceChatAgent (NOT the canvas ChatAgent). Conversations live in
+    # the intel_chat:history: Redis namespace and log under [intel_chat].
+    from agent_service.agents.intelligence_chat_agent import IntelligenceChatAgent
     import agent_service.agents.schema_cache as _schema_cache
 
     dashboard, token_obj, widgets = await _get_canvas_and_token(raw_token, db)
     session_id = req.session_id or str(uuid.uuid4())
-    _agent = ChatAgent()
-    history = await ChatAgent.load_history(session_id, redis)
+    _agent = IntelligenceChatAgent()
+    history = await IntelligenceChatAgent.load_history(session_id, redis)
+    print(
+        f"[intel_chat] ▶ analyst(share-token) turn  session={session_id[:8]}  "
+        f"widgets={len(widgets)}  msg_len={len(req.message)}",
+        flush=True,
+    )
     allowed_tables = _get_allowed_tables(widgets)
 
     # ── Warm-start schema (Option C hybrid) ───────────────────────────────────
@@ -443,7 +452,12 @@ async def analyst_chat(
     inline_chart = inline_charts[0] if inline_charts else None
 
     updated_history = history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": result["text"]}]
-    await ChatAgent.save_history(session_id, updated_history, redis)
+    await IntelligenceChatAgent.save_history(session_id, updated_history, redis)
+    print(
+        f"[intel_chat] ✔ analyst(share-token) complete  session={session_id[:8]}  "
+        f"charts={len(inline_charts)}  turns={len(updated_history) // 2}",
+        flush=True,
+    )
 
     return {
         "session_id": session_id,
