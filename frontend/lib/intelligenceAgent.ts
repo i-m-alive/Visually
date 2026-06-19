@@ -65,7 +65,7 @@ export interface AgentChartReferenceLine {
 
 export interface AgentChart {
   title: string
-  type: 'bar' | 'line' | 'area' | 'pie' | 'table' | 'forecast' | 'combo' | 'waterfall' | 'scatter' | 'bullet'
+  type: 'bar' | 'line' | 'area' | 'pie' | 'donut' | 'table' | 'forecast' | 'combo' | 'waterfall' | 'scatter' | 'bullet' | 'treemap' | 'funnel' | 'radar'
   data: AgentChartRow[]
   projected_data?: AgentChartRow[]
   anomaly_indices?: number[]
@@ -949,12 +949,13 @@ INSTRUCTIONS:
    • recommendation: one concrete, measurable action
    • 2–3 insights[] cards — use specific values; type = positive/negative/neutral/warning
    • top_performers / bottom_performers: 3 rows each, from TOP/BOTTOM PERFORMERS data
-   • 2–3 charts built from the actual data rows (bar, line, pie, combo, waterfall, scatter, bullet) — max 20 data points per chart
+   • 2–3 charts built from the actual data rows — pick the BEST type per data shape from: bar, line, area, pie, donut, combo, waterfall, scatter, bullet, treemap (hierarchical/share of total), funnel (stage drop-off), radar (multi-metric compare) — max 20 data points per chart
    • If a widget's original chart_type is "table", OR if the widget has 3+ named columns of mixed dimensional/numeric data, ALSO include one chart with type:"table" — include up to 50 rows and preserve ALL meaningful column names as keys (e.g. {"customer":"Acme","revenue":120000,"region":"West","2023":95000,"2024":120000})
 3. Extract 4–6 top-level KPIs from the most prominent metrics. For sparkline_data use the actual numeric values from the widget sample_values or column profile (max 12 values).
 4. Write a 3-sentence morning_brief that opens with the single biggest finding (a specific number), covers the top 2 themes, ends with a risk or opportunity.
 
 CHART DATA RULES — build charts from the real row data provided:
+   • Use EXACT numeric values — NEVER round or abbreviate. Write 4200000, not 4.2M / 4.2 / "4.2 million". Keep full precision from the source data.
    • bar/line/area: data: [{name: dimension_value, value: metric_value}, ...]
    • combo: series: [{key:"MetricA",type:"bar"},{key:"MetricB",type:"line"}], data rows include both keys
    • pie: data rows where values sum to total
@@ -982,7 +983,7 @@ RESPOND WITH ONLY RAW JSON — no markdown, no explanation, no trailing text:
     "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
     "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
     "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
-    "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
+    "charts": [{"title":"...","type":"bar|line|area|pie|donut|combo|waterfall|scatter|bullet|treemap|funnel|radar|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
   }]
 }`
 }
@@ -1068,7 +1069,7 @@ function parseResponse(text: string): Omit<ExecutiveAnalysis, 'health_score' | '
   return null
 }
 
-const VALID_CHART_TYPES = ['bar', 'line', 'area', 'pie', 'table', 'forecast', 'combo', 'waterfall', 'scatter', 'bullet'] as const
+const VALID_CHART_TYPES = ['bar', 'line', 'area', 'pie', 'donut', 'table', 'forecast', 'combo', 'waterfall', 'scatter', 'bullet', 'treemap', 'funnel', 'radar'] as const
 const VALID_TRENDS = ['up', 'down', 'neutral'] as const
 
 function sanitizeKpi(k: AgentKPI): AgentKPI {
@@ -1365,7 +1366,11 @@ function injectUncoveredWidgets(analysis: ExecutiveAnalysis, widgets: WidgetInpu
 
   const mapType = (ct: string): AgentChart['type'] => {
     const t = (ct || '').toLowerCase()
-    if (['pie', 'donut'].some(s => t.includes(s))) return 'pie'
+    if (t.includes('treemap')) return 'treemap'
+    if (t.includes('funnel')) return 'funnel'
+    if (t.includes('radar')) return 'radar'
+    if (t.includes('donut')) return 'donut'
+    if (t.includes('pie')) return 'pie'
     if (['line', 'area'].some(s => t.includes(s))) return 'area'
     return 'bar'
   }
@@ -1727,7 +1732,7 @@ Return ONLY the JSON for a single section — no other text:
   "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
   "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
   "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"","sparkline_data":[]}],
-  "charts": [{"title":"...","type":"bar|line|area|pie|combo|waterfall|scatter|bullet|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}]}]
+  "charts": [{"title":"...","type":"bar|line|area|pie|donut|combo|waterfall|scatter|bullet|treemap|funnel|radar|table","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}]}]
 }`
 
   onProgress?.(`Sending section prompt for "${sectionLabel}"…`)

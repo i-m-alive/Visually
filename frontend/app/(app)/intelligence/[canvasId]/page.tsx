@@ -27,6 +27,8 @@ import {
   LineChart, Line, ComposedChart, ScatterChart, Scatter, LabelList,
   ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid,
   Legend, ReferenceLine, ZAxis,
+  Treemap, FunnelChart, Funnel,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
 } from 'recharts'
 
 // ── Design tokens ──────────────────────────────────────────────────────────────
@@ -594,9 +596,17 @@ function TableView({ chart }: { chart: AgentChart }) {
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('desc')
   const [search, setSearch] = React.useState('')
 
-  const rawCols = chart.data.length > 0
+  // Generic synthetic keys ('name'/'value') are pushed to the END so that when a
+  // real column holds the same data, dedup keeps the REAL column name (e.g. "City",
+  // "Client Count") and drops the generic "value"/"name" — not the other way round.
+  const _rawCols0 = chart.data.length > 0
     ? Object.keys(chart.data[0]).filter(k => k !== '_trend')
     : ['name', 'value']
+  const _GENERIC = new Set(['name', 'value'])
+  const rawCols = [
+    ..._rawCols0.filter(k => !_GENERIC.has(k)),
+    ..._rawCols0.filter(k => _GENERIC.has(k)),
+  ]
 
   // Drop columns where every value is identical to a prior column (e.g. NAME == CUSTOMER)
   const dedupedCols = rawCols.filter((col, idx) =>
@@ -688,10 +698,13 @@ function TableView({ chart }: { chart: AgentChart }) {
         </span>
       )
     }
-    if (Math.abs(num) >= 1e9) return <span style={{ color: '#0f172a', fontWeight: 600 }}>{(num / 1e9).toFixed(2)}B</span>
-    if (Math.abs(num) >= 1e6) return <span style={{ color: '#0f172a', fontWeight: 600 }}>{(num / 1e6).toFixed(2)}M</span>
-    if (Math.abs(num) >= 1e3) return <span style={{ color: '#0f172a', fontWeight: 600 }}>{num.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-    return <span style={{ color: '#0f172a', fontWeight: 600 }}>{num.toFixed(2)}</span>
+    // Show the EXACT value, comma-separated — never an abbreviated 1.2M / 3.4B
+    // form (tables should be precise; hover shows full unrounded value too).
+    return (
+      <span title={String(num)} style={{ color: '#0f172a', fontWeight: 600 }}>
+        {num.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+      </span>
+    )
   }
 
   const fmtCell = (val: unknown, col: string): React.ReactNode => {
@@ -895,13 +908,17 @@ const GRID  = <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={fa
 
 // Chart types that can be swapped freely (same {name,value} data shape)
 const CHART_SWITCH_OPTS: Record<string, string[]> = {
-  bar: ['bar', 'line', 'area'],
+  bar: ['bar', 'line', 'area', 'treemap', 'funnel', 'radar'],
   line: ['line', 'bar', 'area'],
   area: ['area', 'bar', 'line'],
-  pie: ['pie', 'bar'],
+  pie: ['pie', 'donut', 'bar', 'treemap'],
+  donut: ['donut', 'pie', 'bar', 'treemap'],
+  treemap: ['treemap', 'bar', 'pie'],
+  funnel: ['funnel', 'bar'],
+  radar: ['radar', 'bar'],
 }
 const CHART_TYPE_ICONS: Record<string, string> = {
-  bar: '▌', line: '∿', area: '△', pie: '◕',
+  bar: '▌', line: '∿', area: '△', pie: '◕', donut: '◍', treemap: '▦', funnel: '▽', radar: '✶',
 }
 
 type DrillFn = (segment: string) => void
@@ -1169,7 +1186,7 @@ function AgentChartView({
             <Bar dataKey="value" fill={color} radius={[4, 4, 0, 0]} maxBarSize={44} opacity={0.88}
               onClick={onDrill ? (d: { name?: string }) => onDrill(String(d?.name ?? '')) : undefined}
               style={onDrill ? { cursor: 'pointer' } : undefined}>
-              <LabelList dataKey="value" position="top" style={{ fontSize: 8, fill: '#94a3b8' }} formatter={(v: number) => Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M` : Math.abs(v) >= 1e3 ? `${(v/1e3).toFixed(1)}K` : v} />
+              <LabelList dataKey="value" position="top" style={{ fontSize: 8, fill: '#94a3b8' }} formatter={(v: number) => fmtExact(v)} />
             </Bar>
             {dataWithTrend.some(d => '_trend' in d) && (
               <Line type="linear" dataKey="_trend" stroke={`${color}70`} strokeWidth={1.5} strokeDasharray="5 3" dot={false} name="Trend" legendType="none" />
@@ -1208,8 +1225,8 @@ function AgentChartView({
         </ResponsiveContainer>
       )}
 
-      {/* ── PIE ── */}
-      {viewType === 'pie' && (
+      {/* ── PIE / DONUT ── */}
+      {(viewType === 'pie' || viewType === 'donut') && (
         <ResponsiveContainer width="100%" height={240}>
           <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
             <Pie
@@ -1238,6 +1255,45 @@ function AgentChartView({
             <Tooltip {...TTP} formatter={(v: number) => [fmtExact(v), ''] as [React.ReactNode, string]} />
             <Legend iconSize={9} wrapperStyle={{ fontSize: 10, paddingTop: 4 }} iconType="circle" />
           </PieChart>
+        </ResponsiveContainer>
+      )}
+
+      {/* ── TREEMAP ── */}
+      {viewType === 'treemap' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <Treemap
+            data={chart.data.map((d, i) => ({ ...d, fill: PALETTE[i % PALETTE.length] }))}
+            dataKey="value" nameKey="name" aspectRatio={4 / 3} stroke="#fff" isAnimationActive={false}
+          >
+            <Tooltip {...TTP} formatter={(v: number) => [fmtExact(v), ''] as [React.ReactNode, string]} />
+          </Treemap>
+        </ResponsiveContainer>
+      )}
+
+      {/* ── FUNNEL ── */}
+      {viewType === 'funnel' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <FunnelChart margin={{ top: 8, right: 16, bottom: 8, left: 16 }}>
+            <Tooltip {...TTP} formatter={(v: number) => [fmtExact(v), ''] as [React.ReactNode, string]} />
+            <Funnel dataKey="value" nameKey="name" data={chart.data} isAnimationActive={false}>
+              {chart.data.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
+              <LabelList position="right" dataKey="name" style={{ fontSize: 10, fill: '#475569' }} />
+              <LabelList position="left" dataKey="value" formatter={(v: number) => fmtExact(v)} style={{ fontSize: 10, fill: '#94a3b8' }} />
+            </Funnel>
+          </FunnelChart>
+        </ResponsiveContainer>
+      )}
+
+      {/* ── RADAR ── */}
+      {viewType === 'radar' && (
+        <ResponsiveContainer width="100%" height={240}>
+          <RadarChart data={chart.data} margin={{ top: 12, right: 24, bottom: 12, left: 24 }}>
+            <PolarGrid stroke="#e8eef5" />
+            <PolarAngleAxis dataKey="name" tick={{ fontSize: 9, fill: '#94a3b8' }} />
+            <PolarRadiusAxis tick={{ fontSize: 8, fill: '#cbd5e1' }} tickFormatter={fmtTick} />
+            <Radar dataKey="value" stroke={color} fill={color} fillOpacity={0.4} />
+            <Tooltip {...TTP} formatter={(v: number) => [fmtExact(v), ''] as [React.ReactNode, string]} />
+          </RadarChart>
         </ResponsiveContainer>
       )}
       </div>{/* /ref */}
