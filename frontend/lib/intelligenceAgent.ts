@@ -1465,6 +1465,38 @@ export async function runIntelligenceAgent(
   }
   console.log(`[intelligence] sql_map built  entries=${widgetSqlMap.size}`)
 
+  // Skill 18 — parallel live-SQL pre-fetch.
+  // Previously each widget's live fetch was awaited serially inside the loop
+  // below (N sequential round-trips). Fetch them all up front with bounded
+  // concurrency so the network latency overlaps instead of summing.
+  const liveRowsByTitle = new Map<string, Record<string, unknown>[]>()
+  if (shareToken) {
+    const needsFetch = widgets.filter(w => {
+      if (!w.sql_query) return false
+      const rows = w.chart_data?.rows ?? []
+      const cols = w.chart_data?.columns ?? []
+      const vals = (w.chart_data?.values ?? []).map(toNum)
+      const poor = rows.length === 0 || cols.length === 0 || vals.filter(v => !isNaN(v)).length < 3
+      return poor || rows.length < 20
+    })
+    if (needsFetch.length) {
+      onProgress?.(`[2/6] Fetching live data for ${needsFetch.length} widget(s)…`)
+      const CONCURRENCY = 5
+      for (let i = 0; i < needsFetch.length; i += CONCURRENCY) {
+        const batch = needsFetch.slice(i, i + CONCURRENCY)
+        const fetched = await Promise.all(
+          batch.map(w =>
+            fetchLiveSqlRows(shareToken, w.sql_query as string)
+              .then(rows => ({ title: w.title, rows }))
+              .catch(() => ({ title: w.title, rows: null as Record<string, unknown>[] | null })),
+          ),
+        )
+        for (const f of fetched) if (f.rows && f.rows.length) liveRowsByTitle.set(f.title, f.rows)
+      }
+      console.log(`[intelligence] live-SQL pre-fetch done  upgraded=${liveRowsByTitle.size}/${needsFetch.length}`)
+    }
+  }
+
   onProgress?.('[2/6] Running statistical skills (trends, forecasts, profiles)…')
 
   for (const w of widgets) {
@@ -1478,19 +1510,12 @@ export async function runIntelligenceAgent(
 
     const vals = (w.chart_data?.values ?? []).map(toNum)
 
-    // Skill 18: fetch richer rows via live SQL if share token available.
-    // Trigger when: cached data is absent/poor (rows=0 or cols=0) OR fewer than 20 rows.
-    // Previously gated at < 50 which blocked Skill 18 whenever bulk-fetch "succeeded"
-    // but the widget_id match had silently failed and returned 0 rows.
-    const cachedDataPoor = rows.length === 0 || cols.length === 0 || vals.filter(v => !isNaN(v)).length < 3
-    if (shareToken && w.sql_query && (cachedDataPoor || rows.length < 20)) {
-      onProgress?.(`[2/6] Fetching live data for "${w.title}"…`)
-      const liveRows = await fetchLiveSqlRows(shareToken, w.sql_query)
-      if (liveRows && liveRows.length > rows.length) {
-        console.log(`[intelligence:widget] "${w.title}" upgraded via live SQL: ${rows.length} → ${liveRows.length} rows`)
-        rows = liveRows
-        liveData = true
-      }
+    // Skill 18: use the rows pre-fetched in parallel above (if any upgraded this widget).
+    const liveRows = liveRowsByTitle.get(w.title)
+    if (liveRows && liveRows.length > rows.length) {
+      console.log(`[intelligence:widget] "${w.title}" upgraded via live SQL: ${rows.length} → ${liveRows.length} rows`)
+      rows = liveRows
+      liveData = true
     }
     const labs = (w.chart_data?.labels ?? []).map(v => String(v ?? ''))
     const pattern = detectPattern(w)
@@ -1587,22 +1612,45 @@ export async function runIntelligenceAgent(
     }
   }
 
-  onProgress?.('[5/6] Sending enriched context to Opus AI analyst…')
+  onProgress?.('[5/6] Orchestrating parallel section analysts…')
 
-  // Fix A+D: Use dedicated /intelligence/analyze endpoint (not chatApi.send).
-  // This endpoint: focused system prompt, no chart-creation instructions, max_tokens=32768.
-  const prompt = buildPrompt(canvasName, healthScore, healthColor, correlations, widgetContexts, schemaBlock)
-  console.log(`[intelligence] prompt_len=${prompt.length}  schema_included=${schemaBlock.length > 0}  sending to /intelligence/analyze`)
+  // Multi-agent orchestration: Planner → parallel Writers → Critic loop → Reducer
+  // runs on the backend. The shared context (schema + every widget's pre-computed
+  // stats) is sent once as widget_blocks and cached as a prompt prefix across all
+  // section calls. Falls back to the single monolithic /intelligence/analyze call,
+  // then to deterministic analysis, so a backend hiccup never blanks the page.
+  const widgetBlocks = widgetContexts.map(buildWidgetBlock)
 
   let responseText = ''
   try {
-    const resp = await intelligenceApi.analyze({ prompt, canvas_name: canvasName, force: opts.force ?? false })
+    console.log(
+      `[intelligence] → orchestrate  canvas="${canvasName}"  widget_blocks=${widgetBlocks.length}` +
+      `  schema_block_len=${schemaBlock.length}  correlations=${correlations.length}  force=${opts.force ?? false}`,
+    )
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+    const resp = await intelligenceApi.orchestrate({
+      canvas_name: canvasName,
+      widget_blocks: widgetBlocks,
+      schema_block: schemaBlock,
+      correlations: correlations.map(c => c.description),
+      force: opts.force ?? false,
+    })
     responseText = resp.data?.text ?? ''
-    console.log(`[intelligence] ai response received  len=${responseText.length}`)
-  } catch (err) {
-    console.warn('[intelligence] ai call failed, falling back to deterministic analysis:', err)
-    onProgress?.('AI unavailable — using deterministic analysis…')
-    return buildFallbackAnalysis(canvasName, widgets, meta)
+    const elapsed = ((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0) / 1000
+    console.log(`[intelligence] ← orchestrate response  len=${responseText.length}  elapsed=${elapsed.toFixed(1)}s`)
+  } catch (orchErr) {
+    console.warn('[intelligence] orchestrate failed, falling back to monolithic analyze:', orchErr)
+    onProgress?.('[5/6] Falling back to single-pass analysis…')
+    try {
+      const prompt = buildPrompt(canvasName, healthScore, healthColor, correlations, widgetContexts, schemaBlock)
+      const resp = await intelligenceApi.analyze({ prompt, canvas_name: canvasName, force: opts.force ?? false })
+      responseText = resp.data?.text ?? ''
+      console.log(`[intelligence] monolithic response received  len=${responseText.length}`)
+    } catch (err) {
+      console.warn('[intelligence] ai call failed, falling back to deterministic analysis:', err)
+      onProgress?.('AI unavailable — using deterministic analysis…')
+      return buildFallbackAnalysis(canvasName, widgets, meta)
+    }
   }
 
   onProgress?.('[6/6] Processing and enriching AI output…')

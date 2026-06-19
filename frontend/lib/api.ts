@@ -428,6 +428,22 @@ export const intelligenceApi = {
     api.post<{ text: string }>('/intelligence/analyze', data),
 
   /**
+   * Parallel multi-agent report generation (Planner → fan-out Writers → Critic
+   * loop → Reducer) on the backend. Returns the SAME { text } JSON shape as
+   * analyze, so the frontend parse/sanitize/inject pipeline is unchanged.
+   *
+   * widget_blocks are the per-widget pre-computed stat blocks (buildWidgetBlock
+   * output); the backend caches them as a shared prompt prefix across all calls.
+   */
+  orchestrate: (data: {
+    canvas_name?: string
+    widget_blocks: string[]
+    schema_block?: string
+    correlations?: string[]
+    force?: boolean
+  }) => api.post<{ text: string }>('/intelligence/orchestrate', data),
+
+  /**
    * Fetch table/column metadata for every table referenced in this dashboard's
    * widget SQL queries so the agent prompt includes DDL-level context.
    */
