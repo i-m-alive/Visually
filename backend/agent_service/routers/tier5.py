@@ -274,6 +274,20 @@ async def refresh_now(
     return {"status": "refreshed", "dashboard_id": dashboard_id, **summary}
 
 
+@router.post("/dashboards/{dashboard_id}/widgets/{widget_id}/refresh")
+async def refresh_widget(
+    dashboard_id: str,
+    widget_id: str,
+    current_user: User = Depends(_get_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-run a SINGLE widget's SQL and save its fresh chart_data — so refreshing
+    one widget only re-queries that widget, not the whole dashboard."""
+    from agent_service.scheduler import run_dashboard_refresh
+    summary = await run_dashboard_refresh(dashboard_id, only_widget_id=widget_id)
+    return {"status": "refreshed", "dashboard_id": dashboard_id, "widget_id": widget_id, **summary}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALCULATED MEASURES
 # ═══════════════════════════════════════════════════════════════════════════════

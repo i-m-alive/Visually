@@ -762,6 +762,9 @@ export const scheduleApi = {
     api.patch<{ schedule: RefreshSchedule }>(`/dashboards/${canvasId}/refresh-schedule`, data),
   refreshNow: (canvasId: string) =>
     api.post(`/dashboards/${canvasId}/refresh-now`),
+  // Re-run a SINGLE widget's SQL (only that widget), not the whole dashboard.
+  refreshWidget: (canvasId: string, widgetId: string) =>
+    api.post(`/dashboards/${canvasId}/widgets/${widgetId}/refresh`),
 }
 
 // ─── Tier 5: Calculated Measures ─────────────────────────────────────────────

@@ -25,9 +25,10 @@ except ImportError:
 _scheduler: Optional["AsyncIOScheduler"] = None  # type: ignore[type-arg]
 
 
-async def run_dashboard_refresh(dashboard_id: str) -> dict:
-    """Re-run all widget SQL for a dashboard and persist fresh chart_data in DB.
+async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = None) -> dict:
+    """Re-run widget SQL for a dashboard and persist fresh chart_data in DB.
 
+    When `only_widget_id` is given, refresh just that one widget; otherwise all.
     Returns {refreshed, total, skipped, errors} so callers can report the real
     outcome instead of blindly claiming success."""
     import uuid as _uuid
@@ -58,12 +59,42 @@ async def run_dashboard_refresh(dashboard_id: str) -> dict:
             widgets_result = await db.execute(
                 select(WidgetModel).where(WidgetModel.dashboard_id == dash_uuid)
             )
-            widgets = widgets_result.scalars().all()
+            widgets = list(widgets_result.scalars().all())
+            if only_widget_id:
+                widgets = [w for w in widgets if str(w.id) == str(only_widget_id)]
             summary["total"] = len(widgets)
+
+            # Fallback connection for widgets that aren't individually bound.
+            # Imported / dashboard-level-bound canvases keep the connection on
+            # layout_config.connection_id (or the project), NOT on every widget.
+            # Without this fallback, refresh silently skips every such widget and
+            # the displayed data never changes even though a connection exists.
+            fallback_conn_id: "str | None" = None
+            lc = dash.layout_config or {}
+            if lc.get("connection_id"):
+                fallback_conn_id = str(lc["connection_id"])
+            if not fallback_conn_id:
+                try:
+                    from shared.models.database_connections import DatabaseConnection
+                    pc = await db.execute(
+                        select(DatabaseConnection).where(
+                            DatabaseConnection.project_id == dash.project_id,
+                            DatabaseConnection.is_active == True,
+                        ).limit(1)
+                    )
+                    pcobj = pc.scalar_one_or_none()
+                    if pcobj:
+                        fallback_conn_id = str(pcobj.id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Scheduler: fallback connection lookup failed: %s", exc)
+            log.info(
+                "Scheduler: refresh dashboard %s  widgets=%d  fallback_conn=%s",
+                dashboard_id, len(widgets), (fallback_conn_id or "none"),
+            )
 
             for w in widgets:
                 sql = w.base_sql or w.sql_query
-                conn_id = str(w.connection_id) if w.connection_id else None
+                conn_id = str(w.connection_id) if w.connection_id else fallback_conn_id
                 if not sql or not conn_id:
                     summary["skipped"] += 1
                     continue
