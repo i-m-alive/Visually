@@ -2227,15 +2227,29 @@ export default function IntelligenceCanvasPage() {
     setAnnotatingKey(null)
   }, [canvasId])
 
-  // Feature 3: regenerate a single section
+  // Feature 3: regenerate a single section — re-queries the DB first (force cache
+  // bypass) so a section refresh reflects current values, then regenerates just
+  // that section from the fresh data. (mergeWidgetData has stable [] deps, so it's
+  // safe to call here without listing it in the dependency array.)
   const handleRegenSection = useCallback(async (sectionId: string) => {
     if (!canvas || !analysis) return
     const sec = analysis.sections.find(s => s.id === sectionId)
     if (!sec) return
     setRegenSection(sectionId)
     try {
+      // 1) Pull fresh live rows for every widget (same path as Sync Now).
+      let widgets = rawWidgets
+      try {
+        setAgentStep('Fetching live data…')
+        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, appliedDateRange ?? undefined, true)
+        widgets = mergeWidgetData(rawWidgets, liveResp.data?.widget_data ?? [])
+        setRawWidgets(widgets)
+        setLastFetchedAt(new Date())
+      } catch { /* fall back to currently-loaded data */ }
+
+      // 2) Regenerate the section from the (now fresh) data.
       const updated = await runSectionAgent(
-        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: rawWidgets as never, shareToken: shareToken || undefined },
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: appliedDateRange ?? undefined },
         sec.label,
         analysis,
         s => setAgentStep(s),
@@ -2248,7 +2262,7 @@ export default function IntelligenceCanvasPage() {
       }
     } catch { /* keep old section */ }
     finally { setRegenSection(null) }
-  }, [canvas, analysis, projectId, canvasId, rawWidgets, shareToken])
+  }, [canvas, analysis, projectId, canvasId, rawWidgets, shareToken, appliedDateRange])
 
   // Merge fresh bulk-fetched rows into the widget array from the canvas API.
   // Fix C: normalize both sides of the widget_id comparison to lowercase without dashes

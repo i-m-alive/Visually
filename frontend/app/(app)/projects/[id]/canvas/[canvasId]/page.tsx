@@ -430,8 +430,10 @@ export default function CanvasEditorPage() {
   const handleRefreshWidget = useCallback(async (widgetId: string) => {
     setRefreshingId(widgetId)
     try {
-      await scheduleApi.refreshNow(canvasId)
-      await load()
+      // Re-run ONLY this widget's query (not the whole dashboard), then re-read
+      // its fresh data silently (no full-page spinner).
+      await scheduleApi.refreshWidget(canvasId, widgetId)
+      await load(true)
       showToast('Data refreshed from database')
     } catch {
       showToast('Refresh failed')

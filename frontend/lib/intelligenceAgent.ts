@@ -1341,6 +1341,86 @@ function injectTableCharts(analysis: ExecutiveAnalysis, widgets: WidgetInput[]):
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// STRICT COVERAGE — guarantee every report widget is represented
+// The AI synthesises sections and may omit some widgets; injectTableCharts only
+// covers tables. This pass adds a chart for any NON-slicer widget that has data
+// and is not already represented in the report, so nothing from the canvas is
+// silently missing from the intelligence page.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function injectUncoveredWidgets(analysis: ExecutiveAnalysis, widgets: WidgetInput[]): void {
+  if (analysis.sections.length === 0) return
+
+  // Tables are handled by injectTableCharts; slicers are filters, not data.
+  const SKIP = new Set(['slicer', 'table', 'data_table'])
+
+  const sigWords = (s: string) => (s || '').toLowerCase().split(/\W+/).filter(x => x.length > 3)
+  const existingTitles = analysis.sections.flatMap(s => s.charts.map(c => c.title.toLowerCase()))
+  // Covered = an existing chart title shares a significant word with the widget title.
+  const isCovered = (title: string) => {
+    const wq = sigWords(title)
+    if (!wq.length) return false
+    return existingTitles.some(t => wq.some(w => t.includes(w)))
+  }
+
+  const mapType = (ct: string): AgentChart['type'] => {
+    const t = (ct || '').toLowerCase()
+    if (['pie', 'donut'].some(s => t.includes(s))) return 'pie'
+    if (['line', 'area'].some(s => t.includes(s))) return 'area'
+    return 'bar'
+  }
+
+  let rrIdx = 0
+  let injected = 0
+  for (const w of widgets) {
+    const ct = (w.chart_type || '').toLowerCase()
+    if (SKIP.has(ct)) continue
+
+    const labels = w.chart_data?.labels ?? []
+    const values = w.chart_data?.values ?? []
+    const rows = w.chart_data?.rows ?? []
+    const cols = w.chart_data?.columns ?? []
+    if (!((labels.length && values.length) || rows.length)) continue   // no data
+    if (isCovered(w.title || '')) continue                              // already shown
+
+    let data: AgentChartRow[] = []
+    if (labels.length && values.length) {
+      data = labels.slice(0, 20).map((l, i) => ({ name: String(l ?? ''), value: toNum(values[i] ?? 0) }))
+    } else if (rows.length && cols.length) {
+      const nameCol = cols[0]
+      const valCol = cols.find(c => rows.slice(0, 5).some(r => !isNaN(Number(r[c])))) ?? cols[1] ?? cols[0]
+      data = rows.slice(0, 20).map(r => ({ name: String(r[nameCol] ?? ''), value: toNum(r[valCol]) }))
+    }
+    data = data.filter(d => d.name !== '' || isFinite(d.value))
+    if (!data.length) continue
+
+    const chart: AgentChart = {
+      title: w.title || 'Chart',
+      type: mapType(ct),
+      data,
+      source_sql: w.sql_query,
+      insight: 'Included for full report coverage',
+    }
+
+    // Drop it into the section whose label/story shares the most words with the title.
+    const wq = sigWords(w.title || '')
+    let best = analysis.sections[rrIdx % analysis.sections.length]
+    let bestScore = 0
+    for (const sec of analysis.sections) {
+      const hay = [sec.label, sec.data_story ?? '', sec.narrative ?? ''].join(' ').toLowerCase()
+      const score = wq.filter(x => hay.includes(x)).length
+      if (score > bestScore) { bestScore = score; best = sec }
+    }
+    best.charts.push(chart)
+    existingTitles.push((w.title || '').toLowerCase())  // so near-dupes don't double-inject
+    rrIdx++
+    injected++
+  }
+
+  if (injected) console.log(`[intelligence] strict coverage: injected ${injected} uncovered widget chart(s)`)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1547,6 +1627,7 @@ export async function runIntelligenceAgent(
   injectReferenceLines(analysis.sections)
   injectSourceSql(analysis.sections, widgetSqlMap)
   injectTableCharts(analysis, widgets as WidgetInput[])
+  injectUncoveredWidgets(analysis, widgets as WidgetInput[])  // strict: no widget left out
 
   const injectedCount = analysis.sections.flatMap(s => s.charts).filter(c => c.source_sql).length
   console.log(
