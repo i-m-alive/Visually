@@ -49,6 +49,7 @@ from agent_service.routers import ai_insights as ai_insights_module
 from agent_service.routers import analyst as analyst_module
 from agent_service.routers import end_user as end_user_module
 from agent_service.routers import intelligence as intelligence_module
+from agent_service.routers import intelligence_orchestrator as intelligence_orchestrator_module
 from agent_service.routers import intelligence_chat as intelligence_chat_module
 
 from contextlib import asynccontextmanager
@@ -139,6 +140,7 @@ app.include_router(ai_insights_module.router)
 app.include_router(analyst_module.router)
 app.include_router(end_user_module.router)
 app.include_router(intelligence_module.router)
+app.include_router(intelligence_orchestrator_module.router)
 app.include_router(intelligence_chat_module.router)
 
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
