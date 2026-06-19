@@ -243,7 +243,27 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
 
   // ── Table ─────────────────────────────────────────────────────────────────────
   if (ct === 'table' || ct === 'data_table') {
-    const cols = columns.length ? columns : (rows[0] ? Object.keys(rows[0]) : [])
+    const baseCols = columns.length ? columns : (rows[0] ? Object.keys(rows[0]) : [])
+    // Drop redundant/empty columns the way the report table does:
+    //  1) a column whose every value duplicates an earlier column (e.g. "ends" == "placement count")
+    //  2) a column whose every value is blank / NaN / NA / null / 0  (phantom "value" columns)
+    const _dataRows = sortedRows.length ? sortedRows : rows
+    const _isJunk = (v: unknown) => {
+      if (v === null || v === undefined) return true
+      const s = String(v).trim()
+      if (s === '' || /^(nan|na|n\/a|null|undefined)$/i.test(s)) return true
+      const n = Number(v)
+      return !isNaN(n) && n === 0
+    }
+    const cols = baseCols.filter((col, idx) => {
+      if (_dataRows.length === 0) return true
+      // (1) exact-duplicate of an earlier kept column → drop
+      const dup = baseCols.slice(0, idx).some(prev =>
+        _dataRows.every(r => String(r[col] ?? '') === String(r[prev] ?? '')))
+      if (dup) return false
+      // (2) every value is junk → drop
+      return _dataRows.some(r => !_isJunk(r[col]))
+    })
 
     // Adaptive sizing — tier based on measured container width
     const tw = tableWidth || 600
