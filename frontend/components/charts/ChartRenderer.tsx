@@ -54,9 +54,12 @@ interface Props {
    *  charts and force pie/donut legends to show. Opt-in for chat surfaces so
    *  dashboard widgets keep their existing single-colour look. */
   legend?: boolean
+  /** Display-only column renames { originalColumnName: "Display Name" }. Applied to
+   *  table headers; data/cell lookups still use the original column name. */
+  columnLabels?: Record<string, string>
 }
 
-export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick, legend = false }: Props) {
+export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick, legend = false, columnLabels }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
 
   // Table sort + search state — must be declared before any early return (React rules of hooks)
@@ -102,6 +105,8 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   const { chart_type, title, x_axis_label, y_axis_label, chart_data } = result
   if (!chart_data) return null
   const { rows, columns, labels, values } = chart_data
+  // Display-only column renames: explicit prop wins, else carried on the result.
+  const effColumnLabels = columnLabels ?? result.column_labels
 
   const height = heightProp ?? (compact ? 180 : 300)
   const ct = (chart_type || 'bar_vertical').toLowerCase()
@@ -319,13 +324,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
                     key={c}
                     className="text-left font-semibold border-b select-none cursor-pointer hover:opacity-80"
                     style={{ ...thStyle, padding: `${T.padY}px ${T.padX}px`, whiteSpace: 'nowrap' }}
-                    title={c}
+                    title={effColumnLabels?.[c] ? `${effColumnLabels[c]} · ${c}` : c}
                     onClick={() => {
                       if (sortCol === c) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
                       else { setSortCol(c); setSortDir('asc') }
                     }}
                   >
-                    {c}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                    {(effColumnLabels?.[c] ?? c)}{sortCol === c ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                   </th>
                 ))}
                 {primaryNumCol && (
@@ -477,9 +482,21 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   // ── Pie / Donut ────────────────────────────────────────────────────────────────
   if (ct === 'pie' || ct === 'donut') {
     const MAX_SLICES = 12
-    let rawPie = labels.length > 0
-      ? labels.map((l, i) => ({ name: l, value: values[i] ?? 0 }))
+    // Coerce values to numbers (they can arrive as strings from JSON) and drop
+    // null / NaN / non-positive slices — recharts can't size those and they make
+    // the pie render blank or with wrong angles.
+    let rawPie = (labels.length > 0
+      ? labels.map((l, i) => ({ name: String(l ?? ''), value: Number(values[i] ?? 0) }))
       : rechartData.map(r => ({ name: String(r[xKey] ?? ''), value: Number(r[yKey] ?? 0) }))
+    ).filter(d => isFinite(d.value) && d.value > 0)
+
+    if (rawPie.length === 0) {
+      return (
+        <div className="h-full flex items-center justify-center text-gray-300 text-xs" style={{ height }}>
+          No positive values to chart
+        </div>
+      )
+    }
     // Sort descending by value so "Other" bucket is the tail
     rawPie = [...rawPie].sort((a, b) => b.value - a.value)
     let pieData = rawPie
@@ -504,7 +521,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
             <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
               innerRadius={ct === 'donut' ? '45%' : 0}
               outerRadius={outerRad}
-              label={showInlineLabels ? ({ name, percent }) => `${truncName(name)} (${(percent * 100).toFixed(0)}%)` : undefined}
+              label={showInlineLabels ? ({ name, percent }) => `${truncName(String(name ?? ''))} (${((percent ?? 0) * 100).toFixed(0)}%)` : undefined}
               labelLine={showInlineLabels}
               onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data.name) : undefined}
             >

@@ -67,6 +67,7 @@ function widgetToResult(w: WidgetData): ChartResult {
       labels: rows.map(r => String(r[cols[0]] ?? '')),
       values: rows.map(r => Number(r[cols[1]] ?? 0)),
     },
+    column_labels: w.config?.column_labels as Record<string, string> | undefined,
   }
 }
 

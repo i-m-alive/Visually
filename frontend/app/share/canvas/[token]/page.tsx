@@ -77,6 +77,7 @@ function widgetToResult(w: WidgetData, override?: { rows: unknown[]; columns: st
     y_axis_label: cols[1] || 'y',
     table_used: '',
     chart_data: { rows, columns: cols, labels, values },
+    column_labels: w.config?.column_labels as Record<string, string> | undefined,
   }
 }
 

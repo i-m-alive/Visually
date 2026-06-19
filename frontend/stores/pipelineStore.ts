@@ -25,6 +25,9 @@ export interface ChartResult {
   output_mode?: string
   // Human-facing explanation: a chart caption, or the prose answer for text mode
   narrative?: string
+  // Display-only table column renames { originalColumn: "Display Name" } — applied
+  // to table headers by ChartRenderer when no columnLabels prop is passed.
+  column_labels?: Record<string, string>
 }
 
 interface PipelineSteps {

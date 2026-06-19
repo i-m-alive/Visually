@@ -1,9 +1,10 @@
 'use client'
 import React, { useState, useRef, useEffect, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import {
   GripVertical, Pencil, Check, X, ChevronDown,
   Maximize2, Download, Trash2, Palette, Image as ImageIcon,
-  RefreshCw, StickyNote, Lock, Unlock, Copy, RotateCcw
+  RefreshCw, StickyNote, Lock, Unlock, Copy, RotateCcw, Tag
 } from 'lucide-react'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import SlicerWidget from '@/components/canvas/SlicerWidget'
@@ -126,6 +127,16 @@ export function CanvasWidget({
   const [noteDraft, setNoteDraft] = useState((widget.config?.note as string) || '')
   const [pendingDelete, setPendingDelete] = useState(false)
   const [mounted, setMounted] = useState(false)
+  // ── Column renaming (display-only, table widgets) ────────────────────────────
+  const columnLabels = (widget.config?.column_labels as Record<string, string>) || undefined
+  const isTableWidget = ['table', 'data_table'].includes(widget.chart_type)
+  const tableColumns: string[] = isTableWidget
+    ? ((widget.chart_data?.columns as string[])?.length
+        ? (widget.chart_data?.columns as string[])
+        : Object.keys(((widget.chart_data?.rows as Record<string, unknown>[]) || [])[0] || {}))
+    : []
+  const [showRenameCols, setShowRenameCols] = useState(false)
+  const [colDrafts, setColDrafts] = useState<Record<string, string>>({})
 
   const titleInputRef = useRef<HTMLInputElement>(null)
   const typeMenuRef   = useRef<HTMLDivElement>(null)
@@ -235,6 +246,29 @@ export function CanvasWidget({
   const saveNote = () => {
     onUpdate(widget.id, { config: { note: noteDraft } })
     setShowNote(false)
+  }
+
+  const openRenameCols = () => {
+    // Seed drafts with current labels so the user edits from where they left off.
+    const seed: Record<string, string> = {}
+    for (const c of tableColumns) seed[c] = columnLabels?.[c] ?? ''
+    setColDrafts(seed)
+    setShowRenameCols(true)
+  }
+
+  const saveColumnLabels = () => {
+    // Keep only entries that differ from the original column name; drop blanks.
+    const map: Record<string, string> = {}
+    for (const c of tableColumns) {
+      const v = (colDrafts[c] ?? '').trim()
+      if (v && v !== c) map[c] = v
+    }
+    onUpdate(widget.id, { config: { column_labels: map } })
+    setShowRenameCols(false)
+  }
+
+  const resetColumnLabels = () => {
+    setColDrafts(Object.fromEntries(tableColumns.map(c => [c, ''])))
   }
 
   const result: ChartResult = {
@@ -437,6 +471,20 @@ export function CanvasWidget({
         {/* Color palette */}
         {colorPaletteNode as any}
 
+        {/* Rename columns — table widgets only */}
+        {isTableWidget && tableColumns.length > 0 && (
+          <button
+            onClick={openRenameCols}
+            disabled={isLocked}
+            className={`p-1 rounded transition-colors flex-shrink-0 disabled:opacity-40 ${
+              columnLabels && Object.keys(columnLabels).length ? 'text-blue-500 hover:text-blue-600' : 'text-gray-400 hover:text-blue-500'
+            }`}
+            title="Rename columns"
+          >
+            <Tag size={13} />
+          </button>
+        )}
+
         {/* Note button */}
         <button
           onClick={() => setShowNote(v => !v)}
@@ -555,6 +603,7 @@ export function CanvasWidget({
             result={result}
             colors={colors}
             height={Math.max(60, chartHeight)}
+            columnLabels={columnLabels}
           />
         ) : (
           <div className="h-full flex items-center justify-center text-gray-300 text-xs">
@@ -599,6 +648,56 @@ export function CanvasWidget({
             />
           </div>
         </div>
+      )}
+
+      {/* Rename columns modal — portal so the widget's overflow:hidden can't clip it */}
+      {showRenameCols && typeof document !== 'undefined' && createPortal(
+        <div
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+          onClick={() => setShowRenameCols(false)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] flex flex-col overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+              <div className="flex items-center gap-2">
+                <Tag size={15} className="text-blue-500" />
+                <span className="text-sm font-semibold text-gray-800">Rename columns — {widget.title}</span>
+              </div>
+              <button onClick={() => setShowRenameCols(false)} className="p-1 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors">
+                <X size={16} />
+              </button>
+            </div>
+            <p className="px-4 pt-2.5 text-[11px] text-gray-400 leading-snug">
+              Display names only — the underlying data and query are unchanged. Leave a field blank to keep the original column name.
+            </p>
+            <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
+              {tableColumns.map(c => (
+                <div key={c} className="flex items-center gap-2">
+                  <span className="w-1/3 text-[11px] font-mono text-gray-500 truncate flex-shrink-0" title={c}>{c}</span>
+                  <input
+                    value={colDrafts[c] ?? ''}
+                    onChange={e => setColDrafts(d => ({ ...d, [c]: e.target.value }))}
+                    placeholder={c}
+                    className="flex-1 min-w-0 text-xs text-gray-800 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-blue-400 focus:bg-white transition-colors"
+                  />
+                </div>
+              ))}
+              {tableColumns.length === 0 && (
+                <p className="text-xs text-gray-400 text-center py-6">No columns found for this widget.</p>
+              )}
+            </div>
+            <div className="flex items-center justify-between gap-2 px-4 py-3 border-t border-gray-100 bg-gray-50">
+              <button onClick={resetColumnLabels} className="text-xs text-gray-500 hover:text-red-500 font-medium transition-colors">Reset all</button>
+              <div className="flex items-center gap-2">
+                <button onClick={() => setShowRenameCols(false)} className="px-3 py-1.5 text-xs text-gray-600 hover:text-gray-800 transition-colors">Cancel</button>
+                <button onClick={saveColumnLabels} className="px-3 py-1.5 text-xs font-semibold text-white rounded-lg transition-opacity hover:opacity-90" style={{ background: 'linear-gradient(135deg,#2563EB,#7C3AED)' }}>Save</button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
     </div>
   )
