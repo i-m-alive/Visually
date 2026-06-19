@@ -349,6 +349,7 @@ export function EndUserCanvasViewer({ dashboardId, onClose }: Props) {
                             x_axis_label: config.x_axis_label || '',
                             y_axis_label: config.y_axis_label || '',
                             sql: '', score: 0, low_confidence: false, table_used: '',
+                            column_labels: (config as Record<string, unknown>).column_labels as Record<string, string> | undefined,
                           }}
                         />
                       ) : (
@@ -422,6 +423,7 @@ export function EndUserCanvasViewer({ dashboardId, onClose }: Props) {
                       x_axis_label: config.x_axis_label || '',
                       y_axis_label: config.y_axis_label || '',
                       sql: '', score: 0, low_confidence: false, table_used: '',
+                      column_labels: (config as Record<string, unknown>).column_labels as Record<string, string> | undefined,
                     }}
                   />
                 ) : (

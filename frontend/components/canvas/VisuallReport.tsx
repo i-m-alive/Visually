@@ -428,6 +428,7 @@ function toChartResult(w: CanvasWidgetData): ChartResult {
     y_axis_label: (w.config?.y_axis_label as string) ?? '',
     sql: w.sql_query ?? '', score: w.validation_score ?? 0,
     low_confidence: false, table_used: '',
+    column_labels: w.config?.column_labels as Record<string, string> | undefined,
   }
 }
 
