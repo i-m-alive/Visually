@@ -225,8 +225,12 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
         } as React.CSSProperties}>{kpi.label}</p>
         {kpi.sparkline_data && kpi.sparkline_data.length > 1 && <Sparkline data={kpi.sparkline_data} color={accentColor} />}
       </div>
-      {/* Value — capped at 24px so long values don't overflow */}
-      <p style={{ fontSize: 24, fontWeight: 800, color: C.ink, margin: '6px 0 0', lineHeight: 1.05, letterSpacing: '-0.02em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+      {/* Value — capped at 24px so long values don't overflow. Hover shows the
+          exact value (the card itself abbreviates large numbers as K/M/B). */}
+      <p
+        title={`${prefix}${animatable ? raw.toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(kpi.value)}${suffix}`}
+        style={{ fontSize: 24, fontWeight: 800, color: C.ink, margin: '6px 0 0', lineHeight: 1.05, letterSpacing: '-0.02em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'help' }}
+      >
         {animatable ? <AnimatedCounter target={raw} prefix={prefix} suffix={suffix} /> : String(kpi.value).slice(0, 14)}
       </p>
       {/* Trend pill — always occupies same space even when absent */}
@@ -602,17 +606,21 @@ function TableView({ chart }: { chart: AgentChart }) {
     )
   )
 
-  // Drop columns where every value would render as "—":
+  // Drop columns where every value would render as empty / junk:
   //   • null / undefined / empty string
+  //   • NaN / NA / null / undefined tokens (the AI's unpopulated "value" column)
   //   • numeric 0  (fmtNum returns "—" for 0)
-  // This removes phantom columns the AI creates but never populates with real data.
+  // Genuine non-numeric text (e.g. names) is always kept.
   const meaningfulCols = dedupedCols.filter(col =>
     chart.data.length === 0 ||
     chart.data.some(row => {
       const v = row[col]
-      if (v === null || v === undefined || v === '' || String(v).trim() === '') return false
+      if (v === null || v === undefined) return false
+      const s = String(v).trim()
+      if (s === '' || /^(nan|na|n\/a|null|undefined)$/i.test(s)) return false
       const n = Number(v)
-      return isNaN(n) || n !== 0   // non-numeric strings are always meaningful; non-zero numbers are meaningful
+      if (!isNaN(n)) return n !== 0   // numeric: meaningful only when non-zero
+      return true                      // genuine non-numeric text → meaningful
     })
   )
 
@@ -688,6 +696,8 @@ function TableView({ chart }: { chart: AgentChart }) {
 
   const fmtCell = (val: unknown, col: string): React.ReactNode => {
     if (val === null || val === undefined || val === '') return <span style={{ color: '#d1d5db' }}>—</span>
+    // NaN / NA / null-like tokens render as an em-dash, never the literal text.
+    if (/^(nan|na|n\/a|null|undefined)$/i.test(String(val).trim())) return <span style={{ color: '#d1d5db' }}>—</span>
     const yoy = isYoyCol(col)
     if (typeof val === 'string' && val.endsWith('%')) {
       const n = parseFloat(val)
@@ -698,42 +708,25 @@ function TableView({ chart }: { chart: AgentChart }) {
     return <span style={{ color: '#0f172a' }}>{String(val)}</span>
   }
 
-  // Scale first-column width down as the table grows wider so data columns breathe
+  // FIXED table styling so every table on the page looks identical regardless of
+  // column count. (These used to scale with totalVisualCols, which rendered wide
+  // tables compact and narrow tables tall/large — i.e. two different looks.)
   const totalVisualCols =
     displayCols.length + (hasTrend ? 1 : 0) + (showBullet ? 1 : 0)
-  const firstColMaxW =
-    totalVisualCols <= 2 ? 320 :
-    totalVisualCols <= 4 ? 220 :
-    totalVisualCols <= 6 ? 180 :
-    totalVisualCols <= 9 ? 150 :
-    120
-
-  // Font + padding + visible-row budget scale inversely with column count
-  // — wide tables use smaller text so every column stays readable
-  const cellFontSize =
-    totalVisualCols <= 3 ? 12 :
-    totalVisualCols <= 6 ? 11 :
-    10
-
-  const cellPadV = totalVisualCols <= 4 ? 9 : totalVisualCols <= 7 ? 7 : 5  // px
-  const cellPadH = totalVisualCols <= 4 ? 14 : totalVisualCols <= 7 ? 10 : 8
+  const firstColMaxW = 260
+  const cellFontSize = 11
+  const cellPadV = 7   // px
+  const cellPadH = 12
   const cellPad  = `${cellPadV}px ${cellPadH}px`
 
-  // How many rows fit comfortably before the table starts to dominate the page.
-  // Sparkline (hasTrend) rows are taller so we show fewer of them.
-  const maxVisibleRows = hasTrend
-    ? (totalVisualCols <= 3 ? 8 : totalVisualCols <= 6 ? 7 : 5)
-    : (totalVisualCols <= 3 ? 12 : totalVisualCols <= 6 ? 10 : totalVisualCols <= 9 ? 7 : 5)
-
-  // Sparkline rows are ~44 px tall; plain rows scale with font size
-  const rowPxH    = hasTrend ? 44 : (cellFontSize <= 10 ? 29 : cellFontSize <= 11 ? 32 : 36)
+  // Sparkline (hasTrend) rows are taller, so show fewer of them; otherwise a fixed budget.
+  const maxVisibleRows = hasTrend ? 7 : 11
+  const rowPxH    = hasTrend ? 44 : 34
   const headerPxH = 42
-  // Hard caps prevent any table from consuming the full visible page.
-  // Trend tables get a tighter cap (320 px) because sparklines already communicate
-  // the data story; users scroll for the remainder.
+  // Hard cap so no single table dominates the page; users scroll for the rest.
   const tableMaxHeight = Math.min(
     maxVisibleRows * rowPxH + headerPxH,
-    hasTrend ? 320 : (totalVisualCols <= 3 ? 380 : 320),
+    hasTrend ? 360 : 440,
   )
 
   const thBase: React.CSSProperties = {
@@ -883,7 +876,14 @@ function TableView({ chart }: { chart: AgentChart }) {
 }
 
 // ── Chart renderer ─────────────────────────────────────────────────────────────
-const TTP = { contentStyle: { fontSize: 11, borderRadius: 8, border: '1px solid #e8eef5', boxShadow: '0 4px 12px rgba(0,0,0,0.08)' } }
+// Exact value for tooltips — full precision with thousands separators (axis ticks
+// and inline labels stay abbreviated; hover always shows the real number).
+const fmtExact = (v: unknown): React.ReactNode =>
+  typeof v === 'number' && isFinite(v) ? v.toLocaleString(undefined, { maximumFractionDigits: 4 }) : (v as React.ReactNode)
+const TTP = {
+  contentStyle: { fontSize: 11, borderRadius: 8, border: '1px solid #e8eef5', boxShadow: '0 4px 12px rgba(0,0,0,0.08)' },
+  formatter: (v: unknown) => fmtExact(v),
+}
 const fmtTick = (v: number) =>
   Math.abs(v) >= 1e9 ? `${(v/1e9).toFixed(1)}B`
   : Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M`
@@ -1100,7 +1100,7 @@ function AgentChartView({
       {viewType === 'waterfall' && (
         <ResponsiveContainer width="100%" height={240}>
           <ComposedChart data={chart.data} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
-            {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} formatter={(v, name) => name === 'base' ? null : v} />
+            {GRID}{XAXIS}{YAXIS}<Tooltip {...TTP} formatter={(v, name) => name === 'base' ? null : fmtExact(v)} />
             <Bar dataKey="base" stackId="wf" fill="transparent" />
             <Bar dataKey="value" stackId="wf" radius={[4, 4, 0, 0]} maxBarSize={44}>
               {chart.data.map((d, i) => (
@@ -1123,7 +1123,7 @@ function AgentChartView({
               <XAxis dataKey="x" type="number" name={xKey} tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} label={{ value: xKey, fill: '#94a3b8', fontSize: 9, position: 'insideBottom', offset: -2 }} />
               <YAxis dataKey="y" type="number" name={yKey} tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={40} label={{ value: yKey, fill: '#94a3b8', fontSize: 9, angle: -90, position: 'insideLeft' }} />
               <ZAxis range={[40, 40]} />
-              <Tooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={TTP.contentStyle} formatter={(v, name) => [String(v), name] as [string, string]} />
+              <Tooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={TTP.contentStyle} formatter={(v, name) => [fmtExact(v), name] as [React.ReactNode, string]} />
               <Scatter data={scatterData} fill={color} fillOpacity={0.75} />
             </ScatterChart>
           </ResponsiveContainer>
@@ -1235,7 +1235,7 @@ function AgentChartView({
               style={onDrill ? { cursor: 'pointer' } : undefined}>
               {chart.data.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
             </Pie>
-            <Tooltip {...TTP} formatter={(v: number) => [fmtTick(v), '']} />
+            <Tooltip {...TTP} formatter={(v: number) => [fmtExact(v), ''] as [React.ReactNode, string]} />
             <Legend iconSize={9} wrapperStyle={{ fontSize: 10, paddingTop: 4 }} iconType="circle" />
           </PieChart>
         </ResponsiveContainer>
