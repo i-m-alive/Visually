@@ -4,6 +4,7 @@ import { useParams, useRouter } from 'next/navigation'
 import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
 import { IntelligenceCopilotPanel } from '@/components/report/IntelligenceCopilotPanel'
+import { VlyExportModal } from '@/components/canvas/VlyExportModal'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import {
   runIntelligenceAgent, buildFallbackAnalysis, runSectionAgent,
@@ -348,8 +349,8 @@ function InsightCards({ insights }: { insights: InsightCard[] }) {
               flexShrink: 0, color: style.icon,
             }}>{icon}</div>
             <div style={{ minWidth: 0 }}>
-              <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: '0 0 4px', lineHeight: 1.35 }}>{ins.headline}</p>
-              <p style={{ fontSize: 11, color: '#5a6b7c', margin: 0, lineHeight: 1.6 }}>{ins.detail}</p>
+              <p style={{ fontSize: 12, fontWeight: 700, color: C.ink, margin: '0 0 4px', lineHeight: 1.35 }} dangerouslySetInnerHTML={{ __html: mdHtml(ins.headline) }} />
+              <p style={{ fontSize: 11, color: '#5a6b7c', margin: 0, lineHeight: 1.6 }} dangerouslySetInnerHTML={{ __html: mdHtml(ins.detail) }} />
               <ConfidenceStars score={ins.confidence} />
             </div>
           </div>
@@ -1327,6 +1328,19 @@ function normLabel(l: string): string {
 const _kfKeyWords = (t: string) =>
   t.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3)
 
+// Lightweight inline markdown → HTML for the report body text (the AI emits
+// **bold**, *italic*, `code`). HTML is escaped FIRST so AI text can't inject markup.
+// Matches the copilot's renderer so markdown is consistent across the page.
+function mdHtml(s: string | undefined): string {
+  if (!s) return ''
+  let h = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+  h = h.replace(/__(.+?)__/g, '<strong>$1</strong>')
+  h = h.replace(/\*(.+?)\*/g, '<em>$1</em>')
+  h = h.replace(/`([^`]+?)`/g, '<code>$1</code>')
+  return h
+}
+
 // Strip ALL leading sentences of the narrative that merely restate the section
 // headline / key finding, so the body adds new detail instead of repeating it.
 // (Fix 2 — stronger client-side dedup vs both data_story and key_finding.)
@@ -1446,17 +1460,17 @@ function SectionContent({
           <div style={{ flex: 1 }}>
             <p style={{ fontSize: 10, fontWeight: 700, color: accentColor, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 4px' }}>{section.label}</p>
             {section.data_story
-              ? <p style={{ fontSize: 18, fontWeight: 800, color: C.ink, margin: 0, lineHeight: 1.3, letterSpacing: '-0.01em' }}>{section.data_story}</p>
+              ? <p style={{ fontSize: 18, fontWeight: 800, color: C.ink, margin: 0, lineHeight: 1.3, letterSpacing: '-0.01em' }} dangerouslySetInnerHTML={{ __html: mdHtml(section.data_story) }} />
               : section.key_finding
-                ? <p style={{ fontSize: 16, fontWeight: 700, color: C.ink, margin: 0, lineHeight: 1.35 }}>{section.key_finding}</p>
-                : <p style={{ fontSize: 14, fontWeight: 600, color: C.slate, margin: 0 }}>{section.narrative?.slice(0, 90) ?? ''}</p>
+                ? <p style={{ fontSize: 16, fontWeight: 700, color: C.ink, margin: 0, lineHeight: 1.35 }} dangerouslySetInnerHTML={{ __html: mdHtml(section.key_finding) }} />
+                : <p style={{ fontSize: 14, fontWeight: 600, color: C.slate, margin: 0 }} dangerouslySetInnerHTML={{ __html: mdHtml(section.narrative?.slice(0, 90) ?? '') }} />
             }
             {section.recommendation && (
               <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 8 }}>
                 <ArrowRight size={11} style={{ color: '#f97316', marginTop: 2, flexShrink: 0 }} />
                 <p style={{ fontSize: 12, color: '#7c2d12', margin: 0, lineHeight: 1.55 }}>
                   <span style={{ fontWeight: 700, color: '#f97316' }}>Next Step: </span>
-                  {section.recommendation}
+                  <span dangerouslySetInnerHTML={{ __html: mdHtml(section.recommendation) }} />
                 </p>
               </div>
             )}
@@ -1501,11 +1515,11 @@ function SectionContent({
               {showFullNarrative ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
             </button>
             {showFullNarrative && (
-              <p style={{ fontSize: 13, lineHeight: 1.78, color: '#64748b', margin: '8px 0 0' }}>{displayNarrative}</p>
+              <p style={{ fontSize: 13, lineHeight: 1.78, color: '#64748b', margin: '8px 0 0' }} dangerouslySetInnerHTML={{ __html: mdHtml(displayNarrative) }} />
             )}
           </div>
         ) : (
-          <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }}>{displayNarrative}</p>
+          <p style={{ fontSize: 13, lineHeight: 1.78, color: '#4a5568', margin: 0 }} dangerouslySetInnerHTML={{ __html: mdHtml(displayNarrative) }} />
         )
       )}
 
@@ -2026,16 +2040,16 @@ function PresentationOverlay({
       {/* slide body */}
       <div style={{ flex: 1, overflow: 'auto', padding: '32px 60px' }}>
         {section.data_story && (
-          <p style={{ fontSize: 32, fontWeight: 800, color: 'white', margin: '0 0 20px', lineHeight: 1.25, letterSpacing: '-0.02em', maxWidth: 820 }}>{section.data_story}</p>
+          <p style={{ fontSize: 32, fontWeight: 800, color: 'white', margin: '0 0 20px', lineHeight: 1.25, letterSpacing: '-0.02em', maxWidth: 820 }} dangerouslySetInnerHTML={{ __html: mdHtml(section.data_story) }} />
         )}
         {section.key_finding && (
           <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', background: `${C.teal}15`, borderLeft: `4px solid ${C.teal}`, borderRadius: '0 12px 12px 0', padding: '14px 18px', marginBottom: 20, maxWidth: 780 }}>
             <Zap size={16} style={{ color: C.teal, flexShrink: 0 }} />
-            <p style={{ fontSize: 18, fontWeight: 600, color: 'white', margin: 0, lineHeight: 1.5 }}>{section.key_finding}</p>
+            <p style={{ fontSize: 18, fontWeight: 600, color: 'white', margin: 0, lineHeight: 1.5 }} dangerouslySetInnerHTML={{ __html: mdHtml(section.key_finding) }} />
           </div>
         )}
         {section.narrative && (
-          <p style={{ fontSize: 15, lineHeight: 1.8, color: 'rgba(255,255,255,0.75)', margin: '0 0 24px', maxWidth: 780 }}>{section.narrative}</p>
+          <p style={{ fontSize: 15, lineHeight: 1.8, color: 'rgba(255,255,255,0.75)', margin: '0 0 24px', maxWidth: 780 }} dangerouslySetInnerHTML={{ __html: mdHtml(section.narrative) }} />
         )}
         {section.charts.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 16 }}>
@@ -2185,9 +2199,11 @@ export default function IntelligenceCanvasPage() {
   const [agentStatus, setAgentStatus] = useState<AgentStatus>('idle')
   const [agentStep, setAgentStep] = useState('')
   const [analysis, setAnalysis] = useState<ExecutiveAnalysis | null>(null)
+  const [showExport, setShowExport] = useState(false)
   const [agentError, setAgentError] = useState<string | null>(null)
   const [aiFallbackWarning, setAiFallbackWarning] = useState(false)
   const [rerunning, setRerunning] = useState(false)
+  const [regenerating, setRegenerating] = useState(false)
   const [syncMenuOpen, setSyncMenuOpen] = useState(false)
   const [autoSyncMins, setAutoSyncMins] = useState<number | null>(() => {
     try { return parseInt(localStorage.getItem(`intel_sync_${canvasId}`) ?? '') || null } catch { return null }
@@ -2603,22 +2619,27 @@ export default function IntelligenceCanvasPage() {
     if (!canvas || !pendingDate.from || !pendingDate.to) return
     const dr = { from: pendingDate.from, to: pendingDate.to }
     setAppliedDateRange(dr)
+    // A date-range change must produce a genuinely fresh report — drop the saved
+    // snapshot and force both the data re-query and the AI rebuild (no cache).
+    try { localStorage.removeItem(`intel_analysis_${canvasId}`) } catch {}
+    setHasSavedData(false)
     setDateLoading(true); setAgentStatus('running'); setAgentError(null); setAiFallbackWarning(false)
     try {
       let widgets = rawWidgets
       try {
-        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, dr)
+        const liveResp = await intelligenceApi.fetchWidgetData(canvasId, dr, true)
         widgets = mergeWidgetData(rawWidgets, liveResp.data?.widget_data ?? [])
         setRawWidgets(widgets)
         setLastFetchedAt(new Date())
       } catch { /* keep stale */ }
       const result = await runIntelligenceAgent(
-        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: dr },
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: dr, force: true },
         s => setAgentStep(s),
       )
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
+      try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
     } catch {
       setAgentStatus('done')
     } finally { setDateLoading(false) }
@@ -2655,6 +2676,28 @@ export default function IntelligenceCanvasPage() {
       setAgentStatus('done')
     } finally { setRerunning(false) }
   }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange])
+
+  // Regenerate from scratch — rebuild the AI report on the CURRENT data without
+  // re-querying the database. Distinct from Sync Now (which also re-fetches data).
+  // Clears the saved snapshot and forces the orchestrator cache bypass.
+  const regenerate = useCallback(async () => {
+    if (!canvas || rerunning || regenerating) return
+    try { localStorage.removeItem(`intel_analysis_${canvasId}`) } catch {}
+    setHasSavedData(false)
+    setRegenerating(true); setAgentStatus('running'); setAgentError(null); setAiFallbackWarning(false)
+    try {
+      const result = await runIntelligenceAgent(
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: rawWidgets as never, shareToken: shareToken || undefined, dateRange: appliedDateRange ?? undefined, force: true },
+        s => setAgentStep(s),
+      )
+      if ((result as unknown as Record<string, unknown>)._fallback) setAiFallbackWarning(true)
+      setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
+      setAgentStatus('done')
+      try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
+    } catch {
+      setAgentStatus('done')
+    } finally { setRegenerating(false) }
+  }, [canvas, rerunning, regenerating, projectId, canvasId, rawWidgets, shareToken, appliedDateRange])
 
   // Keep rerunRef current so the auto-sync interval never closes over a stale rerun
   useEffect(() => { rerunRef.current = rerun }, [rerun])
@@ -2761,13 +2804,22 @@ export default function IntelligenceCanvasPage() {
             {/* <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Play size={11} /> Present
             </button> */}
+            {/* Offline data-source acknowledgment pill */}
+            {(canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline' && (
+              <span
+                title="This canvas was imported without a live database. The report and copilot run on the bundled table data."
+                style={{ padding: '5px 10px', borderRadius: 8, border: `1px solid ${C.teal}60`, background: `${C.teal}20`, color: C.teal2, display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
+              >
+                <Database size={11} /> Offline data
+              </span>
+            )}
             {/* Feature 7: print/PDF */}
             <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Printer size={11} /> PDF
             </button>
-            {/* Export .vly — bundles AI analysis + widget data + SQL + schema */}
+            {/* Export .vly — bundles AI analysis + widget data + SQL + schema (+ optional full tables for offline) */}
             <button
-              onClick={() => vlyApi.exportVly(canvasId, analysis)}
+              onClick={() => setShowExport(true)}
               title="Export as .vly — bundles AI analysis, widget data, SQL queries and schema into one portable file"
               className="intel-hdr-btn"
               style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${C.teal}60`, background: `${C.teal}20`, color: C.teal2, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
@@ -2787,13 +2839,30 @@ export default function IntelligenceCanvasPage() {
             {/* <button onClick={() => { setCompareMode(p => !p); if (!compareMode && analysis.sections[1]) setCompareSectionId(analysis.sections[1].id) }} title="Side-by-side compare" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${compareMode ? C.violet + '80' : 'rgba(255,255,255,0.2)'}`, background: compareMode ? `${C.violet}30` : 'rgba(255,255,255,0.1)', color: compareMode ? '#c4b5fd' : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
               <Columns size={11} /> Compare
             </button> */}
+            {/* Regenerate from scratch — rebuilds the AI report on current data, no DB re-query */}
+            <button
+              onClick={regenerate}
+              disabled={regenerating || rerunning}
+              title="Rebuild the AI report from scratch using the current data (no database re-query)"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '6px 12px', fontSize: 11, fontWeight: 700,
+                cursor: (regenerating || rerunning) ? 'not-allowed' : 'pointer',
+                background: regenerating ? `${C.violet}40` : `${C.violet}25`,
+                border: `1px solid ${C.violet}70`, borderRadius: 8, color: '#c4b5fd',
+                transition: 'all 0.15s',
+              }}
+            >
+              <Sparkles size={11} style={regenerating ? { animation: 'ispin 1s linear infinite' } : {}} />
+              {regenerating ? 'Regenerating…' : 'Regenerate'}
+            </button>
             {/* ── Sync split-button ── */}
             <div ref={syncMenuRef} style={{ position: 'relative', display: 'flex' }}>
               {/* Left: Sync Now */}
               <button
                 onClick={rerun}
                 disabled={rerunning}
-                title="Fetch fresh data and regenerate analysis"
+                title="Fetch fresh data from the database, then regenerate the report"
                 style={{
                   display: 'flex', alignItems: 'center', gap: 5,
                   padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: rerunning ? 'not-allowed' : 'pointer',
@@ -3062,9 +3131,8 @@ export default function IntelligenceCanvasPage() {
             transition: 'max-height 0.3s cubic-bezier(0.4,0,0.2,1)',
           }}>
             <div style={{ height: 1, background: 'rgba(255,255,255,0.07)', margin: '0 13px' }} />
-            <p style={{ fontSize: 12, lineHeight: 1.78, color: 'rgba(255,255,255,0.70)', margin: 0, padding: '11px 13px 14px', overflowY: 'auto', maxHeight: 380 }}>
-              {analysis.morning_brief}
-            </p>
+            <p style={{ fontSize: 12, lineHeight: 1.78, color: 'rgba(255,255,255,0.70)', margin: 0, padding: '11px 13px 14px', overflowY: 'auto', maxHeight: 380 }}
+              dangerouslySetInnerHTML={{ __html: mdHtml(analysis.morning_brief) }} />
           </div>
         </div>
       )}
@@ -3348,6 +3416,14 @@ export default function IntelligenceCanvasPage() {
       {/* Feature 8: Share modal */}
       {shareModalUrl && (
         <ShareModal url={shareModalUrl} onClose={() => setShareModalUrl(null)} />
+      )}
+
+      {showExport && (
+        <VlyExportModal
+          canvasId={canvasId}
+          intelligence={analysis ?? undefined}
+          onClose={() => setShowExport(false)}
+        />
       )}
 
       {/* Feature 10: Annotation popover */}

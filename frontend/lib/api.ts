@@ -620,7 +620,11 @@ export const vlyApi = {
    * - Falls back to a plain <a download> on unsupported browsers.
    * - Pass `intelligence` to bundle the AI analysis into intelligence.json.
    */
-  exportVly: async (canvasId: string, intelligence?: object): Promise<void> => {
+  exportVly: async (
+    canvasId: string,
+    intelligence?: object,
+    opts?: { includeTableData?: boolean },
+  ): Promise<void> => {
     const stored = typeof window !== 'undefined' ? localStorage.getItem('visually-auth') : null
     let token = ''
     if (stored) {
@@ -635,7 +639,10 @@ export const vlyApi = {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ intelligence: intelligence ?? null }),
+      body: JSON.stringify({
+        intelligence: intelligence ?? null,
+        include_table_data: opts?.includeTableData ?? false,
+      }),
     })
     if (!response.ok) throw new Error(`Export failed: ${response.status}`)
 
@@ -683,10 +690,37 @@ export const vlyApi = {
     form.append('file', file)
     form.append('project_id', projectId)
     if (connectionId) form.append('connection_id', connectionId)
-    return api.post('/dashboards/import-vly', form, {
+    return api.post<{
+      dashboard_id: string
+      name: string
+      widget_count: number
+      connection_linked: boolean
+      connection_id: string | null
+      live_connection_id: string | null
+      offline_connection_id: string | null
+      project_id: string
+      original_name: string | null
+      intelligence_bundled: boolean
+      data_mode: 'live' | 'offline' | 'cached'
+      has_table_data: boolean
+      table_count: number
+      connection_test: { ok: boolean; message: string } | null
+    }>('/dashboards/import-vly', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
+
+  /** Persist the canvas's data-source mode (live | offline | cached). */
+  setDataMode: (dashboardId: string, mode: 'live' | 'offline' | 'cached') =>
+    api.post<{ status: string; dashboard_id: string; data_mode: string }>(
+      `/dashboards/${dashboardId}/data-mode`, { mode },
+    ),
+
+  /** Probe the canvas's connection. Offline canvases report bundled-table readiness. */
+  testConnection: (dashboardId: string) =>
+    api.post<{ ok: boolean; message: string; db_type: string | null; data_mode: string | null }>(
+      `/dashboards/${dashboardId}/connection/test`,
+    ),
 
   /**
    * Bind a live DB connection to a canvas (e.g. one just imported with cached data).

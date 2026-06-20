@@ -82,10 +82,29 @@ async def _backfill_project_members():
             print(f"[startup] ProjectMember backfill warning: {e}")
 
 
+async def _ensure_offline_tables() -> None:
+    """Create vly_offline_tables if missing (safe no-op when it exists).
+
+    Belt-and-suspenders for dev environments that haven't run alembic 014 — the
+    offline-import feature writes here. checkfirst=True means existing tables are
+    never touched."""
+    try:
+        from shared.database import engine
+        from shared.models.vly_offline import VlyOfflineTable
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                lambda c: VlyOfflineTable.__table__.create(bind=c, checkfirst=True)
+            )
+        print("[startup] vly_offline_tables ensured", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[startup] vly_offline_tables ensure warning: {e}", flush=True)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     from agent_service.scheduler import start_scheduler, stop_scheduler
     await _backfill_project_members()
+    await _ensure_offline_tables()
     start_scheduler()
     yield
     stop_scheduler()
@@ -486,6 +505,31 @@ async def delete_project(project_id: str, current_user: User = Depends(get_curre
     await db.delete(project)
     await db.commit()
     return {"deleted": project_id}
+
+
+@app.get("/projects/{project_id}/connections", response_model=list[ConnectionResponse])
+async def list_connections(project_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """List a project's active database connections. Drives the import modal's
+    'Connect to live data' picker. Excludes synthetic vly_offline connections."""
+    result = await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+            DatabaseConnection.is_active == True,  # noqa: E712
+        ).order_by(DatabaseConnection.created_at.desc())
+    )
+    conns = result.scalars().all()
+    return [
+        ConnectionResponse(
+            id=str(c.id), project_id=str(c.project_id), name=c.name,
+            db_type=c.db_type.value, host=c.host, port=c.port,
+            database_name=c.database_name, username=c.username,
+            ssl_enabled=c.ssl_enabled, is_active=c.is_active,
+            last_tested_at=c.last_tested_at.isoformat() if c.last_tested_at else None,
+            created_at=c.created_at.isoformat(),
+        )
+        for c in conns
+        if (c.db_type.value if hasattr(c.db_type, "value") else str(c.db_type)) != "vly_offline"
+    ]
 
 
 @app.post("/projects/{project_id}/connections", response_model=ConnectionResponse, status_code=201)

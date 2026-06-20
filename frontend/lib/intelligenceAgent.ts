@@ -216,6 +216,13 @@ function fmtVal(v: number): string {
   return v % 1 === 0 ? String(v) : v.toFixed(2)
 }
 
+/** Exact, non-abbreviated number for the AI prompt (no K/M/B). Integers stay whole;
+ *  decimals keep 2 places. Used so the analyst cites precise figures, not "6.8K". */
+function exactNum(v: number): string {
+  if (v == null || !isFinite(v)) return '—'
+  return Number.isInteger(v) ? String(v) : v.toFixed(2)
+}
+
 function toNum(v: unknown): number {
   if (v == null) return NaN
   if (typeof v === 'number') return isFinite(v) ? v : NaN
@@ -838,14 +845,24 @@ function buildWidgetBlock(ctx: WidgetContext): string {
   const liveTag = ctx.live_data ? ' [LIVE DATA]' : ''
   lines.push(`WIDGET: "${ctx.title}" [${ctx.pattern}${liveTag}]`)
   lines.push(`NARRATIVE: ${ctx.narrative}`)
+  // EXACT raw values (NOT abbreviated) so the analyst cites precise figures and the
+  // critic can verify them. Without this the model only sees fmtVal output like "6.8K".
+  if (ctx.sample_values?.length) {
+    const lbls = ctx.sample_labels ?? []
+    const pairs = ctx.sample_values.slice(0, 24).map((v, i) => {
+      const lab = lbls[i]
+      return (lab != null && String(lab) !== '') ? `${lab}=${exactNum(v)}` : exactNum(v)
+    })
+    lines.push(`EXACT VALUES (cite these precise numbers verbatim — do NOT round or abbreviate): ${pairs.join(', ')}`)
+  }
   if (ctx.sql_query) lines.push(`SQL_QUERY: ${ctx.sql_query.slice(0, 2000)}`)
   if (ctx.table_columns?.length) lines.push(`COLUMNS: ${ctx.table_columns.join(', ')}`)
   if (ctx.column_profiles?.length) lines.push(`PROFILES:\n  ${ctx.column_profiles.map(fmtColProfile).join('\n  ')}`)
-  if (ctx.top_rows?.length) lines.push(`TOP PERFORMERS: ${ctx.top_rows.map(r => `${r.label} ${r.formatted_value}${r.pct_of_total ? ` (${r.pct_of_total.toFixed(0)}%)` : ''}`).join(', ')}`)
-  if (ctx.bottom_rows?.length) lines.push(`BOTTOM PERFORMERS: ${ctx.bottom_rows.map(r => `${r.label} ${r.formatted_value}`).join(', ')}`)
+  if (ctx.top_rows?.length) lines.push(`TOP PERFORMERS (exact): ${ctx.top_rows.map(r => `${r.label}=${exactNum(r.value)}${r.pct_of_total ? ` (${r.pct_of_total.toFixed(0)}%)` : ''}`).join(', ')}`)
+  if (ctx.bottom_rows?.length) lines.push(`BOTTOM PERFORMERS (exact): ${ctx.bottom_rows.map(r => `${r.label}=${exactNum(r.value)}`).join(', ')}`)
   if (ctx.dim_breakdowns?.length) {
     for (const d of ctx.dim_breakdowns.slice(0, 2)) {
-      const top3 = d.rows.slice(0, 3).map(r => `${r.label}=${fmtVal(r.value)} (${r.pct.toFixed(0)}%)`).join(', ')
+      const top3 = d.rows.slice(0, 3).map(r => `${r.label}=${exactNum(r.value)} (${r.pct.toFixed(0)}%)`).join(', ')
       lines.push(`BREAKDOWN by ${d.dimension} / ${d.metric}: ${top3}`)
     }
   }

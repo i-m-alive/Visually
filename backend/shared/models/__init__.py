@@ -17,6 +17,7 @@ from .annotations import DashboardAnnotation
 from .bookmarks import DashboardBookmark
 from .snapshot_schedules import SnapshotSchedule
 from .query_chat import QuerySession, QueryMessage
+from .vly_offline import VlyOfflineTable
 
 __all__ = [
     "User", "Project", "ProjectMember", "DatabaseConnection",
@@ -29,4 +30,5 @@ __all__ = [
     "RLSPolicy",
     "DashboardAnnotation", "DashboardBookmark", "SnapshotSchedule",
     "QuerySession", "QueryMessage",
+    "VlyOfflineTable",
 ]

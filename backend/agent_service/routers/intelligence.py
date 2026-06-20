@@ -862,6 +862,37 @@ async def _run_widget_sql(
     return {"widget_id": widget_id, "ok": False, "error": error_msg}
 
 
+def _conn_db_type(conn) -> str:
+    if conn is None:
+        return ""
+    return conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+
+
+async def _run_widget_offline(
+    db: AsyncSession,
+    dashboard_id: str,
+    widget_id: str,
+    sql: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    """Execute one widget's SQL against the bundled DuckDB snapshot (offline mode)."""
+    from shared.offline_store import execute_offline_sql
+    working_sql = sql
+    if date_from and date_to:
+        working_sql = _inject_date_range(working_sql, date_from, date_to)
+    cleaned = re.sub(r'\bLIMIT\s+\d+\b', '', working_sql, flags=re.IGNORECASE).rstrip('; ')
+    capped_sql = f"{cleaned} LIMIT {_ROW_LIMIT}"
+    res = await execute_offline_sql(db, dashboard_id, capped_sql, _ROW_LIMIT)
+    if res.get("error"):
+        print(f"[intelligence-data] widget={widget_id[:8]} OFFLINE_ERROR: {res['error']}", flush=True)
+        return {"widget_id": widget_id, "ok": False, "error": res["error"]}
+    rows = res.get("rows") or []
+    columns = res.get("columns") or []
+    print(f"[intelligence-data] widget={widget_id[:8]}  rows={len(rows)}  cols={len(columns)}  mode=offline", flush=True)
+    return _build_result(widget_id, rows, columns)
+
+
 @router.post("/dashboards/{dashboard_id}/intelligence-data")
 async def get_intelligence_data(
     dashboard_id: str,
@@ -956,7 +987,10 @@ async def get_intelligence_data(
         if not conn_id:
             skipped.append({"widget_id": str(w.id), "ok": False, "error": "no connection"})
             continue
-        tasks.append(_run_widget_sql(conn_id, str(w.id), w.sql_query, date_from, date_to, conn_obj))
+        if _conn_db_type(conn_obj) == "vly_offline":
+            tasks.append(_run_widget_offline(db, dashboard_id, str(w.id), w.sql_query, date_from, date_to))
+        else:
+            tasks.append(_run_widget_sql(conn_id, str(w.id), w.sql_query, date_from, date_to, conn_obj))
         task_widgets.append(w)
 
     print(
@@ -966,13 +1000,29 @@ async def get_intelligence_data(
         flush=True,
     )
 
-    # --- pre-warm the database before fan-out ---
+    # --- offline mode: warm the DuckDB snapshot once so the fan-out hits cache ---
+    # (Building it inside concurrent tasks would share the request's DB session
+    # unsafely; one warmup builds + caches it, after which queries never touch the
+    # session.) Skips the Redshift live pre-warm below entirely.
+    offline_any = any(
+        _conn_db_type(c) == "vly_offline"
+        for c in list(conn_obj_map.values()) + ([project_conn_obj] if project_conn_obj else [])
+    )
+    if offline_any and tasks:
+        try:
+            from shared.offline_store import execute_offline_sql as _warm_offline
+            await _warm_offline(db, dashboard_id, "SELECT 1", 1)
+            print(f"[intelligence-data] offline store warmed dashboard={dashboard_id[:8]}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[intelligence-data] offline warm failed (non-fatal): {exc}", flush=True)
+
+    # --- pre-warm the database before fan-out (live mode only) ---
     # Redshift Serverless auto-pauses; the first connect after idle takes 60–120s.
     # Without this, all N widget queries race a cold cluster and every one hits the
     # per-query timeout (the ReadTimeout storm seen in the logs). One warm-up SELECT 1
     # (with a long timeout) wakes it, so the real batch runs against a warm cluster.
     warm_conn_id = next((str(w.connection_id) for w in widgets if w.connection_id), project_conn_id)
-    if warm_conn_id and tasks:
+    if warm_conn_id and tasks and not offline_any:
         try:
             async with httpx.AsyncClient(timeout=130.0) as client:
                 await client.post(

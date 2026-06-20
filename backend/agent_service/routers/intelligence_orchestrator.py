@@ -323,9 +323,15 @@ The shared context below contains the full database schema, cross-widget correla
 
 FOCUS: produce BUSINESS insights (revenue, customers, trends, segments, performance, risk, opportunity). Do NOT discuss data quality, null rates, completeness, or data hygiene anywhere.
 
+NUMBER FORMAT (follow exactly — these rules are how your draft is judged):
+- Cite figures from the widget facts' "EXACT VALUES", "TOP PERFORMERS (exact)" and "BREAKDOWN" lines — these are the precise source numbers. Copy them VERBATIM, keeping their scale. Do NOT rescale or convert units: if a value is 30.26 on a "revenue (millions)" widget, write "30.26 million" (or "$30.26M") — NEVER "$30,260,000".
+- Do NOT recompute or derive new numbers (no summing, no ratios/percentages you calculate yourself). Use values as given.
+- Do NOT fabricate or rescale chart points (e.g. never turn 4.52 into 452). Chart "data" values, "value", "target_value", "max_value", "sparkline_data" use the EXACT source numbers (decimals allowed, no thousand separators).
+- Avoid VAGUE words entirely: never "about", "roughly", "~", "approximately", "nearly", "over X". State the exact figure.
+- Prose may use thousands separators ("4,200,000") and percentages in any form ("18%", "43.6%").
+- data_story, key_finding and narrative must each feature a DIFFERENT headline figure — do not repeat the same number across these THREE prose fields. (Reusing a number in top_performers / kpis / charts is fine.)
+
 RULES:
-- data_story, key_finding and narrative must each introduce DIFFERENT numbers — never repeat the same figure across them.
-- Use EXACT numeric values — NEVER round or abbreviate. Write 4200000, not 4.2M / "4.2 million". Keep full precision from the source data.
 - Build 2-3 charts from the real row data; pick the BEST type per data shape. Max 20 data points per chart.
 - For a table chart, preserve ALL meaningful column names as keys (e.g. {{"customer":"Acme","revenue":120000,"region":"West"}}), up to 50 rows.
 - top_performers / bottom_performers: 3 rows each from the TOP/BOTTOM PERFORMERS facts.
@@ -347,7 +353,7 @@ async def _write_section(canvas_name: str, shared_context: str, sec: dict, fix_n
     try:
         raw = await _invoke_json(
             _WRITER_MODEL, _WRITER_INSTRUCTION, shared_context, user,
-            _WRITER_MAX_TOKENS, 0.35, f'write:{sec["id"]}',
+            _WRITER_MAX_TOKENS, 0.2, f'write:{sec["id"]}',
         )
         parsed = _extract_json(raw)
         if not isinstance(parsed, dict):
@@ -365,18 +371,20 @@ async def _write_section(canvas_name: str, shared_context: str, sec: dict, fix_n
 
 
 # ── STAGE 3: CRITIC ───────────────────────────────────────────────────────────
-_CRITIC_INSTRUCTION = """You are a strict editor validating ONE section of an executive report against hard rules. Use the shared context (the pre-computed widget facts) to check that cited numbers are plausible from the data.
+_CRITIC_INSTRUCTION = """You are an editor doing a LIGHT validation pass on ONE section of an executive report. DEFAULT TO PASS. Only fail for the clear, listed violations below — do NOT nitpick wording, comma style, number formatting choices, sparkline semantics, or recompute percentages.
 
-Check ALL of these:
-1. EXACT VALUES: chart data and KPIs use full numbers, never rounded/abbreviated (no "4.2M", "~3K", "about 5 million").
-2. NO REPEATED FIGURES: data_story, key_finding and narrative each use DIFFERENT numbers (no figure repeated across them).
-3. NO DATA-QUALITY TALK: nothing about null rates, completeness, data hygiene, or quality scores.
-4. GROUNDED: cited numbers are consistent with the widget facts in the shared context (not invented).
-5. CHARTS: every chart has a non-empty data array and a valid type.
-6. COMPLETE: data_story, key_finding, narrative, recommendation and at least one chart are all present and non-trivial.
+Fail (ok=false) ONLY when you find one of these:
+1. VAGUE / APPROXIMATE WORDING — the words "about", "roughly", "~", "approximately", "nearly", or "over X". Specific numbers in ANY notation are ALL acceptable ("30.26 million", "$30,260,000", "6,762", "6.8K"). Do NOT flag number notation, scale, or thousands-separators.
+2. The SAME number repeated across ALL THREE prose fields data_story AND key_finding AND narrative. (Overlap with top_performers / kpis / charts is allowed — ignore it.)
+3. DATA-QUALITY talk: null rates, completeness, data hygiene, or quality scores.
+4. A chart with an empty/missing "data" array or an invalid "type".
+5. A figure FABRICATED or RESCALED from the source — e.g. a sparkline that multiplies 4.52 into 452, or a value that appears nowhere in the widget facts. A number matching any value in "EXACT VALUES" / "TOP PERFORMERS" / "BREAKDOWN" is GROUNDED — accept it. Do NOT flag numbers you merely cannot verify.
+6. A MISSING required field: data_story, key_finding, narrative, recommendation, or all charts.
 
-Output ONLY raw JSON: {"ok": true|false, "issues": ["short, actionable fix instruction", ...]}
-Set ok=false ONLY for real violations of rules 1-6. List each issue as a concrete instruction the writer can act on. If the section is good, return {"ok": true, "issues": []}."""
+NEVER recompute or re-derive a percentage/ratio — percentages in any form ("44%", "43.6%") are always acceptable. Do NOT fail for number notation or scale (M/K vs full digits), thousands-separators, a sparkline on a single-point KPI, any value present in the widget facts, or stylistic preferences. When in doubt, PASS.
+
+Output ONLY raw JSON: {"ok": true|false, "issues": ["concise, actionable fix", ...]}
+If the section is acceptable, return {"ok": true, "issues": []}."""
 
 
 async def _critique(section: dict, shared_context: str) -> dict:
