@@ -1402,11 +1402,19 @@ async def delete_dashboard(
     if not dashboard:
         raise HTTPException(status_code=404, detail="Dashboard not found")
 
+    dash_uuid = dashboard.id
     # Collect widget IDs so we can null out references to them
     widget_rows = await db.execute(
-        select(WidgetModel.id).where(WidgetModel.dashboard_id == dashboard.id)
+        select(WidgetModel.id, WidgetModel.connection_id).where(WidgetModel.dashboard_id == dashboard.id)
     )
-    widget_ids = [r[0] for r in widget_rows.all()]
+    widget_id_conn = widget_rows.all()
+    widget_ids = [r[0] for r in widget_id_conn]
+    # Connections this dashboard binds to (widgets + layout) — candidates for cleanup
+    # once the dashboard is gone, so imports don't leave orphan connections behind.
+    candidate_conn_ids = [r[1] for r in widget_id_conn if r[1] is not None]
+    layout_conn = (dashboard.layout_config or {}).get("connection_id")
+    if layout_conn:
+        candidate_conn_ids.append(layout_conn)
 
     # NULL out nullable FK references to this dashboard
     await db.execute(
@@ -1424,8 +1432,14 @@ async def delete_dashboard(
             .execution_options(synchronize_session=False)
         )
     await db.delete(dashboard)
+    await db.flush()
+
+    # Remove connections that existed only to serve this dashboard (offline +
+    # auto-created import connections, if nothing else still references them).
+    from agent_service.utils.connection_cleanup import cleanup_orphaned_connections
+    removed = await cleanup_orphaned_connections(db, dash_uuid, candidate_conn_ids)
     await db.commit()
-    return {"deleted": dashboard_id}
+    return {"deleted": dashboard_id, "connections_removed": removed}
 
 
 import re as _re

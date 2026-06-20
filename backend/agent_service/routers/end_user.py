@@ -137,8 +137,12 @@ async def end_user_create_connection(
     personal_project = await _get_or_create_personal_project(current_user, db)
 
     # Redshift IAM auth (when supplied) is carried in connection_options, where the
-    # query-executor router looks for it.
-    connection_options = {"iam_role_arn": body.iam_role_arn} if body.iam_role_arn else None
+    # query-executor router looks for it. auto_created tags this as a connection the
+    # platform made for an import (analyst connect-on-import) so it can be cleaned up
+    # when the report that needed it is deleted — vs a manually-managed connection.
+    connection_options: dict = {"auto_created": True}
+    if body.iam_role_arn:
+        connection_options["iam_role_arn"] = body.iam_role_arn
 
     conn = DatabaseConnection(
         id=uuid.uuid4(),
@@ -519,6 +523,16 @@ async def delete_my_report(
     if is_owner:
         # Owned (imported) → full delete. Null nullable FKs, drop widgets, then the
         # dashboard (collaborators/tokens/annotations/bookmarks cascade in the DB).
+        # Connections this report binds to (widgets + layout) — candidates to clean up
+        # so deleting the report also removes the connection it created on import.
+        widget_conns = (await db.execute(
+            select(Widget.connection_id).where(Widget.dashboard_id == did)
+        )).scalars().all()
+        candidate_conn_ids = [c for c in widget_conns if c is not None]
+        layout_conn = (dash.layout_config or {}).get("connection_id")
+        if layout_conn:
+            candidate_conn_ids.append(layout_conn)
+
         await db.execute(
             sa_update(ChatSession).where(ChatSession.dashboard_id == did)
             .values(dashboard_id=None).execution_options(synchronize_session=False)
@@ -528,8 +542,12 @@ async def delete_my_report(
             .execution_options(synchronize_session=False)
         )
         await db.delete(dash)
+        await db.flush()
+
+        from agent_service.utils.connection_cleanup import cleanup_orphaned_connections
+        removed = await cleanup_orphaned_connections(db, did, candidate_conn_ids)
         await db.commit()
-        return {"deleted": True, "mode": "deleted", "dashboard_id": dashboard_id}
+        return {"deleted": True, "mode": "deleted", "dashboard_id": dashboard_id, "connections_removed": removed}
 
     # Shared with me → remove only my collaborator link.
     collab = (await db.execute(
