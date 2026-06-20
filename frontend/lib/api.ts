@@ -127,6 +127,8 @@ export const projectApi = {
     api.post(`/projects/${projectId}/connections`, data),
   updateConnection: (projectId: string, connId: string, data: Record<string, unknown>) =>
     api.patch(`/projects/${projectId}/connections/${connId}`, data),
+  deleteConnection: (projectId: string, connId: string) =>
+    api.delete(`/projects/${projectId}/connections/${connId}`),
   testConnection: (projectId: string, connId: string) =>
     api.post(`/projects/${projectId}/connections/${connId}/test`),
   triggerCrawl: (projectId: string) =>

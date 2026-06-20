@@ -555,6 +555,71 @@ async def add_connection(project_id: str, req: ConnectionCreate, current_user: U
                              created_at=conn.created_at.isoformat())
 
 
+@app.patch("/projects/{project_id}/connections/{conn_id}", response_model=ConnectionResponse)
+async def update_connection(project_id: str, conn_id: str, req: ConnectionCreate,
+                            current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Update an existing connection (e.g. fix a username/password/host typo)."""
+    result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.id == uuid.UUID(conn_id), DatabaseConnection.project_id == uuid.UUID(project_id)))
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    conn.name = req.name
+    conn.db_type = DbType(req.db_type)
+    conn.host = req.host
+    conn.port = req.port
+    conn.database_name = req.database_name
+    conn.username = req.username
+    if req.password is not None:
+        # empty string = clear password (switch to IAM auth); non-empty = update it
+        conn.encrypted_password = encrypt(req.password) if req.password else None
+    conn.ssl_enabled = req.ssl_enabled
+    conn.connection_options = req.connection_options
+    conn.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(conn)
+    return ConnectionResponse(id=str(conn.id), project_id=str(conn.project_id), name=conn.name,
+                             db_type=conn.db_type.value, host=conn.host, port=conn.port,
+                             database_name=conn.database_name, username=conn.username,
+                             ssl_enabled=conn.ssl_enabled, is_active=conn.is_active,
+                             last_tested_at=conn.last_tested_at.isoformat() if conn.last_tested_at else None,
+                             created_at=conn.created_at.isoformat())
+
+
+@app.delete("/projects/{project_id}/connections/{conn_id}")
+async def delete_connection(project_id: str, conn_id: str,
+                            current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Delete a connection. Blocked while any widget or dashboard still uses it, so a
+    live report can't lose its data source by accident. Clears the FK rows that have
+    no ON DELETE CASCADE (schema snapshots/alerts, query history) first."""
+    cid = uuid.UUID(conn_id)
+    result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.id == cid, DatabaseConnection.project_id == uuid.UUID(project_id)))
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    used_by_widget = (await db.execute(
+        select(WidgetModel.id).where(WidgetModel.connection_id == cid).limit(1))).first()
+    used_by_layout = (await db.execute(
+        select(Dashboard.id).where(Dashboard.layout_config["connection_id"].astext == str(cid)).limit(1))).first()
+    if used_by_widget or used_by_layout:
+        raise HTTPException(status_code=409,
+            detail="This connection is in use by one or more reports. Remove or re-point them first.")
+
+    from shared.models.schema_snapshots import SchemaSnapshot
+    from shared.models.phase2 import SchemaChangeAlert, QueryHistory
+    await db.execute(sa_delete(SchemaChangeAlert).where(SchemaChangeAlert.connection_id == cid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_delete(SchemaSnapshot).where(SchemaSnapshot.connection_id == cid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_update(QueryHistory).where(QueryHistory.connection_id == cid)
+                     .values(connection_id=None).execution_options(synchronize_session=False))
+    await db.delete(conn)
+    await db.commit()
+    return {"deleted": conn_id}
+
+
 @app.post("/projects/{project_id}/connections/{conn_id}/test", response_model=ConnectionTestResult)
 async def test_connection(project_id: str, conn_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DatabaseConnection).where(
