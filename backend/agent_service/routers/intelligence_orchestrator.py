@@ -103,7 +103,7 @@ _SECTION_JSON_SHAPE = """{
   "insights": [{"icon":"<icon>","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning","confidence":4}],
   "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
   "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
-  "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[]}],
+  "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[],"explanation":"<1 sentence: what this KPI measures and why it matters>"}],
   "charts": [{"title":"...","type":"__CHART_TYPES__","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
 }""".replace("__CHART_TYPES__", VALID_CHART_TYPES)
 
@@ -447,7 +447,7 @@ Produce:
 - kpis: 4-6 top-level KPIs drawn from the most important section metrics.
 
 Do NOT discuss data quality. Output ONLY raw JSON:
-{"title":"...","subtitle":"...","morning_brief":"...","kpis":[{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[]}]}"""
+{"title":"...","subtitle":"...","morning_brief":"...","kpis":[{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[],"explanation":"<1 sentence: what this KPI measures and why it matters>"}]}"""
 
 
 async def _reduce(canvas_name: str, sections: list[dict]) -> dict:

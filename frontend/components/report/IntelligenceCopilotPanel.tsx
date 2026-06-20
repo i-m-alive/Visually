@@ -60,6 +60,7 @@ interface Props {
   initialWidth?: number
   onAddToPage?: (charts: Array<ChartResult | ChatMsg['newWidget']>) => void
   prefillMessage?: string
+  isOffline?: boolean   // offline canvas: query bundled tables, hide DB/scope picker
 }
 
 function inlineRender(text: string): React.ReactNode[] {
@@ -124,7 +125,7 @@ function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]):
   return Array.from(new Set(qs)).slice(0, 5)
 }
 
-export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage }: Props) {
+export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage, isOffline }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([{
     role: 'assistant',
     content: title
@@ -228,7 +229,7 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
           dashboard_id:   canvasId,
           connection_id:  connectionId,
           active_page_id: activePageId || undefined,
-          scope,
+          scope: isOffline ? 'report' : scope,
         },
         {
           onText: (delta) => { acc += delta; updateAssistant(m => ({ ...m, content: acc })) },
@@ -325,36 +326,48 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
         </button>
       </div>
 
-      {/* Scope toggle — Report (this report's tables) vs Full DB (whole schema) */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
-        <div className="flex items-center gap-1 p-0.5 rounded-lg flex-shrink-0" style={{ background: '#eef2f7', border: '1px solid #e2eaf4' }}>
-          <button
-            onClick={() => setScope('report')}
-            title="Answer using only the tables/views that build this report (+ closely related ones). Faster and more focused."
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
-            style={scope === 'report'
-              ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
-              : { background: 'transparent', color: '#64748b' }}
-          >
-            <FileText size={11} /> Report
-          </button>
-          <button
-            onClick={() => setScope('database')}
-            title="Open the full database schema — the copilot can query any table or view, not just the report's."
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
-            style={scope === 'database'
-              ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
-              : { background: 'transparent', color: '#64748b' }}
-          >
-            <Database size={11} /> Full DB
-          </button>
+      {/* Scope row — toggle when live; a fixed "offline" indicator when offline
+          (no DB to switch to; the copilot queries the report's bundled tables). */}
+      {isOffline ? (
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
+          <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold" style={{ background: '#eef2ff', color: '#4338ca', border: '1px solid #c7d2fe' }}>
+            <Database size={11} /> Offline data
+          </span>
+          <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
+            Answering from the report’s bundled tables (no live database)
+          </span>
         </div>
-        <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
-          {scope === 'report'
-            ? 'Scoped to this report’s tables + related ones'
-            : 'Full database — query any table or view'}
-        </span>
-      </div>
+      ) : (
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
+          <div className="flex items-center gap-1 p-0.5 rounded-lg flex-shrink-0" style={{ background: '#eef2f7', border: '1px solid #e2eaf4' }}>
+            <button
+              onClick={() => setScope('report')}
+              title="Answer using only the tables/views that build this report (+ closely related ones). Faster and more focused."
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
+              style={scope === 'report'
+                ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
+                : { background: 'transparent', color: '#64748b' }}
+            >
+              <FileText size={11} /> Report
+            </button>
+            <button
+              onClick={() => setScope('database')}
+              title="Open the full database schema — the copilot can query any table or view, not just the report's."
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
+              style={scope === 'database'
+                ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
+                : { background: 'transparent', color: '#64748b' }}
+            >
+              <Database size={11} /> Full DB
+            </button>
+          </div>
+          <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
+            {scope === 'report'
+              ? 'Scoped to this report’s tables + related ones'
+              : 'Full database — query any table or view'}
+          </span>
+        </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
@@ -550,7 +563,7 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
             <Send size={12} />
           </button>
         </div>
-        <p className="text-xs text-gray-400 mt-1.5 text-center">Full DB access · All pages · Enter to send</p>
+        <p className="text-xs text-gray-400 mt-1.5 text-center">{isOffline ? 'Offline data · All pages · Enter to send' : 'Full DB access · All pages · Enter to send'}</p>
       </div>
       </div>{/* end overflow:hidden inner panel */}
     </div>

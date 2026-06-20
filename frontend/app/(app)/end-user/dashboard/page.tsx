@@ -229,9 +229,10 @@ export default function EndUserDashboardPage() {
     setConnHint(hint)
     setHasTableData(tablesBundled)
     setPendingFile(file)
-    // If the report can run offline (bundled tables) OR there's no DB to connect to,
-    // let the analyst choose; otherwise go straight to the connect form.
-    if (tablesBundled || !hint?.host) setShowImportChoice(true)
+    // .ovly is the offline export → let the analyst choose offline (bundled data) vs
+    // connecting a live DB. A .vly is a live export → go straight to the connect form.
+    const isOffline = /\.ovly$/i.test(file.name)
+    if (isOffline && tablesBundled) setShowImportChoice(true)
     else setShowConnPrompt(true)
   }
 
@@ -463,7 +464,7 @@ export default function EndUserDashboardPage() {
           </button>
           <button onClick={() => fileRef.current?.click()} disabled={importing}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-purple-200 text-purple-600 bg-purple-50 hover:bg-purple-100 transition-colors disabled:opacity-50">
-            {importing ? <><Loader2 size={12} className="animate-spin" /> Importing…</> : <><Upload size={12} /> Import .vly file</>}
+            {importing ? <><Loader2 size={12} className="animate-spin" /> Importing…</> : <><Upload size={12} /> Import</>}
           </button>
         </div>
 

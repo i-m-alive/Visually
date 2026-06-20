@@ -78,7 +78,13 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
     }
     setFile(f)
     setErrorMsg('')
-    // Peek inside: if the archive bundles full tables, offer offline vs live.
+    // A .vly is a live export → import and connect straight away (no offline choice).
+    // Only a .ovly bundles offline data, so only it gets the offline vs live choice.
+    if (!/\.ovly$/i.test(f.name)) {
+      runImport(f, false)
+      return
+    }
+    // Peek inside: confirm the .ovly actually bundles full tables, then offer the choice.
     let bundled = false
     try {
       const { default: JSZip } = await import('jszip')

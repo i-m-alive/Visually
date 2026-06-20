@@ -39,6 +39,7 @@ export interface AgentKPI {
   trend_pct: string
   color?: string
   sparkline_data?: number[]
+  explanation?: string   // 1-sentence "what this measures / why it matters" (hover info)
 }
 
 export interface AgentChartRow {
@@ -1099,6 +1100,7 @@ function sanitizeKpi(k: AgentKPI): AgentKPI {
     sparkline_data: Array.isArray(k.sparkline_data)
       ? k.sparkline_data.map(Number).filter(n => !isNaN(n)).slice(0, 14)
       : undefined,
+    explanation: k.explanation ? String(k.explanation) : undefined,
   }
 }
 

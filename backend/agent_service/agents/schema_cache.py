@@ -285,6 +285,36 @@ async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> En
     return enriched
 
 
+async def get_cached(connection_id: str, schema_doc: dict) -> Optional["EnrichedSchema"]:
+    """Return the enriched schema ONLY if already cached (L1 → Redis → filesystem).
+    NEVER builds. Used by .vly export so exporting bundles a warm cache when present
+    but never triggers a multi-minute cold LLM enrichment build."""
+    if connection_id in _store:
+        return _store[connection_id]
+    try:
+        schema_hash = compute_schema_hash(schema_doc)
+    except Exception:
+        return None
+    redis_key = f"{_REDIS_KEY_PREFIX}:{connection_id}:{schema_hash}"
+    try:
+        from shared.redis_client import get_redis
+        redis = await get_redis()
+        if redis is not None:
+            cached_json = await redis.get(redis_key)
+            if cached_json:
+                enriched = _deserialize_enriched(cached_json)
+                _store[connection_id] = enriched
+                return enriched
+    except Exception:
+        pass
+    fs_json = _fs_read(connection_id, schema_hash)
+    if fs_json:
+        enriched = _deserialize_enriched(fs_json)
+        _store[connection_id] = enriched
+        return enriched
+    return None
+
+
 # Tiny precomputed table-name list cache (just [{name, columns}]) — keeps the
 # picker instant after the first open without re-reading the multi-MB snapshot.
 _TABLE_LIST_PREFIX = "schema_tables_list"
@@ -444,25 +474,31 @@ def import_cache_json(connection_id: str, json_str: str) -> EnrichedSchema:
 
 
 async def export_cache_for_connection(
-    connection_id: str, schema_doc: dict, db_type: str
+    connection_id: str, schema_doc: dict, db_type: str, cache_only: bool = False
 ) -> Optional[str]:
     """
-    Ensure the enriched cache for this connection is warm (build it from schema_doc if
-    it isn't already cached), then return the serialized JSON.
+    Return the serialized enriched cache for this connection.
 
-    Used by .vly export to embed a fully-baked schema cache so the importing
-    environment can skip the cold build (crawl + LLM enrichment) entirely.
+    cache_only=True  → return it ONLY if already warm (L1/Redis/FS); never build.
+                       Used by .vly export so exporting is fast and never triggers a
+                       cold crawl+LLM enrichment.
+    cache_only=False → build it from schema_doc if not cached (slow on a cold cache).
 
-    Returns None if no cache could be produced (e.g. empty schema_doc).
+    Returns None if no cache is available (and, when cache_only, not yet built).
     """
     if not connection_id or not schema_doc or not schema_doc.get("tables"):
         return None
     try:
-        # get_or_build populates _store (L1) — hitting Redis/filesystem if already warm,
-        # cold-building once otherwise. Either way the result is exportable afterwards.
-        await get_or_build(connection_id, schema_doc, db_type)
+        if cache_only:
+            enriched = await get_cached(connection_id, schema_doc)
+            if enriched is None:
+                return None
+        else:
+            # get_or_build populates _store (L1) — hitting Redis/filesystem if warm,
+            # cold-building once otherwise.
+            await get_or_build(connection_id, schema_doc, db_type)
     except Exception as exc:
-        print(f"[schema_cache] ⚠ export_cache_for_connection build failed: {exc}", flush=True)
+        print(f"[schema_cache] ⚠ export_cache_for_connection failed: {exc}", flush=True)
         return None
     return export_cache_json(connection_id)
 

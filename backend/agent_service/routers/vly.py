@@ -469,10 +469,16 @@ async def _generate_vly(
             if include_schema_cache:
                 try:
                     from agent_service.agents import schema_cache as _sc
-                    _enr = await _sc.get_or_build(
-                        str(sample_conn_id), full_schema, conn_hint.get("db_type") or "postgresql"
-                    )
-                    edges = _enr.relationship_graph.edges or {}
+                    # Offline (.ovly) NEEDS the enriched schema bundled (no DB to rebuild
+                    # from), so build it. Live (.vly) can rebuild on connect, so only use
+                    # a warm cache — never block the export on a cold LLM build.
+                    if include_table_data:
+                        _enr = await _sc.get_or_build(
+                            str(sample_conn_id), full_schema, conn_hint.get("db_type") or "postgresql"
+                        )
+                    else:
+                        _enr = await _sc.get_cached(str(sample_conn_id), full_schema)
+                    edges = (_enr.relationship_graph.edges or {}) if _enr else {}
                     seed_nodes = {
                         n for n in edges.keys()
                         if n.lower() in used_tables_lower
@@ -535,8 +541,11 @@ async def _generate_vly(
 
             if cache_snap and cache_snap.schema_document:
                 db_type_str = conn_hint.get("db_type") or "postgresql"
+                # Offline (.ovly) needs the baked cache bundled (no DB to rebuild from)
+                # → build it. Live (.vly) rebuilds on connect → cache-only (fast).
                 enriched_json = await _sc.export_cache_for_connection(
-                    str(sample_conn_id), cache_snap.schema_document, db_type_str
+                    str(sample_conn_id), cache_snap.schema_document, db_type_str,
+                    cache_only=not include_table_data,
                 )
                 if enriched_json:
                     schema_cache_doc = {
@@ -1196,11 +1205,15 @@ async def import_vly(
     # resolved a live connection, restore them so both the chat copilot (enriched
     # cache) and the intelligence page (metadata rows) are warm with ZERO cold build
     # (no crawl, no LLM). Safe & idempotent — see _restore_schema_warmstart.
+    # Warm-start for the LIVE connection OR the synthetic offline one — so the
+    # Canvas/Report copilots know the bundled tables' schema and can write SQL
+    # against the offline DuckDB exactly as they would live.
     cache_warmstarted = False
-    if live_conn_id and ("schema_cache.json" in names or "schema_metadata.json" in names):
+    warm_conn_for_schema = live_conn_id or offline_conn_id
+    if warm_conn_for_schema and ("schema_cache.json" in names or "schema_metadata.json" in names):
         try:
             cache_warmstarted = await _restore_schema_warmstart(
-                db, live_conn_id, zf, names
+                db, warm_conn_for_schema, zf, names
             )
         except Exception as exc:
             print(f"[import-vly] schema cache warm-start failed (non-fatal): {exc}", flush=True)

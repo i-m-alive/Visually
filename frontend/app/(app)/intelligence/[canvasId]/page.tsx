@@ -1,5 +1,6 @@
 'use client'
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { useParams, useRouter } from 'next/navigation'
 import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
@@ -212,6 +213,16 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
   // Full displayed string (actual value, no abbreviation) → drives responsive sizing
   const valueStr = animatable ? `${prefix}${raw.toLocaleString(undefined, { maximumFractionDigits: 2 })}${suffix}` : String(kpi.value)
   const valueFont = valueStr.length <= 7 ? 24 : valueStr.length <= 10 ? 21 : valueStr.length <= 13 ? 18 : valueStr.length <= 17 ? 15 : 13
+  // Explanation shown on hovering the (i): the AI-written one if present, else derived.
+  const explanation = (kpi.explanation && kpi.explanation.trim())
+    ? kpi.explanation.trim()
+    : `${kpi.label}: ${exactValue}${kpi.trend_pct ? ` — ${kpi.trend_pct} vs the prior period` : ''}.`
+  const [tip, setTip] = useState<{ x: number; y: number } | null>(null)
+  const infoRef = useRef<HTMLButtonElement>(null)
+  const showTip = () => {
+    const r = infoRef.current?.getBoundingClientRect()
+    if (r) setTip({ x: r.right, y: r.bottom })
+  }
   return (
     <div className="intel-kpi-card" style={{
       background: C.card, borderRadius: 16, padding: '14px 16px',
@@ -231,7 +242,20 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
           margin: 0, lineHeight: 1.3, flex: 1,
           display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
         } as React.CSSProperties}>{kpi.label}</p>
-        {kpi.sparkline_data && kpi.sparkline_data.length > 1 && <Sparkline data={kpi.sparkline_data} color={accentColor} />}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+          {kpi.sparkline_data && kpi.sparkline_data.length > 1 && <Sparkline data={kpi.sparkline_data} color={accentColor} />}
+          <button
+            ref={infoRef}
+            onMouseEnter={showTip}
+            onMouseLeave={() => setTip(null)}
+            onFocus={showTip}
+            onBlur={() => setTip(null)}
+            aria-label="About this KPI"
+            style={{ width: 16, height: 16, borderRadius: '50%', border: '1px solid #d8e2ee', background: tip ? accentColor : '#fff', color: tip ? '#fff' : C.muted, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'help', padding: 0, flexShrink: 0 }}
+          >
+            <Info size={10} />
+          </button>
+        </div>
       </div>
       {/* Value — capped at 24px so long values don't overflow. Hover shows the
           exact value (the card itself abbreviates large numbers as K/M/B). */}
@@ -253,6 +277,22 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
           </>
         ) : null}
       </div>
+
+      {/* Hover explanation (portal so it isn't clipped by the card's overflow:hidden) */}
+      {tip && createPortal(
+        <div style={{
+          position: 'fixed', top: tip.y + 6,
+          left: Math.max(12, Math.min(tip.x - 240, (typeof window !== 'undefined' ? window.innerWidth : 1200) - 268)),
+          zIndex: 9999, width: 252, background: '#0a213a', color: 'rgba(255,255,255,0.92)',
+          border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10,
+          boxShadow: '0 12px 34px rgba(10,33,58,0.30)', padding: '10px 12px',
+          fontSize: 11.5, lineHeight: 1.55, pointerEvents: 'none',
+        }}>
+          <p style={{ margin: '0 0 4px', fontSize: 9.5, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.5)' }}>{kpi.label}</p>
+          {explanation}
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }
@@ -3253,7 +3293,9 @@ export default function IntelligenceCanvasPage() {
         }}>
           {shareToken
             ? <ExecutiveCopilot token={shareToken} canvasName={String(canvas?.name ?? 'Report')} pageName={activeSection} />
-            : <IntelligenceCopilotPanel
+            : (() => {
+              const _offline = ((canvas as { is_offline?: boolean } | null)?.is_offline) || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline'
+              return <IntelligenceCopilotPanel
                 projectId={projectId}
                 canvasId={canvasId}
                 widgets={rawWidgets as CanvasWidgetData[]}
@@ -3261,11 +3303,13 @@ export default function IntelligenceCanvasPage() {
                 onClose={() => setCopilotOpen(false)}
                 onWidgetAdded={() => {}}
                 title="Report Copilot"
-                subtitle="Full report context · Live DB access"
+                subtitle={_offline ? 'Full report context · Offline data' : 'Full report context · Live DB access'}
                 initialWidth={440}
                 suggestedQuestions={analysisSuggestions}
                 onAddToPage={handleAddToPage}
-              />}
+                isOffline={_offline}
+              />
+            })()}
         </div>
       )}
 

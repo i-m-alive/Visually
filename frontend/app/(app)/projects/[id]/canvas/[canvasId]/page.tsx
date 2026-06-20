@@ -1060,6 +1060,7 @@ export default function CanvasEditorPage() {
               activePageId={activePageId}
               onClose={() => setShowChat(false)}
               onWidgetAdded={() => load(true)}
+              isOffline={canvas?.is_offline || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline'}
             />
           </div>
         )}
