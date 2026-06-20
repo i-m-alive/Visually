@@ -555,6 +555,71 @@ async def add_connection(project_id: str, req: ConnectionCreate, current_user: U
                              created_at=conn.created_at.isoformat())
 
 
+@app.patch("/projects/{project_id}/connections/{conn_id}", response_model=ConnectionResponse)
+async def update_connection(project_id: str, conn_id: str, req: ConnectionCreate,
+                            current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Update an existing connection (e.g. fix a username/password/host typo)."""
+    result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.id == uuid.UUID(conn_id), DatabaseConnection.project_id == uuid.UUID(project_id)))
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    conn.name = req.name
+    conn.db_type = DbType(req.db_type)
+    conn.host = req.host
+    conn.port = req.port
+    conn.database_name = req.database_name
+    conn.username = req.username
+    if req.password is not None:
+        # empty string = clear password (switch to IAM auth); non-empty = update it
+        conn.encrypted_password = encrypt(req.password) if req.password else None
+    conn.ssl_enabled = req.ssl_enabled
+    conn.connection_options = req.connection_options
+    conn.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(conn)
+    return ConnectionResponse(id=str(conn.id), project_id=str(conn.project_id), name=conn.name,
+                             db_type=conn.db_type.value, host=conn.host, port=conn.port,
+                             database_name=conn.database_name, username=conn.username,
+                             ssl_enabled=conn.ssl_enabled, is_active=conn.is_active,
+                             last_tested_at=conn.last_tested_at.isoformat() if conn.last_tested_at else None,
+                             created_at=conn.created_at.isoformat())
+
+
+@app.delete("/projects/{project_id}/connections/{conn_id}")
+async def delete_connection(project_id: str, conn_id: str,
+                            current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Delete a connection. Blocked while any widget or dashboard still uses it, so a
+    live report can't lose its data source by accident. Clears the FK rows that have
+    no ON DELETE CASCADE (schema snapshots/alerts, query history) first."""
+    cid = uuid.UUID(conn_id)
+    result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.id == cid, DatabaseConnection.project_id == uuid.UUID(project_id)))
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    used_by_widget = (await db.execute(
+        select(WidgetModel.id).where(WidgetModel.connection_id == cid).limit(1))).first()
+    used_by_layout = (await db.execute(
+        select(Dashboard.id).where(Dashboard.layout_config["connection_id"].astext == str(cid)).limit(1))).first()
+    if used_by_widget or used_by_layout:
+        raise HTTPException(status_code=409,
+            detail="This connection is in use by one or more reports. Remove or re-point them first.")
+
+    from shared.models.schema_snapshots import SchemaSnapshot
+    from shared.models.phase2 import SchemaChangeAlert, QueryHistory
+    await db.execute(sa_delete(SchemaChangeAlert).where(SchemaChangeAlert.connection_id == cid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_delete(SchemaSnapshot).where(SchemaSnapshot.connection_id == cid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_update(QueryHistory).where(QueryHistory.connection_id == cid)
+                     .values(connection_id=None).execution_options(synchronize_session=False))
+    await db.delete(conn)
+    await db.commit()
+    return {"deleted": conn_id}
+
+
 @app.post("/projects/{project_id}/connections/{conn_id}/test", response_model=ConnectionTestResult)
 async def test_connection(project_id: str, conn_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DatabaseConnection).where(
@@ -567,30 +632,61 @@ async def test_connection(project_id: str, conn_id: str, current_user: User = De
     start = time.monotonic()
     try:
         if conn.db_type.value == "redshift":
-            import redshift_connector, os as _os
+            import os as _os, asyncio as _asyncio
             _is_serverless = "redshift-serverless" in (conn.host or "")
-            conn_kwargs: dict = {
-                "host": conn.host, "port": conn.port or 5439,
-                "database": conn.database_name or "", "ssl": True, "timeout": 15,
-            }
-            if _is_serverless:
-                conn_kwargs["is_serverless"] = True
-            if not password:
-                conn_kwargs["iam"] = True
-                conn_kwargs["aws_access_key_id"] = _os.getenv("AWS_ACCESS_KEY_ID", "")
-                conn_kwargs["aws_secret_access_key"] = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
-                tok = _os.getenv("AWS_SESSION_TOKEN", "")
-                if tok:
-                    conn_kwargs["aws_session_token"] = tok
-                conn_kwargs["database_user"] = conn.username or "awsuser"
+            _use_data_api = _os.getenv("REDSHIFT_USE_DATA_API", "").lower() in ("true", "1", "yes")
+            if _is_serverless and _use_data_api:
+                # Serverless workgroups are private (VPC-only) — a direct TCP connect
+                # from here times out. The Data API reaches the workgroup via AWS's
+                # control plane using IAM creds, exactly like the query executor does,
+                # so test with a trivial SELECT through it. Cold-start safe (polls).
+                def _data_api_test():
+                    import boto3
+                    parts = (conn.host or "").split(".")
+                    workgroup = parts[0] if parts else ""
+                    region = parts[2] if len(parts) >= 3 else _os.getenv("AWS_REGION", "us-east-1")
+                    client = boto3.client("redshift-data", region_name=region)
+                    kwargs = {"WorkgroupName": workgroup, "Database": conn.database_name or "", "Sql": "SELECT 1"}
+                    secret_arn = _os.getenv("REDSHIFT_DATA_API_SECRET_ARN", "").strip()
+                    if secret_arn:
+                        kwargs["SecretArn"] = secret_arn
+                    sid = client.execute_statement(**kwargs)["Id"]
+                    import time as _t
+                    deadline = _t.monotonic() + 120
+                    status = "SUBMITTED"
+                    d: dict = {}
+                    while _t.monotonic() < deadline:
+                        d = client.describe_statement(Id=sid)
+                        status = d["Status"]
+                        if status in ("FINISHED", "FAILED", "ABORTED"):
+                            break
+                        _t.sleep(0.6)
+                    if status != "FINISHED":
+                        raise RuntimeError(d.get("Error") or f"Data API statement {status}")
+                await _asyncio.get_event_loop().run_in_executor(None, _data_api_test)
             else:
-                conn_kwargs["user"] = conn.username or ""
-                conn_kwargs["password"] = password
-            import asyncio as _asyncio
-            def _sync_test():
-                rc = redshift_connector.connect(**conn_kwargs)
-                rc.close()
-            await _asyncio.get_event_loop().run_in_executor(None, _sync_test)
+                import redshift_connector
+                conn_kwargs: dict = {
+                    "host": conn.host, "port": conn.port or 5439,
+                    "database": conn.database_name or "", "ssl": True, "timeout": 15,
+                }
+                if _is_serverless:
+                    conn_kwargs["is_serverless"] = True
+                if not password:
+                    conn_kwargs["iam"] = True
+                    conn_kwargs["aws_access_key_id"] = _os.getenv("AWS_ACCESS_KEY_ID", "")
+                    conn_kwargs["aws_secret_access_key"] = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
+                    tok = _os.getenv("AWS_SESSION_TOKEN", "")
+                    if tok:
+                        conn_kwargs["aws_session_token"] = tok
+                    conn_kwargs["database_user"] = conn.username or "awsuser"
+                else:
+                    conn_kwargs["user"] = conn.username or ""
+                    conn_kwargs["password"] = password
+                def _sync_test():
+                    rc = redshift_connector.connect(**conn_kwargs)
+                    rc.close()
+                await _asyncio.get_event_loop().run_in_executor(None, _sync_test)
         elif conn.db_type.value == "postgresql":
             import asyncpg
             pg_conn = await asyncpg.connect(host=conn.host, port=conn.port or 5432,

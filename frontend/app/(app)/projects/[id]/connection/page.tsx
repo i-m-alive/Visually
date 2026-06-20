@@ -4,7 +4,7 @@ import { useParams } from 'next/navigation'
 import { projectApi } from '@/lib/api'
 import {
   Database, Loader2, AlertCircle, CheckCircle2,
-  Save, RefreshCw, Eye, EyeOff, Link2,
+  Save, RefreshCw, Eye, EyeOff, Link2, Trash2,
 } from 'lucide-react'
 
 interface Connection {
@@ -46,6 +46,9 @@ export default function ConnectionPage() {
   const [testing, setTesting] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string; latency?: number } | null>(null)
   const [testElapsed, setTestElapsed] = useState(0)
+
+  const [deleting, setDeleting] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<{ id: string; msg: string } | null>(null)
 
   useEffect(() => {
     load()
@@ -124,6 +127,21 @@ export default function ConnectionPage() {
     }
   }
 
+  const handleDelete = async (conn: Connection) => {
+    if (!window.confirm(`Delete connection "${conn.name}"? This can't be undone. Reports using it must be removed or re-pointed first.`)) return
+    setDeleting(conn.id); setDeleteError(null)
+    try {
+      await projectApi.deleteConnection(projectId, conn.id)
+      setConnections(prev => prev.filter(c => c.id !== conn.id))
+      if (editing === conn.id) setEditing(null)
+    } catch (err: any) {
+      // 409 = still in use by a report; surface the backend's explanation.
+      setDeleteError({ id: conn.id, msg: err?.response?.data?.detail ?? 'Could not delete this connection.' })
+    } finally {
+      setDeleting(null)
+    }
+  }
+
   const set = (k: string, v: unknown) => setForm(f => ({ ...f, [k]: v }))
 
   return (
@@ -197,8 +215,23 @@ export default function ConnectionPage() {
                 >
                   {editing === conn.id ? 'Cancel' : 'Edit'}
                 </button>
+                <button
+                  onClick={() => handleDelete(conn)}
+                  disabled={deleting === conn.id}
+                  title="Delete connection"
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-600 border border-red-200 rounded-lg hover:bg-red-50 disabled:opacity-60 transition-all"
+                >
+                  {deleting === conn.id ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                </button>
               </div>
             </div>
+
+            {/* Delete error (e.g. 409 — still used by a report) */}
+            {deleteError?.id === conn.id && (
+              <div className="mx-5 mt-3 flex items-center gap-2 px-3 py-2 rounded-xl text-sm bg-red-50 text-red-700 border border-red-200">
+                <AlertCircle size={14} /> {deleteError.msg}
+              </div>
+            )}
 
             {/* Test result */}
             {testResult && testing === null && (
