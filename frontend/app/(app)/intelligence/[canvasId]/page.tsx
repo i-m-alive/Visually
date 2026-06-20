@@ -5,6 +5,7 @@ import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi } from '@/lib/api
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
 import { IntelligenceCopilotPanel } from '@/components/report/IntelligenceCopilotPanel'
 import { VlyExportModal } from '@/components/canvas/VlyExportModal'
+import { ConnectLiveDbModal } from '@/components/canvas/ConnectLiveDbModal'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import {
   runIntelligenceAgent, buildFallbackAnalysis, runSectionAgent,
@@ -147,12 +148,12 @@ function AnimatedCounter({ target, prefix = '', suffix = '', duration = 1200 }: 
     rafRef.current = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(rafRef.current)
   }, [target, duration])
-  const fmt = (n: number) => {
-    if (Math.abs(n) >= 1e9) return `${(n / 1e9).toFixed(1)}B`
-    if (Math.abs(n) >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-    if (Math.abs(n) >= 1e3) return `${(n / 1e3).toFixed(1)}K`
-    return n % 1 === 0 ? String(Math.round(n)) : n.toFixed(1)
-  }
+  // Show the ACTUAL value (full digits, thousands separators) — never K/M/B
+  // abbreviation, which rounds away the real number.
+  const fmt = (n: number) =>
+    Math.abs(n % 1) < 1e-9
+      ? Math.round(n).toLocaleString()
+      : n.toLocaleString(undefined, { maximumFractionDigits: 2 })
   return <span>{prefix}{fmt(display)}{suffix}</span>
 }
 
@@ -205,8 +206,12 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
   const prefix = String(kpi.value).match(/^[^0-9-]*/)?.[0] ?? ''
   // Separate numeric suffix from unit suffix — keep unit short so it doesn't blow up card height
   const rawSuffix = String(kpi.value).match(/[^0-9.]+$/)?.[0] ?? ''
-  const suffix = rawSuffix.length > 6 ? rawSuffix.slice(0, 6) : rawSuffix
+  const suffix = rawSuffix.length > 14 ? rawSuffix.slice(0, 14) : rawSuffix
   const animatable = !isNaN(raw) && isFinite(raw)
+  const exactValue = `${prefix}${animatable ? raw.toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(kpi.value)}${rawSuffix}`
+  // Full displayed string (actual value, no abbreviation) → drives responsive sizing
+  const valueStr = animatable ? `${prefix}${raw.toLocaleString(undefined, { maximumFractionDigits: 2 })}${suffix}` : String(kpi.value)
+  const valueFont = valueStr.length <= 7 ? 24 : valueStr.length <= 10 ? 21 : valueStr.length <= 13 ? 18 : valueStr.length <= 17 ? 15 : 13
   return (
     <div className="intel-kpi-card" style={{
       background: C.card, borderRadius: 16, padding: '14px 16px',
@@ -231,10 +236,10 @@ function KpiCard({ kpi, idx }: { kpi: AgentKPI; idx: number }) {
       {/* Value — capped at 24px so long values don't overflow. Hover shows the
           exact value (the card itself abbreviates large numbers as K/M/B). */}
       <p
-        title={`${prefix}${animatable ? raw.toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(kpi.value)}${suffix}`}
-        style={{ fontSize: 24, fontWeight: 800, color: C.ink, margin: '6px 0 0', lineHeight: 1.05, letterSpacing: '-0.02em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'help' }}
+        title={exactValue}
+        style={{ fontSize: valueFont, fontWeight: 800, color: C.ink, margin: '6px 0 0', lineHeight: 1.05, letterSpacing: '-0.02em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'help' }}
       >
-        {animatable ? <AnimatedCounter target={raw} prefix={prefix} suffix={suffix} /> : String(kpi.value).slice(0, 14)}
+        {animatable ? <AnimatedCounter target={raw} prefix={prefix} suffix={suffix} /> : String(kpi.value)}
       </p>
       {/* Trend pill — always occupies same space even when absent */}
       <div style={{ marginTop: 6, minHeight: 22, display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -1638,8 +1643,16 @@ function SectionContent({
 const RAIL_COLLAPSED = 64
 const RAIL_EXPANDED  = 256
 
-function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; active: string; onNav: (id: string) => void }) {
+interface RailAction { key: string; icon: React.ReactNode; label: string; onClick: () => void; tint?: string }
+
+function LeftRail({ sections, active, onNav, actions = [], onBack }: { sections: AgentSection[]; active: string; onNav: (id: string) => void; actions?: RailAction[]; onBack?: () => void }) {
   const [expanded, setExpanded] = useState(false)
+  const labelStyle = (vis: boolean): React.CSSProperties => ({
+    fontSize: 12.5, fontWeight: 600, letterSpacing: '0.01em', color: 'rgba(255,255,255,0.72)',
+    whiteSpace: 'nowrap', textAlign: 'left', flex: 1, minWidth: 0, paddingRight: 12,
+    overflow: 'hidden', textOverflow: 'ellipsis', opacity: vis ? 1 : 0,
+    transition: 'opacity 0.16s ease', pointerEvents: 'none',
+  })
   return (
     // Outer keeps a fixed 64px footprint in the grid; the nav itself is absolutely
     // positioned so it can slide open over the content on hover without reflowing it.
@@ -1660,6 +1673,23 @@ function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; activ
           zIndex: 60, scrollbarWidth: 'none',
         } as React.CSSProperties}
       >
+        {/* Back button (moved out of the header) */}
+        {onBack && (
+          <>
+            <button
+              onClick={onBack}
+              title="Back"
+              className="intel-nav-item"
+              style={{ width: '100%', flexShrink: 0, background: 'transparent', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12, padding: '2px 0 4px 10px', outline: 'none' }}
+            >
+              <div style={{ width: 44, height: 44, borderRadius: 13, flexShrink: 0, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.82)' }}>
+                <ChevronLeft size={18} />
+              </div>
+              <span style={labelStyle(expanded)}>Back</span>
+            </button>
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.08)', margin: '6px 12px 8px' }} />
+          </>
+        )}
         {sections.map((s, idx) => {
           const isActive = s.id === active
           const color = PALETTE[idx % PALETTE.length]
@@ -1705,6 +1735,41 @@ function LeftRail({ sections, active, onNav }: { sections: AgentSection[]; activ
             </button>
           )
         })}
+
+        {/* Action buttons (moved out of the header to declutter it) */}
+        {actions.length > 0 && (
+          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8 }}>
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.08)', margin: '6px 12px 8px' }} />
+            {actions.map(a => (
+              <button
+                key={a.key}
+                onClick={a.onClick}
+                title={a.label}
+                className="intel-nav-item"
+                style={{
+                  width: '100%', flexShrink: 0, background: 'transparent', border: 'none',
+                  cursor: 'pointer', display: 'flex', flexDirection: 'row', alignItems: 'center',
+                  gap: 12, padding: '4px 0 4px 10px', outline: 'none',
+                }}
+              >
+                <div style={{
+                  width: 44, height: 44, borderRadius: 13, flexShrink: 0,
+                  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: a.tint ?? 'rgba(255,255,255,0.82)',
+                }}>
+                  {a.icon}
+                </div>
+                <span style={{
+                  fontSize: 12.5, fontWeight: 600, letterSpacing: '0.01em',
+                  color: 'rgba(255,255,255,0.72)', whiteSpace: 'nowrap', textAlign: 'left',
+                  flex: 1, minWidth: 0, paddingRight: 12, overflow: 'hidden', textOverflow: 'ellipsis',
+                  opacity: expanded ? 1 : 0, transition: 'opacity 0.16s ease', pointerEvents: 'none',
+                }}>{a.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </nav>
     </div>
   )
@@ -2200,10 +2265,20 @@ export default function IntelligenceCanvasPage() {
   const [agentStep, setAgentStep] = useState('')
   const [analysis, setAnalysis] = useState<ExecutiveAnalysis | null>(null)
   const [showExport, setShowExport] = useState(false)
+  const [showConnectDb, setShowConnectDb] = useState(false)
   const [agentError, setAgentError] = useState<string | null>(null)
   const [aiFallbackWarning, setAiFallbackWarning] = useState(false)
   const [rerunning, setRerunning] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
+  // Discovery stage — mine the underlying tables for extra insights. Default ON.
+  const [discoverEnabled, setDiscoverEnabled] = useState(() => {
+    try { return localStorage.getItem(`intel_discover_${canvasId}`) !== '0' } catch { return true }
+  })
+  const discoverEnabledRef = useRef(discoverEnabled)
+  useEffect(() => {
+    discoverEnabledRef.current = discoverEnabled
+    try { localStorage.setItem(`intel_discover_${canvasId}`, discoverEnabled ? '1' : '0') } catch {}
+  }, [discoverEnabled, canvasId])
   const [syncMenuOpen, setSyncMenuOpen] = useState(false)
   const [autoSyncMins, setAutoSyncMins] = useState<number | null>(() => {
     try { return parseInt(localStorage.getItem(`intel_sync_${canvasId}`) ?? '') || null } catch { return null }
@@ -2593,7 +2668,7 @@ export default function IntelligenceCanvasPage() {
         setAgentStatus('running')
         setAiFallbackWarning(false)
         const result = await runIntelligenceAgent(
-          { projectId: detail?.project_id ?? '', canvasId, canvasName: detail?.name ?? 'Report', widgets: widgets as never, shareToken: token || undefined },
+          { projectId: detail?.project_id ?? '', canvasId, canvasName: detail?.name ?? 'Report', widgets: widgets as never, shareToken: token || undefined, discover: discoverEnabledRef.current },
           s => { if (!cancelled) setAgentStep(s) },
         )
         if (cancelled) { localStorage.removeItem(LOCK_KEY); return }
@@ -2633,7 +2708,7 @@ export default function IntelligenceCanvasPage() {
         setLastFetchedAt(new Date())
       } catch { /* keep stale */ }
       const result = await runIntelligenceAgent(
-        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: dr, force: true },
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, dateRange: dr, force: true, discover: discoverEnabled },
         s => setAgentStep(s),
       )
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
@@ -2643,7 +2718,7 @@ export default function IntelligenceCanvasPage() {
     } catch {
       setAgentStatus('done')
     } finally { setDateLoading(false) }
-  }, [canvas, pendingDate, rawWidgets, projectId, canvasId, shareToken, mergeWidgetData])
+  }, [canvas, pendingDate, rawWidgets, projectId, canvasId, shareToken, mergeWidgetData, discoverEnabled])
 
   const rerun = useCallback(async () => {
     if (!canvas || rerunning) return
@@ -2663,7 +2738,7 @@ export default function IntelligenceCanvasPage() {
       } catch { /* keep stale data */ }
 
       const result = await runIntelligenceAgent(
-        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, force: true },
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: widgets as never, shareToken: shareToken || undefined, force: true, discover: discoverEnabled },
         s => setAgentStep(s),
       )
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
@@ -2675,7 +2750,7 @@ export default function IntelligenceCanvasPage() {
       setAiFallbackWarning(true)
       setAgentStatus('done')
     } finally { setRerunning(false) }
-  }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange])
+  }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange, discoverEnabled])
 
   // Regenerate from scratch — rebuild the AI report on the CURRENT data without
   // re-querying the database. Distinct from Sync Now (which also re-fetches data).
@@ -2687,7 +2762,7 @@ export default function IntelligenceCanvasPage() {
     setRegenerating(true); setAgentStatus('running'); setAgentError(null); setAiFallbackWarning(false)
     try {
       const result = await runIntelligenceAgent(
-        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: rawWidgets as never, shareToken: shareToken || undefined, dateRange: appliedDateRange ?? undefined, force: true },
+        { projectId, canvasId, canvasName: String(canvas?.name ?? 'Report'), widgets: rawWidgets as never, shareToken: shareToken || undefined, dateRange: appliedDateRange ?? undefined, force: true, discover: discoverEnabled },
         s => setAgentStep(s),
       )
       if ((result as unknown as Record<string, unknown>)._fallback) setAiFallbackWarning(true)
@@ -2697,7 +2772,7 @@ export default function IntelligenceCanvasPage() {
     } catch {
       setAgentStatus('done')
     } finally { setRegenerating(false) }
-  }, [canvas, rerunning, regenerating, projectId, canvasId, rawWidgets, shareToken, appliedDateRange])
+  }, [canvas, rerunning, regenerating, projectId, canvasId, rawWidgets, shareToken, appliedDateRange, discoverEnabled])
 
   // Keep rerunRef current so the auto-sync interval never closes over a stale rerun
   useEffect(() => { rerunRef.current = rerun }, [rerun])
@@ -2771,7 +2846,17 @@ export default function IntelligenceCanvasPage() {
     <div className="flex-1 min-h-0" style={{ display: 'grid', gridTemplateColumns: `${RAIL_COLLAPSED}px 1fr`, overflow: 'hidden' }}>
 
       {/* Left rail */}
-      <LeftRail sections={analysis.sections} active={activeSection} onNav={handleNavSection} />
+      <LeftRail
+        sections={analysis.sections}
+        active={activeSection}
+        onNav={handleNavSection}
+        onBack={() => router.back()}
+        actions={[
+          { key: 'pdf', icon: <Printer size={18} />, label: 'Export PDF', onClick: () => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) } },
+          { key: 'export', icon: <Download size={18} />, label: 'Export .vly', onClick: () => setShowExport(true), tint: C.teal2 },
+          { key: 'share', icon: <Link size={18} />, label: 'Share report', onClick: () => setShareModalUrl(window.location.href) },
+        ]}
+      />
 
       {/* Main content */}
       <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', background: C.bg }}>
@@ -2782,16 +2867,17 @@ export default function IntelligenceCanvasPage() {
           padding: '12px 22px', display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0,
           boxShadow: '0 2px 16px rgba(8,33,58,0.2)',
         }}>
-          <button onClick={() => router.back()} style={{ padding: 6, borderRadius: 8, border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex' }}><ChevronLeft size={16} /></button>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
             <div style={{ width: 34, height: 34, borderRadius: 10, background: `linear-gradient(135deg,${C.teal},${C.teal2})`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: `0 4px 12px ${C.teal}50` }}><Zap size={15} style={{ color: 'white' }} /></div>
             <div style={{ minWidth: 0 }}>
               <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap' }}>
-                <h1 style={{ fontSize: 15, fontWeight: 700, color: 'white', margin: 0, lineHeight: 1.25, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{analysis.title}</h1>
+                {/* Real canvas/report name — never the AI-renamed title */}
+                <h1 style={{ fontSize: 15, fontWeight: 700, color: 'white', margin: 0, lineHeight: 1.25, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{String(canvas?.name ?? analysis.title)}</h1>
                 <span style={{ fontSize: 9, fontWeight: 700, color: C.teal2, background: `${C.teal}25`, border: `1px solid ${C.teal}50`, borderRadius: 20, padding: '2px 8px', letterSpacing: '0.06em', flexShrink: 0 }}>OPUS AI</span>
               {hasSavedData && <span style={{ fontSize: 9, fontWeight: 700, color: C.green, background: `${C.green}20`, border: `1px solid ${C.green}50`, borderRadius: 20, padding: '2px 8px', letterSpacing: '0.06em', flexShrink: 0 }}>SAVED</span>}
               </div>
-              <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{analysis.subtitle}</p>
+              {/* AI executive framing kept as the descriptor line */}
+              <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{analysis.title || analysis.subtitle}</p>
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
@@ -2804,33 +2890,26 @@ export default function IntelligenceCanvasPage() {
             {/* <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Play size={11} /> Present
             </button> */}
-            {/* Offline data-source acknowledgment pill */}
-            {(canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline' && (
-              <span
-                title="This canvas was imported without a live database. The report and copilot run on the bundled table data."
-                style={{ padding: '5px 10px', borderRadius: 8, border: `1px solid ${C.teal}60`, background: `${C.teal}20`, color: C.teal2, display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
-              >
-                <Database size={11} /> Offline data
-              </span>
+            {/* Offline data-source pill + connect-to-live button (only when offline) */}
+            {(((canvas as { is_offline?: boolean } | null)?.is_offline) || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline') && (
+              <>
+                <span
+                  title="This canvas was imported without a live database. The report and copilot run on the bundled table data."
+                  style={{ padding: '5px 10px', borderRadius: 8, border: `1px solid ${C.teal}60`, background: `${C.teal}20`, color: C.teal2, display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
+                >
+                  <Database size={11} /> Offline data
+                </span>
+                <button
+                  onClick={() => setShowConnectDb(true)}
+                  title="Connect a live database — switch this canvas from bundled offline data to real-time data"
+                  style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${C.violet}70`, background: `${C.violet}25`, color: '#c4b5fd', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 700 }}
+                >
+                  <Database size={11} /> Connect live DB
+                </button>
+              </>
             )}
-            {/* Feature 7: print/PDF */}
-            <button onClick={() => { setPrintMode(true); setTimeout(() => { window.print(); setPrintMode(false) }, 150) }} title="Export to PDF" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
-              <Printer size={11} /> PDF
-            </button>
-            {/* Export .vly — bundles AI analysis + widget data + SQL + schema (+ optional full tables for offline) */}
-            <button
-              onClick={() => setShowExport(true)}
-              title="Export as .vly — bundles AI analysis, widget data, SQL queries and schema into one portable file"
-              className="intel-hdr-btn"
-              style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${C.teal}60`, background: `${C.teal}20`, color: C.teal2, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
-            >
-              <Download size={11} /> Export .vly
-            </button>
-            {/* Feature 8: share */}
-            <button onClick={() => setShareModalUrl(window.location.href)} title="Share report" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
-              <Link size={11} /> Share
-            </button>
-            {/* Save button */}
+            {/* PDF / Export .vly / Share moved into the LeftRail to declutter the header */}
+            {/* Save button (kept in the top bar) */}
             <button onClick={saveAnalysis} title={hasSavedData ? 'Analysis saved locally' : 'Save analysis to browser'} style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${saved ? C.green + '80' : 'rgba(255,255,255,0.2)'}`, background: saved ? `${C.green}25` : 'rgba(255,255,255,0.1)', color: saved ? C.green : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, transition: 'all 0.2s' }}>
               {saved ? <BookmarkCheck size={11} /> : <Bookmark size={11} />}
               {saved ? 'Saved!' : hasSavedData ? 'Re-save' : 'Save'}
@@ -2915,6 +2994,27 @@ export default function IntelligenceCanvasPage() {
                     <RefreshCw size={13} style={{ color: C.teal }} />
                     Sync Now
                     <span style={{ marginLeft: 'auto', fontSize: 10, color: C.muted }}>fetch + regenerate</span>
+                  </button>
+
+                  {/* Discovery toggle */}
+                  <button
+                    onClick={() => setDiscoverEnabled(v => !v)}
+                    title="When on, the agent mines the underlying tables for extra insights beyond the report's widgets"
+                    style={{
+                      width: '100%', display: 'flex', alignItems: 'center', gap: 9,
+                      padding: '11px 14px', background: 'none', border: 'none',
+                      borderBottom: '1px solid #f1f5f9', cursor: 'pointer',
+                      fontSize: 12, fontWeight: 600, color: C.navy,
+                    }}
+                  >
+                    <Sparkles size={13} style={{ color: discoverEnabled ? C.violet : C.muted }} />
+                    Discover extra insights
+                    <span style={{
+                      marginLeft: 'auto', fontSize: 10, fontWeight: 700,
+                      color: discoverEnabled ? C.green : C.muted,
+                      background: discoverEnabled ? `${C.green}18` : '#f1f5f9',
+                      borderRadius: 20, padding: '2px 8px',
+                    }}>{discoverEnabled ? 'ON' : 'OFF'}</span>
                   </button>
 
                   {/* Schedule section */}
@@ -3423,6 +3523,21 @@ export default function IntelligenceCanvasPage() {
           canvasId={canvasId}
           intelligence={analysis ?? undefined}
           onClose={() => setShowExport(false)}
+        />
+      )}
+
+      {showConnectDb && projectId && (
+        <ConnectLiveDbModal
+          projectId={projectId}
+          dashboardId={canvasId}
+          hint={(canvas as { connection_hint?: import('@/components/canvas/ConnectLiveDbModal').ConnHint } | null)?.connection_hint}
+          onClose={() => setShowConnectDb(false)}
+          onConnected={() => {
+            // Now live — drop the saved offline report and reload so the page
+            // re-fetches live data and the offline pill disappears.
+            try { localStorage.removeItem(`intel_analysis_${canvasId}`) } catch {}
+            window.location.reload()
+          }}
         />
       )}
 

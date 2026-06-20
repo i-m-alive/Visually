@@ -335,6 +335,7 @@ RULES:
 - Build 2-3 charts from the real row data; pick the BEST type per data shape. Max 20 data points per chart.
 - For a table chart, preserve ALL meaningful column names as keys (e.g. {{"customer":"Acme","revenue":120000,"region":"West"}}), up to 50 rows.
 - top_performers / bottom_performers: 3 rows each from the TOP/BOTTOM PERFORMERS facts.
+- SPARKLINES: set "sparkline_data" ONLY for genuine TIME-SERIES KPIs (values ordered over time, from a time-series widget). For ranked/top-N, categorical, or single-point metrics, use "sparkline_data": [] — NEVER put rankings or category counts in a sparkline (a sparkline implies a trend over time). Never invent a data label like "Latest" or a percentage that is not in the widget facts.
 - Use ONLY icons from: {VALID_ICON_NAMES}
 
 Output ONLY raw JSON for this single section — no markdown, no prose:
@@ -371,20 +372,26 @@ async def _write_section(canvas_name: str, shared_context: str, sec: dict, fix_n
 
 
 # ── STAGE 3: CRITIC ───────────────────────────────────────────────────────────
-_CRITIC_INSTRUCTION = """You are an editor doing a LIGHT validation pass on ONE section of an executive report. DEFAULT TO PASS. Only fail for the clear, listed violations below — do NOT nitpick wording, comma style, number formatting choices, sparkline semantics, or recompute percentages.
+_CRITIC_INSTRUCTION = """You are an editor doing a LIGHT validation pass on ONE section of an executive report. DEFAULT TO PASS — when in doubt, pass.
 
-Fail (ok=false) ONLY when you find one of these:
-1. VAGUE / APPROXIMATE WORDING — the words "about", "roughly", "~", "approximately", "nearly", or "over X". Specific numbers in ANY notation are ALL acceptable ("30.26 million", "$30,260,000", "6,762", "6.8K"). Do NOT flag number notation, scale, or thousands-separators.
-2. The SAME number repeated across ALL THREE prose fields data_story AND key_finding AND narrative. (Overlap with top_performers / kpis / charts is allowed — ignore it.)
-3. DATA-QUALITY talk: null rates, completeness, data hygiene, or quality scores.
+NEVER FLAG (these are 100% acceptable — do not mention them at all):
+- Percentages in ANY form or precision: "96%", "38%", "10%", "43.6%". NEVER recompute a percentage and NEVER ask for more decimals.
+- Number notation/scale: "30.26 million", "$30,260,000", "6,762", "6.8K", with or without thousands-separators.
+- An EMPTY "sparkline_data": [] — this is ALWAYS correct on any KPI; never ask to remove or justify it.
+- Business language such as "risk", "margin compression", "churn", "attrition", "concentration", "exposure" — these are insights, NOT data-quality talk.
+- A "trend"/"trend_pct" on a KPI; rounded-but-specific numbers; stylistic wording.
+
+Fail (ok=false) ONLY for one of these concrete violations:
+1. VAGUE / APPROXIMATE WORDING — the literal words "about", "roughly", "~", "approximately", "nearly", or "over X" before a number. (A bare percentage like "96%" is NOT vague — do not flag it.)
+2. The SAME number repeated across ALL THREE prose fields (data_story AND key_finding AND narrative). Overlap with top_performers/kpis/charts is fine.
+3. EXPLICIT data-hygiene talk only: "null rate", "% complete", "missing values", "X nulls", "data quality score", "data hygiene". (Business risk/margin/churn wording does NOT count.)
 4. A chart with an empty/missing "data" array or an invalid "type".
-5. A figure FABRICATED or RESCALED from the source — e.g. a sparkline that multiplies 4.52 into 452, or a value that appears nowhere in the widget facts. A number matching any value in "EXACT VALUES" / "TOP PERFORMERS" / "BREAKDOWN" is GROUNDED — accept it. Do NOT flag numbers you merely cannot verify.
+5. A FABRICATED or RESCALED figure — a value/time-series that appears NOWHERE in the widget facts (e.g. inventing per-month values for a metric the facts only give as a total, or multiplying 4.52 into 452). A number matching any value in "EXACT VALUES"/"TOP PERFORMERS"/"BREAKDOWN" is grounded — accept it. Do NOT flag values you merely cannot verify.
 6. A MISSING required field: data_story, key_finding, narrative, recommendation, or all charts.
-
-NEVER recompute or re-derive a percentage/ratio — percentages in any form ("44%", "43.6%") are always acceptable. Do NOT fail for number notation or scale (M/K vs full digits), thousands-separators, a sparkline on a single-point KPI, any value present in the widget facts, or stylistic preferences. When in doubt, PASS.
+7. A NON-EMPTY "sparkline_data" whose values are a ranking/top-N or category counts (not a time series), or an invented label like "Latest". (Empty [] is fine — see NEVER FLAG.)
 
 Output ONLY raw JSON: {"ok": true|false, "issues": ["concise, actionable fix", ...]}
-If the section is acceptable, return {"ok": true, "issues": []}."""
+If acceptable, return {"ok": true, "issues": []}."""
 
 
 async def _critique(section: dict, shared_context: str) -> dict:

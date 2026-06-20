@@ -138,13 +138,19 @@ async def _get_user(
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_table_names(sql: str) -> list[str]:
-    return list({
-        m.lower() for m in re.findall(
-            r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)',
-            sql or '',
-            re.IGNORECASE,
-        )
-    })
+    sql = sql or ''
+    # Exclude CTE names (`WITH x AS (...)`, chained `), y AS (...)`) — they follow
+    # FROM/JOIN but aren't real tables, so they'd fail to export/bundle.
+    cte = {m.lower() for m in re.findall(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', sql, re.IGNORECASE)}
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.findall(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE):
+        ml = m.lower()
+        if ml.split('.')[-1] in cte or ml in seen:
+            continue
+        seen.add(ml)
+        out.append(ml)
+    return out
 
 
 # How many FK hops out from the report's tables count as "related" in the export.
@@ -899,7 +905,11 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
     raw = buf.read()
 
     safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in dashboard.name)[:64]
-    filename  = f"{safe_name}.vly"
+    # Distinct extension per type so the file is self-identifying:
+    #   .ovly = OFFLINE (full table data bundled; opens with no DB)
+    #   .vly  = LIVE (lightweight; connects to a database on import)
+    ext = "ovly" if (include_table_data and table_files) else "vly"
+    filename  = f"{safe_name}.{ext}"
 
     return Response(
         content=raw,
@@ -910,6 +920,7 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
             "Cache-Control":       "no-cache",
             "X-Vly-Version":       VLY_VERSION,
             "X-Vly-Canvas":        dashboard.name,
+            "X-Vly-Ext":           ext,
         },
     )
 
@@ -922,6 +933,7 @@ async def import_vly(
     file: UploadFile = File(...),
     project_id: str = Form(...),
     connection_id: Optional[str] = Form(None),
+    prefer_offline: bool = Form(False),  # force offline (bundled tables) — skip auto-match
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_get_user),
 ):
@@ -969,7 +981,11 @@ async def import_vly(
     # becomes a synthetic vly_offline connection when there's no live DB.
     live_conn_id: Optional[uuid.UUID] = None
 
-    if connection_id:
+    if prefer_offline:
+        # User explicitly chose offline — never auto-bind a live connection so the
+        # bundled tables are persisted and used.
+        live_conn_id = None
+    elif connection_id:
         live_conn_id = uuid.UUID(connection_id)
     else:
         hint = meta_doc.get("connection_hint", {})
@@ -1004,6 +1020,11 @@ async def import_vly(
     # storing it here keeps live data working even if a widget loses its binding.
     if resolved_conn_id:
         imported_layout["connection_id"] = str(resolved_conn_id)
+    # Keep the source DB fingerprint (host/port/database/user, NO password) so the
+    # "Connect live DB" UI can pre-fill credentials for the report's ORIGINAL
+    # database — which may differ from any connection already in the project.
+    if meta_doc.get("connection_hint"):
+        imported_layout["connection_hint"] = meta_doc.get("connection_hint")
 
     new_dash = Dashboard(
         id=uuid.uuid4(),
@@ -1524,6 +1545,25 @@ async def bind_connection(
         evict_offline(dashboard_id)
     except Exception:
         pass
+
+    # Invalidate the intelligence-data Redis cache so the NEXT report build fetches
+    # fresh LIVE rows instead of the stale offline-era snapshot. Without this the
+    # report would regenerate on cached offline data even though we're now live.
+    try:
+        from shared.redis_client import get_redis as _get_redis
+        _r = await _get_redis()
+        if _r is not None:
+            deleted = 0
+            try:
+                async for _k in _r.scan_iter(match=f"intel_data:{dashboard_id}:*"):
+                    await _r.delete(_k)
+                    deleted += 1
+            except Exception:
+                # Fallback: delete the common no-date-range key form.
+                await _r.delete(f"intel_data:{dashboard_id}:*:*")
+            print(f"[bind-connection] invalidated intel_data cache  dashboard={dashboard_id[:8]}  keys={deleted}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bind-connection] cache invalidation failed (non-fatal): {exc}", flush=True)
 
     # 2 & 3 — crawl schema + refresh widgets in the BACKGROUND. These take minutes
     # on a cold backend; running them inline blew past the gateway timeout and the

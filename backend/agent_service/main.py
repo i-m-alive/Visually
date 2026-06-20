@@ -1237,6 +1237,23 @@ async def get_dashboard(
     widgets = widgets_result.scalars().all()
 
     layout_cfg = dashboard.layout_config or {}
+
+    # Authoritative offline detection: the canvas is offline when its resolved
+    # connection is the synthetic vly_offline type (or the stored flag says so).
+    # Drives the "Connect live DB" button on the canvas + intelligence pages.
+    is_offline = layout_cfg.get("data_mode") == "offline"
+    if not is_offline:
+        _cid = layout_cfg.get("connection_id") or next((str(w.connection_id) for w in widgets if w.connection_id), None)
+        if _cid:
+            try:
+                _c = (await db.execute(
+                    select(DatabaseConnection).where(DatabaseConnection.id == uuid.UUID(str(_cid)))
+                )).scalar_one_or_none()
+                if _c is not None and (_c.db_type.value if hasattr(_c.db_type, "value") else str(_c.db_type)) == "vly_offline":
+                    is_offline = True
+            except Exception:
+                pass
+
     return {
         "id": str(dashboard.id),
         "name": dashboard.name,
@@ -1245,6 +1262,9 @@ async def get_dashboard(
         "project_id": str(dashboard.project_id),
         "created_at": dashboard.created_at.isoformat(),
         "filter_config": dashboard.filter_config or [],
+        "is_offline": is_offline,
+        "data_mode": layout_cfg.get("data_mode") or ("offline" if is_offline else None),
+        "connection_hint": layout_cfg.get("connection_hint") or {},
         "report_title": layout_cfg.get("report_title"),
         "page_tabs": layout_cfg.get("page_tabs", []),
         "colour_theme": layout_cfg.get("colour_theme"),

@@ -444,6 +444,26 @@ export const intelligenceApi = {
   }) => api.post<{ text: string }>('/intelligence/orchestrate', data),
 
   /**
+   * Discovery stage — mine the report's underlying tables for NEW insights beyond
+   * the existing widgets. Returns chart-ready datasets the frontend appends as
+   * synthetic widgets so they flow through the normal agent/orchestrator.
+   */
+  discover: (dashboardId: string, opts?: { max_queries?: number; force?: boolean }) =>
+    api.post<{
+      discoveries: Array<{
+        title: string
+        chart_type: string
+        sql: string
+        why?: string
+        chart_data: { rows: Record<string, unknown>[]; columns: string[]; labels: unknown[]; values: unknown[] }
+      }>
+      message?: string
+    }>(`/dashboards/${dashboardId}/intelligence-discovery`, {
+      max_queries: opts?.max_queries ?? 6,
+      force: opts?.force ?? false,
+    }),
+
+  /**
    * Fetch table/column metadata for every table referenced in this dashboard's
    * widget SQL queries so the agent prompt includes DDL-level context.
    */
@@ -646,12 +666,14 @@ export const vlyApi = {
     })
     if (!response.ok) throw new Error(`Export failed: ${response.status}`)
 
-    // Read server-supplied filename from the now-exposed Content-Disposition header
+    // Read server-supplied filename from the now-exposed Content-Disposition header.
+    // Extension differs by type: .ovly = offline (data bundled), .vly = live.
     const disposition = response.headers.get('Content-Disposition') ?? ''
     const match       = disposition.match(/filename="([^"]+)"/)
     const canvasName  = response.headers.get('X-Vly-Canvas') ?? ''
+    const ext         = (response.headers.get('X-Vly-Ext') || (opts?.includeTableData ? 'ovly' : 'vly')).replace(/^\./, '')
     // Prefer the server filename (canvas name); last-resort fallback only
-    const suggestedName = match?.[1] ?? (canvasName ? `${canvasName}.vly` : `canvas-${canvasId.slice(0, 8)}.vly`)
+    const suggestedName = match?.[1] ?? (canvasName ? `${canvasName}.${ext}` : `canvas-${canvasId.slice(0, 8)}.${ext}`)
 
     const blob = await response.blob()
 
@@ -662,7 +684,7 @@ export const vlyApi = {
           suggestedName,
           types: [{
             description: 'Visually Canvas Archive',
-            accept: { 'application/vnd.visually.canvas+zip': ['.vly'] },
+            accept: { 'application/vnd.visually.canvas+zip': ['.vly', '.ovly'] },
           }],
         })
         const writable = await handle.createWritable()
@@ -684,12 +706,14 @@ export const vlyApi = {
     URL.revokeObjectURL(blobUrl)
   },
 
-  /** Import a .vly file into a project. */
-  importVly: (file: File, projectId: string, connectionId?: string) => {
+  /** Import a .vly/.ovly file into a project. preferOffline forces offline mode
+   *  (use the bundled tables, skip auto-matching a live connection). */
+  importVly: (file: File, projectId: string, connectionId?: string, preferOffline?: boolean) => {
     const form = new FormData()
     form.append('file', file)
     form.append('project_id', projectId)
     if (connectionId) form.append('connection_id', connectionId)
+    if (preferOffline) form.append('prefer_offline', 'true')
     return api.post<{
       dashboard_id: string
       name: string

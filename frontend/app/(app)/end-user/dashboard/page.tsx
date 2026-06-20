@@ -113,6 +113,8 @@ export default function EndUserDashboardPage() {
   const [pendingFile, setPendingFile]     = useState<File | null>(null)
   const [connHint, setConnHint]           = useState<Record<string, string> | undefined>(undefined)
   const [showConnPrompt, setShowConnPrompt] = useState(false)
+  const [hasTableData, setHasTableData]   = useState(false)
+  const [showImportChoice, setShowImportChoice] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -208,6 +210,7 @@ export default function EndUserDashboardPage() {
     setImportError(null)
     setImportSuccess(null)
     let hint: Record<string, string> | undefined
+    let tablesBundled = false
     try {
       const { default: JSZip } = await import('jszip')
       const zip = await JSZip.loadAsync(file)
@@ -216,10 +219,20 @@ export default function EndUserDashboardPage() {
         const meta = JSON.parse(await metaFile.async('string'))
         if (meta?.connection_hint?.host) hint = meta.connection_hint
       }
-    } catch { /* no hint — the form starts blank */ }
+      // Does the archive bundle full tables for offline use?
+      const manFile = zip.file('tables_manifest.json')
+      if (manFile) {
+        const man = JSON.parse(await manFile.async('string'))
+        tablesBundled = (man?.tables || []).some((t: { included?: boolean }) => t.included)
+      }
+    } catch { /* no hint/manifest — proceed without */ }
     setConnHint(hint)
+    setHasTableData(tablesBundled)
     setPendingFile(file)
-    setShowConnPrompt(true)
+    // If the report can run offline (bundled tables) OR there's no DB to connect to,
+    // let the analyst choose; otherwise go straight to the connect form.
+    if (tablesBundled || !hint?.host) setShowImportChoice(true)
+    else setShowConnPrompt(true)
   }
 
   // Step 2 — analyst supplied credentials: create + verify the connection, import the
@@ -259,6 +272,32 @@ export default function EndUserDashboardPage() {
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
         ?? 'Imported, but failed to connect live data. Open the report to retry.'
+      setImportError(msg)
+    } finally {
+      setImporting(false)
+      setPendingFile(null)
+    }
+  }, [pendingFile, load])
+
+  // Import WITHOUT a live connection — offline (query the bundled tables) or a
+  // cached snapshot. No credentials needed.
+  const importWithoutConnection = useCallback(async (preferOffline: boolean) => {
+    if (!pendingFile) return
+    setShowImportChoice(false)
+    setImporting(true)
+    try {
+      const form = new FormData()
+      form.append('file', pendingFile)
+      if (preferOffline) form.append('prefer_offline', 'true')
+      const resp = await api.post('/end-user/import-vly', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      const { dashboard_id, name, has_intelligence } = resp.data
+      await load()
+      setImportSuccess({ name, id: dashboard_id, hasIntel: has_intelligence })
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        ?? 'Import failed. Please try again.'
       setImportError(msg)
     } finally {
       setImporting(false)
@@ -320,9 +359,70 @@ export default function EndUserDashboardPage() {
       )}
 
       {/* Hidden file input */}
-      <input ref={fileRef} type="file" accept=".vly" className="hidden" onChange={handleVlyFile} />
+      <input ref={fileRef} type="file" accept=".vly,.ovly" className="hidden" onChange={handleVlyFile} />
 
-      {/* Required connect-a-DB step before importing — gives the analyst live data */}
+      {/* Import choice — offline (bundled data) vs connect to a live DB */}
+      {showImportChoice && pendingFile && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-indigo-50 flex items-center justify-center flex-shrink-0">
+                  <Database size={16} className="text-indigo-600" />
+                </div>
+                <div>
+                  <p className="text-sm font-bold text-gray-900">How do you want to open this report?</p>
+                  <p className="text-xs text-gray-500 mt-0.5 font-medium">{pendingFile.name}</p>
+                </div>
+              </div>
+              <button onClick={() => { setShowImportChoice(false); setPendingFile(null) }} className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-50"><X size={15} /></button>
+            </div>
+
+            {hasTableData ? (
+              <p className="text-xs text-gray-500 mb-4 leading-relaxed">
+                This report bundles its full table data, so it can run <strong>entirely offline</strong> — no database needed.
+                Or connect a live database for real-time data.
+              </p>
+            ) : (
+              <p className="text-xs text-gray-500 mb-4 leading-relaxed">
+                Connect a live database for real-time data, or open with the cached snapshot bundled in the file.
+              </p>
+            )}
+
+            <div className="space-y-2.5">
+              {hasTableData && (
+                <button
+                  onClick={() => importWithoutConnection(true)}
+                  disabled={importing}
+                  className="w-full py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-50 hover:opacity-90"
+                  style={{ background: 'linear-gradient(135deg, #6366F1, #7C3AED)' }}
+                >
+                  {importing ? <Loader2 size={14} className="animate-spin" /> : <Database size={14} />} Open offline with bundled data
+                </button>
+              )}
+              <button
+                onClick={() => { setShowImportChoice(false); setShowConnPrompt(true) }}
+                disabled={importing}
+                className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50 border"
+                style={{ borderColor: '#2563EB55', color: '#2563EB', background: '#2563EB10' }}
+              >
+                <Database size={14} /> Connect to live database
+              </button>
+              {!hasTableData && (
+                <button
+                  onClick={() => importWithoutConnection(false)}
+                  disabled={importing}
+                  className="w-full py-2.5 rounded-xl text-sm font-medium text-gray-600 border border-gray-200 hover:bg-gray-50 disabled:opacity-50"
+                >
+                  Open with cached snapshot
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Connect-a-DB step (chosen explicitly, or when no bundled data + a DB hint) */}
       {showConnPrompt && pendingFile && (
         <ConnectionPromptModal
           fileName={pendingFile.name}

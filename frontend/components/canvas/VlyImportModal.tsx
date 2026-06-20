@@ -20,7 +20,7 @@ interface Props {
   onImported?: (dashboardId: string) => void
 }
 
-type State = 'idle' | 'dragging' | 'importing' | 'binding' | 'done' | 'error'
+type State = 'idle' | 'dragging' | 'choice' | 'importing' | 'binding' | 'done' | 'error'
 
 export function VlyImportModal({ projectId, connectionId, onClose, onImported }: Props) {
   const router = useRouter()
@@ -43,18 +43,16 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
   const [selectedConn, setSelectedConn] = useState('')
   const [bindMsg, setBindMsg] = useState('')
   const [retrying, setRetrying] = useState(false)
+  const [hasTableData, setHasTableData] = useState(false)
 
-  const handleFile = useCallback(async (f: File) => {
-    if (!f.name.endsWith('.vly') && !f.name.endsWith('.zip')) {
-      setErrorMsg('Please select a .vly file exported from Visually.')
-      setState('error')
-      return
-    }
+  // Run the actual import. preferOffline forces offline mode (use bundled tables,
+  // skip auto-matching a live connection).
+  const runImport = useCallback(async (f: File, preferOffline: boolean) => {
     setFile(f)
     setState('importing')
     setErrorMsg('')
     try {
-      const resp = await vlyApi.importVly(f, projectId, connectionId)
+      const resp = await vlyApi.importVly(f, projectId, connectionId, preferOffline)
       setResult(resp.data)
       setState('done')
       // If the import didn't auto-link a connection, load the project's connections
@@ -71,6 +69,30 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
       setState('error')
     }
   }, [projectId, connectionId])
+
+  const handleFile = useCallback(async (f: File) => {
+    if (!/\.(vly|ovly|zip)$/i.test(f.name)) {
+      setErrorMsg('Please select a .vly or .ovly file exported from Visually.')
+      setState('error')
+      return
+    }
+    setFile(f)
+    setErrorMsg('')
+    // Peek inside: if the archive bundles full tables, offer offline vs live.
+    let bundled = false
+    try {
+      const { default: JSZip } = await import('jszip')
+      const zip = await JSZip.loadAsync(f)
+      const man = zip.file('tables_manifest.json')
+      if (man) {
+        const parsed = JSON.parse(await man.async('string'))
+        bundled = (parsed?.tables || []).some((t: { included?: boolean }) => t.included)
+      }
+    } catch { /* peek failed — just import normally */ }
+    setHasTableData(bundled)
+    if (bundled) setState('choice')
+    else runImport(f, false)
+  }, [runImport])
 
   const bindLiveConnection = useCallback(async () => {
     if (!result || !selectedConn) return
@@ -173,7 +195,34 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
                 {state === 'dragging' ? 'Drop to import' : 'Drop your .vly file here'}
               </p>
               <p className="text-xs text-gray-400 mt-1">or click to browse</p>
-              <input ref={inputRef} type="file" accept=".vly,.zip" className="hidden" onChange={onFileChange} />
+              <input ref={inputRef} type="file" accept=".vly,.ovly,.zip" className="hidden" onChange={onFileChange} />
+            </div>
+          ) : state === 'choice' && file ? (
+            <div className="space-y-3">
+              <p className="text-xs text-gray-500 leading-relaxed">
+                <span className="font-medium text-gray-700">{file.name}</span> bundles its full table data, so it can
+                run <strong>entirely offline</strong> — or you can connect a live database for real-time data.
+              </p>
+              <button
+                onClick={() => runImport(file, true)}
+                className="w-full py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 hover:opacity-90"
+                style={{ background: 'linear-gradient(135deg, #6366F1, #7C3AED)' }}
+              >
+                <Database size={14} /> Open offline with bundled data
+              </button>
+              <button
+                onClick={() => runImport(file, false)}
+                className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 border"
+                style={{ borderColor: '#2563EB55', color: '#2563EB', background: '#2563EB10' }}
+              >
+                <Database size={14} /> Import &amp; connect to live data
+              </button>
+              <button
+                onClick={() => { setState('idle'); setFile(null) }}
+                className="w-full py-2 text-xs font-medium text-gray-500 hover:text-gray-700"
+              >
+                Choose a different file
+              </button>
             </div>
           ) : state === 'importing' || state === 'binding' ? (
             <div className="flex flex-col items-center justify-center py-10 gap-4">

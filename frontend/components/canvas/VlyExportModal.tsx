@@ -57,31 +57,57 @@ export function VlyExportModal({ canvasId, intelligence, onClose }: Props) {
         </div>
 
         <div className="p-5 space-y-4">
-          <label className="flex items-start gap-3 p-3 rounded-xl border border-gray-200 cursor-pointer hover:bg-gray-50 transition-colors">
-            <input
-              type="checkbox"
-              checked={includeTableData}
-              onChange={e => setIncludeTableData(e.target.checked)}
-              className="mt-0.5 w-4 h-4 accent-indigo-600"
-            />
+          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Export type</p>
+
+          {/* Live (.vly) */}
+          <button
+            onClick={() => setIncludeTableData(false)}
+            className="w-full text-left flex items-start gap-3 p-3 rounded-xl border transition-colors"
+            style={{ borderColor: !includeTableData ? '#2563EB' : '#e5e7eb', background: !includeTableData ? '#2563EB0d' : '#fff' }}
+          >
+            <span className="mt-0.5 w-4 h-4 rounded-full border-2 flex items-center justify-center flex-shrink-0" style={{ borderColor: !includeTableData ? '#2563EB' : '#cbd5e1' }}>
+              {!includeTableData && <span className="w-2 h-2 rounded-full" style={{ background: '#2563EB' }} />}
+            </span>
+            <div>
+              <div className="flex items-center gap-1.5">
+                <FileArchive size={13} className="text-blue-500" />
+                <span className="text-sm font-semibold text-gray-800">Live report</span>
+                <code className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">.vly</code>
+              </div>
+              <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+                Lightweight. On import it <strong>connects to a database</strong> for live data. No raw data is bundled.
+              </p>
+            </div>
+          </button>
+
+          {/* Offline (.ovly) */}
+          <button
+            onClick={() => setIncludeTableData(true)}
+            className="w-full text-left flex items-start gap-3 p-3 rounded-xl border transition-colors"
+            style={{ borderColor: includeTableData ? '#6366F1' : '#e5e7eb', background: includeTableData ? '#6366F10d' : '#fff' }}
+          >
+            <span className="mt-0.5 w-4 h-4 rounded-full border-2 flex items-center justify-center flex-shrink-0" style={{ borderColor: includeTableData ? '#6366F1' : '#cbd5e1' }}>
+              {includeTableData && <span className="w-2 h-2 rounded-full" style={{ background: '#6366F1' }} />}
+            </span>
             <div>
               <div className="flex items-center gap-1.5">
                 <Database size={13} className="text-indigo-500" />
-                <span className="text-sm font-medium text-gray-800">Include full table data (offline mode)</span>
+                <span className="text-sm font-semibold text-gray-800">Offline report</span>
+                <code className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">.ovly</code>
               </div>
               <p className="text-xs text-gray-500 mt-1 leading-relaxed">
-                Bundles the complete rows of every table this report uses, so the canvas,
-                intelligence page, and AI copilot work with <strong>no database connection</strong>.
+                Bundles the full table data, so the canvas, intelligence page and AI copilot work with
+                <strong> no database connection</strong>.
               </p>
             </div>
-          </label>
+          </button>
 
           {includeTableData && (
             <div className="flex items-start gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5">
               <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" />
               <span>
-                The archive will contain the <strong>complete underlying data</strong> of the report’s
-                tables (up to 50,000 rows each). Share it only with people allowed to see that data.
+                The <code className="font-mono">.ovly</code> archive contains the <strong>complete underlying data</strong> of
+                the report’s tables (up to 50,000 rows each). Share it only with people allowed to see that data.
               </span>
             </div>
           )}
@@ -92,10 +118,10 @@ export function VlyExportModal({ canvasId, intelligence, onClose }: Props) {
             onClick={doExport}
             disabled={busy}
             className="w-full py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-50 transition-opacity hover:opacity-90"
-            style={{ background: 'linear-gradient(135deg, #0d9488, #2563EB)' }}
+            style={{ background: includeTableData ? 'linear-gradient(135deg, #6366F1, #7C3AED)' : 'linear-gradient(135deg, #0d9488, #2563EB)' }}
           >
             {busy ? <Loader2 size={14} className="animate-spin" /> : <FileArchive size={14} />}
-            {busy ? 'Building archive…' : 'Export .vly'}
+            {busy ? 'Building archive…' : `Export ${includeTableData ? '.ovly' : '.vly'}`}
           </button>
         </div>
       </div>

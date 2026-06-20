@@ -1455,13 +1455,47 @@ export interface AgentOptions {
   dateRange?: { from: string; to: string } | null  // Feature 1: time range override
   skipSchemaFetch?: boolean  // set true to skip schema-context fetch (e.g. per-section regen)
   force?: boolean            // bypass Redis cache and force a fresh Bedrock call
+  discover?: boolean         // mine the underlying tables for extra insights (discovery stage)
 }
 
 export async function runIntelligenceAgent(
   opts: AgentOptions,
   onProgress?: (step: string) => void,
 ): Promise<ExecutiveAnalysis> {
-  const { projectId, canvasId, canvasName, widgets, shareToken } = opts
+  const { projectId, canvasName, shareToken } = opts
+  const { canvasId } = opts
+  let widgets = opts.widgets
+
+  // Discovery stage — ask the backend to mine the report's tables for NEW insights
+  // beyond the existing widgets, then fold the results in as synthetic widgets so
+  // they flow through the same skills + orchestrator and appear as extra charts.
+  if (opts.discover) {
+    try {
+      onProgress?.('Discovering extra insights from the underlying tables…')
+      const dResp = await intelligenceApi.discover(canvasId, { force: opts.force })
+      const discovered = (dResp.data?.discoveries ?? []).filter(d => (d.chart_data?.rows?.length ?? 0) > 0)
+      if (discovered.length) {
+        const extra: WidgetInput[] = discovered.map((d, i) => ({
+          id: `discovered_${i}`,
+          title: d.title,
+          chart_type: d.chart_type || 'bar',
+          sql_query: d.sql,
+          chart_data: {
+            rows: d.chart_data.rows ?? [],
+            columns: d.chart_data.columns ?? [],
+            labels: (d.chart_data.labels ?? []).map(v => String(v ?? '')),
+            values: (d.chart_data.values ?? []).map(v => Number(v)),
+          },
+        }))
+        widgets = [...widgets, ...extra]
+        console.log(`[intelligence] discovery added ${extra.length} widget(s):`, extra.map(e => e.title))
+      } else {
+        console.log('[intelligence] discovery returned no usable datasets')
+      }
+    } catch (e) {
+      console.warn('[intelligence] discovery failed (non-fatal):', e)
+    }
+  }
 
   const sqlWidgets = widgets.filter(w => w.sql_query).length
   console.log(
