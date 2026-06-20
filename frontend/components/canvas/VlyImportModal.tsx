@@ -20,7 +20,7 @@ interface Props {
   onImported?: (dashboardId: string) => void
 }
 
-type State = 'idle' | 'dragging' | 'importing' | 'binding' | 'done' | 'error'
+type State = 'idle' | 'dragging' | 'choice' | 'importing' | 'binding' | 'done' | 'error'
 
 export function VlyImportModal({ projectId, connectionId, onClose, onImported }: Props) {
   const router = useRouter()
@@ -33,23 +33,26 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
     widget_count: number
     connection_linked: boolean
     original_name: string | null
+    data_mode?: 'live' | 'offline' | 'cached'
+    has_table_data?: boolean
+    table_count?: number
+    connection_test?: { ok: boolean; message: string } | null
   } | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
   const [connections, setConnections] = useState<Conn[]>([])
   const [selectedConn, setSelectedConn] = useState('')
   const [bindMsg, setBindMsg] = useState('')
+  const [retrying, setRetrying] = useState(false)
+  const [hasTableData, setHasTableData] = useState(false)
 
-  const handleFile = useCallback(async (f: File) => {
-    if (!f.name.endsWith('.vly') && !f.name.endsWith('.zip')) {
-      setErrorMsg('Please select a .vly file exported from Visually.')
-      setState('error')
-      return
-    }
+  // Run the actual import. preferOffline forces offline mode (use bundled tables,
+  // skip auto-matching a live connection).
+  const runImport = useCallback(async (f: File, preferOffline: boolean) => {
     setFile(f)
     setState('importing')
     setErrorMsg('')
     try {
-      const resp = await vlyApi.importVly(f, projectId, connectionId)
+      const resp = await vlyApi.importVly(f, projectId, connectionId, preferOffline)
       setResult(resp.data)
       setState('done')
       // If the import didn't auto-link a connection, load the project's connections
@@ -67,13 +70,43 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
     }
   }, [projectId, connectionId])
 
+  const handleFile = useCallback(async (f: File) => {
+    if (!/\.(vly|ovly|zip)$/i.test(f.name)) {
+      setErrorMsg('Please select a .vly or .ovly file exported from Visually.')
+      setState('error')
+      return
+    }
+    setFile(f)
+    setErrorMsg('')
+    // A .vly is a live export → import and connect straight away (no offline choice).
+    // Only a .ovly bundles offline data, so only it gets the offline vs live choice.
+    if (!/\.ovly$/i.test(f.name)) {
+      runImport(f, false)
+      return
+    }
+    // Peek inside: confirm the .ovly actually bundles full tables, then offer the choice.
+    let bundled = false
+    try {
+      const { default: JSZip } = await import('jszip')
+      const zip = await JSZip.loadAsync(f)
+      const man = zip.file('tables_manifest.json')
+      if (man) {
+        const parsed = JSON.parse(await man.async('string'))
+        bundled = (parsed?.tables || []).some((t: { included?: boolean }) => t.included)
+      }
+    } catch { /* peek failed — just import normally */ }
+    setHasTableData(bundled)
+    if (bundled) setState('choice')
+    else runImport(f, false)
+  }, [runImport])
+
   const bindLiveConnection = useCallback(async () => {
     if (!result || !selectedConn) return
     setState('binding')
     setBindMsg('')
     try {
       await vlyApi.bindConnection(result.dashboard_id, selectedConn, { crawl: true, refresh: true })
-      setResult(r => (r ? { ...r, connection_linked: true } : r))
+      setResult(r => (r ? { ...r, connection_linked: true, data_mode: 'live', connection_test: { ok: true, message: 'Connected' } } : r))
       setState('done')
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -81,6 +114,29 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
       setState('done')
     }
   }, [result, selectedConn])
+
+  // Re-probe a configured-but-unreachable live connection (complaint: no retry today).
+  const retryTest = useCallback(async () => {
+    if (!result) return
+    setRetrying(true)
+    try {
+      const r = await vlyApi.testConnection(result.dashboard_id)
+      setResult(prev => (prev ? { ...prev, connection_test: { ok: r.data.ok, message: r.data.message } } : prev))
+    } catch {
+      setResult(prev => (prev ? { ...prev, connection_test: { ok: false, message: 'Still unreachable' } } : prev))
+    } finally {
+      setRetrying(false)
+    }
+  }, [result])
+
+  // Lock the canvas into offline mode (query the bundled tables, no DB) and open it.
+  const continueOffline = useCallback(async () => {
+    if (!result) return
+    try { await vlyApi.setDataMode(result.dashboard_id, 'offline') } catch { /* non-fatal */ }
+    if (onImported) onImported(result.dashboard_id)
+    else router.push(`/projects/${projectId}/canvas/${result.dashboard_id}`)
+    onClose()
+  }, [result, onImported, router, projectId, onClose])
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -107,9 +163,9 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
       style={{ background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(4px)' }}
       onClick={e => { if (e.target === e.currentTarget && state !== 'importing') onClose() }}
     >
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden max-h-[90vh] flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 flex-shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl flex items-center justify-center"
               style={{ background: 'linear-gradient(135deg, #2563EB22, #7C3AED22)' }}>
@@ -127,7 +183,7 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
           )}
         </div>
 
-        <div className="p-5">
+        <div className="p-5 overflow-y-auto">
           {state === 'idle' || state === 'dragging' ? (
             <div
               onDragOver={e => { e.preventDefault(); setState('dragging') }}
@@ -145,7 +201,34 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
                 {state === 'dragging' ? 'Drop to import' : 'Drop your .vly file here'}
               </p>
               <p className="text-xs text-gray-400 mt-1">or click to browse</p>
-              <input ref={inputRef} type="file" accept=".vly,.zip" className="hidden" onChange={onFileChange} />
+              <input ref={inputRef} type="file" accept=".vly,.ovly,.zip" className="hidden" onChange={onFileChange} />
+            </div>
+          ) : state === 'choice' && file ? (
+            <div className="space-y-3">
+              <p className="text-xs text-gray-500 leading-relaxed">
+                <span className="font-medium text-gray-700">{file.name}</span> bundles its full table data, so it can
+                run <strong>entirely offline</strong> — or you can connect a live database for real-time data.
+              </p>
+              <button
+                onClick={() => runImport(file, true)}
+                className="w-full py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 hover:opacity-90"
+                style={{ background: 'linear-gradient(135deg, #6366F1, #7C3AED)' }}
+              >
+                <Database size={14} /> Open offline with bundled data
+              </button>
+              <button
+                onClick={() => runImport(file, false)}
+                className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 border"
+                style={{ borderColor: '#2563EB55', color: '#2563EB', background: '#2563EB10' }}
+              >
+                <Database size={14} /> Import &amp; connect to live data
+              </button>
+              <button
+                onClick={() => { setState('idle'); setFile(null) }}
+                className="w-full py-2 text-xs font-medium text-gray-500 hover:text-gray-700"
+              >
+                Choose a different file
+              </button>
             </div>
           ) : state === 'importing' || state === 'binding' ? (
             <div className="flex flex-col items-center justify-center py-10 gap-4">
@@ -188,12 +271,76 @@ export function VlyImportModal({ projectId, connectionId, onClose, onImported }:
                   <span className="font-medium text-gray-800">{result.widget_count}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs">
-                  <span className="text-gray-400">Live data</span>
-                  <span className={`font-medium ${result.connection_linked ? 'text-green-600' : 'text-amber-600'}`}>
-                    {result.connection_linked ? '✓ DB connection linked' : '⚠ Not connected — cached data'}
+                  <span className="text-gray-400">Data source</span>
+                  <span className={`font-medium ${
+                    result.connection_linked && result.connection_test?.ok !== false ? 'text-green-600'
+                    : result.has_table_data ? 'text-indigo-600'
+                    : 'text-amber-600'}`}>
+                    {result.connection_linked && result.connection_test?.ok !== false
+                      ? '✓ Live database connected'
+                      : result.connection_linked
+                        ? '✗ Database unreachable'
+                        : result.has_table_data
+                          ? `● Offline — ${result.table_count ?? 0} bundled table${(result.table_count ?? 0) !== 1 ? 's' : ''}`
+                          : '⚠ Not connected — cached snapshot only'}
                   </span>
                 </div>
+                {result.connection_linked && result.connection_test && !result.connection_test.ok && (
+                  <p className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-200">
+                    {result.connection_test.message}
+                  </p>
+                )}
               </div>
+
+              {/* ── Database unreachable → Retry / Continue offline ── */}
+              {result.connection_linked && result.connection_test && !result.connection_test.ok && (
+                <div className="border border-amber-100 bg-amber-50/40 rounded-xl p-4 space-y-3">
+                  <p className="text-xs text-gray-600 leading-relaxed">
+                    The linked database didn’t respond. Retry the connection, or
+                    {result.has_table_data ? ' open the canvas offline using the bundled table data.' : ' open with the cached snapshot.'}
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={retryTest}
+                      disabled={retrying}
+                      className="flex-1 py-2 rounded-lg text-xs font-semibold border border-gray-200 text-gray-700 hover:bg-white flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      {retrying ? <Loader2 size={12} className="animate-spin" /> : <Database size={12} />} Retry connection
+                    </button>
+                    {result.has_table_data && (
+                      <button
+                        onClick={continueOffline}
+                        className="flex-1 py-2 rounded-lg text-xs font-semibold text-white flex items-center justify-center gap-2 hover:opacity-90"
+                        style={{ background: 'linear-gradient(135deg, #6366F1, #7C3AED)' }}
+                      >
+                        Continue offline
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Offline canvas (bundled tables, no live DB) ── */}
+              {!result.connection_linked && result.has_table_data && (
+                <div className="border border-indigo-100 bg-indigo-50/40 rounded-xl p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Database size={14} className="text-indigo-500" />
+                    <p className="text-xs font-semibold text-gray-800">Offline mode available</p>
+                  </div>
+                  <p className="text-xs text-gray-500 leading-relaxed">
+                    This archive bundles {result.table_count ?? 0} full table{(result.table_count ?? 0) !== 1 ? 's' : ''}.
+                    You can open it and run the report + AI copilot entirely offline — no database connection needed.
+                    {connections.length > 0 ? ' Or connect a live database below.' : ''}
+                  </p>
+                  <button
+                    onClick={continueOffline}
+                    className="w-full py-2 rounded-lg text-xs font-semibold text-white flex items-center justify-center gap-2 hover:opacity-90"
+                    style={{ background: 'linear-gradient(135deg, #6366F1, #7C3AED)' }}
+                  >
+                    <Database size={12} /> Open offline with bundled data
+                  </button>
+                </div>
+              )}
 
               {/* ── Connect-to-live-data step (shown only when not auto-linked) ── */}
               {!result.connection_linked && (

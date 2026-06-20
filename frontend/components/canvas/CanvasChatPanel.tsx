@@ -1,6 +1,6 @@
 'use client'
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Bot, Loader2, X, Plus, Sparkles } from 'lucide-react'
+import { Send, Bot, Loader2, X, Plus, Sparkles, Database } from 'lucide-react'
 import { streamChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
@@ -51,6 +51,7 @@ interface Props {
   initialWidth?: number
   onAddToPage?: (charts: Array<ChartResult | ChatMsg['newWidget']>) => void
   prefillMessage?: string
+  isOffline?: boolean   // offline canvas: query bundled tables, hide the table picker
 }
 
 function inlineRender(text: string): React.ReactNode[] {
@@ -115,7 +116,7 @@ function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]):
   return Array.from(new Set(qs)).slice(0, 5)
 }
 
-export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage }: Props) {
+export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage, isOffline }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([{
     role: 'assistant',
     content: title
@@ -222,9 +223,11 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
           dashboard_id:   canvasId,
           connection_id:  connectionId,
           active_page_id: activePageId || undefined,
-          scope,
-          selected_tables: scope === 'selected' ? selectedTables : undefined,
-          selected_hops:   scope === 'selected' ? selectedHops : undefined,
+          // Offline: no table-scoping — the connection only holds the report's
+          // bundled tables, so use the full (offline) schema.
+          scope:           isOffline ? 'database' : scope,
+          selected_tables: (!isOffline && scope === 'selected') ? selectedTables : undefined,
+          selected_hops:   (!isOffline && scope === 'selected') ? selectedHops : undefined,
         },
         {
           onText: (delta) => { acc += delta; updateAssistant(m => ({ ...m, content: acc })) },
@@ -321,10 +324,22 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
         </button>
       </div>
 
-      {/* Scope bar — shared with the canvas toolbar picker via tableScopeStore */}
-      <div className="border-b border-gray-100 flex-shrink-0">
-        <TableScopePicker canvasId={canvasId} />
-      </div>
+      {/* Scope bar — shared with the canvas toolbar picker via tableScopeStore.
+          Offline canvases have no DB / table choice, so show a fixed indicator. */}
+      {isOffline ? (
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
+          <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold" style={{ background: '#eef2ff', color: '#4338ca', border: '1px solid #c7d2fe' }}>
+            <Database size={11} /> Offline data
+          </span>
+          <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
+            Answering from this report’s bundled tables (no live database)
+          </span>
+        </div>
+      ) : (
+        <div className="border-b border-gray-100 flex-shrink-0">
+          <TableScopePicker canvasId={canvasId} />
+        </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">

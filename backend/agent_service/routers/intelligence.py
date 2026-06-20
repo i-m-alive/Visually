@@ -367,14 +367,40 @@ _TABLE_RE = re.compile(
 )
 
 
+# CTE names defined via `WITH x AS (...)` (incl. chained `), y AS (...)`) — these
+# appear after FROM/JOIN but are NOT real tables, so exclude them.
+_CTE_RE = re.compile(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', re.IGNORECASE)
+
+
 def _extract_table_names(sql: str) -> set[str]:
-    """Pull bare table names (strip schema prefix) from a SQL statement."""
+    """Pull bare table names (strip schema prefix) from a SQL statement,
+    excluding CTE names defined in the same query."""
+    sql = sql or ""
+    cte = {m.lower() for m in _CTE_RE.findall(sql)}
     names: set[str] = set()
     for m in _TABLE_RE.finditer(sql):
-        full = m.group(1)
-        bare = full.split(".")[-1].lower()
+        bare = m.group(1).split(".")[-1].lower()
+        if bare in cte:
+            continue
         names.add(bare)
     return names
+
+
+def _extract_qualified_table_names(sql: str) -> list[str]:
+    """Like _extract_table_names but KEEPS the schema-qualified form
+    (e.g. 'staging.orders'), excluding CTE names. Needed for live discovery
+    sampling — a schema-qualified DB rejects bare table names."""
+    sql = sql or ""
+    cte = {m.lower() for m in _CTE_RE.findall(sql)}
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _TABLE_RE.finditer(sql):
+        name = m.group(1)
+        if name.split(".")[-1].lower() in cte or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append(name)
+    return out
 
 
 @router.get("/dashboards/{dashboard_id}/schema-context")
@@ -862,6 +888,37 @@ async def _run_widget_sql(
     return {"widget_id": widget_id, "ok": False, "error": error_msg}
 
 
+def _conn_db_type(conn) -> str:
+    if conn is None:
+        return ""
+    return conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+
+
+async def _run_widget_offline(
+    db: AsyncSession,
+    dashboard_id: str,
+    widget_id: str,
+    sql: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    """Execute one widget's SQL against the bundled DuckDB snapshot (offline mode)."""
+    from shared.offline_store import execute_offline_sql
+    working_sql = sql
+    if date_from and date_to:
+        working_sql = _inject_date_range(working_sql, date_from, date_to)
+    cleaned = re.sub(r'\bLIMIT\s+\d+\b', '', working_sql, flags=re.IGNORECASE).rstrip('; ')
+    capped_sql = f"{cleaned} LIMIT {_ROW_LIMIT}"
+    res = await execute_offline_sql(db, dashboard_id, capped_sql, _ROW_LIMIT)
+    if res.get("error"):
+        print(f"[intelligence-data] widget={widget_id[:8]} OFFLINE_ERROR: {res['error']}", flush=True)
+        return {"widget_id": widget_id, "ok": False, "error": res["error"]}
+    rows = res.get("rows") or []
+    columns = res.get("columns") or []
+    print(f"[intelligence-data] widget={widget_id[:8]}  rows={len(rows)}  cols={len(columns)}  mode=offline", flush=True)
+    return _build_result(widget_id, rows, columns)
+
+
 @router.post("/dashboards/{dashboard_id}/intelligence-data")
 async def get_intelligence_data(
     dashboard_id: str,
@@ -956,7 +1013,10 @@ async def get_intelligence_data(
         if not conn_id:
             skipped.append({"widget_id": str(w.id), "ok": False, "error": "no connection"})
             continue
-        tasks.append(_run_widget_sql(conn_id, str(w.id), w.sql_query, date_from, date_to, conn_obj))
+        if _conn_db_type(conn_obj) == "vly_offline":
+            tasks.append(_run_widget_offline(db, dashboard_id, str(w.id), w.sql_query, date_from, date_to))
+        else:
+            tasks.append(_run_widget_sql(conn_id, str(w.id), w.sql_query, date_from, date_to, conn_obj))
         task_widgets.append(w)
 
     print(
@@ -966,13 +1026,29 @@ async def get_intelligence_data(
         flush=True,
     )
 
-    # --- pre-warm the database before fan-out ---
+    # --- offline mode: warm the DuckDB snapshot once so the fan-out hits cache ---
+    # (Building it inside concurrent tasks would share the request's DB session
+    # unsafely; one warmup builds + caches it, after which queries never touch the
+    # session.) Skips the Redshift live pre-warm below entirely.
+    offline_any = any(
+        _conn_db_type(c) == "vly_offline"
+        for c in list(conn_obj_map.values()) + ([project_conn_obj] if project_conn_obj else [])
+    )
+    if offline_any and tasks:
+        try:
+            from shared.offline_store import execute_offline_sql as _warm_offline
+            await _warm_offline(db, dashboard_id, "SELECT 1", 1)
+            print(f"[intelligence-data] offline store warmed dashboard={dashboard_id[:8]}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[intelligence-data] offline warm failed (non-fatal): {exc}", flush=True)
+
+    # --- pre-warm the database before fan-out (live mode only) ---
     # Redshift Serverless auto-pauses; the first connect after idle takes 60–120s.
     # Without this, all N widget queries race a cold cluster and every one hits the
     # per-query timeout (the ReadTimeout storm seen in the logs). One warm-up SELECT 1
     # (with a long timeout) wakes it, so the real batch runs against a warm cluster.
     warm_conn_id = next((str(w.connection_id) for w in widgets if w.connection_id), project_conn_id)
-    if warm_conn_id and tasks:
+    if warm_conn_id and tasks and not offline_any:
         try:
             async with httpx.AsyncClient(timeout=130.0) as client:
                 await client.post(
@@ -1054,3 +1130,258 @@ async def get_intelligence_data(
             print(f"[intelligence-data] cache write failed (non-fatal): {exc}", flush=True)
 
     return payload
+
+
+# ─── /dashboards/{id}/intelligence-discovery ─────────────────────────────────
+# Discovery stage: mine the report's underlying tables for NEW insights beyond the
+# existing widgets. Samples each table, asks the LLM to propose analytical queries,
+# executes them (DuckDB offline OR live DB), and returns ready-to-chart datasets.
+# The frontend appends these as synthetic widgets so they flow through the normal
+# orchestrator and surface as extra charts/sections.
+
+_DISCOVERY_TTL = int(os.getenv("INTELLIGENCE_DISCOVERY_TTL", "1800"))
+_DISCOVERY_TABLE_CAP = int(os.getenv("INTELLIGENCE_DISCOVERY_TABLE_CAP", "8"))
+_DISCOVERY_ROW_CAP = int(os.getenv("INTELLIGENCE_DISCOVERY_ROW_CAP", "200"))
+_DISCOVERY_CONCURRENCY = int(os.getenv("INTELLIGENCE_DISCOVERY_CONCURRENCY", "4"))
+# Proposal JSON for 6 queries of non-trivial SQL needs headroom; 2048 truncated it.
+_DISCOVERY_MAX_TOKENS = int(os.getenv("INTELLIGENCE_DISCOVERY_MAX_TOKENS", "4096"))
+
+_DISCOVERY_SYSTEM_PROMPT = """You are a senior data analyst exploring a database to surface NEW business insights that are NOT already shown in an existing report. You will be given the report's tables (columns + sample rows), the dialect, and the titles of widgets that already exist.
+
+Propose analytical queries that reveal fresh, decision-useful findings (trends, segments, concentrations, ratios, outliers, cohorts) the existing widgets do NOT already cover. Each query MUST:
+- be a SINGLE read-only statement starting with SELECT or WITH (no INSERT/UPDATE/DELETE/DDL, no semicolons, no multiple statements),
+- aggregate/group so it returns at most ~50 rows (use GROUP BY, COUNT, SUM, AVG, etc.),
+- reference only the given tables and columns,
+- be valid in the stated DIALECT.
+
+Do NOT duplicate an existing widget's angle. Output ONLY raw JSON:
+{"discoveries":[{"title":"<short insight title>","chart_type":"bar|line|area|pie|donut|table","sql":"<one SELECT/WITH query>","why":"<one line: the business question it answers>"}]}"""
+
+_DISCOVERY_VALID_CHARTS = {"bar", "line", "area", "pie", "donut", "table"}
+
+
+def _extract_json_obj(text: str):
+    """Tolerant JSON-object extraction from model output."""
+    if not text:
+        return None
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\n?|```$", "", s, flags=re.MULTILINE).strip()
+    for cand in (s, re.sub(r",(\s*[}\]])", r"\1", s)):
+        try:
+            return json.loads(cand)
+        except Exception:
+            pass
+    # balanced-brace scan
+    depth = 0
+    start = -1
+    for i, ch in enumerate(s):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    return json.loads(re.sub(r",(\s*[}\]])", r"\1", s[start:i + 1]))
+                except Exception:
+                    start = -1
+    return None
+
+
+def _is_safe_select(sql: str) -> bool:
+    s = (sql or "").strip().rstrip(";").strip()
+    low = s.lower()
+    if not (low.startswith("select") or low.startswith("with")):
+        return False
+    if ";" in s:
+        return False
+    banned = ("insert ", "update ", "delete ", "drop ", "alter ", "create ",
+              "truncate ", "grant ", "revoke ", "attach ", "copy ", "pragma ", " into ")
+    return not any(b in low for b in banned)
+
+
+async def _discovery_exec(db, offline: bool, dashboard_id: str, conn_id: Optional[str], sql: str, cap: int) -> dict:
+    """Run a read query in the dashboard's mode (offline DuckDB or live executor)."""
+    if offline:
+        from shared.offline_store import execute_offline_sql
+        return await execute_offline_sql(db, dashboard_id, sql, cap)
+    if not conn_id:
+        return {"rows": [], "columns": [], "error": "no connection"}
+    from agent_service.utils.http_clients import call_query_executor
+    return await call_query_executor(conn_id, sql, row_limit=cap, timeout_seconds=40)
+
+
+class DiscoveryRequest(BaseModel):
+    max_queries: int = 6
+    force: bool = False
+
+
+@router.post("/dashboards/{dashboard_id}/intelligence-discovery")
+async def intelligence_discovery(
+    dashboard_id: str,
+    body: Optional[DiscoveryRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Propose + execute NEW analytical queries against the report's tables and
+    return chart-ready datasets ('discovered widgets')."""
+    max_queries = max(1, min(10, body.max_queries if body else 6))
+    force = bool(body.force) if body else False
+
+    try:
+        dash_uuid = uuid.UUID(dashboard_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid dashboard_id")
+
+    dash = (await db.execute(select(Dashboard).where(Dashboard.id == dash_uuid))).scalar_one_or_none()
+    if not dash:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+    widgets = (await db.execute(select(Widget).where(Widget.dashboard_id == dash_uuid))).scalars().all()
+
+    # ── resolve connection + mode ───────────────────────────────────────────
+    conn_obj = None
+    conn_ids = {w.connection_id for w in widgets if w.connection_id}
+    if conn_ids:
+        conn_obj = (await db.execute(
+            select(DatabaseConnection).where(DatabaseConnection.id == next(iter(conn_ids)))
+        )).scalar_one_or_none()
+    if conn_obj is None:
+        lc_conn = (dash.layout_config or {}).get("connection_id") if isinstance(dash.layout_config, dict) else None
+        if lc_conn:
+            try:
+                conn_obj = (await db.execute(
+                    select(DatabaseConnection).where(DatabaseConnection.id == uuid.UUID(str(lc_conn)))
+                )).scalar_one_or_none()
+            except ValueError:
+                conn_obj = None
+    if conn_obj is None:
+        pc = (await db.execute(
+            select(DatabaseConnection)
+            .where(DatabaseConnection.project_id == dash.project_id)
+            .where(DatabaseConnection.is_active == True)  # noqa: E712
+            .limit(1)
+        )).scalar_one_or_none()
+        conn_obj = pc
+    if conn_obj is None:
+        return {"discoveries": [], "message": "No connection or offline data for discovery"}
+
+    offline = _conn_db_type(conn_obj) == "vly_offline"
+    conn_id = str(conn_obj.id)
+    dialect = "duckdb" if offline else (conn_obj.db_type.value if hasattr(conn_obj.db_type, "value") else str(conn_obj.db_type))
+
+    # ── table list ───────────────────────────────────────────────────────────
+    # Offline: use the AUTHORITATIVE bundled table names (no phantom CTE/alias
+    # names, exact schema-qualified form). Live: extract from widget SQL.
+    table_names: list[str] = []
+    if offline:
+        from shared.models.vly_offline import VlyOfflineTable
+        recs = (await db.execute(
+            select(VlyOfflineTable.table_name).where(VlyOfflineTable.dashboard_id == dash_uuid)
+        )).all()
+        table_names = [r[0] for r in recs][:_DISCOVERY_TABLE_CAP]
+    else:
+        # Live: keep schema-qualified names — a schema-qualified DB (e.g. Redshift
+        # with a 'staging' schema) rejects bare table names, so sampling would fail.
+        seen: set = set()
+        for w in widgets:
+            for t in _extract_qualified_table_names(w.sql_query or w.base_sql or ""):
+                if t.lower() not in seen:
+                    seen.add(t.lower())
+                    table_names.append(t)
+        table_names = table_names[:_DISCOVERY_TABLE_CAP]
+    if not table_names:
+        return {"discoveries": [], "message": "No tables available for discovery"}
+
+    # ── cache check ──────────────────────────────────────────────────────────
+    redis = await get_redis()
+    titles = sorted((w.title or "") for w in widgets)
+    cache_seed = dashboard_id + "|" + "|".join(table_names) + "|" + "|".join(titles) + f"|{max_queries}|{dialect}"
+    cache_key = f"intel:discovery:{hashlib.sha256(cache_seed.encode()).hexdigest()[:24]}"
+    if redis is not None and not force:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                print(f"[intel-discovery] CACHE HIT dashboard={dashboard_id[:8]}", flush=True)
+                return json.loads(cached)
+        except Exception:
+            pass
+
+    # ── warm offline store once (so concurrent samples hit cache, not db) ────
+    if offline:
+        try:
+            await _discovery_exec(db, True, dashboard_id, conn_id, "SELECT 1", 1)
+        except Exception:
+            pass
+
+    # ── sample each table ────────────────────────────────────────────────────
+    schema_blocks: list[str] = []
+    for t in table_names:
+        res = await _discovery_exec(db, offline, dashboard_id, conn_id, f"SELECT * FROM {t} LIMIT 3", 3)
+        if res.get("error"):
+            continue
+        cols = (res.get("columns") or [])[:40]
+        rows = res.get("rows") or []
+        sample = [{c: r.get(c) for c in cols} for r in rows[:3]]
+        schema_blocks.append(
+            f"TABLE {t}\n  columns: {', '.join(cols)}\n  sample_rows: {json.dumps(sample, default=str)[:1500]}"
+        )
+    if not schema_blocks:
+        print(f"[intel-discovery] dashboard={dashboard_id[:8]}  offline={offline}  could not sample any of: {table_names}", flush=True)
+        return {"discoveries": [], "message": "Could not sample any tables"}
+
+    existing = ", ".join(f'"{t}"' for t in titles if t) or "(none)"
+    user_msg = (
+        f"DIALECT: {dialect}\n\n"
+        f"TABLES:\n" + "\n\n".join(schema_blocks) +
+        f"\n\nEXISTING REPORT WIDGETS (do NOT duplicate these angles):\n{existing}\n\n"
+        f"Propose up to {max_queries} NEW analytical queries as specified."
+    )
+
+    print(f"[intel-discovery] dashboard={dashboard_id[:8]}  offline={offline}  tables={len(schema_blocks)}  max_q={max_queries}", flush=True)
+    try:
+        raw = await _intel_bedrock_invoke(_DISCOVERY_SYSTEM_PROMPT, user_msg, max_tokens=_DISCOVERY_MAX_TOKENS, temperature=0.5)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[intel-discovery] LLM failed: {exc}", flush=True)
+        return {"discoveries": [], "message": f"LLM failed: {exc}"}
+
+    parsed = _extract_json_obj(raw) or {}
+    proposals = parsed.get("discoveries") or []
+    proposals = [p for p in proposals if isinstance(p, dict) and _is_safe_select(p.get("sql", ""))][:max_queries]
+    print(f"[intel-discovery] proposals={len(proposals)} (after safety filter)", flush=True)
+
+    # ── execute proposals (bounded concurrency) ──────────────────────────────
+    sem = asyncio.Semaphore(_DISCOVERY_CONCURRENCY)
+
+    async def _run(p: dict) -> Optional[dict]:
+        async with sem:
+            res = await _discovery_exec(db, offline, dashboard_id, conn_id, p["sql"], _DISCOVERY_ROW_CAP)
+        if res.get("error") or not (res.get("rows")):
+            if res.get("error"):
+                print(f"[intel-discovery] '{p.get('title')}' exec failed: {str(res['error'])[:120]}", flush=True)
+            return None
+        rows = res.get("rows") or []
+        columns = res.get("columns") or []
+        labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
+        values = ([r.get(columns[1]) for r in rows] if len(columns) > 1
+                  else [r.get(columns[0]) for r in rows] if columns else [])
+        ct = str(p.get("chart_type", "bar")).lower()
+        if ct not in _DISCOVERY_VALID_CHARTS:
+            ct = "bar"
+        return {
+            "title": str(p.get("title") or "Discovered insight")[:120],
+            "chart_type": ct,
+            "sql": p["sql"],
+            "why": str(p.get("why") or "")[:240],
+            "chart_data": {"rows": rows, "columns": columns, "labels": labels, "values": values},
+        }
+
+    executed = [d for d in await asyncio.gather(*[_run(p) for p in proposals]) if d]
+    print(f"[intel-discovery] executed OK={len(executed)}/{len(proposals)} dashboard={dashboard_id[:8]}", flush=True)
+
+    out = {"discoveries": executed}
+    if redis is not None and executed:
+        try:
+            await redis.set(cache_key, json.dumps(out, default=str), ex=_DISCOVERY_TTL)
+        except Exception:
+            pass
+    return out

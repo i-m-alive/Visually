@@ -186,6 +186,7 @@ async def end_user_create_connection(
 @router.post("/end-user/import-vly", status_code=201)
 async def end_user_import_vly(
     file: UploadFile = File(...),
+    prefer_offline: bool = Form(False),
     current_user: User = Depends(_get_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -196,7 +197,8 @@ async def end_user_import_vly(
     """
     from shared.models.projects import Project
     from shared.models.project_members import ProjectMember, MemberRole
-    from shared.models.database_connections import DatabaseConnection
+    from shared.models.database_connections import DatabaseConnection, DbType
+    from shared.models.vly_offline import VlyOfflineTable
 
     raw = await file.read()
     if not raw:
@@ -217,8 +219,16 @@ async def end_user_import_vly(
         queries_doc: dict  = json.loads(zf.read("queries.json"))  if "queries.json"  in names else {}
         schema_enriched    = json.loads(zf.read("schema_enriched.json")) if "schema_enriched.json" in names else {}
         ai_context_doc     = json.loads(zf.read("ai_context.json"))      if "ai_context.json"      in names else {}
+        tables_manifest: dict = json.loads(zf.read("tables_manifest.json")) if "tables_manifest.json" in names else {}
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Malformed JSON in .vly: {exc}")
+
+    # Bundled raw tables for offline use (only entries actually present in the zip).
+    offline_table_entries = [
+        e for e in (tables_manifest.get("tables") or [])
+        if e.get("included") and e.get("path") in names
+    ]
+    has_table_data = len(offline_table_entries) > 0
 
     # ── Find or create personal "Imported Reports" project ─────────────────────
     proj_result = await db.execute(
@@ -265,8 +275,8 @@ async def end_user_import_vly(
     if hint:
         layout_cfg["connection_hint"] = hint
         hint_host = hint.get("host", "")
-        hint_db   = hint.get("database", "")
-        if hint_host and hint_db:
+        hint_db   = hint.get("database", "") or hint.get("database_name", "")
+        if hint_host and hint_db and not prefer_offline:
             mc_result = await db.execute(
                 select(DatabaseConnection)
                 .join(Project, Project.id == DatabaseConnection.project_id)
@@ -314,6 +324,36 @@ async def end_user_import_vly(
     db.add(new_dash)
     await db.flush()
 
+    # ── Offline mode: no live DB but raw tables are bundled ─────────────────────
+    # Mirror the builder import — create a synthetic vly_offline connection bound to
+    # this dashboard, persist the Parquet tables, and bind widgets to it so the
+    # report + copilot run on DuckDB over the bundled data.
+    resolved_conn_id = matched_conn_id
+    offline_conn_id: uuid.UUID | None = None
+    if not matched_conn_id and has_table_data:
+        offline_conn = DatabaseConnection(
+            id=uuid.uuid4(),
+            project_id=personal_project.id,
+            name="Offline (imported tables)",
+            db_type=DbType.vly_offline,
+            connection_options={"dashboard_id": str(new_dash.id)},
+            is_active=True,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(offline_conn)
+        await db.flush()
+        offline_conn_id = offline_conn.id
+        resolved_conn_id = offline_conn_id
+        print(f"[end-user-import] offline: created connection for dashboard={str(new_dash.id)[:8]} — {len(offline_table_entries)} table(s) persist after the canvas commit", flush=True)
+
+    data_mode = "live" if matched_conn_id else ("offline" if offline_conn_id else "cached")
+    lc2 = dict(new_dash.layout_config or {})
+    lc2["data_mode"] = data_mode
+    if resolved_conn_id:
+        lc2["connection_id"] = str(resolved_conn_id)
+    new_dash.layout_config = lc2
+
     # ── Create permanent CanvasCollaborator row ─────────────────────────────────
     # This is what makes the canvas appear in GET /dashboards/shared-with-me
     # permanently — without this the canvas was invisible after the share token expired.
@@ -349,7 +389,7 @@ async def end_user_import_vly(
             chart_type=w_def.get("chart_type", "bar"),
             sql_query=q_info.get("sql")     or None,
             base_sql=q_info.get("base_sql") or None,
-            connection_id=matched_conn_id,   # linked when host+db matched an existing connection
+            connection_id=resolved_conn_id,   # matched live conn, or synthetic vly_offline, or None
             position_x=w_def.get("position_x", 0),
             position_y=w_def.get("position_y", 0),
             width=w_def.get("width", 6),
@@ -364,6 +404,50 @@ async def end_user_import_vly(
 
     await db.commit()
     await db.refresh(new_dash)
+
+    # ── persist offline tables (per-table, isolated commits) ───────────────────
+    # Done AFTER the small canvas commit so a big single transaction of Parquet
+    # blobs can't hang the import. Each table commits on its own with a tight
+    # timeout; a slow/contended platform DB degrades gracefully instead of hanging.
+    offline_persisted = 0
+    if offline_conn_id and offline_table_entries:
+        from sqlalchemy import text as _sql_text
+        for e in offline_table_entries:
+            try:
+                pq_bytes = zf.read(e["path"])
+            except Exception:
+                continue
+            try:
+                await db.execute(_sql_text("SET LOCAL statement_timeout = '45s'"))
+                db.add(VlyOfflineTable(
+                    id=uuid.uuid4(),
+                    dashboard_id=new_dash.id,
+                    table_name=e.get("name") or e["path"],
+                    columns_json=e.get("columns") or [],
+                    parquet_bytes=pq_bytes,
+                    row_count=int(e.get("row_count") or 0),
+                    truncated=bool(e.get("truncated")),
+                    source_dialect=e.get("source_dialect"),
+                    created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                offline_persisted += 1
+                print(f"[end-user-import] offline table '{e.get('name')}' persisted {len(pq_bytes)/1024/1024:.2f} MB", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                print(f"[end-user-import] offline table '{e.get('name')}' FAILED: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        print(f"[end-user-import] offline: persisted {offline_persisted}/{len(offline_table_entries)} table(s)", flush=True)
+        if offline_persisted == 0:
+            # nothing landed → don't promise offline
+            try:
+                _lc = dict(new_dash.layout_config or {})
+                _lc["data_mode"] = "cached"
+                new_dash.layout_config = _lc
+                await db.commit()
+                data_mode = "cached"
+            except Exception:
+                await db.rollback()
+
     zf.close()
 
     # ── Issue a long-lived analyst share token (90 days) ───────────────────────
@@ -393,6 +477,10 @@ async def end_user_import_vly(
         "has_intelligence":  layout_cfg["has_intelligence"],
         "expires_at":        expires.isoformat(),
         "saved_permanently": True,   # canvas is now in My Reports via CanvasCollaborator
+        "data_mode":         data_mode,
+        "has_table_data":    has_table_data,
+        "table_count":       len(offline_table_entries),
+        "offline_connection_id": str(offline_conn_id) if offline_conn_id else None,
     }
 
 

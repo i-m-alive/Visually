@@ -17,6 +17,9 @@ class DbType(str, enum.Enum):
     mssql = "mssql"
     rest_api = "rest_api"
     csv = "csv"
+    # Synthetic connection type for canvases imported WITHOUT a live DB. SQL is
+    # executed by DuckDB over the tables bundled in the .vly (see OfflineStore).
+    vly_offline = "vly_offline"
 
 
 class DatabaseConnection(Base):

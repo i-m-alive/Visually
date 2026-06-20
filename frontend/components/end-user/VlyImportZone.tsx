@@ -18,8 +18,8 @@ export function VlyImportZone({ importing, onImport, onClose }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
 
   const handleFile = useCallback(async (f: File) => {
-    if (!f.name.endsWith('.vly')) {
-      setError('Only .vly files are supported.')
+    if (!/\.(vly|ovly)$/i.test(f.name)) {
+      setError('Only .vly / .ovly files are supported.')
       return
     }
     setError(null)
@@ -96,7 +96,7 @@ export function VlyImportZone({ importing, onImport, onClose }: Props) {
           <input
             ref={inputRef}
             type="file"
-            accept=".vly"
+            accept=".vly,.ovly"
             className="hidden"
             onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f) }}
           />
@@ -151,12 +151,8 @@ export function VlyImportZone({ importing, onImport, onClose }: Props) {
         <ConnectionPromptModal
           fileName={file.name}
           connectionHint={connHint ?? undefined}
-          onConnect={_details => {
+          onConnect={async _details => {
             // For now, import without pre-created connectionId — the backend auto-matches by host/db
-            setShowConnPrompt(false)
-            onImport(file)
-          }}
-          onSkip={() => {
             setShowConnPrompt(false)
             onImport(file)
           }}

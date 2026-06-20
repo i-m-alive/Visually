@@ -1,8 +1,9 @@
 'use client'
 import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { Plus, Layers, ArrowRight, Loader2, AlertCircle, BarChart2, Trash2, Pencil, Check, X, Zap } from 'lucide-react'
+import { Plus, Layers, ArrowRight, Loader2, AlertCircle, BarChart2, Trash2, Pencil, Check, X, Zap, FileArchive } from 'lucide-react'
 import { canvasApi } from '@/lib/api'
+import { VlyImportModal } from '@/components/canvas/VlyImportModal'
 
 interface Canvas {
   id: string
@@ -20,6 +21,7 @@ export default function CanvasListPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showNew, setShowNew] = useState(false)
+  const [showImport, setShowImport] = useState(false)
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
@@ -108,6 +110,12 @@ export default function CanvasListPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
+            onClick={() => setShowImport(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-white text-gray-700 text-sm font-medium rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors"
+          >
+            <FileArchive size={14} /> Import .vly
+          </button>
+          <button
             onClick={() => setShowNew(true)}
             className="flex items-center gap-2 px-4 py-2 bg-brand text-white text-sm font-medium rounded-lg hover:bg-brand/90 transition-colors"
           >
@@ -115,6 +123,14 @@ export default function CanvasListPage() {
           </button>
         </div>
       </div>
+
+      {showImport && (
+        <VlyImportModal
+          projectId={projectId}
+          onClose={() => setShowImport(false)}
+          onImported={(dashboardId) => { setShowImport(false); router.push(`/projects/${projectId}/canvas/${dashboardId}`) }}
+        />
+      )}
 
       <div className="flex-1 overflow-auto p-6">
         {error && (

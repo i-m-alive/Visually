@@ -103,7 +103,7 @@ _SECTION_JSON_SHAPE = """{
   "insights": [{"icon":"<icon>","headline":"...","detail":"<specific stat>","type":"positive|negative|neutral|warning","confidence":4}],
   "top_performers": [{"label":"...","value":0,"formatted_value":"...","pct_of_total":0,"rank":1}],
   "bottom_performers": [{"label":"...","value":0,"formatted_value":"...","rank":1}],
-  "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[]}],
+  "kpis": [{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[],"explanation":"<1 sentence: what this KPI measures and why it matters>"}],
   "charts": [{"title":"...","type":"__CHART_TYPES__","insight":"<1-2 sentence finding specific to this chart's data>","data":[{"name":"...","value":0}],"series":[{"key":"...","type":"bar|line"}],"target_value":0,"x_key":"...","y_key":"..."}]
 }""".replace("__CHART_TYPES__", VALID_CHART_TYPES)
 
@@ -323,12 +323,19 @@ The shared context below contains the full database schema, cross-widget correla
 
 FOCUS: produce BUSINESS insights (revenue, customers, trends, segments, performance, risk, opportunity). Do NOT discuss data quality, null rates, completeness, or data hygiene anywhere.
 
+NUMBER FORMAT (follow exactly — these rules are how your draft is judged):
+- Cite figures from the widget facts' "EXACT VALUES", "TOP PERFORMERS (exact)" and "BREAKDOWN" lines — these are the precise source numbers. Copy them VERBATIM, keeping their scale. Do NOT rescale or convert units: if a value is 30.26 on a "revenue (millions)" widget, write "30.26 million" (or "$30.26M") — NEVER "$30,260,000".
+- Do NOT recompute or derive new numbers (no summing, no ratios/percentages you calculate yourself). Use values as given.
+- Do NOT fabricate or rescale chart points (e.g. never turn 4.52 into 452). Chart "data" values, "value", "target_value", "max_value", "sparkline_data" use the EXACT source numbers (decimals allowed, no thousand separators).
+- Avoid VAGUE words entirely: never "about", "roughly", "~", "approximately", "nearly", "over X". State the exact figure.
+- Prose may use thousands separators ("4,200,000") and percentages in any form ("18%", "43.6%").
+- data_story, key_finding and narrative must each feature a DIFFERENT headline figure — do not repeat the same number across these THREE prose fields. (Reusing a number in top_performers / kpis / charts is fine.)
+
 RULES:
-- data_story, key_finding and narrative must each introduce DIFFERENT numbers — never repeat the same figure across them.
-- Use EXACT numeric values — NEVER round or abbreviate. Write 4200000, not 4.2M / "4.2 million". Keep full precision from the source data.
 - Build 2-3 charts from the real row data; pick the BEST type per data shape. Max 20 data points per chart.
 - For a table chart, preserve ALL meaningful column names as keys (e.g. {{"customer":"Acme","revenue":120000,"region":"West"}}), up to 50 rows.
 - top_performers / bottom_performers: 3 rows each from the TOP/BOTTOM PERFORMERS facts.
+- SPARKLINES: set "sparkline_data" ONLY for genuine TIME-SERIES KPIs (values ordered over time, from a time-series widget). For ranked/top-N, categorical, or single-point metrics, use "sparkline_data": [] — NEVER put rankings or category counts in a sparkline (a sparkline implies a trend over time). Never invent a data label like "Latest" or a percentage that is not in the widget facts.
 - Use ONLY icons from: {VALID_ICON_NAMES}
 
 Output ONLY raw JSON for this single section — no markdown, no prose:
@@ -347,7 +354,7 @@ async def _write_section(canvas_name: str, shared_context: str, sec: dict, fix_n
     try:
         raw = await _invoke_json(
             _WRITER_MODEL, _WRITER_INSTRUCTION, shared_context, user,
-            _WRITER_MAX_TOKENS, 0.35, f'write:{sec["id"]}',
+            _WRITER_MAX_TOKENS, 0.2, f'write:{sec["id"]}',
         )
         parsed = _extract_json(raw)
         if not isinstance(parsed, dict):
@@ -365,18 +372,26 @@ async def _write_section(canvas_name: str, shared_context: str, sec: dict, fix_n
 
 
 # ── STAGE 3: CRITIC ───────────────────────────────────────────────────────────
-_CRITIC_INSTRUCTION = """You are a strict editor validating ONE section of an executive report against hard rules. Use the shared context (the pre-computed widget facts) to check that cited numbers are plausible from the data.
+_CRITIC_INSTRUCTION = """You are an editor doing a LIGHT validation pass on ONE section of an executive report. DEFAULT TO PASS — when in doubt, pass.
 
-Check ALL of these:
-1. EXACT VALUES: chart data and KPIs use full numbers, never rounded/abbreviated (no "4.2M", "~3K", "about 5 million").
-2. NO REPEATED FIGURES: data_story, key_finding and narrative each use DIFFERENT numbers (no figure repeated across them).
-3. NO DATA-QUALITY TALK: nothing about null rates, completeness, data hygiene, or quality scores.
-4. GROUNDED: cited numbers are consistent with the widget facts in the shared context (not invented).
-5. CHARTS: every chart has a non-empty data array and a valid type.
-6. COMPLETE: data_story, key_finding, narrative, recommendation and at least one chart are all present and non-trivial.
+NEVER FLAG (these are 100% acceptable — do not mention them at all):
+- Percentages in ANY form or precision: "96%", "38%", "10%", "43.6%". NEVER recompute a percentage and NEVER ask for more decimals.
+- Number notation/scale: "30.26 million", "$30,260,000", "6,762", "6.8K", with or without thousands-separators.
+- An EMPTY "sparkline_data": [] — this is ALWAYS correct on any KPI; never ask to remove or justify it.
+- Business language such as "risk", "margin compression", "churn", "attrition", "concentration", "exposure" — these are insights, NOT data-quality talk.
+- A "trend"/"trend_pct" on a KPI; rounded-but-specific numbers; stylistic wording.
 
-Output ONLY raw JSON: {"ok": true|false, "issues": ["short, actionable fix instruction", ...]}
-Set ok=false ONLY for real violations of rules 1-6. List each issue as a concrete instruction the writer can act on. If the section is good, return {"ok": true, "issues": []}."""
+Fail (ok=false) ONLY for one of these concrete violations:
+1. VAGUE / APPROXIMATE WORDING — the literal words "about", "roughly", "~", "approximately", "nearly", or "over X" before a number. (A bare percentage like "96%" is NOT vague — do not flag it.)
+2. The SAME number repeated across ALL THREE prose fields (data_story AND key_finding AND narrative). Overlap with top_performers/kpis/charts is fine.
+3. EXPLICIT data-hygiene talk only: "null rate", "% complete", "missing values", "X nulls", "data quality score", "data hygiene". (Business risk/margin/churn wording does NOT count.)
+4. A chart with an empty/missing "data" array or an invalid "type".
+5. A FABRICATED or RESCALED figure — a value/time-series that appears NOWHERE in the widget facts (e.g. inventing per-month values for a metric the facts only give as a total, or multiplying 4.52 into 452). A number matching any value in "EXACT VALUES"/"TOP PERFORMERS"/"BREAKDOWN" is grounded — accept it. Do NOT flag values you merely cannot verify.
+6. A MISSING required field: data_story, key_finding, narrative, recommendation, or all charts.
+7. A NON-EMPTY "sparkline_data" whose values are a ranking/top-N or category counts (not a time series), or an invented label like "Latest". (Empty [] is fine — see NEVER FLAG.)
+
+Output ONLY raw JSON: {"ok": true|false, "issues": ["concise, actionable fix", ...]}
+If acceptable, return {"ok": true, "issues": []}."""
 
 
 async def _critique(section: dict, shared_context: str) -> dict:
@@ -432,7 +447,7 @@ Produce:
 - kpis: 4-6 top-level KPIs drawn from the most important section metrics.
 
 Do NOT discuss data quality. Output ONLY raw JSON:
-{"title":"...","subtitle":"...","morning_brief":"...","kpis":[{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[]}]}"""
+{"title":"...","subtitle":"...","morning_brief":"...","kpis":[{"label":"...","value":"...","trend":"up|down|neutral","trend_pct":"+X%","sparkline_data":[],"explanation":"<1 sentence: what this KPI measures and why it matters>"}]}"""
 
 
 async def _reduce(canvas_name: str, sections: list[dict]) -> dict:

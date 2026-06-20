@@ -10,7 +10,7 @@ import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
   Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
-  FunctionSquare, Clock, Shield, FileDown, FileUp, Zap, Table2,
+  FunctionSquare, Clock, Shield, FileDown, Zap, Table2, Database,
 } from 'lucide-react'
 import { canvasApi, widgetApi, vlyApi, scheduleApi } from '@/lib/api'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
@@ -18,7 +18,8 @@ import { ZoomModal } from '@/components/canvas/ZoomModal'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
 import { TableScopePicker } from '@/components/canvas/TableScopePicker'
 import { useTableScopeStore } from '@/stores/tableScopeStore'
-import { VlyImportModal } from '@/components/canvas/VlyImportModal'
+import { VlyExportModal } from '@/components/canvas/VlyExportModal'
+import { ConnectLiveDbModal } from '@/components/canvas/ConnectLiveDbModal'
 import { VisuallReport } from '@/components/canvas/VisuallReport'
 import { CanvasPageTabs, type CanvasPage } from '@/components/canvas/CanvasPageTabs'
 import { MeasuresPanel } from '@/components/canvas/MeasuresPanel'
@@ -134,6 +135,8 @@ interface CanvasDetail {
   widgets: WidgetWithPosition[]
   pages?: CanvasPage[]
   layout_config?: Record<string, unknown>
+  is_offline?: boolean
+  connection_hint?: import('@/components/canvas/ConnectLiveDbModal').ConnHint
 }
 
 export default function CanvasEditorPage() {
@@ -149,7 +152,8 @@ export default function CanvasEditorPage() {
   const [savedOk, setSavedOk]         = useState(false)
   const [showChat, setShowChat]       = useState(false)
   const [showTablePicker, setShowTablePicker] = useState(false)
-  const [showImport, setShowImport]   = useState(false)
+  const [showExport, setShowExport]   = useState(false)
+  const [showConnectDb, setShowConnectDb] = useState(false)
   const [tablesPopPos, setTablesPopPos] = useState<{ top: number; right: number } | null>(null)
   const tablesBtnRef = useRef<HTMLButtonElement>(null)
   const [showReport, setShowReport]   = useState(false)
@@ -762,14 +766,16 @@ export default function CanvasEditorPage() {
               <FileJson size={16} />
               <span className="text-[9px]">JSON</span>
             </button>
-            <button onClick={() => vlyApi.exportVly(canvasId)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-teal-50 hover:text-teal-700 transition-colors text-gray-600" title="Export .vly">
+            <button onClick={() => setShowExport(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-teal-50 hover:text-teal-700 transition-colors text-gray-600" title="Export .vly">
               <FileDown size={16} />
               <span className="text-[9px]">Export .vly</span>
             </button>
-            <button onClick={() => setShowImport(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-indigo-50 hover:text-indigo-700 transition-colors text-gray-600" title="Import a .vly file">
-              <FileUp size={16} />
-              <span className="text-[9px]">Import .vly</span>
-            </button>
+            {(canvas?.is_offline || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline') && (
+              <button onClick={() => setShowConnectDb(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-indigo-50 hover:text-indigo-700 transition-colors text-indigo-600" title="Connect a live database — switch from bundled offline data to real-time data">
+                <Database size={16} />
+                <span className="text-[9px]">Connect DB</span>
+              </button>
+            )}
           </div>
           <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Share</span>
         </div>
@@ -837,11 +843,19 @@ export default function CanvasEditorPage() {
               </>,
               document.body,
             )}
-            {showImport && (
-              <VlyImportModal
+            {showExport && (
+              <VlyExportModal
+                canvasId={canvasId}
+                onClose={() => setShowExport(false)}
+              />
+            )}
+            {showConnectDb && (
+              <ConnectLiveDbModal
                 projectId={projectId}
-                connectionId={widgets.find(w => w.connection_id)?.connection_id}
-                onClose={() => setShowImport(false)}
+                dashboardId={canvasId}
+                hint={canvas?.connection_hint}
+                onClose={() => setShowConnectDb(false)}
+                onConnected={() => window.location.reload()}
               />
             )}
             <button
@@ -1046,6 +1060,7 @@ export default function CanvasEditorPage() {
               activePageId={activePageId}
               onClose={() => setShowChat(false)}
               onWidgetAdded={() => load(true)}
+              isOffline={canvas?.is_offline || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline'}
             />
           </div>
         )}

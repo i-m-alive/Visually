@@ -40,6 +40,16 @@ async def route_and_execute(
             "error": f"Connection {connection_id} not found",
         }
 
+    _db_type_early = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+    if _db_type_early == "vly_offline":
+        # Offline (imported, no live DB): execute against the bundled DuckDB snapshot.
+        from shared.offline_store import execute_offline_sql
+        dashboard_id = (conn.connection_options or {}).get("dashboard_id") if isinstance(conn.connection_options, dict) else None
+        if not dashboard_id:
+            return {"rows": [], "row_count": 0, "columns": [], "duration_ms": 0,
+                    "truncated": False, "error": "Offline connection missing dashboard_id"}
+        return await execute_offline_sql(db, str(dashboard_id), sql, row_limit)
+
     password = ""
     if conn.encrypted_password:
         try:

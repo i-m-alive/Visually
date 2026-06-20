@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.database import get_db
 from shared.models.dashboards import Dashboard
-from shared.models.database_connections import DatabaseConnection
+from shared.models.database_connections import DatabaseConnection, DbType
 from shared.models.users import User
 from shared.models.widgets import Widget
 from shared.security import decode_token
@@ -138,13 +138,19 @@ async def _get_user(
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_table_names(sql: str) -> list[str]:
-    return list({
-        m.lower() for m in re.findall(
-            r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)',
-            sql or '',
-            re.IGNORECASE,
-        )
-    })
+    sql = sql or ''
+    # Exclude CTE names (`WITH x AS (...)`, chained `), y AS (...)`) — they follow
+    # FROM/JOIN but aren't real tables, so they'd fail to export/bundle.
+    cte = {m.lower() for m in re.findall(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', sql, re.IGNORECASE)}
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.findall(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE):
+        ml = m.lower()
+        if ml.split('.')[-1] in cte or ml in seen:
+            continue
+        seen.add(ml)
+        out.append(ml)
+    return out
 
 
 # How many FK hops out from the report's tables count as "related" in the export.
@@ -248,6 +254,10 @@ class ExportVlyBody(BaseModel):
     # Embed the baked schema cache + metadata so the importing environment skips the
     # cold build (crawl + LLM enrichment). Set False to exclude DB values from the file.
     include_schema_cache: bool = True
+    # Bundle the FULL raw rows of every table the report uses (as Parquet) so the
+    # archive can be opened and queried WITHOUT a live DB (offline mode). Opt-in
+    # because it embeds the complete underlying data — far more than the aggregates.
+    include_table_data: bool = False
 
 
 @router.get("/dashboards/{dashboard_id}/export-vly")
@@ -258,12 +268,16 @@ async def export_vly(
         True,
         description="Embed baked schema cache + metadata so import skips the cold build",
     ),
+    include_table_data: bool = Query(
+        False,
+        description="Bundle full raw table rows (Parquet) for offline / no-DB use",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_get_user),
 ):
     """Stream a .vly archive (GET — for the small / no-intelligence case)."""
     return await _generate_vly(
-        dashboard_id, intelligence, db, current_user, include_schema_cache
+        dashboard_id, intelligence, db, current_user, include_schema_cache, include_table_data
     )
 
 
@@ -281,7 +295,7 @@ async def export_vly_post(
     """
     intel_str = json.dumps(body.intelligence, default=str) if body.intelligence is not None else None
     return await _generate_vly(
-        dashboard_id, intel_str, db, current_user, body.include_schema_cache
+        dashboard_id, intel_str, db, current_user, body.include_schema_cache, body.include_table_data
     )
 
 
@@ -291,6 +305,7 @@ async def _generate_vly(
     db: AsyncSession,
     current_user: User,
     include_schema_cache: bool = True,
+    include_table_data: bool = False,
 ):
     """Build and stream the .vly archive for a canvas."""
     dash_result = await db.execute(
@@ -325,6 +340,26 @@ async def _generate_vly(
     layout_cfg = dashboard.layout_config or {}
     pages      = layout_cfg.get("pages", [])
     now_iso    = datetime.utcnow().isoformat()
+
+    # Connection to use for the optional table-data dump. Widgets often rely on the
+    # PROJECT-level connection (widget.connection_id is NULL), so fall back to the
+    # layout connection and then the project's active connection — otherwise an
+    # offline export would silently bundle nothing.
+    export_conn_id = sample_conn_id
+    if export_conn_id is None and isinstance(layout_cfg, dict) and layout_cfg.get("connection_id"):
+        try:
+            export_conn_id = uuid.UUID(str(layout_cfg["connection_id"]))
+        except ValueError:
+            export_conn_id = None
+    if export_conn_id is None:
+        pc = (await db.execute(
+            select(DatabaseConnection)
+            .where(DatabaseConnection.project_id == dashboard.project_id)
+            .where(DatabaseConnection.is_active == True)
+            .limit(1)
+        )).scalar_one_or_none()
+        if pc:
+            export_conn_id = pc.id
 
     # ── canvas.json ──────────────────────────────────────────────────────────
     canvas_doc = {
@@ -434,10 +469,16 @@ async def _generate_vly(
             if include_schema_cache:
                 try:
                     from agent_service.agents import schema_cache as _sc
-                    _enr = await _sc.get_or_build(
-                        str(sample_conn_id), full_schema, conn_hint.get("db_type") or "postgresql"
-                    )
-                    edges = _enr.relationship_graph.edges or {}
+                    # Offline (.ovly) NEEDS the enriched schema bundled (no DB to rebuild
+                    # from), so build it. Live (.vly) can rebuild on connect, so only use
+                    # a warm cache — never block the export on a cold LLM build.
+                    if include_table_data:
+                        _enr = await _sc.get_or_build(
+                            str(sample_conn_id), full_schema, conn_hint.get("db_type") or "postgresql"
+                        )
+                    else:
+                        _enr = await _sc.get_cached(str(sample_conn_id), full_schema)
+                    edges = (_enr.relationship_graph.edges or {}) if _enr else {}
                     seed_nodes = {
                         n for n in edges.keys()
                         if n.lower() in used_tables_lower
@@ -500,8 +541,11 @@ async def _generate_vly(
 
             if cache_snap and cache_snap.schema_document:
                 db_type_str = conn_hint.get("db_type") or "postgresql"
+                # Offline (.ovly) needs the baked cache bundled (no DB to rebuild from)
+                # → build it. Live (.vly) rebuilds on connect → cache-only (fast).
                 enriched_json = await _sc.export_cache_for_connection(
-                    str(sample_conn_id), cache_snap.schema_document, db_type_str
+                    str(sample_conn_id), cache_snap.schema_document, db_type_str,
+                    cache_only=not include_table_data,
                 )
                 if enriched_json:
                     schema_cache_doc = {
@@ -740,6 +784,78 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
         for w in widgets
         if any(w.chart_data and isinstance(w.chart_data, dict) and w.chart_data.get("rows") for _ in [None])
     ]
+    # ── tables/<name>.parquet  +  tables_manifest.json (offline data bundle) ──
+    # Opt-in: dump the FULL raw rows of every table the report references, so the
+    # archive can be opened and queried with no live DB. Capped per-table and in
+    # total; truncation/omission is recorded in the manifest and surfaced in the UI.
+    table_files: list[tuple[str, bytes]] = []
+    tables_manifest_entries: list[dict] = []
+    print(
+        f"[vly-export] dashboard={dashboard_id[:8]}  include_table_data={include_table_data}"
+        f"  export_conn={str(export_conn_id)[:8] if export_conn_id else None}",
+        flush=True,
+    )
+    if include_table_data and export_conn_id:
+        from agent_service.utils.http_clients import call_query_executor
+        from shared.offline_store import rows_to_parquet_bytes
+        ROW_CAP = int(os.getenv("VLY_TABLE_ROW_CAP", "50000"))
+        TOTAL_CAP = int(os.getenv("VLY_TABLE_TOTAL_BYTES_CAP", str(200 * 1024 * 1024)))
+        dialect = conn_hint.get("db_type") or "postgresql"
+        names = sorted({
+            t for w in widgets
+            for t in _extract_table_names(w.sql_query or w.base_sql or "")
+        })
+        print(f"[vly-export] table-data: {len(names)} referenced table(s): {names}", flush=True)
+        total_bytes = 0
+        for tname in names:
+            safe = re.sub(r"[^\w.]", "_", tname)
+            try:
+                res = await call_query_executor(
+                    str(export_conn_id), f"SELECT * FROM {tname} LIMIT {ROW_CAP + 1}",
+                    row_limit=ROW_CAP + 1, timeout_seconds=120,
+                )
+            except Exception as exc:  # noqa: BLE001
+                tables_manifest_entries.append({"name": tname, "included": False, "error": str(exc)[:200]})
+                continue
+            if res.get("error"):
+                tables_manifest_entries.append({"name": tname, "included": False, "error": str(res["error"])[:200]})
+                continue
+            rows = res.get("rows") or []
+            columns = res.get("columns") or []
+            truncated = len(rows) > ROW_CAP
+            rows = rows[:ROW_CAP]
+            try:
+                pq = rows_to_parquet_bytes(rows, columns)
+            except Exception as exc:  # noqa: BLE001
+                tables_manifest_entries.append({"name": tname, "included": False, "error": f"parquet failed: {exc}"})
+                continue
+            if total_bytes + len(pq) > TOTAL_CAP:
+                tables_manifest_entries.append({
+                    "name": tname, "included": False,
+                    "omitted_reason": "total size cap reached", "row_count": len(rows),
+                })
+                continue
+            total_bytes += len(pq)
+            path = f"tables/{safe}.parquet"
+            table_files.append((path, pq))
+            tables_manifest_entries.append({
+                "name": tname, "path": path, "included": True,
+                "columns": [{"name": c} for c in columns],
+                "row_count": len(rows), "truncated": truncated,
+                "bytes": len(pq), "source_dialect": dialect,
+            })
+        included_n = sum(1 for e in tables_manifest_entries if e.get("included"))
+        print(
+            f"[vly-export] table-data: included={included_n}/{len(names)}  bytes={total_bytes}",
+            flush=True,
+        )
+
+    tables_manifest_doc = {
+        "vly_version": VLY_VERSION,
+        "row_cap": int(os.getenv("VLY_TABLE_ROW_CAP", "50000")),
+        "tables": tables_manifest_entries,
+    } if tables_manifest_entries else {}
+
     manifest_doc = {
         "vly_version":  VLY_VERSION,
         "format":       "visually-canvas-archive",
@@ -759,6 +875,8 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
             *([{"path": "schema_metadata.json","type": "schema_metadata", "required": False, "description": "LLM-generated table/column metadata rows"}] if schema_metadata_doc else []),
             {"path": "ai_context.json",     "type": "ai_context",         "required": False, "description": "AI warm-start context"},
             {"path": "intelligence.json",   "type": "intelligence",       "required": False, "description": "AI analysis: KPIs, sections, brief"},
+            *([{"path": "tables_manifest.json", "type": "tables_manifest", "required": False, "description": "Index of bundled raw tables for offline use"}] if tables_manifest_doc else []),
+            *([{"path": e["path"], "type": "table_data_parquet", "required": False, "description": f"Raw rows for {e['name']}"} for e in tables_manifest_entries if e.get("included")]),
             *all_data_entries,
             *all_csv_entries,
         ],
@@ -783,6 +901,10 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
             zf.writestr("schema_cache.json", json.dumps(schema_cache_doc, ensure_ascii=False, indent=2, default=str))
         if schema_metadata_doc:
             zf.writestr("schema_metadata.json", json.dumps(schema_metadata_doc, ensure_ascii=False, indent=2, default=str))
+        if tables_manifest_doc:
+            zf.writestr("tables_manifest.json", json.dumps(tables_manifest_doc, ensure_ascii=False, indent=2, default=str))
+        for path, content in table_files:
+            zf.writestr(path, content)   # bytes (Parquet)
         for path, content in data_files:
             zf.writestr(path, content)
         for path, content in csv_files:
@@ -792,7 +914,11 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
     raw = buf.read()
 
     safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in dashboard.name)[:64]
-    filename  = f"{safe_name}.vly"
+    # Distinct extension per type so the file is self-identifying:
+    #   .ovly = OFFLINE (full table data bundled; opens with no DB)
+    #   .vly  = LIVE (lightweight; connects to a database on import)
+    ext = "ovly" if (include_table_data and table_files) else "vly"
+    filename  = f"{safe_name}.{ext}"
 
     return Response(
         content=raw,
@@ -803,6 +929,7 @@ Exported from **Visually** · {now_iso} · Format v{VLY_VERSION}
             "Cache-Control":       "no-cache",
             "X-Vly-Version":       VLY_VERSION,
             "X-Vly-Canvas":        dashboard.name,
+            "X-Vly-Ext":           ext,
         },
     )
 
@@ -815,6 +942,7 @@ async def import_vly(
     file: UploadFile = File(...),
     project_id: str = Form(...),
     connection_id: Optional[str] = Form(None),
+    prefer_offline: bool = Form(False),  # force offline (bundled tables) — skip auto-match
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_get_user),
 ):
@@ -845,14 +973,29 @@ async def import_vly(
         meta_doc:    dict = json.loads(zf.read("meta.json"))
         queries_doc: dict = json.loads(zf.read("queries.json")) if "queries.json" in names else {}
         intel_doc:   dict = json.loads(zf.read("intelligence.json")) if "intelligence.json" in names else {}
+        tables_manifest: dict = json.loads(zf.read("tables_manifest.json")) if "tables_manifest.json" in names else {}
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Malformed JSON in .vly: {exc}")
 
-    # ── resolve connection ─────────────────────────────────────────────────────
-    resolved_conn_id: Optional[uuid.UUID] = None
+    # Bundled raw tables for offline use (only entries actually written to the zip).
+    offline_table_entries = [
+        e for e in (tables_manifest.get("tables") or [])
+        if e.get("included") and e.get("path") in names
+    ]
+    has_table_data = len(offline_table_entries) > 0
 
-    if connection_id:
-        resolved_conn_id = uuid.UUID(connection_id)
+    # ── resolve connection ─────────────────────────────────────────────────────
+    # live_conn_id = a real database the importer is linked to (explicit pick or
+    # fingerprint match). resolved_conn_id = whatever the widgets bind to, which
+    # becomes a synthetic vly_offline connection when there's no live DB.
+    live_conn_id: Optional[uuid.UUID] = None
+
+    if prefer_offline:
+        # User explicitly chose offline — never auto-bind a live connection so the
+        # bundled tables are persisted and used.
+        live_conn_id = None
+    elif connection_id:
+        live_conn_id = uuid.UUID(connection_id)
     else:
         hint = meta_doc.get("connection_hint", {})
         if hint.get("host") and hint.get("database_name"):
@@ -866,7 +1009,9 @@ async def import_vly(
             )
             matched = conn_result.scalar_one_or_none()
             if matched:
-                resolved_conn_id = matched.id
+                live_conn_id = matched.id
+
+    resolved_conn_id: Optional[uuid.UUID] = live_conn_id
 
     # ── create Dashboard ──────────────────────────────────────────────────────
     canvas_name = canvas_doc.get("name") or meta_doc.get("canvas_name") or "Imported Canvas"
@@ -884,6 +1029,11 @@ async def import_vly(
     # storing it here keeps live data working even if a widget loses its binding.
     if resolved_conn_id:
         imported_layout["connection_id"] = str(resolved_conn_id)
+    # Keep the source DB fingerprint (host/port/database/user, NO password) so the
+    # "Connect live DB" UI can pre-fill credentials for the report's ORIGINAL
+    # database — which may differ from any connection already in the project.
+    if meta_doc.get("connection_hint"):
+        imported_layout["connection_hint"] = meta_doc.get("connection_hint")
 
     new_dash = Dashboard(
         id=uuid.uuid4(),
@@ -898,6 +1048,51 @@ async def import_vly(
     )
     db.add(new_dash)
     await db.flush()
+
+    # Fail fast instead of hanging the import for minutes if the platform DB is
+    # contended (e.g. a prior cancelled import left a transaction holding locks).
+    # SET LOCAL applies to the current transaction only, through commit.
+    from sqlalchemy import text as _sql_text
+    try:
+        await db.execute(_sql_text("SET LOCAL lock_timeout = '20s'"))
+        await db.execute(_sql_text("SET LOCAL statement_timeout = '180s'"))
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[import-vly] could not set timeouts (non-fatal): {_exc}", flush=True)
+
+    # ── offline mode: no live DB but raw tables are bundled ────────────────────
+    # Create a synthetic vly_offline connection bound to this dashboard, persist
+    # the bundled Parquet tables, and bind the widgets to it. Every existing query
+    # path then resolves to DuckDB over these tables (see OfflineStore). data_mode
+    # is recorded on the layout so the UI knows which mode to present + lock.
+    offline_conn_id: Optional[uuid.UUID] = None
+    data_mode = "live" if live_conn_id else ("offline" if has_table_data else "cached")
+
+    if not live_conn_id and has_table_data:
+        offline_conn = DatabaseConnection(
+            id=uuid.uuid4(),
+            project_id=uuid.UUID(project_id),
+            name="Offline (imported tables)",
+            db_type=DbType.vly_offline,
+            connection_options={"dashboard_id": str(new_dash.id)},
+            is_active=True,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(offline_conn)
+        await db.flush()
+        offline_conn_id = offline_conn.id
+        resolved_conn_id = offline_conn_id
+        print(
+            f"[import-vly] offline: created connection for dashboard={str(new_dash.id)[:8]} "
+            f"— {len(offline_table_entries)} table(s) will persist after the canvas commit",
+            flush=True,
+        )
+
+    # Record the binding + mode on the layout (chat copilot + intelligence resolve from here).
+    imported_layout["data_mode"] = data_mode
+    if resolved_conn_id:
+        imported_layout["connection_id"] = str(resolved_conn_id)
+    new_dash.layout_config = dict(imported_layout)
 
     # ── create Widgets ────────────────────────────────────────────────────────
     widget_defs: list[dict] = canvas_doc.get("widgets", [])
@@ -943,19 +1138,82 @@ async def import_vly(
         )
         db.add(new_widget)
 
+    _t_commit = datetime.utcnow()
     await db.commit()
+    _commit_secs = (datetime.utcnow() - _t_commit).total_seconds()
+    print(f"[import-vly] canvas commit took {_commit_secs:.1f}s (dashboard + {len(widget_defs)} widgets) dashboard={str(new_dash.id)[:8]}", flush=True)
     await db.refresh(new_dash)
+
+    # ── persist offline tables (per-table, isolated commits) ───────────────────
+    # Done AFTER the small/fast canvas commit so the canvas is usable immediately.
+    # Each Parquet blob commits in its OWN transaction with a tight timeout, so a
+    # slow/remote platform DB degrades gracefully (fewer offline tables, logged)
+    # instead of hanging the whole import. zf is still open here.
+    offline_persisted = 0
+    if offline_conn_id and offline_table_entries:
+        from shared.models.vly_offline import VlyOfflineTable
+        for e in offline_table_entries:
+            try:
+                pq_bytes = zf.read(e["path"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"[import-vly] could not read {e.get('path')}: {exc}", flush=True)
+                continue
+            _t = datetime.utcnow()
+            try:
+                await db.execute(_sql_text("SET LOCAL statement_timeout = '45s'"))
+                db.add(VlyOfflineTable(
+                    id=uuid.uuid4(),
+                    dashboard_id=new_dash.id,
+                    table_name=e.get("name") or e["path"],
+                    columns_json=e.get("columns") or [],
+                    parquet_bytes=pq_bytes,
+                    row_count=int(e.get("row_count") or 0),
+                    truncated=bool(e.get("truncated")),
+                    source_dialect=e.get("source_dialect"),
+                    created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                offline_persisted += 1
+                print(
+                    f"[import-vly] offline table '{e.get('name')}' persisted "
+                    f"{len(pq_bytes)/1024/1024:.2f} MB in {(datetime.utcnow()-_t).total_seconds():.1f}s",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                print(
+                    f"[import-vly] offline table '{e.get('name')}' FAILED after "
+                    f"{(datetime.utcnow()-_t).total_seconds():.1f}s: {type(exc).__name__}: {str(exc)[:160]}",
+                    flush=True,
+                )
+        print(f"[import-vly] offline: persisted {offline_persisted}/{len(offline_table_entries)} table(s)", flush=True)
+        # If every offline table failed to persist, the canvas can't query offline —
+        # downgrade to cached-snapshot mode so the UI doesn't promise offline data.
+        if offline_persisted == 0:
+            try:
+                lc = dict(new_dash.layout_config or {})
+                lc["data_mode"] = "cached"
+                new_dash.layout_config = lc
+                await db.commit()
+                data_mode = "cached"
+                print("[import-vly] offline: 0 tables persisted → data_mode downgraded to 'cached'", flush=True)
+            except Exception:
+                await db.rollback()
 
     # ── warm-start the AI copilots from the embedded schema cache + metadata ───
     # If the .vly carries a baked schema cache and/or LLM metadata rows and we
     # resolved a live connection, restore them so both the chat copilot (enriched
     # cache) and the intelligence page (metadata rows) are warm with ZERO cold build
     # (no crawl, no LLM). Safe & idempotent — see _restore_schema_warmstart.
+    # Warm-start for the LIVE connection OR the synthetic offline one — so the
+    # Canvas/Report copilots know the bundled tables' schema and can write SQL
+    # against the offline DuckDB exactly as they would live.
     cache_warmstarted = False
-    if resolved_conn_id and ("schema_cache.json" in names or "schema_metadata.json" in names):
+    warm_conn_for_schema = live_conn_id or offline_conn_id
+    if warm_conn_for_schema and ("schema_cache.json" in names or "schema_metadata.json" in names):
         try:
             cache_warmstarted = await _restore_schema_warmstart(
-                db, resolved_conn_id, zf, names
+                db, warm_conn_for_schema, zf, names
             )
         except Exception as exc:
             print(f"[import-vly] schema cache warm-start failed (non-fatal): {exc}", flush=True)
@@ -968,27 +1226,50 @@ async def import_vly(
     # the request exceed the gateway timeout (cold executor + Redshift wake + many
     # widget queries). Cached data shows immediately; live data fills in after.
     refresh_scheduled = False
-    if resolved_conn_id:
+    if live_conn_id:
         background_tasks.add_task(
             _crawl_and_refresh,
-            str(new_dash.id), str(resolved_conn_id), project_id,
+            str(new_dash.id), str(live_conn_id), project_id,
             False,  # crawl handled by the embedded-cache warm-start above
             True,   # refresh widgets with live data
         )
         refresh_scheduled = True
 
+    # ── connection acknowledgment ──────────────────────────────────────────────
+    # Actively probe the live DB so the UI can show Connected / Unreachable (and a
+    # Retry / Continue-offline choice) instead of silently assuming it works.
+    connection_test = None
+    if live_conn_id:
+        try:
+            from agent_service.utils.http_clients import call_query_executor
+            res = await call_query_executor(str(live_conn_id), "SELECT 1", row_limit=1, timeout_seconds=8)
+            if res.get("error"):
+                connection_test = {"ok": False, "message": str(res["error"])[:200]}
+            else:
+                connection_test = {"ok": True, "message": "Connected"}
+        except Exception as exc:  # noqa: BLE001
+            connection_test = {"ok": False, "message": f"Could not reach database: {str(exc)[:160]}"}
+    elif offline_conn_id:
+        connection_test = {"ok": True, "message": f"Offline data ready: {len(offline_table_entries)} table(s)"}
+
     return {
         "dashboard_id":       str(new_dash.id),
         "name":               new_dash.name,
         "widget_count":       len(widget_defs),
-        "connection_linked":  resolved_conn_id is not None,
+        "connection_linked":  live_conn_id is not None,
         "connection_id":      str(resolved_conn_id) if resolved_conn_id else None,
+        "live_connection_id": str(live_conn_id) if live_conn_id else None,
+        "offline_connection_id": str(offline_conn_id) if offline_conn_id else None,
         "project_id":         project_id,
         "original_name":      canvas_doc.get("name"),
         "intelligence_bundled": bool(intel_doc.get("analysis")),
         "refreshed":          0,
         "refresh_status":     "in_progress" if refresh_scheduled else "skipped",
         "schema_cache_warmstarted": cache_warmstarted,
+        "data_mode":          data_mode,
+        "has_table_data":     has_table_data and (offline_conn_id is None or offline_persisted > 0),
+        "table_count":        offline_persisted if offline_conn_id else len(offline_table_entries),
+        "connection_test":    connection_test,
     }
 
 
@@ -1266,9 +1547,36 @@ async def bind_connection(
 
     lc = dict(dashboard.layout_config or {})
     lc["connection_id"] = str(conn_uuid)
+    lc["data_mode"] = "live"   # binding a live DB leaves offline mode
     dashboard.layout_config = lc
     dashboard.updated_at = datetime.utcnow()
     await db.commit()
+
+    # Drop any cached offline DuckDB handle for this dashboard — it's live now.
+    try:
+        from shared.offline_store import evict_offline
+        evict_offline(dashboard_id)
+    except Exception:
+        pass
+
+    # Invalidate the intelligence-data Redis cache so the NEXT report build fetches
+    # fresh LIVE rows instead of the stale offline-era snapshot. Without this the
+    # report would regenerate on cached offline data even though we're now live.
+    try:
+        from shared.redis_client import get_redis as _get_redis
+        _r = await _get_redis()
+        if _r is not None:
+            deleted = 0
+            try:
+                async for _k in _r.scan_iter(match=f"intel_data:{dashboard_id}:*"):
+                    await _r.delete(_k)
+                    deleted += 1
+            except Exception:
+                # Fallback: delete the common no-date-range key form.
+                await _r.delete(f"intel_data:{dashboard_id}:*:*")
+            print(f"[bind-connection] invalidated intel_data cache  dashboard={dashboard_id[:8]}  keys={deleted}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bind-connection] cache invalidation failed (non-fatal): {exc}", flush=True)
 
     # 2 & 3 — crawl schema + refresh widgets in the BACKGROUND. These take minutes
     # on a cold backend; running them inline blew past the gateway timeout and the
@@ -1296,4 +1604,94 @@ async def bind_connection(
         "crawl_triggered": body.crawl,
         "refreshed":       False,
         "refresh_status":  "in_progress" if body.refresh else "skipped",
+        "data_mode":       "live",
     }
+
+
+# ── data mode + connection acknowledgment ─────────────────────────────────────
+
+class DataModeRequest(BaseModel):
+    mode: str  # 'live' | 'offline' | 'cached'
+
+
+async def _resolve_dashboard_connection(db: AsyncSession, dashboard) -> Optional[DatabaseConnection]:
+    """Resolve a dashboard's connection from layout_config.connection_id, else any
+    widget's connection_id."""
+    conn_id_str = (dashboard.layout_config or {}).get("connection_id") if isinstance(dashboard.layout_config, dict) else None
+    conn_uuid: Optional[uuid.UUID] = None
+    if conn_id_str:
+        try:
+            conn_uuid = uuid.UUID(str(conn_id_str))
+        except ValueError:
+            conn_uuid = None
+    if conn_uuid is None:
+        w = (await db.execute(
+            select(Widget).where(Widget.dashboard_id == dashboard.id, Widget.connection_id.isnot(None)).limit(1)
+        )).scalar_one_or_none()
+        if w and w.connection_id:
+            conn_uuid = w.connection_id
+    if conn_uuid is None:
+        return None
+    return (await db.execute(
+        select(DatabaseConnection).where(DatabaseConnection.id == conn_uuid)
+    )).scalar_one_or_none()
+
+
+@router.post("/dashboards/{dashboard_id}/data-mode")
+async def set_data_mode(
+    dashboard_id: str,
+    body: DataModeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(_get_user),
+):
+    """Persist the canvas's data-source mode (live | offline | cached)."""
+    if body.mode not in ("live", "offline", "cached"):
+        raise HTTPException(status_code=400, detail="mode must be live|offline|cached")
+    dash = (await db.execute(
+        select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
+    )).scalar_one_or_none()
+    if not dash:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+    lc = dict(dash.layout_config or {})
+    lc["data_mode"] = body.mode
+    dash.layout_config = lc
+    dash.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"status": "ok", "dashboard_id": dashboard_id, "data_mode": body.mode}
+
+
+@router.post("/dashboards/{dashboard_id}/connection/test")
+async def test_dashboard_connection(
+    dashboard_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(_get_user),
+):
+    """Probe the canvas's connection so the UI can show Connected / Unreachable and
+    offer Retry. Offline canvases report their bundled-table readiness instead."""
+    dash = (await db.execute(
+        select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id))
+    )).scalar_one_or_none()
+    if not dash:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
+    data_mode = (dash.layout_config or {}).get("data_mode") if isinstance(dash.layout_config, dict) else None
+    conn = await _resolve_dashboard_connection(db, dash)
+    if conn is None:
+        return {"ok": False, "message": "No connection configured", "db_type": None, "data_mode": data_mode}
+
+    db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+    if db_type == "vly_offline":
+        from shared.models.vly_offline import VlyOfflineTable
+        n = len((await db.execute(
+            select(VlyOfflineTable).where(VlyOfflineTable.dashboard_id == dash.id)
+        )).scalars().all())
+        return {"ok": True, "message": f"Offline data ready: {n} table(s)", "db_type": db_type, "data_mode": data_mode or "offline"}
+
+    try:
+        from agent_service.utils.http_clients import call_query_executor
+        res = await call_query_executor(str(conn.id), "SELECT 1", row_limit=1, timeout_seconds=10)
+        if res.get("error"):
+            return {"ok": False, "message": str(res["error"])[:200], "db_type": db_type, "data_mode": data_mode}
+        return {"ok": True, "message": "Connected", "db_type": db_type, "data_mode": data_mode or "live"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Could not reach database: {str(exc)[:160]}", "db_type": db_type, "data_mode": data_mode}

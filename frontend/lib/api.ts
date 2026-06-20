@@ -444,6 +444,26 @@ export const intelligenceApi = {
   }) => api.post<{ text: string }>('/intelligence/orchestrate', data),
 
   /**
+   * Discovery stage — mine the report's underlying tables for NEW insights beyond
+   * the existing widgets. Returns chart-ready datasets the frontend appends as
+   * synthetic widgets so they flow through the normal agent/orchestrator.
+   */
+  discover: (dashboardId: string, opts?: { max_queries?: number; force?: boolean }) =>
+    api.post<{
+      discoveries: Array<{
+        title: string
+        chart_type: string
+        sql: string
+        why?: string
+        chart_data: { rows: Record<string, unknown>[]; columns: string[]; labels: unknown[]; values: unknown[] }
+      }>
+      message?: string
+    }>(`/dashboards/${dashboardId}/intelligence-discovery`, {
+      max_queries: opts?.max_queries ?? 6,
+      force: opts?.force ?? false,
+    }),
+
+  /**
    * Fetch table/column metadata for every table referenced in this dashboard's
    * widget SQL queries so the agent prompt includes DDL-level context.
    */
@@ -620,7 +640,11 @@ export const vlyApi = {
    * - Falls back to a plain <a download> on unsupported browsers.
    * - Pass `intelligence` to bundle the AI analysis into intelligence.json.
    */
-  exportVly: async (canvasId: string, intelligence?: object): Promise<void> => {
+  exportVly: async (
+    canvasId: string,
+    intelligence?: object,
+    opts?: { includeTableData?: boolean },
+  ): Promise<void> => {
     const stored = typeof window !== 'undefined' ? localStorage.getItem('visually-auth') : null
     let token = ''
     if (stored) {
@@ -635,16 +659,21 @@ export const vlyApi = {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ intelligence: intelligence ?? null }),
+      body: JSON.stringify({
+        intelligence: intelligence ?? null,
+        include_table_data: opts?.includeTableData ?? false,
+      }),
     })
     if (!response.ok) throw new Error(`Export failed: ${response.status}`)
 
-    // Read server-supplied filename from the now-exposed Content-Disposition header
+    // Read server-supplied filename from the now-exposed Content-Disposition header.
+    // Extension differs by type: .ovly = offline (data bundled), .vly = live.
     const disposition = response.headers.get('Content-Disposition') ?? ''
     const match       = disposition.match(/filename="([^"]+)"/)
     const canvasName  = response.headers.get('X-Vly-Canvas') ?? ''
+    const ext         = (response.headers.get('X-Vly-Ext') || (opts?.includeTableData ? 'ovly' : 'vly')).replace(/^\./, '')
     // Prefer the server filename (canvas name); last-resort fallback only
-    const suggestedName = match?.[1] ?? (canvasName ? `${canvasName}.vly` : `canvas-${canvasId.slice(0, 8)}.vly`)
+    const suggestedName = match?.[1] ?? (canvasName ? `${canvasName}.${ext}` : `canvas-${canvasId.slice(0, 8)}.${ext}`)
 
     const blob = await response.blob()
 
@@ -655,7 +684,7 @@ export const vlyApi = {
           suggestedName,
           types: [{
             description: 'Visually Canvas Archive',
-            accept: { 'application/vnd.visually.canvas+zip': ['.vly'] },
+            accept: { 'application/vnd.visually.canvas+zip': ['.vly', '.ovly'] },
           }],
         })
         const writable = await handle.createWritable()
@@ -677,16 +706,45 @@ export const vlyApi = {
     URL.revokeObjectURL(blobUrl)
   },
 
-  /** Import a .vly file into a project. */
-  importVly: (file: File, projectId: string, connectionId?: string) => {
+  /** Import a .vly/.ovly file into a project. preferOffline forces offline mode
+   *  (use the bundled tables, skip auto-matching a live connection). */
+  importVly: (file: File, projectId: string, connectionId?: string, preferOffline?: boolean) => {
     const form = new FormData()
     form.append('file', file)
     form.append('project_id', projectId)
     if (connectionId) form.append('connection_id', connectionId)
-    return api.post('/dashboards/import-vly', form, {
+    if (preferOffline) form.append('prefer_offline', 'true')
+    return api.post<{
+      dashboard_id: string
+      name: string
+      widget_count: number
+      connection_linked: boolean
+      connection_id: string | null
+      live_connection_id: string | null
+      offline_connection_id: string | null
+      project_id: string
+      original_name: string | null
+      intelligence_bundled: boolean
+      data_mode: 'live' | 'offline' | 'cached'
+      has_table_data: boolean
+      table_count: number
+      connection_test: { ok: boolean; message: string } | null
+    }>('/dashboards/import-vly', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
+
+  /** Persist the canvas's data-source mode (live | offline | cached). */
+  setDataMode: (dashboardId: string, mode: 'live' | 'offline' | 'cached') =>
+    api.post<{ status: string; dashboard_id: string; data_mode: string }>(
+      `/dashboards/${dashboardId}/data-mode`, { mode },
+    ),
+
+  /** Probe the canvas's connection. Offline canvases report bundled-table readiness. */
+  testConnection: (dashboardId: string) =>
+    api.post<{ ok: boolean; message: string; db_type: string | null; data_mode: string | null }>(
+      `/dashboards/${dashboardId}/connection/test`,
+    ),
 
   /**
    * Bind a live DB connection to a canvas (e.g. one just imported with cached data).
