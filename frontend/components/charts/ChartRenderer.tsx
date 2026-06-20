@@ -976,12 +976,37 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     const funnelData = labels.map((l, i) => ({
       name: l, value: values[i] ?? 0, fill: COLORS[i % COLORS.length],
     })).sort((a, b) => Number(b.value) - Number(a.value))
+    const fmtFunnel = (v: number) =>
+      Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(1)}M`
+      : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K`
+      : v.toLocaleString(undefined, { maximumFractionDigits: 1 })
+    // Centred, two-line label (name + value) drawn inside each band. Anchored to the
+    // band centre rather than an edge so wide top segments never clip, with a dark halo
+    // (paint-order: stroke) so white text stays legible on every segment colour.
+    const FunnelLabel = (props: Record<string, unknown>) => {
+      const x = Number(props.x), y = Number(props.y)
+      const w = Number(props.width), h = Number(props.height)
+      const idx = Number(props.index)
+      const d = funnelData[idx]
+      if (!d || !isFinite(x) || !isFinite(w)) return null
+      const cx = x + w / 2
+      const cy = y + h / 2
+      const halo = { stroke: 'rgba(2,18,38,0.45)', strokeWidth: 3, paintOrder: 'stroke' as const }
+      return (
+        <g style={{ pointerEvents: 'none' }}>
+          <text x={cx} y={cy - 4} textAnchor="middle" fill="#fff" {...halo}
+            style={{ fontSize: 11, fontWeight: 700 }}>{d.name}</text>
+          <text x={cx} y={cy + 11} textAnchor="middle" fill="#fff" {...halo}
+            style={{ fontSize: 11, fontWeight: 600 }}>{fmtFunnel(Number(d.value))}</text>
+        </g>
+      )
+    }
     return (
       <ResponsiveContainer width="100%" height={height}>
-        <FunnelChart>
-          <Tooltip />
+        <FunnelChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+          <Tooltip formatter={(v: number) => Number(v).toLocaleString()} />
           <Funnel dataKey="value" data={funnelData} isAnimationActive>
-            <LabelList position="right" fill="#374151" stroke="none" dataKey="name" style={{ fontSize: 11 }} />
+            <LabelList content={FunnelLabel as unknown as React.ComponentProps<typeof LabelList>['content']} />
           </Funnel>
         </FunnelChart>
       </ResponsiveContainer>
