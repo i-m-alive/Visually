@@ -632,30 +632,61 @@ async def test_connection(project_id: str, conn_id: str, current_user: User = De
     start = time.monotonic()
     try:
         if conn.db_type.value == "redshift":
-            import redshift_connector, os as _os
+            import os as _os, asyncio as _asyncio
             _is_serverless = "redshift-serverless" in (conn.host or "")
-            conn_kwargs: dict = {
-                "host": conn.host, "port": conn.port or 5439,
-                "database": conn.database_name or "", "ssl": True, "timeout": 15,
-            }
-            if _is_serverless:
-                conn_kwargs["is_serverless"] = True
-            if not password:
-                conn_kwargs["iam"] = True
-                conn_kwargs["aws_access_key_id"] = _os.getenv("AWS_ACCESS_KEY_ID", "")
-                conn_kwargs["aws_secret_access_key"] = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
-                tok = _os.getenv("AWS_SESSION_TOKEN", "")
-                if tok:
-                    conn_kwargs["aws_session_token"] = tok
-                conn_kwargs["database_user"] = conn.username or "awsuser"
+            _use_data_api = _os.getenv("REDSHIFT_USE_DATA_API", "").lower() in ("true", "1", "yes")
+            if _is_serverless and _use_data_api:
+                # Serverless workgroups are private (VPC-only) — a direct TCP connect
+                # from here times out. The Data API reaches the workgroup via AWS's
+                # control plane using IAM creds, exactly like the query executor does,
+                # so test with a trivial SELECT through it. Cold-start safe (polls).
+                def _data_api_test():
+                    import boto3
+                    parts = (conn.host or "").split(".")
+                    workgroup = parts[0] if parts else ""
+                    region = parts[2] if len(parts) >= 3 else _os.getenv("AWS_REGION", "us-east-1")
+                    client = boto3.client("redshift-data", region_name=region)
+                    kwargs = {"WorkgroupName": workgroup, "Database": conn.database_name or "", "Sql": "SELECT 1"}
+                    secret_arn = _os.getenv("REDSHIFT_DATA_API_SECRET_ARN", "").strip()
+                    if secret_arn:
+                        kwargs["SecretArn"] = secret_arn
+                    sid = client.execute_statement(**kwargs)["Id"]
+                    import time as _t
+                    deadline = _t.monotonic() + 120
+                    status = "SUBMITTED"
+                    d: dict = {}
+                    while _t.monotonic() < deadline:
+                        d = client.describe_statement(Id=sid)
+                        status = d["Status"]
+                        if status in ("FINISHED", "FAILED", "ABORTED"):
+                            break
+                        _t.sleep(0.6)
+                    if status != "FINISHED":
+                        raise RuntimeError(d.get("Error") or f"Data API statement {status}")
+                await _asyncio.get_event_loop().run_in_executor(None, _data_api_test)
             else:
-                conn_kwargs["user"] = conn.username or ""
-                conn_kwargs["password"] = password
-            import asyncio as _asyncio
-            def _sync_test():
-                rc = redshift_connector.connect(**conn_kwargs)
-                rc.close()
-            await _asyncio.get_event_loop().run_in_executor(None, _sync_test)
+                import redshift_connector
+                conn_kwargs: dict = {
+                    "host": conn.host, "port": conn.port or 5439,
+                    "database": conn.database_name or "", "ssl": True, "timeout": 15,
+                }
+                if _is_serverless:
+                    conn_kwargs["is_serverless"] = True
+                if not password:
+                    conn_kwargs["iam"] = True
+                    conn_kwargs["aws_access_key_id"] = _os.getenv("AWS_ACCESS_KEY_ID", "")
+                    conn_kwargs["aws_secret_access_key"] = _os.getenv("AWS_SECRET_ACCESS_KEY", "")
+                    tok = _os.getenv("AWS_SESSION_TOKEN", "")
+                    if tok:
+                        conn_kwargs["aws_session_token"] = tok
+                    conn_kwargs["database_user"] = conn.username or "awsuser"
+                else:
+                    conn_kwargs["user"] = conn.username or ""
+                    conn_kwargs["password"] = password
+                def _sync_test():
+                    rc = redshift_connector.connect(**conn_kwargs)
+                    rc.close()
+                await _asyncio.get_event_loop().run_in_executor(None, _sync_test)
         elif conn.db_type.value == "postgresql":
             import asyncpg
             pg_conn = await asyncpg.connect(host=conn.host, port=conn.port or 5432,

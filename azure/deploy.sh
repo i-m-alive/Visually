@@ -253,7 +253,9 @@ if run backend; then
     --min-replicas 0 --max-replicas 1 --cpu 0.5 --memory 1.0Gi \
     "${SEC[@]}" \
     --env-vars DATABASE_URL="$DB_ASYNC" REDIS_URL="$REDIS_URL_VAL" \
-               ENCRYPTION_KEY=secretref:enc-key "${AWS_ENV[@]}" "${BEDROCK_ENV[@]}" -o none
+               ENCRYPTION_KEY=secretref:enc-key \
+               REDSHIFT_USE_DATA_API=true REDSHIFT_DATA_API_SECRET_ARN="${REDSHIFT_DATA_API_SECRET_ARN:-}" \
+               "${AWS_ENV[@]}" "${BEDROCK_ENV[@]}" -o none
 
   az containerapp create -n "$APP_RENDER" -g "$RG" --environment "$ENV_ID" \
     --image "$ACR_LOGIN/render-service:$TAG" "${REG[@]}" \

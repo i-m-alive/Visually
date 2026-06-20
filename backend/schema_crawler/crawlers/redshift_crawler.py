@@ -13,6 +13,98 @@ from bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL  # noqa: E402
 
 SCHEMA_MODEL = BEDROCK_SONNET_MODEL
 
+# Route Serverless crawls through the AWS Redshift Data API (public HTTPS, no VPC/VPN
+# needed) instead of a direct TCP connect to the private workgroup endpoint. Same path
+# the query executor uses. Requires valid AWS creds + redshift-data permissions.
+_USE_DATA_API = os.getenv("REDSHIFT_USE_DATA_API", "").lower() in ("true", "1", "yes")
+
+
+def _da_cell(cell: dict):
+    if cell.get("isNull"):
+        return None
+    for k in ("stringValue", "longValue", "doubleValue", "booleanValue"):
+        if k in cell:
+            return cell[k]
+    if "blobValue" in cell:
+        return str(cell["blobValue"])
+    return None
+
+
+class _DataAPICursor:
+    """Minimal cursor shim over the Redshift Data API so the existing crawl logic
+    (cursor.execute / fetchall / description) runs unchanged from outside the VPC."""
+
+    def __init__(self, client, workgroup: str, database: str, secret_arn: str):
+        self._client = client
+        self._wg = workgroup
+        self._db = database
+        self._secret = secret_arn
+        self._rows: list[tuple] = []
+        self.description: list | None = None
+
+    def execute(self, sql: str):
+        import time as _t
+        kwargs = {"WorkgroupName": self._wg, "Database": self._db, "Sql": sql}
+        if self._secret:
+            kwargs["SecretArn"] = self._secret
+        sid = self._client.execute_statement(**kwargs)["Id"]
+        # Poll — the first query also wakes a paused Serverless workgroup (why the
+        # Data API tolerates cold starts where a socket connect would time out).
+        deadline = _t.monotonic() + 180
+        status, d = "SUBMITTED", {}
+        while _t.monotonic() < deadline:
+            d = self._client.describe_statement(Id=sid)
+            status = d["Status"]
+            if status in ("FINISHED", "FAILED", "ABORTED"):
+                break
+            _t.sleep(0.6)
+        if status != "FINISHED":
+            raise RuntimeError(d.get("Error") or f"Data API statement {status}")
+        self._rows, self.description = [], None
+        if not d.get("HasResultSet"):
+            return
+        columns: list[str] = []
+        records: list[list] = []
+        token = None
+        while True:
+            rk = {"Id": sid}
+            if token:
+                rk["NextToken"] = token
+            res = self._client.get_statement_result(**rk)
+            if not columns:
+                columns = [c.get("name", c.get("label", "")) for c in res.get("ColumnMetadata", [])]
+            for rec in res.get("Records", []):
+                records.append(tuple(_da_cell(c) for c in rec))
+            token = res.get("NextToken")
+            if not token:
+                break
+        self.description = [(c,) for c in columns]
+        self._rows = records
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+class _DataAPIConn:
+    def __init__(self, host: str, database: str):
+        import boto3
+        parts = (host or "").split(".")
+        self._wg = parts[0] if parts else ""
+        region = parts[2] if len(parts) >= 3 else os.getenv("AWS_REGION", "us-east-1")
+        self._client = boto3.client("redshift-data", region_name=region)
+        self._db = database
+        self._secret = os.getenv("REDSHIFT_DATA_API_SECRET_ARN", "").strip()
+
+    def cursor(self):
+        return _DataAPICursor(self._client, self._wg, self._db, self._secret)
+
+    def close(self):
+        pass
+
+
 _PII_SIGNALS = frozenset({"email", "phone", "ssn", "dob", "password", "secret", "token", "auth", "credit", "card"})
 
 SEMANTIC_TABLE_KEYWORDS = {
@@ -26,6 +118,19 @@ def _crawl_sync(
     ssl: bool, connection_id: str, iam_role_arn: str | None,
 ) -> dict:
     is_serverless = "redshift-serverless" in (host or "")
+
+    # Serverless workgroups are private (VPC-only) — a direct TCP connect from outside
+    # the VPC (e.g. Azure) times out. When the Data API is enabled, crawl through it
+    # instead: it reaches the workgroup via AWS's control plane over public HTTPS.
+    if is_serverless and _USE_DATA_API:
+        conn = _DataAPIConn(host, database)
+        cursor = conn.cursor()
+        try:
+            return _crawl_with_cursor(cursor, is_serverless)
+        finally:
+            cursor.close()
+            conn.close()
+
     # Serverless workgroups auto-pause; allow more time for cold-start wake-up
     _timeout = 180 if is_serverless else 120
 
@@ -93,7 +198,16 @@ def _crawl_sync(
 
     conn = redshift_connector.connect(**conn_kwargs)
     cursor = conn.cursor()
+    try:
+        return _crawl_with_cursor(cursor, is_serverless)
+    finally:
+        cursor.close()
+        conn.close()
 
+
+def _crawl_with_cursor(cursor, is_serverless: bool) -> dict:
+    """Run the schema introspection over an already-open cursor (real redshift_connector
+    cursor, or the Data API shim — both expose execute/fetchall/description)."""
     try:
         # Tables and views via information_schema
         cursor.execute("""
@@ -308,8 +422,8 @@ def _crawl_sync(
 
         return table_data
     finally:
-        cursor.close()
-        conn.close()
+        # Caller owns the cursor/connection lifecycle (closes both).
+        pass
 
 
 async def crawl_redshift(
