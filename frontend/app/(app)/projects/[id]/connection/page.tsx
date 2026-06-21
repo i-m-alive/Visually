@@ -50,15 +50,33 @@ export default function ConnectionPage() {
   const [deleting, setDeleting] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<{ id: string; msg: string } | null>(null)
 
+  // Live connection status per connection — drives the Connected/Not reachable badge.
+  const [status, setStatus] = useState<Record<string, { state: 'checking' | 'ok' | 'fail'; msg?: string; latency?: number }>>({})
+
   useEffect(() => {
     load()
   }, [projectId])
+
+  // Probe a connection and record its status (used on load + by the Test button).
+  const probeStatus = async (connId: string) => {
+    setStatus(s => ({ ...s, [connId]: { state: 'checking' } }))
+    try {
+      const resp = await projectApi.testConnection(projectId, connId)
+      setStatus(s => ({ ...s, [connId]: { state: resp.data.success ? 'ok' : 'fail', msg: resp.data.message, latency: resp.data.latency_ms } }))
+      return resp.data
+    } catch (err: any) {
+      setStatus(s => ({ ...s, [connId]: { state: 'fail', msg: err?.response?.data?.detail ?? 'Unreachable' } }))
+      return null
+    }
+  }
 
   const load = async () => {
     setLoading(true); setLoadError('')
     try {
       const resp = await projectApi.listConnections(projectId)
       setConnections(resp.data)
+      // Auto-check each connection so the card shows its live status without a click.
+      ;(resp.data as Connection[]).forEach(c => { void probeStatus(c.id) })
     } catch {
       setLoadError('Failed to load connections.')
     } finally {
@@ -112,19 +130,12 @@ export default function ConnectionPage() {
   const handleTest = async (connId: string) => {
     setTesting(connId); setTestResult(null); setTestElapsed(0)
     const timer = setInterval(() => setTestElapsed(s => s + 1), 1000)
-    try {
-      const resp = await projectApi.testConnection(projectId, connId)
-      setTestResult({
-        ok: resp.data.success,
-        msg: resp.data.message,
-        latency: resp.data.latency_ms,
-      })
-    } catch (err: any) {
-      setTestResult({ ok: false, msg: err?.response?.data?.detail ?? 'Test failed' })
-    } finally {
-      clearInterval(timer)
-      setTesting(null)
-    }
+    const data = await probeStatus(connId)
+    setTestResult(data
+      ? { ok: data.success, msg: data.message, latency: data.latency_ms }
+      : { ok: false, msg: 'Test failed' })
+    clearInterval(timer)
+    setTesting(null)
   }
 
   const handleDelete = async (conn: Connection) => {
@@ -189,7 +200,32 @@ export default function ConnectionPage() {
                   <Database size={16} className="text-blue-600" />
                 </div>
                 <div>
-                  <p className="text-sm font-semibold text-gray-900">{conn.name}</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-semibold text-gray-900">{conn.name}</p>
+                    {(() => {
+                      const st = status[conn.id]?.state
+                      if (st === 'checking') return (
+                        <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500 border border-gray-200">
+                          <Loader2 size={9} className="animate-spin" /> Checking…
+                        </span>
+                      )
+                      if (st === 'ok') return (
+                        <span title={status[conn.id]?.msg} className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500" /> Connected
+                        </span>
+                      )
+                      if (st === 'fail') return (
+                        <span title={status[conn.id]?.msg} className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-red-50 text-red-600 border border-red-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-red-500" /> Not reachable
+                        </span>
+                      )
+                      return (
+                        <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-400 border border-gray-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-gray-300" /> Unknown
+                        </span>
+                      )
+                    })()}
+                  </div>
                   <p className="text-xs text-gray-400 font-mono">
                     {conn.db_type} · {conn.host}:{conn.port} / {conn.database_name}
                   </p>
