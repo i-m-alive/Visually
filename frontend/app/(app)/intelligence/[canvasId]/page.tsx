@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { useParams, useRouter } from 'next/navigation'
-import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi } from '@/lib/api'
+import { canvasApi, shareApi, intelligenceApi, vlyApi, chatApi, dashboardApi } from '@/lib/api'
 import { ExecutiveCopilot } from '@/components/report/ExecutiveCopilot'
 import { IntelligenceCopilotPanel } from '@/components/report/IntelligenceCopilotPanel'
 import { VlyExportModal } from '@/components/canvas/VlyExportModal'
@@ -23,7 +23,7 @@ import {
   Award, Package, Briefcase, LineChart as LineChartIcon, ChevronDown, ChevronUp,
   Code2, Scale,
   X, Download, Maximize2, Play, Link, Copy, Printer, Pin,
-  Columns, ChevronRight, CalendarRange, Edit3, Bookmark, BookmarkCheck,
+  Columns, ChevronRight, CalendarRange, Edit3, Bookmark, BookmarkCheck, Wifi,
 } from 'lucide-react'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -2287,6 +2287,34 @@ function FreshnessBadge({ fetchedAt }: { fetchedAt: Date }) {
   )
 }
 
+// Shows when the report was last data-synced or AI-regenerated, from the backend
+// timestamps. Picks the most recent and labels it accordingly.
+function ActivityBadge({ activity }: { activity: { last_synced_at: string | null; last_regenerated_at: string | null } }) {
+  const [, tick] = useState(0)
+  useEffect(() => { const t = setInterval(() => tick(n => n + 1), 30000); return () => clearInterval(t) }, [])
+  const parse = (s: string | null) => {
+    if (!s) return null
+    const d = new Date(/[Zz]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z')
+    return isNaN(d.getTime()) ? null : d
+  }
+  const synced = parse(activity.last_synced_at)
+  const regen = parse(activity.last_regenerated_at)
+  // Regenerate stamps both to the same instant → prefer the "Regenerated" label then.
+  const isRegen = !!regen && (!synced || regen.getTime() >= synced.getTime())
+  const when = isRegen ? regen : synced
+  if (!when) return null
+  const mins = Math.floor((Date.now() - when.getTime()) / 60000)
+  const rel = mins < 1 ? 'just now' : mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.floor(mins / 60)}h ago` : `${Math.floor(mins / 1440)}d ago`
+  return (
+    <span
+      title={`${isRegen ? 'Report rebuilt' : 'Data synced'} ${when.toLocaleString()}`}
+      style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9, padding: '3px 9px', borderRadius: 20, background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.55)', flexShrink: 0 }}
+    >
+      <Clock size={9} /> {isRegen ? 'Regenerated' : 'Synced'} {rel}
+    </span>
+  )
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Main page
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2366,6 +2394,8 @@ export default function IntelligenceCanvasPage() {
 
   // Feature 9: Data freshness
   const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null)
+  // Persisted last data-sync / AI-regenerate timestamps (from the backend).
+  const [lastActivity, setLastActivity] = useState<{ last_synced_at: string | null; last_regenerated_at: string | null } | null>(null)
 
   // Feature 10: Annotations
   const [annotations, setAnnotations] = useState<Record<string, string>>(() => {
@@ -2628,6 +2658,10 @@ export default function IntelligenceCanvasPage() {
         const detail = canvasResp.data?.dashboard ?? canvasResp.data
         let widgets: unknown[] = detail?.widgets ?? []
         setCanvas(detail); setProjectId(detail?.project_id ?? '')
+        setLastActivity({
+          last_synced_at: (detail as { last_synced_at?: string | null } | null)?.last_synced_at ?? null,
+          last_regenerated_at: (detail as { last_regenerated_at?: string | null } | null)?.last_regenerated_at ?? null,
+        })
         const sharesList: unknown[] = sharesResp.data?.shares ?? (Array.isArray(sharesResp.data) ? sharesResp.data : [])
         const token = sharesList.length ? ((sharesList[0] as Record<string,string>).token ?? '') : ''
         if (token) setShareToken(token)
@@ -2755,6 +2789,8 @@ export default function IntelligenceCanvasPage() {
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
       try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
+      // Date-range apply re-fetches data AND rebuilds the report → record a regenerate.
+      try { const r = await dashboardApi.recordActivity(canvasId, 'regenerate'); setLastActivity(r.data) } catch {}
     } catch {
       setAgentStatus('done')
     } finally { setDateLoading(false) }
@@ -2784,6 +2820,8 @@ export default function IntelligenceCanvasPage() {
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
+      // Sync Now re-fetches live data → record a data sync.
+      try { const r = await dashboardApi.recordActivity(canvasId, 'sync'); setLastActivity(r.data) } catch {}
     } catch {
       const fb = buildFallbackAnalysis(String(canvas?.name ?? 'Report'), rawWidgets as never)
       setAnalysis(fb); setActiveSection(fb.sections[0]?.id ?? '')
@@ -2809,6 +2847,8 @@ export default function IntelligenceCanvasPage() {
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
       try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
+      // Full AI rebuild → record a regenerate.
+      try { const r = await dashboardApi.recordActivity(canvasId, 'regenerate'); setLastActivity(r.data) } catch {}
     } catch {
       setAgentStatus('done')
     } finally { setRegenerating(false) }
@@ -2921,7 +2961,9 @@ export default function IntelligenceCanvasPage() {
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            {lastFetchedAt && <FreshnessBadge fetchedAt={lastFetchedAt} />}
+            {lastActivity && (lastActivity.last_synced_at || lastActivity.last_regenerated_at)
+              ? <ActivityBadge activity={lastActivity} />
+              : lastFetchedAt && <FreshnessBadge fetchedAt={lastFetchedAt} />}
             {/* Feature 1: date range toggle */}
             <button onClick={() => setShowDatePicker(p => !p)} title="Filter by date range" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: `1px solid ${showDatePicker ? C.teal : 'rgba(255,255,255,0.2)'}`, background: showDatePicker ? `${C.teal}30` : 'rgba(255,255,255,0.1)', color: showDatePicker ? C.teal2 : 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <CalendarRange size={11} />{appliedDateRange ? `${appliedDateRange.from.slice(5)} → ${appliedDateRange.to.slice(5)}` : 'Date'}
@@ -2930,8 +2972,9 @@ export default function IntelligenceCanvasPage() {
             {/* <button onClick={() => { setPresentStartIdx(analysis.sections.findIndex(s => s.id === activeSection)); setPresenting(true) }} title="Presentation mode" className="intel-hdr-btn" style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <Play size={11} /> Present
             </button> */}
-            {/* Offline data-source pill + connect-to-live button (only when offline) */}
-            {(((canvas as { is_offline?: boolean } | null)?.is_offline) || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline') && (
+            {/* Data-source indicator: Offline pill + connect button when offline;
+                a green "Live" pill when connected to a database. */}
+            {(((canvas as { is_offline?: boolean } | null)?.is_offline) || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline') ? (
               <>
                 <span
                   title="This canvas was imported without a live database. The report and copilot run on the bundled table data."
@@ -2947,6 +2990,20 @@ export default function IntelligenceCanvasPage() {
                   <Database size={11} /> Connect live DB
                 </button>
               </>
+            ) : (
+              <span
+                title={(() => {
+                  const hint = (canvas?.layout_config as { connection_hint?: { host?: string; db_type?: string; database_name?: string } } | undefined)?.connection_hint
+                  return hint?.host ? `Connected to ${hint.db_type ?? 'database'}${hint.database_name ? ` · ${hint.database_name}` : ''}` : 'Connected to a live database'
+                })()}
+                style={{ padding: '5px 10px', borderRadius: 8, border: `1px solid ${C.green}60`, background: `${C.green}20`, color: C.green, display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600 }}
+              >
+                <Wifi size={11} /> Live
+                {(() => {
+                  const hint = (canvas?.layout_config as { connection_hint?: { db_type?: string } } | undefined)?.connection_hint
+                  return hint?.db_type ? <span style={{ opacity: 0.8 }}>· {hint.db_type}</span> : null
+                })()}
+              </span>
             )}
             {/* PDF / Export .vly / Share moved into the LeftRail to declutter the header */}
             {/* Save button (kept in the top bar) */}

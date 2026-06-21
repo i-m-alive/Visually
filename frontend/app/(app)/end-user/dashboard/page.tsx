@@ -8,6 +8,7 @@ import {
   BarChart2, Clock, RefreshCw, Share2, Heart, TrendingUp, Zap,
   ChevronRight, Sparkles, UserCircle2, Link2, Upload, FileArchive,
   Database, CheckCircle2, Package, Brain, Calendar, Wifi, WifiOff, Trash2,
+  Pencil, Check, Download,
 } from 'lucide-react'
 
 interface DashCard {
@@ -30,6 +31,9 @@ interface DashCard {
   live_connection?: boolean
   connection_label?: string
   connection_synced_at?: string | null
+  // Report-level activity (set when the report is data-synced / AI-regenerated)
+  last_synced_at?: string | null
+  last_regenerated_at?: string | null
 }
 
 // Render a short AI summary as clean text — strip markdown markers (**bold**,
@@ -651,56 +655,102 @@ function ImportedCard({ dash, aiSummary, aiLoading, onShare, onDelete, router }:
   onDelete: () => void
   router: ReturnType<typeof useRouter>
 }) {
-  const colors    = THEME_COLORS[dash.theme] ?? THEME_COLORS.frost
-  const health    = computeHealthScore(dash.widget_count)
   // Live = an active DB connection is actually bound on the project (not the
   // import-time hint). Falls back to the hint for older records.
   const hasDB     = dash.live_connection ?? !!(dash.connection_hint?.host)
   const dbLabel   = dash.connection_label
     || (dash.connection_hint?.db_type ? `${dash.connection_hint.db_type} · ${dash.connection_hint.database_name ?? ''}` : 'Live database')
-  const syncedAgo = dash.connection_synced_at ? timeAgo(dash.connection_synced_at) : ''
-  const importedAgo = dash.imported_at ? timeAgo(dash.imported_at) : ''
+  // Prefer report-level activity (set on Sync/Regenerate in the intelligence page);
+  // fall back to the connection sync, then last update. Label the verb to match.
+  const regenAt = dash.last_regenerated_at
+  const syncAt  = dash.last_synced_at
+  const isRegen = !!regenAt && (!syncAt || regenAt >= syncAt)
+  const refreshedAt = regenAt || syncAt || dash.connection_synced_at || dash.updated_at
+  const refreshedAgo = refreshedAt ? timeAgo(refreshedAt) : ''
+  const refreshedVerb = isRegen ? 'regenerated' : 'synced'
+
+  const [name, setName] = useState(dash.name)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(dash.name)
+  const [saving, setSaving] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDoc = (e: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [menuOpen])
+
+  const saveName = async () => {
+    const next = draft.trim()
+    if (!next || next === name) { setEditing(false); return }
+    setSaving(true)
+    try {
+      await dashboardApi.rename(dash.id, next)
+      setName(next)
+      setEditing(false)
+    } catch { /* keep editing so the user can retry */ }
+    finally { setSaving(false) }
+  }
+
+  const exportAs = async (offline: boolean) => {
+    setMenuOpen(false); setBusy(offline ? 'ovly' : 'vly')
+    try { await vlyApi.exportVly(dash.id, undefined, { includeTableData: offline }) }
+    catch { /* surfaced by the browser download flow */ }
+    finally { setBusy(null) }
+  }
 
   return (
     <div className="group relative rounded-2xl overflow-hidden bg-white border border-purple-100 hover:shadow-xl hover:-translate-y-1 transition-all duration-200">
-      {/* Header band */}
-      <div className="h-20 relative flex items-end px-4 pb-3" style={{ background: `linear-gradient(135deg, #7c3aed22, #7c3aed44)` }}>
-        <div className="flex items-center gap-1.5 opacity-70">
-          <Package size={14} className="text-purple-500" />
-          <span className="text-[10px] font-bold text-purple-600 uppercase tracking-wide">Imported</span>
-        </div>
-        <div className="absolute top-3 right-3 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
-          style={{ background: 'rgba(0,0,0,0.25)', color: health >= 80 ? '#4ADE80' : health >= 55 ? '#FCD34D' : '#F87171' }}>
-          <Heart size={9} fill="currentColor" />{health}
-        </div>
-        {/* AI badge */}
-        {dash.has_intelligence && (
-          <div className="absolute top-3 left-12 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-700">
-            <Brain size={9} /> AI
+      {/* Header band — holds the report name + inline rename */}
+      <div className="h-20 relative flex items-center px-4" style={{ background: `linear-gradient(135deg, #7c3aed22, #7c3aed44)` }}>
+        {editing ? (
+          <div className="flex items-center gap-1.5 w-full">
+            <input
+              autoFocus
+              value={draft}
+              onChange={e => setDraft(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') { setDraft(name); setEditing(false) } }}
+              className="flex-1 min-w-0 text-sm font-bold text-gray-900 bg-white/90 rounded-lg px-2.5 py-1.5 outline-none border border-purple-300 focus:border-purple-500"
+            />
+            <button onClick={saveName} disabled={saving} title="Save name"
+              className="p-1.5 rounded-lg bg-white/90 text-green-600 hover:bg-white disabled:opacity-50">
+              {saving ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+            </button>
+            <button onClick={() => { setDraft(name); setEditing(false) }} title="Cancel"
+              className="p-1.5 rounded-lg bg-white/90 text-gray-500 hover:bg-white"><X size={13} /></button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5 w-full min-w-0">
+            <h3 className="text-base font-bold text-gray-900 truncate flex-1">{name}</h3>
+            <button
+              onClick={e => { e.stopPropagation(); setDraft(name); setEditing(true) }}
+              title="Rename report"
+              className="p-1.5 rounded-lg text-purple-600 opacity-0 group-hover:opacity-100 hover:bg-white/60 transition-opacity flex-shrink-0"
+            >
+              <Pencil size={13} />
+            </button>
           </div>
         )}
       </div>
 
       <div className="p-4">
-        {/* Title row */}
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-bold text-gray-900 truncate">{dash.name}</h3>
-            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-              <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
-              {importedAgo && <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><Calendar size={9} /> Imported {importedAgo}</span>}
-            </div>
-          </div>
-          <ChevronRight size={14} className="text-gray-300 group-hover:text-purple-400 transition-colors mt-1 flex-shrink-0" />
+        {/* Meta row */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><BarChart2 size={9} /> {dash.widget_count} charts</span>
+          {dash.imported_at && <span className="text-[10px] text-gray-400 flex items-center gap-0.5"><Calendar size={9} /> Imported {timeAgo(dash.imported_at)}</span>}
         </div>
 
-        {/* DB status pill */}
+        {/* DB status pill — shows when data was last synced */}
         <div className={`mt-2 flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-medium w-fit ${
           hasDB ? 'bg-green-50 text-green-700 border border-green-100' : 'bg-amber-50 text-amber-700 border border-amber-100'
         }`}>
           {hasDB ? <Wifi size={9} /> : <WifiOff size={9} />}
-          <span className="truncate max-w-[200px]">
-            {hasDB ? `Live · ${dbLabel}${syncedAgo ? ` · synced ${syncedAgo}` : ''}` : 'Cached data only — no live DB'}
+          <span className="truncate max-w-[220px]">
+            {hasDB ? `Live · ${dbLabel}${refreshedAgo ? ` · ${refreshedVerb} ${refreshedAgo}` : ''}` : 'Cached data only — no live DB'}
           </span>
         </div>
 
@@ -726,13 +776,32 @@ function ImportedCard({ dash, aiSummary, aiLoading, onShare, onDelete, router }:
             style={{ background: 'linear-gradient(135deg, #7c3aed, #a855f7)' }}>
             <Brain size={12} /> Open
           </button>
-          <button
-            onClick={e => { e.stopPropagation(); onShare() }}
-            title="Copy share link"
-            className="p-2 rounded-lg border border-gray-100 text-gray-400 hover:text-blue-500 hover:bg-blue-50 transition-colors"
-          >
-            <Share2 size={14} />
-          </button>
+
+          {/* Share / export menu */}
+          <div className="relative" ref={menuRef}>
+            <button
+              onClick={e => { e.stopPropagation(); setMenuOpen(o => !o) }}
+              title="Share & export"
+              className="p-2 rounded-lg border border-gray-100 text-gray-400 hover:text-blue-500 hover:bg-blue-50 transition-colors"
+            >
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <Share2 size={14} />}
+            </button>
+            {menuOpen && (
+              <div className="absolute right-0 bottom-full mb-1.5 z-20 w-44 bg-white rounded-xl shadow-xl border border-gray-100 py-1 text-xs">
+                <button onClick={() => exportAs(false)} className="w-full flex items-center gap-2 px-3 py-2 text-gray-700 hover:bg-gray-50 text-left">
+                  <Download size={13} className="text-blue-500" /> Export <code className="text-gray-500">.vly</code> (live)
+                </button>
+                <button onClick={() => exportAs(true)} className="w-full flex items-center gap-2 px-3 py-2 text-gray-700 hover:bg-gray-50 text-left">
+                  <Download size={13} className="text-purple-500" /> Export <code className="text-gray-500">.ovly</code> (offline)
+                </button>
+                <div className="my-1 border-t border-gray-50" />
+                <button onClick={() => { setMenuOpen(false); onShare() }} className="w-full flex items-center gap-2 px-3 py-2 text-gray-700 hover:bg-gray-50 text-left">
+                  <Link2 size={13} className="text-teal-500" /> Copy share link
+                </button>
+              </div>
+            )}
+          </div>
+
           <button
             onClick={e => { e.stopPropagation(); onDelete() }}
             title="Delete report"

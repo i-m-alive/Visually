@@ -308,66 +308,54 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
         <div className="w-1 h-10 rounded-full bg-gray-300 group-hover:bg-blue-400 transition-colors" />
       </div>
       <div className="relative bg-white flex flex-col h-full w-full" style={{ borderRadius: 16, overflow: 'hidden', border: '1px solid #e2eaf4' }}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0" style={{ background: 'linear-gradient(135deg, #0a213a, #0d3060)' }}>
-        <div className="flex items-center gap-2.5">
+      {/* Header — title (left) + scope toggle & close (top-right) */}
+      <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-gray-100 flex-shrink-0" style={{ background: 'linear-gradient(135deg, #0a213a, #0d3060)' }}>
+        <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: 'linear-gradient(135deg, #00b4d8, #0077b6)' }}>
             <Sparkles size={13} className="text-white" />
           </div>
-          <div>
-            <span className="text-sm font-semibold text-white">{title ?? 'Report Copilot'}</span>
-            {subtitle && <p className="text-[10px] leading-tight" style={{ color: 'rgba(255,255,255,0.45)', margin: 0 }}>{subtitle}</p>}
+          <div className="min-w-0">
+            <span className="text-sm font-semibold text-white truncate block">{title ?? 'Report Copilot'}</span>
+            {subtitle && <p className="text-[10px] leading-tight truncate" style={{ color: 'rgba(255,255,255,0.45)', margin: 0 }}>{subtitle}</p>}
           </div>
         </div>
-        <button onClick={onClose} className="p-1 rounded transition-colors" style={{ color: 'rgba(255,255,255,0.5)' }}
-          onMouseEnter={e => (e.currentTarget.style.color = 'white')}
-          onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.5)')}>
-          <X size={16} />
-        </button>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {/* Scope: toggle when live; fixed "offline" chip when offline (no DB to switch to). */}
+          {isOffline ? (
+            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold" style={{ background: 'rgba(199,210,254,0.18)', color: '#c7d2fe', border: '1px solid rgba(199,210,254,0.35)' }} title="Answering from the report's bundled tables (no live database)">
+              <Database size={11} /> Offline data
+            </span>
+          ) : (
+            <div className="flex items-center gap-1 p-0.5 rounded-lg flex-shrink-0" style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.15)' }}>
+              <button
+                onClick={() => setScope('report')}
+                title="Answer using only the tables/views that build this report (+ closely related ones). Faster and more focused."
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
+                style={scope === 'report'
+                  ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(0,0,0,0.18)' }
+                  : { background: 'transparent', color: 'rgba(255,255,255,0.7)' }}
+              >
+                <FileText size={11} /> Report
+              </button>
+              <button
+                onClick={() => setScope('database')}
+                title="Open the full database schema — the copilot can query any table or view, not just the report's."
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
+                style={scope === 'database'
+                  ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(0,0,0,0.18)' }
+                  : { background: 'transparent', color: 'rgba(255,255,255,0.7)' }}
+              >
+                <Database size={11} /> Full DB
+              </button>
+            </div>
+          )}
+          <button onClick={onClose} className="p-1 rounded transition-colors" style={{ color: 'rgba(255,255,255,0.5)' }}
+            onMouseEnter={e => (e.currentTarget.style.color = 'white')}
+            onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.5)')}>
+            <X size={16} />
+          </button>
+        </div>
       </div>
-
-      {/* Scope row — toggle when live; a fixed "offline" indicator when offline
-          (no DB to switch to; the copilot queries the report's bundled tables). */}
-      {isOffline ? (
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
-          <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold" style={{ background: '#eef2ff', color: '#4338ca', border: '1px solid #c7d2fe' }}>
-            <Database size={11} /> Offline data
-          </span>
-          <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
-            Answering from the report’s bundled tables (no live database)
-          </span>
-        </div>
-      ) : (
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 flex-shrink-0" style={{ background: '#f8fafc' }}>
-          <div className="flex items-center gap-1 p-0.5 rounded-lg flex-shrink-0" style={{ background: '#eef2f7', border: '1px solid #e2eaf4' }}>
-            <button
-              onClick={() => setScope('report')}
-              title="Answer using only the tables/views that build this report (+ closely related ones). Faster and more focused."
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
-              style={scope === 'report'
-                ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
-                : { background: 'transparent', color: '#64748b' }}
-            >
-              <FileText size={11} /> Report
-            </button>
-            <button
-              onClick={() => setScope('database')}
-              title="Open the full database schema — the copilot can query any table or view, not just the report's."
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors"
-              style={scope === 'database'
-                ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 3px rgba(10,33,58,0.12)' }
-                : { background: 'transparent', color: '#64748b' }}
-            >
-              <Database size={11} /> Full DB
-            </button>
-          </div>
-          <span className="text-[10px] leading-tight" style={{ color: '#94a3b8' }}>
-            {scope === 'report'
-              ? 'Scoped to this report’s tables + related ones'
-              : 'Full database — query any table or view'}
-          </span>
-        </div>
-      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">

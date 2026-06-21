@@ -523,6 +523,10 @@ export const dashboardApi = {
     api.patch(`/dashboards/${dashboardId}`, { theme }),
   rename: (dashboardId: string, name: string) =>
     api.patch(`/dashboards/${dashboardId}`, { name }),
+  // Stamp when a report was last data-synced or AI-regenerated (drives "synced X ago").
+  recordActivity: (dashboardId: string, kind: 'sync' | 'regenerate') =>
+    api.post<{ last_synced_at: string | null; last_regenerated_at: string | null }>(
+      `/dashboards/${dashboardId}/activity`, { kind }),
   delete: (dashboardId: string) => api.delete(`/dashboards/${dashboardId}`),
   duplicate: (dashboardId: string) => api.post(`/dashboards/${dashboardId}/duplicate`),
   requery: (
