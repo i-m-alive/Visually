@@ -81,7 +81,12 @@ function extractToken(input: string): string | null {
 }
 
 function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z').getTime()
+  // Backend sends naive UTC ISO timestamps (no offset). Normalise to a 'T'-separated
+  // string and append 'Z' when there's no timezone marker, so they aren't parsed as
+  // local time (which would skew the result by the viewer's UTC offset).
+  const s = iso.includes('T') ? iso : iso.replace(' ', 'T')
+  const norm = /[Zz]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z'
+  const diff = Date.now() - new Date(norm).getTime()
   const mins = Math.floor(diff / 60000)
   if (mins < 2) return 'just now'
   if (mins < 60) return `${mins}m ago`
