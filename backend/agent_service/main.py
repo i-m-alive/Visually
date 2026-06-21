@@ -1235,6 +1235,9 @@ async def list_shared_with_me(
                 "live_connection":      d.project_id in live_info,
                 "connection_label":     live_info.get(d.project_id, {}).get("label", ""),
                 "connection_synced_at": live_info.get(d.project_id, {}).get("synced_at"),
+                # Report-level activity (data sync / AI rebuild) — stamped via /activity.
+                "last_synced_at":       (d.layout_config or {}).get("last_synced_at"),
+                "last_regenerated_at":  (d.layout_config or {}).get("last_regenerated_at"),
             }
             for d, project_name in rows
         ]
@@ -1361,6 +1364,9 @@ async def get_dashboard(
         "is_offline": is_offline,
         "data_mode": layout_cfg.get("data_mode") or ("offline" if is_offline else None),
         "connection_hint": layout_cfg.get("connection_hint") or {},
+        # When the report's data was last synced / AI-rebuilt (stamped via /activity).
+        "last_synced_at": layout_cfg.get("last_synced_at"),
+        "last_regenerated_at": layout_cfg.get("last_regenerated_at"),
         "report_title": layout_cfg.get("report_title"),
         "page_tabs": layout_cfg.get("page_tabs", []),
         "colour_theme": layout_cfg.get("colour_theme"),
@@ -1385,6 +1391,41 @@ async def get_dashboard(
             }
             for w in widgets
         ],
+    }
+
+
+class _ActivityBody(BaseModel):
+    # "sync" = live data re-fetched; "regenerate" = AI report rebuilt.
+    kind: str = "sync"
+
+
+@app.post("/dashboards/{dashboard_id}/activity")
+async def record_dashboard_activity(
+    dashboard_id: str,
+    body: _ActivityBody = _ActivityBody(),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stamp when a report was last data-synced or AI-regenerated so the dashboard
+    cards and the intelligence header can show 'synced/regenerated X ago' accurately.
+    Stored in layout_config (JSONB) — no migration needed."""
+    result = await db.execute(select(Dashboard).where(Dashboard.id == uuid.UUID(dashboard_id)))
+    dashboard = result.scalar_one_or_none()
+    if not dashboard:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+    now = datetime.utcnow().isoformat()
+    cfg = dict(dashboard.layout_config or {})
+    if body.kind == "regenerate":
+        cfg["last_regenerated_at"] = now
+        cfg["last_synced_at"] = now  # a fresh rebuild reflects current data too
+    else:
+        cfg["last_synced_at"] = now
+    dashboard.layout_config = cfg          # reassign so SQLAlchemy flags the JSONB dirty
+    dashboard.updated_at = datetime.utcnow()
+    await db.commit()
+    return {
+        "last_synced_at": cfg.get("last_synced_at"),
+        "last_regenerated_at": cfg.get("last_regenerated_at"),
     }
 
 
