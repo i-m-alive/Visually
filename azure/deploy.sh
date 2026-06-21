@@ -323,6 +323,10 @@ properties:
             secretRef: aws-secret-key
           - name: AWS_SESSION_TOKEN
             secretRef: aws-session-token
+          - name: REDSHIFT_USE_DATA_API
+            value: "true"
+          - name: REDSHIFT_DATA_API_SECRET_ARN
+            value: "$REDSHIFT_DATA_API_SECRET_ARN"
           - name: JWT_SECRET
             secretRef: jwt-secret
           - name: ENCRYPTION_KEY
