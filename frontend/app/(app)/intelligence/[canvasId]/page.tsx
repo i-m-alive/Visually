@@ -680,10 +680,20 @@ function TableView({ chart }: { chart: AgentChart }) {
     })
   )
 
+  // #1 — Drop columns that are CONSTANT across all rows (a single distinct value),
+  // e.g. a TTM snapshot's "MONTH YEAR" = "Sep 2025" on every row. They carry no
+  // per-row information and shouldn't lead the table. Only when there are ≥2 rows,
+  // and never drop everything (fall back to the full set if it would empty the grid).
+  const _distinct = (c: string) => new Set(chart.data.map(r => String(r[c] ?? '').trim())).size
+  const _informative = chart.data.length >= 2
+    ? meaningfulCols.filter(c => _distinct(c) > 1)
+    : meaningfulCols
+  const informativeCols = _informative.length > 0 ? _informative : meaningfulCols
+
   // Detect year-like columns (2020–2030) to build sparkline
-  const yearCols = meaningfulCols.filter(c => YEAR_RE.test(c))
+  const yearCols = informativeCols.filter(c => YEAR_RE.test(c))
   const hasTrend = yearCols.length >= 2
-  const _baseCols = hasTrend ? meaningfulCols.filter(c => !YEAR_RE.test(c)) : meaningfulCols
+  const _baseCols = hasTrend ? informativeCols.filter(c => !YEAR_RE.test(c)) : informativeCols
 
   // Classify columns
   const isYoyCol = (c: string) =>
@@ -691,11 +701,17 @@ function TableView({ chart }: { chart: AgentChart }) {
   const isNumericCol = (c: string) =>
     chart.data.slice(0, 8).filter(r => r[c] !== null && r[c] !== undefined && r[c] !== '').some(r => !isNaN(Number(r[c])))
 
-  // Conventional left→right reading order: dimension/label (text) columns first,
-  // then numeric metric columns, then YoY/%/change columns. Stable sort, so the
-  // original column order is preserved WITHIN each group.
+  // Left→right order: dimension/label (text) columns first, then numeric metrics,
+  // then YoY/%/change columns. #2 — within the dimension group, lead with the
+  // highest-cardinality column (the primary entity, e.g. PARENT NAME) so it sits on
+  // the left; numeric/YoY groups keep their source order (stable).
   const _colRank = (c: string) => (isYoyCol(c) ? 2 : isNumericCol(c) ? 1 : 0)
-  const displayCols = [..._baseCols].sort((a, b) => _colRank(a) - _colRank(b))
+  const displayCols = [..._baseCols].sort((a, b) => {
+    const ra = _colRank(a), rb = _colRank(b)
+    if (ra !== rb) return ra - rb
+    if (ra === 0) return _distinct(b) - _distinct(a)   // dimensions: entity (most distinct) first
+    return 0                                            // metrics / YoY: keep source order
+  })
 
   // Primary value column for bullet bars (first numeric non-YOY non-name column)
   const valueCol = displayCols.find(c =>
