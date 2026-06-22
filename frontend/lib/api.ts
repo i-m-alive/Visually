@@ -450,7 +450,7 @@ export const intelligenceApi = {
    * the existing widgets. Returns chart-ready datasets the frontend appends as
    * synthetic widgets so they flow through the normal agent/orchestrator.
    */
-  discover: (dashboardId: string, opts?: { max_queries?: number; force?: boolean }) =>
+  discover: (dashboardId: string, opts?: { max_queries?: number; force?: boolean; date_range?: { from: string; to: string } | null }) =>
     api.post<{
       discoveries: Array<{
         title: string
@@ -463,7 +463,21 @@ export const intelligenceApi = {
     }>(`/dashboards/${dashboardId}/intelligence-discovery`, {
       max_queries: opts?.max_queries ?? 6,
       force: opts?.force ?? false,
+      date_range: opts?.date_range ?? null,
     }),
+
+  /**
+   * Server-side persistence of the generated AI report (one per dashboard) so the
+   * intelligence page retrieves a durable copy instead of relying on localStorage.
+   */
+  getReport: (dashboardId: string) =>
+    api.get<{ analysis: Record<string, unknown> | null; data_version?: string | null; generated_at?: string | null }>(
+      `/dashboards/${dashboardId}/intelligence-report`),
+  saveReport: (dashboardId: string, analysis: unknown, dataVersion?: string | null) =>
+    api.put<{ ok: boolean; generated_at: string }>(
+      `/dashboards/${dashboardId}/intelligence-report`, { analysis, data_version: dataVersion ?? null }),
+  deleteReport: (dashboardId: string) =>
+    api.delete(`/dashboards/${dashboardId}/intelligence-report`),
 
   /**
    * Fetch table/column metadata for every table referenced in this dashboard's

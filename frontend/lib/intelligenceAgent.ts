@@ -1524,7 +1524,9 @@ export async function runIntelligenceAgent(
   if (opts.discover) {
     try {
       onProgress?.('Discovering extra insights from the underlying tables…')
-      const dResp = await intelligenceApi.discover(canvasId, { force: opts.force })
+      // Pass the report's date range so discovered insights cover the SAME window
+      // (and so the discovery cache is keyed per range, not served stale).
+      const dResp = await intelligenceApi.discover(canvasId, { force: opts.force, date_range: opts.dateRange ?? null })
       const discovered = (dResp.data?.discoveries ?? []).filter(d => (d.chart_data?.rows?.length ?? 0) > 0)
       if (discovered.length) {
         const extra: WidgetInput[] = discovered.map((d, i) => ({

@@ -1215,6 +1215,53 @@ async def _discovery_exec(db, offline: bool, dashboard_id: str, conn_id: Optiona
 class DiscoveryRequest(BaseModel):
     max_queries: int = 6
     force: bool = False
+    # The report's applied date window {"from","to"} — discovery covers the SAME
+    # window (prompt hint) and the cache is keyed per-range so it's never served stale.
+    date_range: Optional[dict] = None
+
+
+def _pick_label_value_cols(columns: list, rows: list) -> tuple:
+    """Pick (label_col, value_col) by data, not position. The LLM may SELECT the
+    measure first (e.g. COUNT(*) AS total, status) — positional guessing then swaps
+    labels/values and the chart renders garbage. Choose the first numeric column as
+    the value and the first non-numeric as the label."""
+    def _is_num(col: str) -> bool:
+        seen = 0
+        for r in rows[:8]:
+            v = r.get(col)
+            if v is None or v == "":
+                continue
+            seen += 1
+            try:
+                float(str(v).replace(",", "").replace("$", "").replace("%", ""))
+            except (ValueError, TypeError):
+                return False
+        return seen > 0
+    if not columns:
+        return None, None
+    numeric = [c for c in columns if _is_num(c)]
+    value_col = numeric[0] if numeric else (columns[1] if len(columns) > 1 else columns[0])
+    label_col = next((c for c in columns if c != value_col), columns[0])
+    return label_col, value_col
+
+
+def _infer_col_type(col: str, rows: list) -> str:
+    """Cheap type hint from sample rows so the LLM proposes valid SQL."""
+    saw = False
+    for r in rows[:8]:
+        v = r.get(col)
+        if v is None or v == "":
+            continue
+        saw = True
+        try:
+            float(str(v).replace(",", "").replace("$", "").replace("%", ""))
+            return "number"
+        except (ValueError, TypeError):
+            s = str(v)
+            if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+                return "date"
+            return "text"
+    return "unknown" if not saw else "text"
 
 
 @router.post("/dashboards/{dashboard_id}/intelligence-discovery")
@@ -1262,6 +1309,13 @@ async def intelligence_discovery(
             .limit(1)
         )).scalar_one_or_none()
         conn_obj = pc
+        if conn_obj is not None:
+            # The report's widgets/layout name no connection — falling back to an
+            # arbitrary active project connection, which may be a DIFFERENT database
+            # than the report. Live sampling self-corrects (the report's table names
+            # won't exist there), but log it so any discrepancy is traceable.
+            print(f"[intel-discovery] dashboard={dashboard_id[:8]} — no widget/layout connection; "
+                  f"falling back to project connection {str(conn_obj.id)[:8]}", flush=True)
     if conn_obj is None:
         return {"discoveries": [], "message": "No connection or offline data for discovery"}
 
@@ -1295,7 +1349,14 @@ async def intelligence_discovery(
     # ── cache check ──────────────────────────────────────────────────────────
     redis = await get_redis()
     titles = sorted((w.title or "") for w in widgets)
-    cache_seed = dashboard_id + "|" + "|".join(table_names) + "|" + "|".join(titles) + f"|{max_queries}|{dialect}"
+    # Date range + data-freshness stamps in the key → range change or a Sync/Regenerate
+    # produces a fresh discovery instead of serving numbers from a stale window.
+    dr = body.date_range if (body and isinstance(body.date_range, dict)) else None
+    dr_key = f"{dr.get('from','')}~{dr.get('to','')}" if dr else ""
+    lc = dash.layout_config if isinstance(dash.layout_config, dict) else {}
+    stamp = str(lc.get("last_regenerated_at") or lc.get("last_synced_at") or "")
+    cache_seed = (dashboard_id + "|" + "|".join(table_names) + "|" + "|".join(titles)
+                  + f"|{max_queries}|{dialect}|{dr_key}|{stamp}")
     cache_key = f"intel:discovery:{hashlib.sha256(cache_seed.encode()).hexdigest()[:24]}"
     if redis is not None and not force:
         try:
@@ -1313,28 +1374,48 @@ async def intelligence_discovery(
         except Exception:
             pass
 
-    # ── sample each table ────────────────────────────────────────────────────
+    # ── sample each table (5 rows + inferred column types so the LLM proposes
+    #    valid SQL and doesn't guess column meaning from too little data) ────────
     schema_blocks: list[str] = []
     for t in table_names:
-        res = await _discovery_exec(db, offline, dashboard_id, conn_id, f"SELECT * FROM {t} LIMIT 3", 3)
+        res = await _discovery_exec(db, offline, dashboard_id, conn_id, f"SELECT * FROM {t} LIMIT 5", 5)
         if res.get("error"):
             continue
         cols = (res.get("columns") or [])[:40]
         rows = res.get("rows") or []
-        sample = [{c: r.get(c) for c in cols} for r in rows[:3]]
+        sample = [{c: r.get(c) for c in cols} for r in rows[:5]]
+        typed_cols = ", ".join(f"{c} ({_infer_col_type(c, rows)})" for c in cols)
         schema_blocks.append(
-            f"TABLE {t}\n  columns: {', '.join(cols)}\n  sample_rows: {json.dumps(sample, default=str)[:1500]}"
+            f"TABLE {t}\n  columns: {typed_cols}\n  sample_rows: {json.dumps(sample, default=str)[:1800]}"
         )
     if not schema_blocks:
         print(f"[intel-discovery] dashboard={dashboard_id[:8]}  offline={offline}  could not sample any of: {table_names}", flush=True)
         return {"discoveries": [], "message": "Could not sample any tables"}
 
-    existing = ", ".join(f'"{t}"' for t in titles if t) or "(none)"
+    # Existing widgets: give the model their TITLES *and* SQL so it can tell what's
+    # already measured and avoid re-deriving the same metric under a new name.
+    existing_lines = []
+    for w in widgets:
+        if not (w.title or w.sql_query):
+            continue
+        sig = (w.sql_query or w.base_sql or "").strip().replace("\n", " ")
+        existing_lines.append(f'- "{w.title or "untitled"}": {sig[:240]}')
+    existing = "\n".join(existing_lines) or "(none)"
+
+    date_hint = ""
+    if dr and (dr.get("from") or dr.get("to")):
+        date_hint = (
+            f"\n\nDATE WINDOW: restrict every query to the period "
+            f"{dr.get('from','')}..{dr.get('to','')} when a date/timestamp column exists, "
+            f"so findings match the report's window.\n"
+        )
+
     user_msg = (
         f"DIALECT: {dialect}\n\n"
         f"TABLES:\n" + "\n\n".join(schema_blocks) +
-        f"\n\nEXISTING REPORT WIDGETS (do NOT duplicate these angles):\n{existing}\n\n"
-        f"Propose up to {max_queries} NEW analytical queries as specified."
+        f"\n\nEXISTING REPORT WIDGETS (do NOT duplicate these metrics/angles):\n{existing}\n"
+        + date_hint +
+        f"\nPropose up to {max_queries} NEW analytical queries as specified."
     )
 
     print(f"[intel-discovery] dashboard={dashboard_id[:8]}  offline={offline}  tables={len(schema_blocks)}  max_q={max_queries}", flush=True)
@@ -1345,9 +1426,35 @@ async def intelligence_discovery(
         return {"discoveries": [], "message": f"LLM failed: {exc}"}
 
     parsed = _extract_json_obj(raw) or {}
-    proposals = parsed.get("discoveries") or []
-    proposals = [p for p in proposals if isinstance(p, dict) and _is_safe_select(p.get("sql", ""))][:max_queries]
-    print(f"[intel-discovery] proposals={len(proposals)} (after safety filter)", flush=True)
+    raw_proposals = parsed.get("discoveries") or []
+
+    # Allowed tables (bare names) we actually sampled — reject any proposal that
+    # references a table we didn't provide (the model hallucinated it). And dedupe
+    # against existing widget titles so discovery never re-shows an existing metric.
+    allowed_bare = {t.split(".")[-1].lower() for t in table_names}
+    existing_norm = {re.sub(r"[^a-z0-9]", "", (t or "").lower()) for t in titles if t}
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    proposals: list = []
+    seen_titles: set = set()
+    for p in raw_proposals:
+        if not (isinstance(p, dict) and _is_safe_select(p.get("sql", ""))):
+            continue
+        refs = _extract_table_names(p.get("sql", ""))
+        if refs and not refs.issubset(allowed_bare):
+            print(f"[intel-discovery] drop '{p.get('title')}' — references unknown table(s): {refs - allowed_bare}", flush=True)
+            continue
+        tnorm = _norm(p.get("title", ""))
+        if tnorm and (tnorm in existing_norm or tnorm in seen_titles):
+            print(f"[intel-discovery] drop '{p.get('title')}' — duplicates an existing/earlier title", flush=True)
+            continue
+        seen_titles.add(tnorm)
+        proposals.append(p)
+        if len(proposals) >= max_queries:
+            break
+    print(f"[intel-discovery] proposals={len(proposals)} (after safety/allow-list/dedup filter)", flush=True)
 
     # ── execute proposals (bounded concurrency) ──────────────────────────────
     sem = asyncio.Semaphore(_DISCOVERY_CONCURRENCY)
@@ -1361,9 +1468,11 @@ async def intelligence_discovery(
             return None
         rows = res.get("rows") or []
         columns = res.get("columns") or []
-        labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
-        values = ([r.get(columns[1]) for r in rows] if len(columns) > 1
-                  else [r.get(columns[0]) for r in rows] if columns else [])
+        # Pick label/value by DATA (numeric col = value), not by position — the model
+        # may SELECT the measure first, which would otherwise swap labels↔values.
+        label_col, value_col = _pick_label_value_cols(columns, rows)
+        labels = [str(r.get(label_col, "")) for r in rows] if label_col else []
+        values = [r.get(value_col) for r in rows] if value_col else []
         ct = str(p.get("chart_type", "bar")).lower()
         if ct not in _DISCOVERY_VALID_CHARTS:
             ct = "bar"
@@ -1385,3 +1494,76 @@ async def intelligence_discovery(
         except Exception:
             pass
     return out
+
+
+# ─── /dashboards/{id}/intelligence-report ────────────────────────────────────
+# Durable, server-side persistence of the generated AI report so the intelligence
+# page never silently regenerates: once saved it is retrieved as-is across devices,
+# and only rebuilt when the user explicitly Syncs/Regenerates.
+
+class SaveReportRequest(BaseModel):
+    analysis: dict
+    data_version: Optional[str] = None
+
+
+@router.get("/dashboards/{dashboard_id}/intelligence-report")
+async def get_intelligence_report(dashboard_id: str, db: AsyncSession = Depends(get_db)):
+    """Return the saved AI report for a dashboard, or {analysis: null} if none."""
+    from shared.models.intelligence_report import IntelligenceReport
+    try:
+        dash_uuid = uuid.UUID(dashboard_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid dashboard_id")
+    row = (await db.execute(
+        select(IntelligenceReport).where(IntelligenceReport.dashboard_id == dash_uuid)
+    )).scalar_one_or_none()
+    if not row:
+        return {"analysis": None}
+    return {
+        "analysis": row.analysis,
+        "data_version": row.data_version,
+        "generated_at": row.generated_at.isoformat() if row.generated_at else None,
+    }
+
+
+@router.put("/dashboards/{dashboard_id}/intelligence-report")
+async def save_intelligence_report(dashboard_id: str, body: SaveReportRequest, db: AsyncSession = Depends(get_db)):
+    """Upsert the saved AI report for a dashboard (one latest per dashboard)."""
+    from datetime import datetime as _dt
+    from shared.models.intelligence_report import IntelligenceReport
+    try:
+        dash_uuid = uuid.UUID(dashboard_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid dashboard_id")
+    if not isinstance(body.analysis, dict) or not body.analysis.get("sections"):
+        raise HTTPException(status_code=400, detail="analysis must contain sections")
+    now = _dt.utcnow()
+    row = (await db.execute(
+        select(IntelligenceReport).where(IntelligenceReport.dashboard_id == dash_uuid)
+    )).scalar_one_or_none()
+    if row:
+        row.analysis = body.analysis
+        row.data_version = body.data_version
+        row.generated_at = now
+        row.updated_at = now
+    else:
+        db.add(IntelligenceReport(
+            dashboard_id=dash_uuid, analysis=body.analysis,
+            data_version=body.data_version, generated_at=now, updated_at=now,
+        ))
+    await db.commit()
+    return {"ok": True, "generated_at": now.isoformat()}
+
+
+@router.delete("/dashboards/{dashboard_id}/intelligence-report")
+async def delete_intelligence_report(dashboard_id: str, db: AsyncSession = Depends(get_db)):
+    """Drop the saved report (used when the user wants a clean rebuild)."""
+    from sqlalchemy import delete as _sa_delete
+    from shared.models.intelligence_report import IntelligenceReport
+    try:
+        dash_uuid = uuid.UUID(dashboard_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid dashboard_id")
+    await db.execute(_sa_delete(IntelligenceReport).where(IntelligenceReport.dashboard_id == dash_uuid))
+    await db.commit()
+    return {"ok": True}
