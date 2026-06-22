@@ -2657,15 +2657,20 @@ export default function IntelligenceCanvasPage() {
     } : prev)
   }, [analysis, activeSection])
 
+  // Persist a generated report durably: server-side (survives device/browser
+  // changes and quota limits) + localStorage as a fast local cache.
+  const persistReport = useCallback(async (result: ExecutiveAnalysis) => {
+    try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
+    try { await intelligenceApi.saveReport(canvasId, result) } catch (e) { console.warn('[intelligence] server save failed (kept local):', e) }
+    setHasSavedData(true)
+  }, [canvasId])
+
   const saveAnalysis = useCallback(() => {
     if (!analysis) return
-    try {
-      localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(analysis))
-      setSaved(true)
-      setHasSavedData(true)
-      setTimeout(() => setSaved(false), 2000)
-    } catch {}
-  }, [analysis, canvasId])
+    void persistReport(analysis)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 2000)
+  }, [analysis, persistReport])
 
   useEffect(() => {
     let cancelled = false
@@ -2704,12 +2709,31 @@ export default function IntelligenceCanvasPage() {
         const token = sharesList.length ? ((sharesList[0] as Record<string,string>).token ?? '') : ''
         if (token) setShareToken(token)
 
-        // Saved analysis available — use it, skip AI run
-        if (savedObj) {
-          if (cancelled) return
+        // ── Server-saved report takes priority — durable across devices/browsers.
+        //    Once a report exists we render it as-is and NEVER auto-regenerate;
+        //    only an explicit Sync / Regenerate rebuilds it.
+        let serverAnalysis: ExecutiveAnalysis | null = null
+        try {
+          const rep = await intelligenceApi.getReport(canvasId)
+          const a = rep.data?.analysis as ExecutiveAnalysis | null
+          if (a && a.sections?.length) serverAnalysis = a
+        } catch { /* fall through to local cache / generate */ }
+        if (cancelled) return
+
+        if (serverAnalysis) {
           setRawWidgets(widgets)   // must set before return so copilot has connection_id
+          setAnalysis(serverAnalysis); setActiveSection(serverAnalysis.sections[0]?.id ?? '')
+          setAgentStatus('done'); setHasSavedData(true)
+          try { localStorage.setItem(RESULT_KEY, JSON.stringify(serverAnalysis)) } catch {}
+          return
+        }
+
+        // Legacy local copy — use it AND migrate it to the server so it's durable.
+        if (savedObj) {
+          setRawWidgets(widgets)
           setAnalysis(savedObj); setActiveSection(savedObj.sections[0]?.id ?? '')
           setAgentStatus('done'); setHasSavedData(true)
+          try { await intelligenceApi.saveReport(canvasId, savedObj) } catch {}
           return
         }
 
@@ -2787,8 +2811,13 @@ export default function IntelligenceCanvasPage() {
         if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
         setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
         setAgentStatus('done')
-        // Auto-save so waiting tabs pick it up and future loads skip the AI run
-        try { localStorage.setItem(RESULT_KEY, JSON.stringify(result)) } catch {}
+        // Auto-save (server + local) so future visits load it as-is and never
+        // regenerate — and so other tabs pick it up. Skip persisting a fallback.
+        if (!(result as unknown as Record<string, unknown>)._fallback) {
+          void persistReport(result)
+        } else {
+          try { localStorage.setItem(RESULT_KEY, JSON.stringify(result)) } catch {}
+        }
       } catch (err) {
         if (cancelled) return
         setAgentError(err instanceof Error ? err.message : 'Failed to load')
@@ -2826,13 +2855,13 @@ export default function IntelligenceCanvasPage() {
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
-      try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
+      void persistReport(result)   // durable save (server + local)
       // Date-range apply re-fetches data AND rebuilds the report → record a regenerate.
       try { const r = await dashboardApi.recordActivity(canvasId, 'regenerate'); setLastActivity(r.data) } catch {}
     } catch {
       setAgentStatus('done')
     } finally { setDateLoading(false) }
-  }, [canvas, pendingDate, rawWidgets, projectId, canvasId, shareToken, mergeWidgetData, discoverEnabled])
+  }, [canvas, pendingDate, rawWidgets, projectId, canvasId, shareToken, mergeWidgetData, discoverEnabled, persistReport])
 
   const rerun = useCallback(async () => {
     if (!canvas || rerunning) return
@@ -2858,6 +2887,7 @@ export default function IntelligenceCanvasPage() {
       if ((result as Record<string,unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
+      void persistReport(result)   // durable save (server + local)
       // Sync Now re-fetches live data → record a data sync.
       try { const r = await dashboardApi.recordActivity(canvasId, 'sync'); setLastActivity(r.data) } catch {}
     } catch {
@@ -2866,7 +2896,7 @@ export default function IntelligenceCanvasPage() {
       setAiFallbackWarning(true)
       setAgentStatus('done')
     } finally { setRerunning(false) }
-  }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange, discoverEnabled])
+  }, [canvas, rerunning, projectId, canvasId, rawWidgets, shareToken, mergeWidgetData, appliedDateRange, discoverEnabled, persistReport])
 
   // Regenerate from scratch — rebuild the AI report on the CURRENT data without
   // re-querying the database. Distinct from Sync Now (which also re-fetches data).
@@ -2884,22 +2914,23 @@ export default function IntelligenceCanvasPage() {
       if ((result as unknown as Record<string, unknown>)._fallback) setAiFallbackWarning(true)
       setAnalysis(result); setActiveSection(result.sections[0]?.id ?? '')
       setAgentStatus('done')
-      try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(result)) } catch {}
+      void persistReport(result)   // durable save (server + local)
       // Full AI rebuild → record a regenerate.
       try { const r = await dashboardApi.recordActivity(canvasId, 'regenerate'); setLastActivity(r.data) } catch {}
     } catch {
       setAgentStatus('done')
     } finally { setRegenerating(false) }
-  }, [canvas, rerunning, regenerating, projectId, canvasId, rawWidgets, shareToken, appliedDateRange, discoverEnabled])
+  }, [canvas, rerunning, regenerating, projectId, canvasId, rawWidgets, shareToken, appliedDateRange, discoverEnabled, persistReport])
 
   // Keep rerunRef current so the auto-sync interval never closes over a stale rerun
   useEffect(() => { rerunRef.current = rerun }, [rerun])
 
-  // Auto-sync interval
+  // Auto-sync interval — DISABLED by request: a saved report must never regenerate
+  // on its own; it only rebuilds when the user explicitly clicks Sync or Regenerate.
+  // (Schedule UI is retained but does not auto-fire.)
   useEffect(() => {
-    if (!autoSyncMins) return
-    const id = setInterval(() => rerunRef.current(), autoSyncMins * 60 * 1000)
-    return () => clearInterval(id)
+    void autoSyncMins
+    void rerunRef
   }, [autoSyncMins])
 
   // Close sync dropdown on outside click
@@ -3671,10 +3702,11 @@ export default function IntelligenceCanvasPage() {
           dashboardId={canvasId}
           hint={(canvas as { connection_hint?: import('@/components/canvas/ConnectLiveDbModal').ConnHint } | null)?.connection_hint}
           onClose={() => setShowConnectDb(false)}
-          onConnected={() => {
-            // Now live — drop the saved offline report and reload so the page
-            // re-fetches live data and the offline pill disappears.
+          onConnected={async () => {
+            // Now live — drop the saved offline report (server + local) so the page
+            // rebuilds against live data on reload and the offline pill disappears.
             try { localStorage.removeItem(`intel_analysis_${canvasId}`) } catch {}
+            try { await intelligenceApi.deleteReport(canvasId) } catch {}
             window.location.reload()
           }}
         />
