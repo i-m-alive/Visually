@@ -1319,12 +1319,27 @@ function AgentChartView({
       {/* ── FUNNEL ── */}
       {viewType === 'funnel' && (
         <ResponsiveContainer width="100%" height={240}>
-          <FunnelChart margin={{ top: 8, right: 16, bottom: 8, left: 16 }}>
+          <FunnelChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
             <Tooltip {...TTP} formatter={(v: number) => [fmtExact(v), ''] as [React.ReactNode, string]} />
             <Funnel dataKey="value" nameKey="name" data={chart.data} isAnimationActive={false}>
               {chart.data.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
-              <LabelList position="right" dataKey="name" style={{ fontSize: 10, fill: '#475569' }} />
-              <LabelList position="left" dataKey="value" formatter={(v: number) => fmtExact(v)} style={{ fontSize: 10, fill: '#94a3b8' }} />
+              {/* Centred two-line label (name + value) inside each band, anchored to the
+                  band centre so wide top segments never clip; white text + dark halo
+                  (paint-order: stroke) stays legible on every segment colour. */}
+              <LabelList content={((props: Record<string, unknown>) => {
+                const x = Number(props.x), y = Number(props.y)
+                const w = Number(props.width), h = Number(props.height)
+                const d = (chart.data as Array<{ name?: unknown; value?: unknown }>)[Number(props.index)]
+                if (!d || !isFinite(x) || !isFinite(w)) return null
+                const cx = x + w / 2, cy = y + h / 2
+                const halo = { stroke: 'rgba(2,18,38,0.55)', strokeWidth: 2.5, paintOrder: 'stroke' as const }
+                return (
+                  <g style={{ pointerEvents: 'none' }}>
+                    <text x={cx} y={cy - 3} textAnchor="middle" fill="#fff" {...halo} style={{ fontSize: 10, fontWeight: 700 }}>{String(d.name ?? '')}</text>
+                    <text x={cx} y={cy + 10} textAnchor="middle" fill="#fff" {...halo} style={{ fontSize: 10, fontWeight: 600 }}>{fmtExact(Number(d.value ?? 0))}</text>
+                  </g>
+                )
+              }) as unknown as React.ComponentProps<typeof LabelList>['content']} />
             </Funnel>
           </FunnelChart>
         </ResponsiveContainer>
@@ -1582,6 +1597,27 @@ function SectionContent({
             Object.values(row).some(v => v !== null && v !== undefined && v !== '' && String(v).trim() !== '')
           )
           if (!hasAnyRealValue) return false
+
+          // Skip charts whose NUMERIC values are all zero / non-finite — these render
+          // as a flat zero line (a broken/empty graph) even though category labels
+          // exist. Ignore the category axis key (name/x) so a year like "2026" used as
+          // a label doesn't count as data. Tables may be non-numeric, so skip them.
+          if (ch.type !== 'table') {
+            const catKeys = new Set(
+              ['name', 'x', String((ch as { x_key?: string }).x_key ?? '')]
+                .filter(Boolean).map(s => s.toLowerCase())
+            )
+            let sawNonZero = false
+            for (const row of ch.data) {
+              for (const [k, v] of Object.entries(row)) {
+                if (catKeys.has(k.toLowerCase()) || typeof v === 'boolean') continue
+                const n = typeof v === 'number' ? v : Number(v)
+                if (isFinite(n) && n !== 0) { sawNonZero = true; break }
+              }
+              if (sawNonZero) break
+            }
+            if (!sawNonZero) return false
+          }
 
           // Fix B — suppress table charts whose first-column entities are already
           // shown by the PerformerPanel (≥50% overlap → duplicate visual)

@@ -1294,6 +1294,56 @@ function injectSourceSql(sections: AgentSection[], widgetSqlMap: Map<string, str
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rebind chart data to the source widget's REAL rows.
+// The AI sometimes emits a chart whose values are all zero/empty (a transcription
+// failure) even though the widget it maps to has real data — producing a flat
+// "ghost" chart. When that happens, replace the chart's data with the widget's
+// actual labels/values so the report shows the true numbers instead of zeros.
+// Conservative: only overwrites when the widget HAS real numbers AND the AI's data
+// is empty/all-zero — never clobbers a chart the AI populated correctly (which may
+// carry intentional top-N / aggregation transforms).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function hasNonZeroValue(rows: AgentChartRow[] | undefined): boolean {
+  if (!rows) return false
+  return rows.some(r => { const n = toNum((r as { value?: unknown }).value); return isFinite(n) && n !== 0 })
+}
+
+function rebindChartDataToWidgets(sections: AgentSection[], widgets: WidgetInput[]): void {
+  const bySql = new Map<string, WidgetInput>()
+  for (const w of widgets) if (w.sql_query) bySql.set(w.sql_query.trim(), w)
+  if (bySql.size === 0) return
+
+  for (const section of sections) {
+    for (const chart of section.charts) {
+      // Tables build their own data from rows; forecast carries a projected series.
+      if (chart.type === 'table' || chart.type === 'forecast') continue
+      const sql = chart.source_sql?.trim()
+      if (!sql) continue
+      const cd = bySql.get(sql)?.chart_data
+      if (!cd) continue
+
+      // Build ground-truth {name, value} rows from the widget's real data.
+      let rebuilt: AgentChartRow[] = []
+      if ((cd.labels?.length ?? 0) > 0 && (cd.values?.length ?? 0) > 0) {
+        rebuilt = cd.labels.map((l, i) => ({ name: String(l ?? ''), value: toNum(cd.values[i]) || 0 }))
+      } else if ((cd.rows?.length ?? 0) > 0 && (cd.columns?.length ?? 0) > 0) {
+        const nameCol = cd.columns[0]
+        const valCol = cd.columns.find(c => cd.rows.slice(0, 5).some(r => isFinite(toNum(r[c])))) ?? cd.columns[1] ?? 'value'
+        rebuilt = cd.rows.map(r => ({ name: String(r[nameCol] ?? ''), value: toNum(r[valCol]) || 0, ...r }))
+      }
+      if (rebuilt.length === 0) continue
+
+      // Swap in ground truth only when the widget has real numbers and the AI's
+      // version is empty/all-zero (the broken-chart case).
+      if (hasNonZeroValue(rebuilt) && !hasNonZeroValue(chart.data)) {
+        chart.data = rebuilt
+      }
+    }
+  }
+}
+
 function injectTableCharts(analysis: ExecutiveAnalysis, widgets: WidgetInput[]): void {
   if (analysis.sections.length === 0) return
 
@@ -1732,6 +1782,7 @@ export async function runIntelligenceAgent(
   injectForecastData(analysis.sections, forecastMap, labelMap)
   injectReferenceLines(analysis.sections)
   injectSourceSql(analysis.sections, widgetSqlMap)
+  rebindChartDataToWidgets(analysis.sections, widgets as WidgetInput[])  // fix all-zero "ghost" charts
   injectTableCharts(analysis, widgets as WidgetInput[])
   injectUncoveredWidgets(analysis, widgets as WidgetInput[])  // strict: no widget left out
 
@@ -1879,6 +1930,7 @@ Return ONLY the JSON for a single section — no other text:
   }
 
   injectSourceSql([section], widgetSqlMap)
+  rebindChartDataToWidgets([section], widgets as WidgetInput[])  // fix all-zero "ghost" charts
   injectReferenceLines([section])
 
   return section
