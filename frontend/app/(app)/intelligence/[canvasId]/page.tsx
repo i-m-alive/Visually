@@ -23,7 +23,7 @@ import {
   Award, Package, Briefcase, LineChart as LineChartIcon, ChevronDown, ChevronUp,
   Code2, Scale,
   X, Download, Maximize2, Play, Link, Copy, Printer, Pin,
-  Columns, ChevronRight, CalendarRange, Edit3, Bookmark, BookmarkCheck, Wifi,
+  Columns, ChevronRight, CalendarRange, Edit3, Bookmark, BookmarkCheck, Wifi, FileSpreadsheet,
 } from 'lucide-react'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -1031,6 +1031,19 @@ function AgentChartView({
     img.src = URL.createObjectURL(blob)
   }
 
+  // Download the chart's underlying data as a real .xlsx (the numbers behind the chart).
+  const downloadData = async () => {
+    try {
+      const { downloadXlsx, chartToTable } = await import('@/lib/xlsx')
+      const { columns, rows } = chartToTable(chart.data as Array<Record<string, unknown>>)
+      if (!columns.length || !rows.length) return
+      const base = cleanChartTitle(chart.title)
+      await downloadXlsx((base || 'chart_data').replace(/[^a-z0-9]+/gi, '_'), columns, rows, base)
+    } catch (e) {
+      console.warn('[intelligence] xlsx export failed:', e)
+    }
+  }
+
   const pinnedAnnotations = annotations
     ? Object.entries(annotations).map(([k, v]) => ({ point: k, note: v }))
     : []
@@ -1109,7 +1122,8 @@ function AgentChartView({
                 {showRawData ? 'Hide' : 'Data'}
               </button>
             )}
-            <button onClick={downloadPng} title="Download PNG" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
+            <button onClick={downloadPng} title="Download chart as PNG image" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Download size={10} /></button>
+            <button onClick={downloadData} title="Download chart data as Excel (.xlsx)" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: '#16794f' }}><FileSpreadsheet size={10} /></button>
             {onFullscreen && <button onClick={onFullscreen} title="Fullscreen" className="intel-toolbar-btn" style={{ padding: 4, borderRadius: 6, border: '1px solid #e8eef5', background: 'white', cursor: 'pointer', display: 'flex', color: C.slate }}><Maximize2 size={10} /></button>}
           </div>
         </div>
