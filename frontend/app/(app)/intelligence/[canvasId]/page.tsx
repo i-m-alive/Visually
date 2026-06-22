@@ -683,13 +683,19 @@ function TableView({ chart }: { chart: AgentChart }) {
   // Detect year-like columns (2020–2030) to build sparkline
   const yearCols = meaningfulCols.filter(c => YEAR_RE.test(c))
   const hasTrend = yearCols.length >= 2
-  const displayCols = hasTrend ? meaningfulCols.filter(c => !YEAR_RE.test(c)) : meaningfulCols
+  const _baseCols = hasTrend ? meaningfulCols.filter(c => !YEAR_RE.test(c)) : meaningfulCols
 
   // Classify columns
   const isYoyCol = (c: string) =>
     /yoy|pct|percent|change|growth|vs\s/i.test(c) || c.includes('%')
   const isNumericCol = (c: string) =>
     chart.data.slice(0, 8).filter(r => r[c] !== null && r[c] !== undefined && r[c] !== '').some(r => !isNaN(Number(r[c])))
+
+  // Conventional left→right reading order: dimension/label (text) columns first,
+  // then numeric metric columns, then YoY/%/change columns. Stable sort, so the
+  // original column order is preserved WITHIN each group.
+  const _colRank = (c: string) => (isYoyCol(c) ? 2 : isNumericCol(c) ? 1 : 0)
+  const displayCols = [..._baseCols].sort((a, b) => _colRank(a) - _colRank(b))
 
   // Primary value column for bullet bars (first numeric non-YOY non-name column)
   const valueCol = displayCols.find(c =>
