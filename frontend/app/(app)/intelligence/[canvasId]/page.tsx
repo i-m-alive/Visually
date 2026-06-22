@@ -1598,25 +1598,27 @@ function SectionContent({
           )
           if (!hasAnyRealValue) return false
 
-          // Skip charts whose NUMERIC values are all zero / non-finite — these render
-          // as a flat zero line (a broken/empty graph) even though category labels
-          // exist. Ignore the category axis key (name/x) so a year like "2026" used as
-          // a label doesn't count as data. Tables may be non-numeric, so skip them.
+          // Hide charts that would render blank. Key on the SAME field the renderer
+          // reads, not just "any numeric column": almost every chart type draws from
+          // `value` (bar/line/area/pie/donut/funnel/treemap/radar/waterfall/forecast),
+          // scatter draws from x/y. A chart with numbers only under some other key
+          // (e.g. `jobs`) but no real `value` renders empty — so drop it. `combo` may
+          // use multiple series keys, so it keeps the broad any-numeric check.
           if (ch.type !== 'table') {
-            const catKeys = new Set(
-              ['name', 'x', String((ch as { x_key?: string }).x_key ?? '')]
-                .filter(Boolean).map(s => s.toLowerCase())
-            )
-            let sawNonZero = false
-            for (const row of ch.data) {
-              for (const [k, v] of Object.entries(row)) {
-                if (catKeys.has(k.toLowerCase()) || typeof v === 'boolean') continue
-                const n = typeof v === 'number' ? v : Number(v)
-                if (isFinite(n) && n !== 0) { sawNonZero = true; break }
-              }
-              if (sawNonZero) break
+            const toN = (v: unknown) => (typeof v === 'number' ? v : Number(v))
+            const nonZero = (v: unknown) => { const n = toN(v); return isFinite(n) && n !== 0 }
+            let renderable: boolean
+            if (ch.type === 'scatter') {
+              const xk = (ch as { x_key?: string }).x_key || 'x'
+              const yk = (ch as { y_key?: string }).y_key || 'y'
+              renderable = ch.data.some(r => isFinite(toN(r[xk] ?? r.x ?? r.value)) && isFinite(toN(r[yk] ?? r.y)))
+            } else if (ch.type === 'combo') {
+              const catKeys = new Set(['name', 'x', String((ch as { x_key?: string }).x_key ?? '')].filter(Boolean).map(s => s.toLowerCase()))
+              renderable = ch.data.some(r => Object.entries(r).some(([k, v]) => !catKeys.has(k.toLowerCase()) && typeof v !== 'boolean' && nonZero(v)))
+            } else {
+              renderable = ch.data.some(r => nonZero((r as { value?: unknown }).value))
             }
-            if (!sawNonZero) return false
+            if (!renderable) return false
           }
 
           // Fix B — suppress table charts whose first-column entities are already
