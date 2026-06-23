@@ -12,7 +12,7 @@
  */
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database, Maximize2 } from 'lucide-react'
+import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database, Maximize2, RotateCcw } from 'lucide-react'
 import { streamIntelligenceChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
@@ -218,6 +218,24 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
     if (prefillMessage) { setInput(prefillMessage); setTimeout(() => textareaRef.current?.focus(), 100) }
   }, [prefillMessage])
 
+  const clearChat = useCallback(() => {
+    const newSid = `intel-${canvasId}-${Date.now()}`
+    try {
+      localStorage.removeItem(`intel_chat_msgs_${canvasId}`)
+      localStorage.setItem(`intel_chat_sid_${canvasId}`, newSid)
+    } catch { /* ignore */ }
+    const greeting: ChatMsg = {
+      role: 'assistant',
+      content: title
+        ? `Hi! I'm your **${title}**. I have full access to your report data and live database. Ask me anything about the data, explore trends, or generate new charts.`
+        : 'Hi! I have full access to your intelligence report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
+    }
+    setMessages([greeting])
+    setShowSuggestions(true)
+    setEnlarged(null)
+    setVizOverride({})
+  }, [canvasId, title])
+
   const connectionId = widgets.find(w => w.connection_id)?.connection_id
   const widgetRecs   = buildRecommendations(widgets, pages)
   const recommended  = suggestedQuestions?.length
@@ -417,6 +435,16 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
               </button>
             </div>
           )}
+          <button
+            onClick={clearChat}
+            title="Clear chat history and start a new conversation"
+            className="p-1 rounded transition-colors"
+            style={{ color: 'rgba(255,255,255,0.5)' }}
+            onMouseEnter={e => (e.currentTarget.style.color = 'white')}
+            onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.5)')}
+          >
+            <RotateCcw size={14} />
+          </button>
           <button onClick={onClose} className="p-1 rounded transition-colors" style={{ color: 'rgba(255,255,255,0.5)' }}
             onMouseEnter={e => (e.currentTarget.style.color = 'white')}
             onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.5)')}>
