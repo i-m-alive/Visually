@@ -90,6 +90,7 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
     )
 
     history = await IntelligenceChatAgent.load_history(session_id, redis)
+    memory = await IntelligenceChatAgent.load_memory(session_id, redis)
     schema_doc, connection_id_for_schema, db_type = await _get_schema_context(req.project_id, db)
     effective_connection_id = req.connection_id or connection_id_for_schema
 
@@ -129,6 +130,7 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
     return {
         "session_id": session_id,
         "history": history,
+        "memory": memory,
         "schema_doc": schema_doc,
         "enriched": enriched,
         "dashboard_widgets": dashboard_widgets,
@@ -220,6 +222,7 @@ async def intel_chat(
         model_override=ctx["model_pref"],
         connection_id=ctx["connection_id"],
         scope=req.scope or "report",
+        conversation_memory=ctx["memory"],
     )
 
     sql_spec = result.get("sql_to_execute")
@@ -243,7 +246,8 @@ async def intel_chat(
         {"role": "user", "content": req.message},
         {"role": "assistant", "content": result["text"]},
     ]
-    await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis)
+    new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
+    await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
     print(f"[intel_chat] ✔ turn complete  session={ctx['session_id'][:8]}  turns={len(updated_history) // 2}", flush=True)
 
     return IntelChatResponse(
@@ -285,6 +289,7 @@ async def intel_chat_stream(
             model_override=ctx["model_pref"],
             connection_id=ctx["connection_id"],
             scope=req.scope or "report",
+            conversation_memory=ctx["memory"],
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[intel_chat] ✗ stream setup failed: {exc!r}", flush=True)
@@ -373,7 +378,8 @@ async def intel_chat_stream(
             {"role": "user", "content": req.message},
             {"role": "assistant", "content": final_text},
         ]
-        await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis)
+        new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
+        await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
         print(f"[intel_chat] ✔ stream complete  session={ctx['session_id'][:8]}  turns={len(updated_history) // 2}", flush=True)
 
         yield _sse({"type": "done", "session_id": ctx["session_id"],
