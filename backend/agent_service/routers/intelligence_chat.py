@@ -77,6 +77,52 @@ class IntelChatResponse(BaseModel):
     turn_count: int
 
 
+async def _fetch_priority_columns_doc(connection_id: str, priority_tables: set) -> dict:
+    """Layer 2: fetch real column names for priority tables from information_schema.
+    Only called when the enriched schema cache is absent (cold start / missing crawl).
+    Caps at 8 tables to avoid per-turn latency blowing up."""
+    doc: dict = {}
+    for tbl in list(priority_tables)[:8]:
+        schema_part, _, table_part = tbl.rpartition('.')
+        if not table_part:
+            table_part = tbl
+            schema_part = 'public'
+        sql = (
+            "SELECT column_name, data_type "
+            "FROM information_schema.columns "
+            f"WHERE table_name = '{table_part}'"
+            + (f" AND table_schema = '{schema_part}'" if schema_part else "")
+            + " ORDER BY ordinal_position LIMIT 80"
+        )
+        res = await _execute_sql(connection_id, sql)
+        if res.get("error") or not res.get("rows"):
+            continue
+        cols = [str(r["column_name"]) for r in res["rows"] if r.get("column_name")]
+        if cols:
+            doc[tbl] = {"columns": cols, "used_by_widgets": [], "source": "live_fetch"}
+    return doc
+
+
+async def _load_report_tables_metadata(dashboard_id: str, db: AsyncSession) -> dict:
+    """Layer 3 (read): load the _tables_metadata that was stored alongside the
+    saved IntelligenceReport. Returns {} when none was persisted yet."""
+    if not dashboard_id:
+        return {}
+    try:
+        from shared.models.intelligence_report import IntelligenceReport
+        row = (await db.execute(
+            select(IntelligenceReport)
+            .where(IntelligenceReport.dashboard_id == uuid.UUID(dashboard_id))
+        )).scalar_one_or_none()
+        if row and isinstance(row.analysis, dict):
+            meta = row.analysis.get("_tables_metadata")
+            if isinstance(meta, dict) and meta:
+                return meta
+    except Exception as exc:
+        print(f"[intel_chat] ⚠ _load_report_tables_metadata failed (non-fatal): {exc}", flush=True)
+    return {}
+
+
 async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis) -> dict:
     """Resolve everything a Report-Copilot turn needs: session, history, schema,
     enrichment, widgets, pages, priority tables, connection, model preference.
@@ -127,6 +173,63 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         effective_model_pref = "opus"
         print(f"[intel_chat] auto-upgraded to opus (msg_len={len(req.message)} > 8000)", flush=True)
 
+    # ── Build verified_tables_doc (Layers 2 + 3) ────────────────────────────────
+    # Base: widget → table mapping from SQL (always, no DB needed).
+    widget_table_map: dict = {}
+    for w in dashboard_widgets:
+        sql = w.get("sql_query") or ""
+        if not sql:
+            continue
+        tbls = re.findall(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE)
+        ctes = {m.lower() for m in re.findall(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', sql, re.IGNORECASE)}
+        for t in tbls:
+            if t.split('.')[-1].lower() in ctes:
+                continue
+            entry = widget_table_map.setdefault(t, {"used_by_widgets": [], "columns": [], "source": "widget_sql"})
+            if w.get("title") and w["title"] not in entry["used_by_widgets"]:
+                entry["used_by_widgets"].append(w["title"])
+
+    # Layer 2: add column info from enriched schema when available.
+    if enriched and enriched.compact_tables and widget_table_map:
+        compact_idx = {ct.get("name", "").lower(): ct for ct in enriched.compact_tables if ct.get("name")}
+        for tbl, entry in widget_table_map.items():
+            ct = compact_idx.get(tbl.lower()) or compact_idx.get(tbl.split(".")[-1].lower())
+            if ct:
+                cols = [c.get("name", "") for c in (ct.get("columns") or []) if c.get("name")]
+                if cols:
+                    entry["columns"] = cols
+                    entry["source"] = "enriched_schema"
+
+    # Layer 2 fallback: if enrichment absent, fetch live columns for priority tables.
+    if not enriched and priority_tables and effective_connection_id and widget_table_map:
+        missing = {t for t in widget_table_map if not widget_table_map[t].get("columns")}
+        if missing:
+            live = await _fetch_priority_columns_doc(effective_connection_id, missing)
+            for t, info in live.items():
+                if t in widget_table_map:
+                    widget_table_map[t]["columns"] = info["columns"]
+                    widget_table_map[t]["source"] = "live_fetch"
+                else:
+                    widget_table_map[t] = info
+
+    # Layer 3: override with saved report metadata (most trusted — verified at report-gen time).
+    report_meta = await _load_report_tables_metadata(req.dashboard_id or "", db)
+    for tbl, info in report_meta.items():
+        if tbl in widget_table_map:
+            # preserve used_by_widgets from widget parse; update columns + source from metadata
+            widget_table_map[tbl]["columns"] = info.get("columns") or widget_table_map[tbl].get("columns") or []
+            widget_table_map[tbl]["source"] = "report_metadata"
+        else:
+            widget_table_map[tbl] = {**info, "source": "report_metadata"}
+
+    verified_tables_doc = {t: v for t, v in widget_table_map.items() if v.get("columns") or v.get("used_by_widgets")}
+    if verified_tables_doc:
+        print(
+            f"[intel_chat] verified_tables_doc: {len(verified_tables_doc)} table(s)  "
+            f"sources={set(v.get('source','?') for v in verified_tables_doc.values())}",
+            flush=True,
+        )
+
     return {
         "session_id": session_id,
         "history": history,
@@ -138,6 +241,7 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         "priority_tables": priority_tables,
         "connection_id": effective_connection_id,
         "model_pref": effective_model_pref,
+        "verified_tables_doc": verified_tables_doc,
     }
 
 
@@ -223,6 +327,7 @@ async def intel_chat(
         connection_id=ctx["connection_id"],
         scope=req.scope or "report",
         conversation_memory=ctx["memory"],
+        verified_tables_doc=ctx.get("verified_tables_doc"),
     )
 
     sql_spec = result.get("sql_to_execute")
@@ -290,6 +395,7 @@ async def intel_chat_stream(
             connection_id=ctx["connection_id"],
             scope=req.scope or "report",
             conversation_memory=ctx["memory"],
+            verified_tables_doc=ctx.get("verified_tables_doc"),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[intel_chat] ✗ stream setup failed: {exc!r}", flush=True)

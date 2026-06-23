@@ -1501,6 +1501,82 @@ async def intelligence_discovery(
 # page never silently regenerates: once saved it is retrieved as-is across devices,
 # and only rebuilt when the user explicitly Syncs/Regenerates.
 
+_SAVE_TABLE_RE = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', re.IGNORECASE)
+_SAVE_CTE_RE   = re.compile(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', re.IGNORECASE)
+
+
+async def _build_tables_metadata_for_report(dashboard_id: str, db) -> dict:
+    """Layer 3 (write): extract per-table metadata for a report at save time.
+
+    Builds:
+      { "public.wahve_billing": { "used_by_widgets": [...], "columns": [...], "source": "..." } }
+
+    Column info is sourced from the enriched schema cache (most accurate). If the
+    cache is cold, columns are left empty — the live_fetch fallback fills them in at
+    query time. Called once on PUT /intelligence-report so the copilot is always
+    grounded the next time the user opens the chat.
+    """
+    try:
+        widget_result = await db.execute(
+            select(Widget).where(Widget.dashboard_id == uuid.UUID(dashboard_id))
+        )
+        widgets = list(widget_result.scalars().all())
+    except Exception:
+        return {}
+
+    # widget → tables mapping
+    table_map: dict = {}
+    sample_conn_id: str = ""
+    for w in widgets:
+        if w.connection_id and not sample_conn_id:
+            sample_conn_id = str(w.connection_id)
+        sql = w.sql_query or w.base_sql or ""
+        if not sql:
+            continue
+        ctes = {m.lower() for m in _SAVE_CTE_RE.findall(sql)}
+        for t in _SAVE_TABLE_RE.findall(sql):
+            if t.split('.')[-1].lower() in ctes:
+                continue
+            entry = table_map.setdefault(t, {"used_by_widgets": [], "columns": [], "source": "widget_sql"})
+            if w.title and w.title not in entry["used_by_widgets"]:
+                entry["used_by_widgets"].append(w.title)
+
+    if not table_map:
+        return {}
+
+    # enrich with columns from the cached enriched schema
+    if sample_conn_id:
+        try:
+            from shared.models.schema_snapshots import SchemaSnapshot
+            from agent_service.agents import schema_cache as _sc
+            snap = (await db.execute(
+                select(SchemaSnapshot)
+                .where(SchemaSnapshot.connection_id == uuid.UUID(sample_conn_id))
+                .order_by(SchemaSnapshot.version.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+            if snap and snap.schema_document:
+                enr = await _sc.get_cached(sample_conn_id, snap.schema_document)
+                if enr and enr.compact_tables:
+                    idx = {ct.get("name", "").lower(): ct for ct in enr.compact_tables if ct.get("name")}
+                    for tbl, entry in table_map.items():
+                        ct = idx.get(tbl.lower()) or idx.get(tbl.split(".")[-1].lower())
+                        if ct:
+                            cols = [c.get("name", "") for c in (ct.get("columns") or []) if c.get("name")]
+                            if cols:
+                                entry["columns"] = cols
+                                entry["source"] = "enriched_schema"
+        except Exception as exc:
+            print(f"[intelligence] _build_tables_metadata enrichment failed (non-fatal): {exc}", flush=True)
+
+    print(
+        f"[intelligence] tables_metadata built: {len(table_map)} table(s)  "
+        f"dashboard={dashboard_id[:8]}",
+        flush=True,
+    )
+    return table_map
+
+
 class SaveReportRequest(BaseModel):
     analysis: dict
     data_version: Optional[str] = None
@@ -1519,8 +1595,13 @@ async def get_intelligence_report(dashboard_id: str, db: AsyncSession = Depends(
     )).scalar_one_or_none()
     if not row:
         return {"analysis": None}
+    # Strip the internal _tables_metadata key before returning to the frontend —
+    # it's a server-side hint for the copilot, not part of the AI analysis payload.
+    analysis = dict(row.analysis) if isinstance(row.analysis, dict) else row.analysis
+    if isinstance(analysis, dict):
+        analysis.pop("_tables_metadata", None)
     return {
-        "analysis": row.analysis,
+        "analysis": analysis,
         "data_version": row.data_version,
         "generated_at": row.generated_at.isoformat() if row.generated_at else None,
     }
@@ -1528,7 +1609,11 @@ async def get_intelligence_report(dashboard_id: str, db: AsyncSession = Depends(
 
 @router.put("/dashboards/{dashboard_id}/intelligence-report")
 async def save_intelligence_report(dashboard_id: str, body: SaveReportRequest, db: AsyncSession = Depends(get_db)):
-    """Upsert the saved AI report for a dashboard (one latest per dashboard)."""
+    """Upsert the saved AI report for a dashboard (one latest per dashboard).
+
+    Layer 3: also computes and stores _tables_metadata alongside the analysis so
+    the copilot has a verified widget→table→column mapping on every subsequent turn.
+    """
     from datetime import datetime as _dt
     from shared.models.intelligence_report import IntelligenceReport
     try:
@@ -1537,18 +1622,25 @@ async def save_intelligence_report(dashboard_id: str, body: SaveReportRequest, d
         raise HTTPException(status_code=400, detail="Invalid dashboard_id")
     if not isinstance(body.analysis, dict) or not body.analysis.get("sections"):
         raise HTTPException(status_code=400, detail="analysis must contain sections")
+
+    # Build tables metadata and embed under a private key so the frontend ignores it.
+    tables_meta = await _build_tables_metadata_for_report(dashboard_id, db)
+    analysis_to_save = dict(body.analysis)
+    if tables_meta:
+        analysis_to_save["_tables_metadata"] = tables_meta
+
     now = _dt.utcnow()
     row = (await db.execute(
         select(IntelligenceReport).where(IntelligenceReport.dashboard_id == dash_uuid)
     )).scalar_one_or_none()
     if row:
-        row.analysis = body.analysis
+        row.analysis = analysis_to_save
         row.data_version = body.data_version
         row.generated_at = now
         row.updated_at = now
     else:
         db.add(IntelligenceReport(
-            dashboard_id=dash_uuid, analysis=body.analysis,
+            dashboard_id=dash_uuid, analysis=analysis_to_save,
             data_version=body.data_version, generated_at=now, updated_at=now,
         ))
     await db.commit()

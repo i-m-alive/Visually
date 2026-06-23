@@ -261,6 +261,60 @@ _SAMPLE_VALUE_LIMIT = int(os.getenv("INTEL_CHAT_SAMPLE_VALUE_LIMIT", "5"))
 _COL_DESC_MAX = int(os.getenv("INTEL_CHAT_COL_DESC_MAX", "80"))
 _TABLE_DESC_MAX = int(os.getenv("INTEL_CHAT_TABLE_DESC_MAX", "160"))
 
+# ── Widget-table extraction helpers ───────────────────────────────────────────
+_WIDGET_TABLE_RE = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', re.IGNORECASE)
+_WIDGET_CTE_RE   = re.compile(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', re.IGNORECASE)
+
+
+def _extract_widget_tables(sql: str) -> list:
+    """Return real table names referenced in widget SQL (excludes CTE aliases)."""
+    sql = sql or ''
+    ctes = {m.lower() for m in _WIDGET_CTE_RE.findall(sql)}
+    seen: set = set()
+    out: list = []
+    for m in _WIDGET_TABLE_RE.findall(sql):
+        ml = m.lower()
+        if ml.split('.')[-1] in ctes or ml in seen:
+            continue
+        seen.add(ml)
+        out.append(m)
+    return out
+
+
+def _format_verified_tables(doc: dict) -> str:
+    """Render the VERIFIED TABLES block that is injected into the system prompt.
+
+    Structure of each entry in `doc`:
+      { "used_by_widgets": [...], "columns": [...], "source": "report_metadata|enriched_schema|live_fetch" }
+    """
+    if not doc:
+        return ""
+    lines = [
+        "══════════════════════════════════════════════════════════════════════",
+        "VERIFIED TABLES — authoritative mapping built from this report's actual SQL.",
+        "These are the REAL tables backing each widget. ALWAYS query from this list first.",
+        "Do NOT invent or assume alternative table names — every widget's source table is listed here.",
+        "══════════════════════════════════════════════════════════════════════",
+    ]
+    for tbl in sorted(doc.keys()):
+        info      = doc[tbl]
+        widgets   = info.get("used_by_widgets") or []
+        cols      = info.get("columns") or []
+        w_str     = ", ".join(f'"{w}"' for w in widgets[:12])
+        lines.append(f"\n[{tbl}]" + (f"  →  used by: {w_str}" if w_str else ""))
+        if cols:
+            lines.append(f"  Columns: {', '.join(str(c) for c in cols[:50])}")
+        src = info.get("source", "")
+        if src == "live_fetch":
+            lines.append("  (columns fetched live from DB — authoritative)")
+        elif src == "report_metadata":
+            lines.append("  (columns from saved report metadata — authoritative)")
+    lines.append(
+        "\nWhen writing SQL for any widget listed above, use the exact table name shown "
+        "and only the columns listed. For any widget NOT listed, use the schema below."
+    )
+    return "\n".join(lines)
+
 
 def _clip(text: str, limit: int) -> str:
     """Trim text to `limit` chars (limit<=0 disables trimming)."""
@@ -600,11 +654,9 @@ class IntelligenceChatAgent:
             active_marker = " (ACTIVE — new charts go here)" if pid == active_page_id else ""
             parts.append(f"\nPage '{p['name']}'{active_marker}:")
             for w in page_widgets:
-                sql_preview = (w.get("sql_query") or "")[:60]
-                parts.append(
-                    f"  • {w['title']} [{w['chart_type']}]"
-                    + (f" | SQL: {sql_preview}" if sql_preview else "")
-                )
+                tbls = _extract_widget_tables(w.get("sql_query") or "")
+                tbl_hint = f" | tables: {', '.join(tbls)}" if tbls else ""
+                parts.append(f"  • {w['title']} [{w['chart_type']}]{tbl_hint}")
 
         if unassigned:
             parts.append(f"\nUnassigned widgets ({len(unassigned)}):")
@@ -655,6 +707,7 @@ class IntelligenceChatAgent:
         enriched: Optional["EnrichedSchema"] = None,
         connection_id: Optional[str] = None,
         scope: str = "database",
+        verified_tables_doc: Optional[dict] = None,
     ) -> list[dict]:
         dynamic = self._build_dynamic_context(
             dashboard_widgets, dashboard_pages, active_page_id, priority_tables,
@@ -694,16 +747,22 @@ class IntelligenceChatAgent:
                     f"[intel_chat_agent] scope=database — full schema ({total} tables)",
                     flush=True,
                 )
+            verified_block = _format_verified_tables(verified_tables_doc or {})
+            extra = [{"type": "text", "text": verified_block}] if verified_block else []
             return [
                 {"type": "text", "text": _INSTRUCTIONS},
                 {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
+                *extra,
                 {"type": "text", "text": dynamic},
             ]
 
         raw_schema = self._build_schema_section_raw(schema_doc)
+        verified_block = _format_verified_tables(verified_tables_doc or {})
+        extra = [{"type": "text", "text": verified_block}] if verified_block else []
         return [
             {"type": "text", "text": _INSTRUCTIONS + "\n\n" + raw_schema,
              "cache_control": {"type": "ephemeral"}},
+            *extra,
             {"type": "text", "text": dynamic},
         ]
 
@@ -721,6 +780,7 @@ class IntelligenceChatAgent:
         connection_id: Optional[str] = None,
         scope: str = "database",
         conversation_memory: Optional[list[str]] = None,
+        verified_tables_doc: Optional[dict] = None,
     ) -> tuple[list[dict], list[dict], str, int]:
         """Build (system_blocks, messages, model_id, max_tokens)."""
         system_blocks = self._build_system_blocks(
@@ -732,6 +792,7 @@ class IntelligenceChatAgent:
             enriched=enriched_schema,
             connection_id=connection_id,
             scope=scope,
+            verified_tables_doc=verified_tables_doc,
         )
         # Distilled memory: the gist of earlier questions, injected as a small dynamic
         # block so the copilot remembers what was asked WITHOUT replaying the full
@@ -846,12 +907,14 @@ class IntelligenceChatAgent:
         connection_id: Optional[str] = None,
         scope: str = "database",
         conversation_memory: Optional[list[str]] = None,
+        verified_tables_doc: Optional[dict] = None,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
             dashboard_pages, active_page_id, priority_tables, enriched_schema,
             model_override, connection_id, scope=scope,
             conversation_memory=conversation_memory,
+            verified_tables_doc=verified_tables_doc,
         )
 
         raw = await bedrock_invoke_with_history(
