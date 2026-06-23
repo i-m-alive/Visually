@@ -970,7 +970,21 @@ const fmtTick = (v: number) =>
   : Math.abs(v) >= 1e6 ? `${(v/1e6).toFixed(1)}M`
   : Math.abs(v) >= 1e3 ? `${(v/1e3).toFixed(0)}K`
   : String(v)
-const XAXIS = <XAxis dataKey="name" tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+// Category-axis tick that truncates long labels with an ellipsis (full text on
+// hover) so long names like "Ategrity Specialty Insurance Company" don't overlap
+// or render unevenly across the axis.
+function CategoryTick(props: { x?: number; y?: number; payload?: { value?: unknown } }) {
+  const { x = 0, y = 0, payload } = props
+  const full = String(payload?.value ?? '')
+  const label = full.length > 14 ? full.slice(0, 13) + '…' : full
+  return (
+    <g transform={`translate(${x},${y})`}>
+      <title>{full}</title>
+      <text x={0} y={0} dy={10} textAnchor="middle" fontSize={9} fill="#94a3b8">{label}</text>
+    </g>
+  )
+}
+const XAXIS = <XAxis dataKey="name" tick={<CategoryTick />} axisLine={false} tickLine={false} interval="preserveStartEnd" />
 const YAXIS = <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={46} tickFormatter={fmtTick} />
 const GRID  = <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
 
@@ -2614,7 +2628,7 @@ export default function IntelligenceCanvasPage() {
   }, [analysis, activeSection])
 
   // Add copilot-generated charts to the active intelligence section
-  const handleAddToPage = useCallback((charts: Array<{ title: string; chart_type: string; chart_data?: { labels?: unknown[]; values?: unknown[]; rows?: Record<string, unknown>[]; columns?: string[] } } | undefined>) => {
+  const handleAddToPage = useCallback(async (charts: Array<{ title: string; chart_type: string; chart_data?: { labels?: unknown[]; values?: unknown[]; rows?: Record<string, unknown>[]; columns?: string[] } } | undefined>) => {
     if (!analysis) return
     const targetId = activeSection || analysis.sections[0]?.id
 
@@ -2685,13 +2699,19 @@ export default function IntelligenceCanvasPage() {
       }
     })
     if (!newCharts.length) return
-    setAnalysis(prev => prev ? {
-      ...prev,
-      sections: prev.sections.map(s =>
+    const next: ExecutiveAnalysis = {
+      ...analysis,
+      sections: analysis.sections.map(s =>
         s.id === targetId ? { ...s, charts: [...s.charts, ...newCharts] } : s
       ),
-    } : prev)
-  }, [analysis, activeSection])
+    }
+    setAnalysis(next)
+    // Persist with the whole-page data server-side (+ local) so the added chart
+    // survives reloads — previously it lived only in memory and was lost.
+    try { localStorage.setItem(`intel_analysis_${canvasId}`, JSON.stringify(next)) } catch {}
+    try { await intelligenceApi.saveReport(canvasId, next) } catch (e) { console.warn('[intelligence] save after add failed (kept local):', e) }
+    setHasSavedData(true)
+  }, [analysis, activeSection, canvasId])
 
   // Persist a generated report durably: server-side (survives device/browser
   // changes and quota limits) + localStorage as a fast local cache.

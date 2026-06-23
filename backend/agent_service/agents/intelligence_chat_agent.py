@@ -34,6 +34,9 @@ INTEL_HISTORY_PREFIX = "intel_chat:history:"
 
 # In-memory fallback when Redis is unavailable (separate dict from chat_agent's).
 _intel_memory_history: dict[str, list[dict]] = {}
+# Distilled conversation memory (gist of prior questions), Redis-less fallback.
+_intel_memory_summary: dict[str, list[str]] = {}
+_MEMORY_MAX = 20  # max remembered prior-question gists
 
 print("[intel_chat_agent] module loaded — Report Copilot agent (forked from chat_agent)", flush=True)
 
@@ -717,6 +720,7 @@ class IntelligenceChatAgent:
         model_override: Optional[str] = None,
         connection_id: Optional[str] = None,
         scope: str = "database",
+        conversation_memory: Optional[list[str]] = None,
     ) -> tuple[list[dict], list[dict], str, int]:
         """Build (system_blocks, messages, model_id, max_tokens)."""
         system_blocks = self._build_system_blocks(
@@ -729,7 +733,20 @@ class IntelligenceChatAgent:
             connection_id=connection_id,
             scope=scope,
         )
-        messages = conversation_history[-20:] + [{"role": "user", "content": message}]
+        # Distilled memory: the gist of earlier questions, injected as a small dynamic
+        # block so the copilot remembers what was asked WITHOUT replaying the full
+        # transcript. Lets us keep only a short raw window below (lower tokens).
+        if conversation_memory:
+            mem_text = (
+                "CONVERSATION MEMORY — earlier in this session the user asked about:\n"
+                + "\n".join(f"- {q}" for q in conversation_memory[-_MEMORY_MAX:])
+                + "\n\nStay consistent with these, build on prior answers, and don't "
+                  "re-introduce topics already covered unless the user asks again."
+            )
+            system_blocks = system_blocks + [{"type": "text", "text": mem_text}]
+        # Keep only a short raw window for immediate coherence — the long arc lives in
+        # the distilled memory above (vs. previously replaying the last 20 messages).
+        messages = conversation_history[-8:] + [{"role": "user", "content": message}]
         effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else INTEL_CHAT_MODEL
         effective_max_tokens = 8192 if model_override == "opus" else 2048
 
@@ -828,11 +845,13 @@ class IntelligenceChatAgent:
         model_override: Optional[str] = None,
         connection_id: Optional[str] = None,
         scope: str = "database",
+        conversation_memory: Optional[list[str]] = None,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
             dashboard_pages, active_page_id, priority_tables, enriched_schema,
             model_override, connection_id, scope=scope,
+            conversation_memory=conversation_memory,
         )
 
         raw = await bedrock_invoke_with_history(
@@ -876,15 +895,44 @@ class IntelligenceChatAgent:
         return []
 
     @staticmethod
-    async def save_history(session_id: str, messages: list[dict], redis) -> None:
+    async def load_memory(session_id: str, redis) -> list[str]:
+        """Distilled memory = the gist of what the user has asked before (NOT the raw
+        transcript). Lets the copilot stay consistent and build on prior questions
+        without replaying the whole conversation."""
+        if redis is None:
+            return list(_intel_memory_summary.get(session_id, []))
+        raw = await redis.get(f"{INTEL_HISTORY_PREFIX}{session_id}")
+        if raw:
+            try:
+                data = json.loads(raw)
+                return data.get("memory", []) if isinstance(data, dict) else []
+            except Exception:
+                return []
+        return []
+
+    @staticmethod
+    def distill_memory(prev: list[str], user_message: str) -> list[str]:
+        """Append the gist of the latest user question to memory (deduped, capped).
+        Cheap + deterministic — no extra LLM call."""
+        q = " ".join((user_message or "").split())[:180]
+        if not q:
+            return list(prev or [])[-_MEMORY_MAX:]
+        out = [m for m in (prev or []) if m.strip().lower() != q.strip().lower()]
+        out.append(q)
+        return out[-_MEMORY_MAX:]
+
+    @staticmethod
+    async def save_history(session_id: str, messages: list[dict], redis, memory: Optional[list[str]] = None) -> None:
         trimmed = messages[-40:]
+        mem = (memory or [])[-_MEMORY_MAX:]
         if redis is None:
             _intel_memory_history[session_id] = trimmed
+            _intel_memory_summary[session_id] = mem
             return
         await redis.setex(
             f"{INTEL_HISTORY_PREFIX}{session_id}",
             INTEL_CONVERSATION_TTL_SECONDS,
-            json.dumps({"messages": trimmed}),
+            json.dumps({"messages": trimmed, "memory": mem}),
         )
 
     @staticmethod

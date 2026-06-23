@@ -11,13 +11,45 @@
  * /agent/chat/stream, and uses an `intel-` session-id prefix.
  */
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database, Maximize2 } from 'lucide-react'
 import { streamIntelligenceChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 
 type InlineChart = ChartResult & { selected: boolean }
+
+// Visualization switcher — lets the user flip a generated chart between types.
+const VIZ_TYPES: Array<{ type: string; glyph: string; label: string }> = [
+  { type: 'bar',   glyph: '▌', label: 'Bar' },
+  { type: 'line',  glyph: '∿', label: 'Line' },
+  { type: 'area',  glyph: '△', label: 'Area' },
+  { type: 'pie',   glyph: '◕', label: 'Pie' },
+  { type: 'donut', glyph: '◍', label: 'Donut' },
+  { type: 'table', glyph: '▦', label: 'Table' },
+]
+
+function VizSwitcher({ value, onChange }: { value: string; onChange: (t: string) => void }) {
+  return (
+    <div className="flex items-center gap-0.5 bg-gray-100 rounded-lg p-0.5" title="Switch visualization">
+      {VIZ_TYPES.map(v => (
+        <button
+          key={v.type}
+          type="button"
+          onClick={e => { e.preventDefault(); onChange(v.type) }}
+          title={v.label}
+          className="w-6 h-6 rounded-md text-[13px] leading-none flex items-center justify-center transition-colors"
+          style={value === v.type
+            ? { background: '#fff', color: '#0d3060', boxShadow: '0 1px 2px rgba(0,0,0,0.12)' }
+            : { background: 'transparent', color: '#94a3b8' }}
+        >
+          {v.glyph}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 interface ChatMsg {
   role: 'user' | 'assistant'
@@ -126,16 +158,44 @@ function buildRecommendations(widgets: CanvasWidgetData[], pages: CanvasPage[]):
 }
 
 export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages = [], activePageId = '', onClose, onWidgetAdded, title, subtitle, suggestedQuestions, initialWidth, onAddToPage, prefillMessage, isOffline }: Props) {
-  const [messages, setMessages] = useState<ChatMsg[]>([{
+  const _greeting: ChatMsg = {
     role: 'assistant',
     content: title
       ? `Hi! I'm your **${title}**. I have full access to your report data and live database. Ask me anything about the data, explore trends, or generate new charts.`
       : 'Hi! I have full access to your intelligence report (all pages) and your live database. Ask me to explore data, explain trends, or generate new charts.',
-  }])
+  }
+  // Restore the conversation from localStorage so closing/reopening the chat (or a
+  // page reload) keeps the history instead of starting over.
+  const [messages, setMessages] = useState<ChatMsg[]>(() => {
+    try {
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(`intel_chat_msgs_${canvasId}`) : null
+      if (raw) {
+        const arr = JSON.parse(raw)
+        if (Array.isArray(arr) && arr.length) return arr
+      }
+    } catch { /* ignore */ }
+    return [_greeting]
+  })
   const [input, setInput]     = useState('')
   const [sending, setSending]   = useState(false)
+  // Chart enlarged into a fullscreen overlay (null = closed); `key` ties it to its
+  // visualization-type override so the switcher state is shared with the inline chart.
+  const [enlarged, setEnlarged] = useState<{ chart: InlineChart; key: string } | null>(null)
+  // Per-chart visualization-type override (keyed by `${msgIdx}:${chartIdx}`).
+  const [vizOverride, setVizOverride] = useState<Record<string, string>>({})
+  const setViz = useCallback((key: string, t: string) => setVizOverride(p => ({ ...p, [key]: t })), [])
   // `intel-` prefix keeps Report-Copilot sessions distinct from canvas chat sessions.
-  const [sessionId]             = useState(() => `intel-${canvasId}-${Date.now()}`)
+  // Stable + persisted per canvas so reopening continues the SAME backend session
+  // (server-side memory/history stays intact too).
+  const [sessionId] = useState(() => {
+    try {
+      const s = typeof window !== 'undefined' ? localStorage.getItem(`intel_chat_sid_${canvasId}`) : null
+      if (s) return s
+    } catch { /* ignore */ }
+    const sid = `intel-${canvasId}-${Date.now()}`
+    try { localStorage.setItem(`intel_chat_sid_${canvasId}`, sid) } catch { /* ignore */ }
+    return sid
+  })
   const [showSuggestions, setShowSuggestions] = useState(true)
   // Scope toggle — 'report' (default) limits the copilot to this report's tables +
   // their 2-hop FK neighbours; 'database' opens the full schema for free exploration.
@@ -148,6 +208,12 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
   const resizeStartW = useRef(initialWidth ?? 320)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+
+  // Persist the conversation so it survives closing the panel / reloading. Cap to the
+  // last 50 messages to stay well under the localStorage quota.
+  useEffect(() => {
+    try { localStorage.setItem(`intel_chat_msgs_${canvasId}`, JSON.stringify(messages.slice(-50))) } catch { /* quota — keep in memory */ }
+  }, [messages, canvasId])
   useEffect(() => {
     if (prefillMessage) { setInput(prefillMessage); setTimeout(() => textareaRef.current?.focus(), 100) }
   }, [prefillMessage])
@@ -283,19 +349,21 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
     }
   }, [canvasId, connectionId, onWidgetAdded, activePageId, pages])
 
-  const toggleChart = useCallback((msgIdx: number, chartIdx: number) => {
-    setMessages(prev => prev.map((m, mi) => mi !== msgIdx ? m : {
-      ...m,
-      inlineCharts: m.inlineCharts?.map((c, ci) => ci !== chartIdx ? c : { ...c, selected: !c.selected }),
-    }))
-  }, [])
+  // On the intelligence page a single "Add" should land the chart in BOTH the
+  // report (persisted server-side via onAddToPage) AND the canvas (a real widget),
+  // so it's never lost and also shows up in the builder.
+  const addBoth = useCallback(async (srcs: Array<ChartResult | ChatMsg['newWidget']>) => {
+    await handleAddWidgets(srcs)        // → canvas widget (persisted)
+    if (onAddToPage) onAddToPage(srcs)  // → report section + server persist
+  }, [handleAddWidgets, onAddToPage])
 
-  const toggleAllCharts = useCallback((msgIdx: number, val: boolean) => {
-    setMessages(prev => prev.map((m, mi) => mi !== msgIdx ? m : {
-      ...m,
-      inlineCharts: m.inlineCharts?.map(c => ({ ...c, selected: val })),
-    }))
-  }, [])
+  // Drill-down: clicking a category/segment in a generated chart asks the copilot
+  // to break that value down further — a conversational drill that reuses context.
+  const drillDown = useCallback((_column: string, value: unknown) => {
+    const v = String(value ?? '').trim()
+    if (!v || sending) return
+    send(`Drill down into "${v}": break it down by the most useful sub-dimension and show the detail as a chart.`)
+  }, [send, sending])
 
   return (
     <div className="relative flex h-full" style={{ width: panelWidth, flexShrink: 0 }}>
@@ -399,93 +467,65 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
                   : msg.content}
               </div>
 
-              {/* Inline chart previews */}
+              {/* Inline chart previews — each chart rendered as its own card with a
+                  visualization switcher, enlarge, and add button. */}
               {msg.inlineCharts && msg.inlineCharts.length > 0 && (
-                msg.inlineCharts.length === 1 ? (
-                  // Single chart — compact preview
-                  <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
-                    <p className="text-xs font-semibold text-gray-700 mb-2">{msg.inlineCharts[0].title}</p>
-                    <ChartRenderer result={msg.inlineCharts[0]} height={172} legend />
-                    <div className="mt-2.5">
-                      {onAddToPage ? (
-                        <button
-                          onClick={() => onAddToPage([msg.inlineCharts![0]])}
-                          className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors"
-                          style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
-                        >
-                          <Plus size={11} /> Add to Section
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handleAddWidgets([msg.inlineCharts![0]])}
-                          className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
-                          style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
-                        >
-                          <Plus size={11} /> Add to Report
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  // Multiple charts — selectable list
-                  <div className="bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
-                    <div className="px-3 py-2 border-b border-gray-100 flex items-center justify-between">
-                      <span className="text-xs font-semibold text-gray-600">{msg.inlineCharts.length} charts generated</span>
-                      <div className="flex items-center gap-2">
-                        <button onClick={() => toggleAllCharts(i, true)} className="text-[10px] text-indigo-500 hover:text-indigo-700">All</button>
-                        <span className="text-gray-300 text-[10px]">·</span>
-                        <button onClick={() => toggleAllCharts(i, false)} className="text-[10px] text-gray-400 hover:text-gray-600">None</button>
+                <div className="flex flex-col gap-2">
+                  {msg.inlineCharts.map((chart, ci) => {
+                    const key = `${i}:${ci}`
+                    const curType = vizOverride[key] ?? chart.chart_type
+                    return (
+                      <div key={ci} className="bg-gray-50 border border-gray-200 rounded-xl p-3">
+                        <div className="flex items-center justify-between mb-2 gap-2">
+                          <p className="text-xs font-semibold text-gray-700 truncate flex-1">{chart.title}</p>
+                          <div className="flex items-center gap-1.5 flex-shrink-0">
+                            <VizSwitcher value={curType} onChange={t => setViz(key, t)} />
+                            <button
+                              onClick={() => setEnlarged({ chart, key })}
+                              title="Enlarge chart"
+                              className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-200/70 transition-colors"
+                            >
+                              <Maximize2 size={12} />
+                            </button>
+                          </div>
+                        </div>
+                        <ChartRenderer result={{ ...chart, chart_type: curType }} height={172} legend onDataPointClick={drillDown} />
+                        <div className="mt-2.5">
+                          {onAddToPage ? (
+                            <button
+                              onClick={() => addBoth([chart])}
+                              title="Adds this chart to the report and the canvas, and saves it"
+                              className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors"
+                              style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
+                            >
+                              <Plus size={11} /> Add to report
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => handleAddWidgets([chart])}
+                              className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand rounded-lg transition-colors"
+                              style={{ background: 'linear-gradient(135deg, #EFF6FF, #F5F3FF)', border: '1px solid #BFDBFE' }}
+                            >
+                              <Plus size={11} /> Add to Report
+                            </button>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                    {msg.inlineCharts.map((chart, ci) => (
-                      <div key={ci} className={`p-3 border-b border-gray-100 last:border-0 transition-opacity ${chart.selected ? '' : 'opacity-50'}`}>
-                        <label className="flex items-center gap-2 mb-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={chart.selected}
-                            onChange={() => toggleChart(i, ci)}
-                            className="w-3.5 h-3.5 rounded accent-indigo-600 cursor-pointer"
-                          />
-                          <span className="text-xs font-semibold text-gray-700 truncate flex-1">{chart.title}</span>
-                          <span className="text-[10px] text-gray-400 shrink-0 bg-gray-100 px-1.5 py-0.5 rounded">{chart.chart_type}</span>
-                        </label>
-                        <ChartRenderer result={chart} height={134} legend />
-                      </div>
-                    ))}
-                    <div className="px-3 py-2.5 bg-white">
-                      {onAddToPage ? (
-                        <button
-                          onClick={() => onAddToPage(msg.inlineCharts!.filter(c => c.selected))}
-                          disabled={!msg.inlineCharts.some(c => c.selected)}
-                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold rounded-lg disabled:opacity-40"
-                          style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
-                        >
-                          <Plus size={10} /> Add to Section ({msg.inlineCharts.filter(c => c.selected).length})
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handleAddWidgets(msg.inlineCharts!.filter(c => c.selected))}
-                          disabled={!msg.inlineCharts.some(c => c.selected)}
-                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-white rounded-lg disabled:opacity-40 transition-opacity"
-                          style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
-                        >
-                          <Plus size={10} /> Add to Report ({msg.inlineCharts.filter(c => c.selected).length})
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )
+                    )
+                  })}
+                </div>
               )}
 
               {/* JSON widget add button */}
               {msg.newWidget && (
                 onAddToPage ? (
                   <button
-                    onClick={() => onAddToPage([msg.newWidget!])}
+                    onClick={() => addBoth([msg.newWidget!])}
+                    title="Adds this widget to the report and the canvas, and saves it"
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg self-start"
                     style={{ background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)', border: '1px solid #6ee7b7', color: '#065f46' }}
                   >
-                    <Plus size={12} /> Add to Section
+                    <Plus size={12} /> Add to report
                   </button>
                 ) : (
                   <button
@@ -554,6 +594,34 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
         <p className="text-xs text-gray-400 mt-1.5 text-center">{isOffline ? 'Offline data · All pages · Enter to send' : 'Full DB access · All pages · Enter to send'}</p>
       </div>
       </div>{/* end overflow:hidden inner panel */}
+
+      {/* Enlarged chart overlay */}
+      {enlarged && typeof document !== 'undefined' && createPortal(
+        <div
+          className="fixed inset-0 z-[9999] flex items-center justify-center p-4 sm:p-8"
+          style={{ background: 'rgba(2,18,38,0.72)', backdropFilter: 'blur(6px)' }}
+          onClick={e => { e.stopPropagation(); setEnlarged(null) }}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100 flex-shrink-0 gap-3">
+              <p className="text-sm font-semibold text-gray-900 truncate flex-1">{enlarged.chart.title}</p>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <VizSwitcher value={vizOverride[enlarged.key] ?? enlarged.chart.chart_type} onChange={t => setViz(enlarged.key, t)} />
+                <button onClick={() => setEnlarged(null)} title="Close" className="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100">
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+            <div className="p-5 overflow-auto">
+              <ChartRenderer result={{ ...enlarged.chart, chart_type: vizOverride[enlarged.key] ?? enlarged.chart.chart_type }} height={460} legend onDataPointClick={drillDown} />
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }
