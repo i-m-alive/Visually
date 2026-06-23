@@ -12,7 +12,8 @@
  */
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database, Maximize2, RotateCcw } from 'lucide-react'
+import { Send, Bot, Loader2, X, Plus, Sparkles, FileText, Database, Maximize2, RotateCcw, FileSpreadsheet } from 'lucide-react'
+import { downloadXlsx, chartToTable } from '@/lib/xlsx'
 import { streamIntelligenceChat, canvasApi, type WidgetCreate } from '@/lib/api'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult } from '@/stores/pipelineStore'
@@ -375,6 +376,18 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
     if (onAddToPage) onAddToPage(srcs)  // → report section + server persist
   }, [handleAddWidgets, onAddToPage])
 
+  const downloadChart = useCallback((chart: InlineChart) => {
+    const data = chart.chart_data
+    const rawRows: Array<Record<string, unknown>> =
+      (data?.rows && data.rows.length > 0)
+        ? data.rows
+        : (data?.labels ?? []).map((lbl: unknown, i: number) => ({ name: lbl, value: data?.values?.[i] ?? null }))
+    const { columns, rows } = chartToTable(rawRows)
+    if (!columns.length) return
+    const safe = (chart.title || 'chart').replace(/[^a-z0-9_\- ]/gi, '_').trim()
+    downloadXlsx(safe, columns, rows, chart.title?.slice(0, 31) || 'Data')
+  }, [])
+
   // Drill-down: clicking a category/segment in a generated chart asks the copilot
   // to break that value down further — a conversational drill that reuses context.
   const drillDown = useCallback((_column: string, value: unknown) => {
@@ -509,6 +522,13 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
                           <div className="flex items-center gap-1.5 flex-shrink-0">
                             <VizSwitcher value={curType} onChange={t => setViz(key, t)} />
                             <button
+                              onClick={() => downloadChart(chart)}
+                              title="Download as Excel (.xlsx)"
+                              className="p-1 rounded-md text-gray-400 hover:text-green-600 hover:bg-green-50 transition-colors"
+                            >
+                              <FileSpreadsheet size={12} />
+                            </button>
+                            <button
                               onClick={() => setEnlarged({ chart, key })}
                               title="Enlarge chart"
                               className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-200/70 transition-colors"
@@ -638,6 +658,13 @@ export function IntelligenceCopilotPanel({ projectId, canvasId, widgets, pages =
               <p className="text-sm font-semibold text-gray-900 truncate flex-1">{enlarged.chart.title}</p>
               <div className="flex items-center gap-2 flex-shrink-0">
                 <VizSwitcher value={vizOverride[enlarged.key] ?? enlarged.chart.chart_type} onChange={t => setViz(enlarged.key, t)} />
+                <button
+                  onClick={() => downloadChart(enlarged.chart)}
+                  title="Download as Excel (.xlsx)"
+                  className="p-1.5 rounded-lg text-gray-400 hover:text-green-600 hover:bg-green-50 transition-colors"
+                >
+                  <FileSpreadsheet size={15} />
+                </button>
                 <button onClick={() => setEnlarged(null)} title="Close" className="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100">
                   <X size={16} />
                 </button>
