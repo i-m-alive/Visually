@@ -249,6 +249,16 @@ The user has already provided the full pre-computed report data inline.
 - If the answer is in the data, cite the exact numbers right away.
 - Only generate SQL if the question explicitly asks for something NOT present in the provided data.
 
+WHEN THE USER PASTES A PRE-COMPUTED NARRATIVE (long paragraph with specific dollar amounts and/or percentages):
+If the user's message is a long prose passage (more than ~300 characters) that already contains specific
+formatted values — such as "$68,600,000", "90%", "16%", "$217,800" — it IS pre-computed report data they
+are sharing for discussion, NOT a request to query the database.
+- Treat it exactly like an [INTELLIGENCE REPORT] block: answer DIRECTLY from the numbers in the pasted text.
+- NEVER say "I'll verify", "let me check", "I'll query", or "I'll look into" — the data is already present.
+- Do NOT generate SQL or a chart unless the user's message ALSO contains an EXPLICIT follow-up question
+  that asks for something not already covered by the pasted figures.
+- If there is no follow-up question, summarise the key takeaways or ask "What would you like to explore further?"
+
 TONE: Clear, helpful, and data-focused. For charts/tables/KPIs, always explain the request and what the chart shows in 2–4 sentences BEFORE the block (never after it). Reference actual values when the data is already provided; avoid empty filler phrases."""
 
 # ── Prompt zones (see chat_agent caching design) ──────────────────────────────
@@ -355,9 +365,40 @@ _CHART_CREATION_KEYWORDS = {
     "plot", "donut", "scatter", "funnel", "treemap", "waterfall",
 }
 
+# Detects a formatted dollar amount: $1,234  $68,600,000  $15.8M  $2.3B  $500K
+_DOLLAR_RE = re.compile(r'\$[\d,]+(?:\.\d+)?\s*[MBKmk]?\b')
+# Detects an explicit percentage: 16%  9.2%  90%
+_PCT_RE    = re.compile(r'\d+(?:\.\d+)?%')
+
+
+def _is_provided_data_block(message: str) -> bool:
+    """Return True when the message looks like a pre-computed narrative the user is
+    sharing for discussion — not a question asking us to fetch data.
+
+    A block is recognised when ALL of the following are true:
+      1. Long message (>300 chars) — short questions don't qualify.
+      2. Contains at least two specific dollar amounts OR two percentages — these are
+         hallmarks of pre-computed report text, not a query.
+      3. Does NOT start with a recognised question/command word — it reads as prose,
+         not as an imperative or interrogative directed at the database.
+    """
+    if len(message) < 300:
+        return False
+    if len(_DOLLAR_RE.findall(message)) < 2 and len(_PCT_RE.findall(message)) < 2:
+        return False
+    question_starts = (
+        "what ", "how ", "which ", "who ", "when ", "where ", "why ",
+        "show me", "find ", "list ", "get me", "give me", "tell me",
+        "create ", "make ", "build ", "generate ", "add ", "fetch ",
+    )
+    lower_strip = message.lower().strip()
+    return not any(lower_strip.startswith(s) for s in question_starts)
+
 
 def _is_chart_creation_request(message: str) -> bool:
     """Return True when the message is asking for chart/viz creation."""
+    if _is_provided_data_block(message):
+        return False
     words = set(re.sub(r"[^a-z0-9 ]", " ", message.lower()).split())
     action_words = {"create", "make", "build", "generate", "add", "give", "draw", "produce"}
     subject_words = {"chart", "graph", "pie", "bar", "kpi", "table", "visual",
@@ -369,6 +410,8 @@ def _is_chart_creation_request(message: str) -> bool:
 
 def _is_data_query_request(message: str) -> bool:
     """Return True when the message is asking a data question that requires SQL."""
+    if _is_provided_data_block(message):
+        return False
     lower = message.lower()
     question_starters = (
         "what", "how many", "how much", "which", "who", "when", "where",

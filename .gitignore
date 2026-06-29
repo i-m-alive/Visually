@@ -4,6 +4,8 @@ azure/DEPLOYMENT_INFO.local.md
 *.pyc
 __pycache__/
 .venv/
+backend/.venv/
+backend/venv/
 node_modules/
 .next/
 dist/
