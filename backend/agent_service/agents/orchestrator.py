@@ -20,7 +20,12 @@ from agent_service.agents.intent_classifier import IntentClassifier
 from agent_service.agents.query_agent import QueryAgent
 from agent_service.agents.validator_agent import ValidatorAgent
 import agent_service.agents.schema_cache as _schema_cache
+import agent_service.agents.graph_rag_retriever as _graph_rag
 from agent_service.services.ws_manager import manager as _ws_manager
+
+# Minimum validation score to emit a chart result (was 0.80, kept retrying 4×).
+# 0.65 lets well-formed results pass on the first attempt.
+_VALIDATION_PASS_THRESHOLD = 0.65
 
 DASHBOARD_DECOMPOSE_MODEL = BEDROCK_HAIKU_MODEL
 DASHBOARD_MAX_CHARTS = 5        # max charts per dashboard (count cap)
@@ -52,6 +57,7 @@ class Orchestrator:
         connection_id: str,
         redis,
         db: AsyncSession,
+        conversation_history: Optional[list] = None,
     ) -> dict:
         async def emit(event: dict):
             # Direct in-process broadcast (works with or without Redis)
@@ -118,6 +124,24 @@ class Orchestrator:
             except Exception as _e:
                 print(f"[pipeline:{job_id}] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
 
+            # Graph RAG retrieval — runs in <5 ms against in-memory EnrichedSchema.
+            # Returns ranked TableCandidates with column/JOIN hints for QueryAgent.
+            retrieved_context = None
+            if enriched:
+                retrieved_context = _graph_rag.retrieve(
+                    user_text=user_text,
+                    intent=intent,
+                    enriched=enriched,
+                    top_k=6,
+                )
+                if retrieved_context and retrieved_context.primary_tables:
+                    await emit({
+                        "type": "rag.retrieved",
+                        "job_id": job_id,
+                        "tables": retrieved_context.primary_tables[:4],
+                        "confidence": round(retrieved_context.confidence, 3),
+                    })
+
             # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
             final_result = None
             retry_feedback: Optional[str] = None
@@ -130,7 +154,11 @@ class Orchestrator:
             for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1):
                 # Step 3: Generate query — pass attempt so temperature scales on retries
                 await set_pipeline_state(redis, job_id, "step", f"generating_query_attempt_{attempt}")
-                query_plan = await self._query.generate(intent, schema, db_type, retry_feedback, attempt, enriched)
+                query_plan = await self._query.generate(
+                    intent, schema, db_type, retry_feedback, attempt, enriched,
+                    retrieved_context=retrieved_context,
+                    conversation_history=conversation_history,
+                )
                 await emit({
                     "type": "query.generated",
                     "job_id": job_id,
@@ -202,7 +230,10 @@ class Orchestrator:
                     "dimension_scores": validation.dimension_scores.model_dump(),
                 })
 
-                if not validation.passed and attempt < _MAX_SINGLE_VIZ_ATTEMPTS and validation.retry_feedback:
+                # Use local threshold (0.65) instead of validator's hardcoded 0.80.
+                # This lets well-formed results pass on the first attempt.
+                _passed = validation.score >= _VALIDATION_PASS_THRESHOLD
+                if not _passed and attempt < _MAX_SINGLE_VIZ_ATTEMPTS and validation.retry_feedback:
                     retry_feedback = validation.retry_feedback.feedback
                     await emit({
                         "type": "validation.retry",

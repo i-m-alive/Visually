@@ -149,8 +149,20 @@ export const projectApi = {
     api.get(`/projects/${projectId}/schema/metadata`),
 }
 
+export interface ConversationTurn {
+  role: 'user' | 'assistant'
+  content: string          // user text or chart title/narrative
+  chart_title?: string     // if assistant turn had a chart
+  sql?: string             // SQL that produced the last chart
+}
+
 export const agentApi = {
-  submitIntent: (data: { text: string; project_id: string; connection_id?: string }) =>
+  submitIntent: (data: {
+    text: string
+    project_id: string
+    connection_id?: string
+    conversation_history?: ConversationTurn[]
+  }) =>
     api.post('/agent/intent', data),
   getJob: (jobId: string) =>
     api.get(`/agent/jobs/${jobId}`),

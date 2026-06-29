@@ -7,6 +7,9 @@ from agent_service.agents import schema_scope as _scope
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
+    from agent_service.agents.nl_schema_router import ResolvedContext
+
+from agent_service.agents.nl_schema_router import format_routing_hints
 
 CHAT_MODEL = BEDROCK_SONNET_MODEL
 CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
@@ -616,10 +619,12 @@ class ChatAgent:
         scope: str = "database",
         selected_tables: Optional[list[str]] = None,
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
+        resolved_context: Optional["ResolvedContext"] = None,
     ) -> list[dict]:
         """Assemble the system prompt as Bedrock content blocks with a cache
         breakpoint at the end of the schema. Zones 1+2 (instructions + schema)
-        are cached; only zone 3 (the small canvas tail) is re-sent each turn.
+        are cached; Zone 2.5 (NL2SQL routing hints, per-query) and Zone 3
+        (canvas context) are re-sent each turn without cache.
 
         scope:
           "database" → full enriched schema (every table) — the default.
@@ -630,6 +635,9 @@ class ChatAgent:
             dashboard_widgets, dashboard_pages, active_page_id, priority_tables,
         )
 
+        # Zone 2.5 — NL2SQL routing hints (non-empty only when resolved_context was built)
+        routing_hints = format_routing_hints(resolved_context) if resolved_context else ""
+
         if enriched and enriched.compact_tables:
             total = len(enriched.compact_tables)
             if scope == "selected":
@@ -639,20 +647,28 @@ class ChatAgent:
             else:
                 schema = self._get_cached_schema(enriched, connection_id)
                 print(f"[chat] scope=database — full schema ({total} tables)", flush=True)
-            return [
+
+            blocks: list[dict] = [
                 {"type": "text", "text": _INSTRUCTIONS},
                 {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": dynamic},
             ]
+            # Zone 2.5 injected only when non-empty (avoids a pointless empty block)
+            if routing_hints:
+                blocks.append({"type": "text", "text": routing_hints})
+            blocks.append({"type": "text", "text": dynamic})
+            return blocks
 
         # No enriched schema → fall back to the raw doc. Cache instructions + raw
         # schema together (still stable per schema); canvas stays in the tail.
         raw_schema = self._build_schema_section_raw(schema_doc)
-        return [
+        blocks = [
             {"type": "text", "text": _INSTRUCTIONS + "\n\n" + raw_schema,
              "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": dynamic},
         ]
+        if routing_hints:
+            blocks.append({"type": "text", "text": routing_hints})
+        blocks.append({"type": "text", "text": dynamic})
+        return blocks
 
     def prepare(
         self,
@@ -669,6 +685,7 @@ class ChatAgent:
         scope: str = "database",
         selected_tables: Optional[list[str]] = None,
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
+        resolved_context: Optional["ResolvedContext"] = None,
     ) -> tuple[list[dict], list[dict], str, int]:
         """Build everything needed for a model call: (system_blocks, messages,
         model_id, max_tokens). Shared by both respond() and the streaming path."""
@@ -683,6 +700,7 @@ class ChatAgent:
             scope=scope,
             selected_tables=selected_tables,
             selected_hops=selected_hops,
+            resolved_context=resolved_context,
         )
         messages = conversation_history[-20:] + [{"role": "user", "content": message}]
         effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else CHAT_MODEL
@@ -785,12 +803,14 @@ class ChatAgent:
         scope: str = "database",
         selected_tables: Optional[list[str]] = None,
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
+        resolved_context: Optional["ResolvedContext"] = None,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
             dashboard_pages, active_page_id, priority_tables, enriched_schema,
             model_override, connection_id,
             scope=scope, selected_tables=selected_tables, selected_hops=selected_hops,
+            resolved_context=resolved_context,
         )
 
         raw = await bedrock_invoke_with_history(

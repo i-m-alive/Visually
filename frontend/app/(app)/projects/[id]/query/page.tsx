@@ -3,9 +3,10 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import {
   Send, Loader2, AlertCircle, TrendingUp, MessageSquare, X, LayoutDashboard,
-  Plus, Trash2, Edit2, Check, ChevronLeft, ChevronRight,
+  Plus, Trash2, Edit2, Check, ChevronLeft, ChevronRight, Code, Download, RefreshCw,
+  Copy, Volume2, VolumeX, FileText, Star, Maximize2, Square, Search, ChevronDown,
 } from 'lucide-react'
-import { agentApi, chatApi, querySessionApi } from '@/lib/api'
+import { agentApi, querySessionApi, streamChat, type ConversationTurn } from '@/lib/api'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { IntentStatusBar } from '@/components/pipeline/IntentStatusBar'
@@ -14,9 +15,9 @@ import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult, DashboardResult } from '@/stores/pipelineStore'
 
 interface Message {
-  id: string                  // local render key (= serverId once persisted)
-  serverId?: string           // query_messages id
-  parentId?: string | null    // tree parent (server id)
+  id: string
+  serverId?: string
+  parentId?: string | null
   type: 'user' | 'agent'
   content: string
   jobId?: string
@@ -25,6 +26,7 @@ interface Message {
   dashboardResult?: DashboardResult
   error?: string
   jobType?: string
+  created_at?: string
 }
 
 interface TreeNode {
@@ -76,7 +78,7 @@ function deepestLeaf(tree: Record<string, TreeNode>, startId: string): string {
 
 function nodeToMessage(n: TreeNode): Message {
   if (n.role === 'user') {
-    return { id: n.id, serverId: n.id, parentId: n.parent_id, type: 'user', content: n.content }
+    return { id: n.id, serverId: n.id, parentId: n.parent_id, type: 'user', content: n.content, created_at: n.created_at ?? undefined }
   }
   const r = n.result || {}
   return {
@@ -84,7 +86,68 @@ function nodeToMessage(n: TreeNode): Message {
     chartResult: r.kind === 'chart' ? r.chartResult : undefined,
     dashboardResult: r.kind === 'dashboard' ? r.dashboardResult : undefined,
     error: r.kind === 'error' ? r.error : undefined,
+    created_at: n.created_at ?? undefined,
   }
+}
+
+// ── sidebar date grouping ─────────────────────────────────────────────────────
+function groupSessionsByDate(sessions: SessionMeta[]): Array<{ label: string; items: SessionMeta[] }> {
+  const now = Date.now()
+  const todayStr = new Date().toDateString()
+  const yesterdayStr = new Date(now - 86400000).toDateString()
+  const weekAgo = now - 7 * 86400000
+  const buckets: Record<string, SessionMeta[]> = { Today: [], Yesterday: [], 'This week': [], Older: [] }
+  for (const s of sessions) {
+    const d = new Date(s.updated_at || '')
+    const ds = d.toDateString()
+    if (ds === todayStr) buckets.Today.push(s)
+    else if (ds === yesterdayStr) buckets.Yesterday.push(s)
+    else if (d.getTime() > weekAgo) buckets['This week'].push(s)
+    else buckets.Older.push(s)
+  }
+  return Object.entries(buckets)
+    .filter(([, items]) => items.length > 0)
+    .map(([label, items]) => ({ label, items }))
+}
+
+// ── CSV download ──────────────────────────────────────────────────────────────
+function downloadCsv(rows: Record<string, unknown>[], columns: string[], filename: string) {
+  const header = columns.join(',')
+  const body = rows.map((r) => columns.map((c) => JSON.stringify(r[c] ?? '')).join(',')).join('\n')
+  const blob = new Blob([header + '\n' + body], { type: 'text/csv' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename.replace(/[^a-z0-9_\-]/gi, '_') + '.csv'
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+// ── chart fingerprint ─────────────────────────────────────────────────────────
+function chartKey(c: ChartResult): string {
+  return (c.title || '') + '||' + (c.sql || '')
+}
+
+// ── relative time ─────────────────────────────────────────────────────────────
+function relativeTime(iso?: string): string {
+  if (!iso) return ''
+  const diff = Date.now() - new Date(iso).getTime()
+  if (diff < 60000) return 'just now'
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+// ── chart type compatibility ───────────────────────────────────────────────────
+const ALL_CHART_TYPES = ['bar', 'line', 'area', 'pie', 'scatter', 'table'] as const
+type ChartTypeOption = typeof ALL_CHART_TYPES[number]
+
+function compatibleChartTypes(cr: ChartResult): ChartTypeOption[] {
+  const rowCount = cr.chart_data?.rows?.length ?? 0
+  return ALL_CHART_TYPES.filter((t) => {
+    if (t === 'pie' && rowCount > 12) return false
+    if (t === 'scatter' && (cr.chart_data?.columns?.length ?? 0) < 2) return false
+    return true
+  })
 }
 
 export default function QueryPage() {
@@ -94,6 +157,9 @@ export default function QueryPage() {
   const [submitting, setSubmitting] = useState(false)
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const isAtBottomRef = useRef(true)
   const jobs = usePipelineStore((s) => s.jobs)
   const setStoreActiveJob = usePipelineStore((s) => s.setActiveJob)
 
@@ -107,22 +173,82 @@ export default function QueryPage() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editText, setEditText] = useState('')
 
-  // Refs for the async pipeline-completion closure
+  // Refs for async pipeline-completion closure
   const sessionIdRef = useRef<string | null>(null)
   const activeLeafRef = useRef<string | null>(null)
   const pendingParentRef = useRef<string | null>(null)
   const persistedRef = useRef<Set<string>>(new Set())
 
-  // Chat panel state ("Ask about this")
+  // Sidebar search
+  const [sidebarSearch, setSidebarSearch] = useState('')
+
+  // Output format hint for next query
+  const [outputMode, setOutputMode] = useState<'auto' | 'chart' | 'table' | 'text'>('auto')
+
+  // Scroll-to-bottom FAB
+  const [showScrollFab, setShowScrollFab] = useState(false)
+  const [hasNewMsg, setHasNewMsg] = useState(false)
+
+  // Chart expand modal + per-message type overrides
+  const [expandedChart, setExpandedChart] = useState<ChartResult | null>(null)
+  const [chartTypeOverrides, setChartTypeOverrides] = useState<Record<string, string>>({})
+
+  // "Ask about this" chat panel
   const [chatOpen, setChatOpen] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
-  const [chatSessionId, setChatSessionId] = useState<string | undefined>(undefined)
+  const [chartSessionMap, setChartSessionMap] = useState<Map<string, string>>(new Map())
   const [activeChartContext, setActiveChartContext] = useState<ChartResult | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const chatAbortRef = useRef<AbortController | null>(null)
+  const activeChartContextRef = useRef<ChartResult | null>(null)
+
+  // Message actions state
+  const [starredIds, setStarredIds] = useState<Set<string>>(new Set())
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [speakingId, setSpeakingId] = useState<string | null>(null)
 
   usePipelineSocket(activeJobId)
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      chatAbortRef.current?.abort()
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel()
+      }
+    }
+  }, [])
+
+  // Scroll tracking for FAB
+  useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const onScroll = () => {
+      const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+      const atBottom = distFromBottom < 80
+      isAtBottomRef.current = atBottom
+      setShowScrollFab(!atBottom)
+      if (atBottom) setHasNewMsg(false)
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const meta = e.metaKey || e.ctrlKey
+      if (meta && e.key === 'k') { e.preventDefault(); newChat() }
+      if (meta && e.key === '.') { e.preventDefault(); if (submitting) cancelPipeline() }
+      if (e.key === 'Escape' && editingId) setEditingId(null)
+      if (e.key === 'Escape' && expandedChart) setExpandedChart(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [submitting, editingId, expandedChart])
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -163,7 +289,22 @@ export default function QueryPage() {
     return sid
   }
 
-  // ── run one turn (optionally branching from a given parent message) ──────────
+  const cancelPipeline = useCallback(() => {
+    setActiveJobId(null)
+    setSubmitting(false)
+    setMessages((prev) => prev.map((m) =>
+      m.loading ? { ...m, loading: false, error: 'Cancelled' } : m
+    ))
+  }, [])
+
+  const autoResize = useCallback(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 140) + 'px'
+  }, [])
+
+  // ── run one turn ─────────────────────────────────────────────────────────────
   const runTurn = async (text: string, branchParentId?: string | null) => {
     if (!text.trim() || submitting) return
     setSubmitting(true)
@@ -176,21 +317,38 @@ export default function QueryPage() {
       const r = await querySessionApi.addMessage(sid, { role: 'user', content: text, parent_id: parentId })
       userServerId = r.data.id
       setActiveLeafId(userServerId!); activeLeafRef.current = userServerId!
-      // Backend auto-titles the session from the first question — reflect it in
-      // the sidebar immediately rather than waiting for the answer to finish.
       refreshSessions()
-    } catch { /* persist best-effort */ }
+    } catch { /* best-effort */ }
     pendingParentRef.current = userServerId || null
 
     const agentMsgId = crypto.randomUUID()
     setMessages((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), serverId: userServerId, parentId, type: 'user', content: text },
+      { id: crypto.randomUUID(), serverId: userServerId, parentId, type: 'user', content: text, created_at: new Date().toISOString() },
       { id: agentMsgId, type: 'agent', content: '', loading: true, jobId: '' },
     ])
 
+    const conversationHistory: ConversationTurn[] = messages
+      .filter((m) => !m.loading && (m.type === 'user' ? !!m.content : !!(m.chartResult || m.dashboardResult)))
+      .slice(-6)
+      .map((m): ConversationTurn => {
+        if (m.type === 'user') return { role: 'user', content: m.content }
+        const cr = m.chartResult
+        return {
+          role: 'assistant',
+          content: cr?.narrative || cr?.title || (m.dashboardResult ? 'Dashboard with multiple charts' : ''),
+          chart_title: cr?.title,
+          sql: cr?.sql,
+        }
+      })
+
     try {
-      const resp = await agentApi.submitIntent({ text, project_id: projectId })
+      const resp = await agentApi.submitIntent({
+        text,
+        project_id: projectId,
+        conversation_history: conversationHistory.length > 0 ? conversationHistory : undefined,
+        ...(outputMode !== 'auto' ? { output_mode: outputMode } : {}),
+      })
       const jobId = resp.data.job_id
       const jobType = resp.data.job_type || 'SINGLE_VIZ'
       setActiveJobId(jobId); setStoreActiveJob(jobId)
@@ -209,10 +367,11 @@ export default function QueryPage() {
     const text = input.trim()
     if (!text) return
     setInput('')
+    if (inputRef.current) inputRef.current.style.height = 'auto'
     await runTurn(text)
   }
 
-  // ── persist assistant result when the pipeline finishes, then reload tree ─────
+  // ── persist assistant result, reload tree ─────────────────────────────────────
   const finalizeTurn = useCallback(async (jid: string, job: { chartResult?: ChartResult; dashboardResult?: DashboardResult; error?: string }) => {
     const sid = sessionIdRef.current
     if (!sid) { setSubmitting(false); return }
@@ -245,10 +404,18 @@ export default function QueryPage() {
     }
   }, [jobs, activeJobId, finalizeTurn])
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  // Scroll to bottom only when already at bottom; otherwise show "New" badge
+  useEffect(() => {
+    if (isAtBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    } else {
+      setHasNewMsg(true)
+    }
+  }, [messages])
+
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages])
 
-  // ── branching: edit a user message + switch between sibling versions ─────────
+  // ── branching ────────────────────────────────────────────────────────────────
   const siblingsOf = (serverId?: string): TreeNode[] => {
     if (!serverId || !tree[serverId]) return []
     const node = tree[serverId]
@@ -275,11 +442,18 @@ export default function QueryPage() {
     const text = editText.trim()
     if (!text) return
     setEditingId(null)
-    // Branch: new user message under the SAME parent as the edited one.
     await runTurn(text, msg.parentId ?? null)
   }
 
-  // ── session sidebar actions ──────────────────────────────────────────────────
+  const regenerateFromAssistant = async (msg: Message) => {
+    if (!msg.serverId || !tree[msg.serverId]) return
+    const assistantNode = tree[msg.serverId]
+    const userNode = assistantNode.parent_id ? tree[assistantNode.parent_id] : null
+    if (!userNode || userNode.role !== 'user') return
+    await runTurn(userNode.content, userNode.parent_id ?? null)
+  }
+
+  // ── session sidebar actions ───────────────────────────────────────────────────
   const deleteSession = async (sid: string) => {
     try { await querySessionApi.remove(sid) } catch { /* ignore */ }
     if (sid === sessionIdRef.current) newChat()
@@ -293,12 +467,29 @@ export default function QueryPage() {
     refreshSessions()
   }
 
-  // ── "Ask about this" chat panel (unchanged) ──────────────────────────────────
+  // ── "Ask about this" panel ────────────────────────────────────────────────────
+  const openChatForChart = (chartResult: ChartResult) => {
+    const prevKey = activeChartContext ? chartKey(activeChartContext) : null
+    const newKey = chartKey(chartResult)
+    const isNewChart = prevKey !== newKey
+    setActiveChartContext(chartResult)
+    activeChartContextRef.current = chartResult
+    setChatOpen(true)
+    if (isNewChart) {
+      chatAbortRef.current?.abort()
+      chatAbortRef.current = null
+      setChatMessages([{
+        id: crypto.randomUUID(), role: 'assistant',
+        content: `I can help you explore the "${chartResult.title}" chart. Ask me anything about the data, patterns, or trends.`,
+      }])
+      setChatInput(''); setChatLoading(false)
+    }
+  }
+
   const handleChatSend = async () => {
     if (!chatInput.trim() || chatLoading) return
     const userText = chatInput.trim()
-    setChatInput('')
-    setChatLoading(true)
+    setChatInput(''); setChatLoading(true)
     const userMsgId = crypto.randomUUID()
     const assistantMsgId = crypto.randomUUID()
     setChatMessages((prev) => [
@@ -306,283 +497,619 @@ export default function QueryPage() {
       { id: userMsgId, role: 'user', content: userText },
       { id: assistantMsgId, role: 'assistant', content: '', loading: true },
     ])
+    const ctx = activeChartContextRef.current
+    let messageToSend = userText
+    if (ctx) {
+      const rowSample = ctx.chart_data?.rows?.slice(0, 8) ?? []
+      const contextBlock = [
+        `[Chart context: "${ctx.title}"`,
+        ctx.sql ? ` | SQL: ${ctx.sql}` : '',
+        rowSample.length > 0 ? ` | Data sample (first ${rowSample.length} rows): ${JSON.stringify(rowSample)}` : '',
+        ']',
+      ].join('')
+      messageToSend = contextBlock + '\nUser question: ' + userText
+    }
+    const currentKey = ctx ? chartKey(ctx) : 'default'
+    const existingSessionId = chartSessionMap.get(currentKey)
+    const abort = new AbortController()
+    chatAbortRef.current = abort
+    let accumulated = ''
     try {
-      const resp = await chatApi.send({ session_id: chatSessionId, message: userText, project_id: projectId })
-      const data = resp.data
-      if (data.session_id && !chatSessionId) setChatSessionId(data.session_id)
-      let inlineChart: ChartResult | undefined = undefined
-      if (data.inline_chart) {
-        const ic = data.inline_chart
-        inlineChart = {
-          chart_type: ic.chart_type, title: ic.title, sql: ic.sql || '', score: 1, low_confidence: false,
-          x_axis_label: ic.x_axis_label || 'x', y_axis_label: ic.y_axis_label || 'y', table_used: '',
-          chart_data: ic.chart_data || { rows: [], columns: [], labels: [], values: [] },
-        }
-      }
-      setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, content: data.text, loading: false, inlineChart } : m))
-      if (data.dashboard_action?.action === 'filter_widget' && data.dashboard_action?.params?.instruction) {
-        setInput(data.dashboard_action.params.instruction)
-      }
+      await streamChat(
+        { session_id: existingSessionId, message: messageToSend, project_id: projectId },
+        {
+          onText: (delta) => {
+            accumulated += delta
+            setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, content: accumulated, loading: false } : m))
+          },
+          onChart: (rawChart) => {
+            const ic = rawChart as Record<string, unknown>
+            const inlineChart: ChartResult = {
+              chart_type: ic.chart_type as string, title: ic.title as string,
+              sql: (ic.sql as string) || '', score: 1, low_confidence: false,
+              x_axis_label: (ic.x_axis_label as string) || 'x', y_axis_label: (ic.y_axis_label as string) || 'y',
+              table_used: '', chart_data: (ic.chart_data as ChartResult['chart_data']) || { rows: [], columns: [], labels: [], values: [] },
+            }
+            setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, inlineChart } : m))
+          },
+          onAction: (action) => {
+            const act = action as { action?: string; params?: { instruction?: string } }
+            if (act.action === 'filter_widget' && act.params?.instruction) setInput(act.params.instruction)
+          },
+          onDone: (meta) => {
+            setChartSessionMap((prev) => new Map(prev).set(currentKey, meta.session_id))
+            setChatLoading(false)
+          },
+          onError: () => {
+            setChatMessages((prev) => prev.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: 'Sorry, I could not process your request.', loading: false } : m))
+            setChatLoading(false)
+          },
+        },
+        abort.signal,
+      )
     } catch {
-      setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, content: 'Sorry, I could not process your request.', loading: false } : m))
-    } finally {
-      setChatLoading(false)
+      if (!abort.signal.aborted) {
+        setChatMessages((prev) => prev.map((m) =>
+          m.id === assistantMsgId ? { ...m, content: 'Sorry, I could not process your request.', loading: false } : m))
+        setChatLoading(false)
+      }
     }
   }
 
-  const openChatForChart = (chartResult: ChartResult) => {
-    setActiveChartContext(chartResult)
-    setChatOpen(true)
-    if (chatMessages.length === 0) {
-      setChatMessages([{
-        id: crypto.randomUUID(), role: 'assistant',
-        content: `I can help you explore the "${chartResult.title}" chart. Ask me anything about the data, or say "filter by region" to refine it.`,
-      }])
-    }
+  const closeChatPanel = () => {
+    chatAbortRef.current?.abort(); chatAbortRef.current = null; setChatOpen(false)
   }
+
+  // ── Message action helpers ────────────────────────────────────────────────────
+  const copyText = (text: string, id: string) => {
+    navigator.clipboard.writeText(text).catch(() => {})
+    setCopiedId(id)
+    setTimeout(() => setCopiedId((s) => (s === id ? null : s)), 1800)
+  }
+
+  const toggleStar = (id: string) => {
+    setStarredIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next })
+  }
+
+  const speakText = (text: string, id: string) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    window.speechSynthesis.cancel()
+    if (speakingId === id) { setSpeakingId(null); return }
+    const utt = new SpeechSynthesisUtterance(text)
+    utt.rate = 1.0; utt.onend = () => setSpeakingId(null); utt.onerror = () => setSpeakingId(null)
+    setSpeakingId(id); window.speechSynthesis.speak(utt)
+  }
+
+  const stopSpeaking = () => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+    setSpeakingId(null)
+  }
+
+  const starredMessages = messages.filter((m) => starredIds.has(m.serverId || m.id))
+  const sessionGroups = groupSessionsByDate(sessions)
+  const filteredSessionGroups = sidebarSearch
+    ? sessionGroups.map(({ label, items }) => ({
+        label, items: items.filter((s) => s.title.toLowerCase().includes(sidebarSearch.toLowerCase())),
+      })).filter(({ items }) => items.length > 0)
+    : sessionGroups
 
   return (
     <div className="flex h-full overflow-hidden">
+
       {/* ── History sidebar ── */}
       <aside className="w-64 flex-shrink-0 border-r border-gray-100 bg-gray-50 flex flex-col">
-        <div className="p-3">
+        <div className="p-3 pb-2">
           <button onClick={newChat} className="btn-primary w-full flex items-center justify-center gap-2 py-2 text-sm">
             <Plus size={15} /> New chat
           </button>
         </div>
+
+        {/* Sidebar search */}
+        <div className="px-3 pb-2">
+          <div className="relative">
+            <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+            <input
+              value={sidebarSearch}
+              onChange={(e) => setSidebarSearch(e.target.value)}
+              placeholder="Search chats…"
+              className="w-full pl-7 pr-3 py-1.5 text-xs bg-white border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-brand/30 focus:border-brand/40"
+            />
+          </div>
+        </div>
+
+        {/* Starred messages */}
+        {starredMessages.length > 0 && (
+          <div className="px-2 pb-2 border-b border-gray-200">
+            <p className="px-2 py-1 text-[11px] uppercase tracking-wide text-amber-600 font-semibold flex items-center gap-1">
+              <Star size={10} fill="currentColor" /> Starred
+            </p>
+            <div className="space-y-0.5">
+              {starredMessages.map((m) => (
+                <div
+                  key={m.serverId || m.id}
+                  className="flex items-start gap-1.5 rounded-lg px-2 py-1.5 cursor-pointer hover:bg-amber-50 text-xs text-gray-700"
+                  onClick={() => {
+                    const el = document.getElementById(`msg-${m.serverId || m.id}`)
+                    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                  }}
+                >
+                  <span className={`mt-0.5 flex-shrink-0 w-1.5 h-1.5 rounded-full ${m.type === 'user' ? 'bg-brand' : 'bg-green-500'}`} />
+                  <span className="truncate leading-snug">
+                    {m.type === 'user' ? m.content : (m.chartResult?.title || m.chartResult?.narrative || 'AI response')}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto px-2 pb-3 space-y-0.5">
-          <p className="px-2 py-1 text-[11px] uppercase tracking-wide text-gray-400">Recent</p>
-          {sessions.length === 0 && <p className="px-2 text-xs text-gray-400">No chats yet</p>}
-          {sessions.map((s) => (
-            <div
-              key={s.id}
-              className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer text-sm ${
-                s.id === activeSessionId ? 'bg-brand-light text-brand' : 'text-gray-700 hover:bg-gray-100'
-              }`}
-              onClick={() => s.id !== renamingId && loadSession(s.id)}
-            >
-              {renamingId === s.id ? (
-                <input
-                  autoFocus value={renameText} onChange={(e) => setRenameText(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null) }}
-                  onBlur={() => commitRename(s.id)}
-                  className="flex-1 bg-white border border-gray-200 rounded px-1 py-0.5 text-xs"
-                  onClick={(e) => e.stopPropagation()}
-                />
-              ) : (
-                <>
-                  <span className="flex-1 truncate">{s.title}</span>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setRenamingId(s.id); setRenameText(s.title) }}
-                    className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-gray-600"
-                    title="Rename"
-                  ><Edit2 size={12} /></button>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }}
-                    className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500"
-                    title="Delete"
-                  ><Trash2 size={12} /></button>
-                </>
-              )}
+          {sessions.length === 0 && !sidebarSearch && <p className="px-2 text-xs text-gray-400 mt-2">No chats yet</p>}
+          {sidebarSearch && filteredSessionGroups.length === 0 && (
+            <p className="px-2 text-xs text-gray-400 mt-2">No results for &ldquo;{sidebarSearch}&rdquo;</p>
+          )}
+          {filteredSessionGroups.map(({ label, items }) => (
+            <div key={label}>
+              <p className="px-2 py-1 text-[11px] uppercase tracking-wide text-gray-400 mt-1">{label}</p>
+              {items.map((s) => (
+                <div
+                  key={s.id}
+                  className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer text-sm ${
+                    s.id === activeSessionId ? 'bg-brand-light text-brand' : 'text-gray-700 hover:bg-gray-100'
+                  }`}
+                  onClick={() => s.id !== renamingId && loadSession(s.id)}
+                >
+                  {renamingId === s.id ? (
+                    <input
+                      autoFocus value={renameText} onChange={(e) => setRenameText(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null) }}
+                      onBlur={() => commitRename(s.id)}
+                      className="flex-1 bg-white border border-gray-200 rounded px-1 py-0.5 text-xs"
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <>
+                      <span className="flex-1 truncate">{s.title}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setRenamingId(s.id); setRenameText(s.title) }}
+                        className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-gray-600"
+                        title="Rename"
+                      ><Edit2 size={12} /></button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }}
+                        className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500"
+                        title="Delete"
+                      ><Trash2 size={12} /></button>
+                    </>
+                  )}
+                </div>
+              ))}
             </div>
           ))}
         </div>
       </aside>
 
-      {/* ── Main + chat panel ── */}
+      {/* ── Main + right panel ── */}
       <div className="flex flex-1 overflow-hidden">
         <div className={`flex flex-col ${chatOpen ? 'flex-1' : 'w-full'} transition-all duration-300`}>
           <IntentStatusBar jobId={activeJobId} />
 
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center h-full text-center">
-                <TrendingUp size={48} className="text-brand-light mb-4" />
-                <h3 className="text-xl font-semibold font-display text-gray-700 mb-2">Ask anything about your data</h3>
-                <p className="text-gray-400 text-sm max-w-md">
-                  Try a single chart, or ask for a full &quot;dashboard overview&quot; to get multiple visualizations at once.
-                </p>
-                <div className="mt-4 flex flex-wrap gap-2 justify-center">
-                  {[
-                    'Show monthly revenue trend',
-                    'Top 10 products by sales',
-                    'Give me a dashboard overview of sales performance',
-                  ].map((s) => (
-                    <button key={s} onClick={() => setInput(s)} className="text-xs px-3 py-1.5 bg-brand-light text-brand rounded-full hover:bg-blue-100 transition-colors">
-                      {s}
-                    </button>
-                  ))}
+          {/* Scroll area + FAB */}
+          <div className="relative flex-1 overflow-hidden">
+            <div ref={scrollContainerRef} className="h-full overflow-y-auto p-4 space-y-4">
+
+              {/* Empty state */}
+              {messages.length === 0 && (
+                <div className="flex flex-col items-center justify-center h-full text-center">
+                  <TrendingUp size={48} className="text-brand-light mb-4" />
+                  <h3 className="text-xl font-semibold font-display text-gray-700 mb-2">Ask anything about your data</h3>
+                  <p className="text-gray-400 text-sm max-w-md">
+                    Try a single chart, or ask for a full &quot;dashboard overview&quot; to get multiple visualizations at once.
+                  </p>
+                  <div className="mt-4 flex flex-wrap gap-2 justify-center">
+                    {[
+                      'Show monthly revenue trend',
+                      'Top 10 products by sales',
+                      'Give me a dashboard overview of sales performance',
+                    ].map((s) => (
+                      <button key={s} onClick={() => setInput(s)} className="text-xs px-3 py-1.5 bg-brand-light text-brand rounded-full hover:bg-blue-100 transition-colors">
+                        {s}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {messages.map((msg) => {
-              const sibs = msg.type === 'user' ? siblingsOf(msg.serverId) : []
-              const sibIdx = sibs.findIndex((s) => s.id === msg.serverId)
-              return (
-                <div key={msg.id} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  {msg.type === 'user' ? (
-                    editingId === (msg.serverId || msg.id) ? (
-                      <div className="max-w-sm w-full flex flex-col items-end gap-1">
-                        <textarea
-                          autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitEdit(msg) } }}
-                          className="input-field w-full text-sm" rows={2}
-                        />
-                        <div className="flex gap-2">
-                          <button onClick={() => setEditingId(null)} className="text-xs text-gray-500 px-2 py-1">Cancel</button>
-                          <button onClick={() => submitEdit(msg)} className="btn-primary text-xs px-3 py-1 flex items-center gap-1">
-                            <Check size={12} /> Send
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="group flex items-center gap-1.5">
-                        {sibs.length > 1 && (
-                          <div className="flex items-center gap-0.5 text-[11px] text-gray-400">
-                            <button disabled={sibIdx <= 0} onClick={() => switchSibling(msg.serverId!, -1)} className="disabled:opacity-30 hover:text-gray-700"><ChevronLeft size={13} /></button>
-                            <span>{sibIdx + 1}/{sibs.length}</span>
-                            <button disabled={sibIdx >= sibs.length - 1} onClick={() => switchSibling(msg.serverId!, 1)} className="disabled:opacity-30 hover:text-gray-700"><ChevronRight size={13} /></button>
+              {/* Messages */}
+              {messages.map((msg) => {
+                const sibs = msg.type === 'user' ? siblingsOf(msg.serverId) : []
+                const sibIdx = sibs.findIndex((s) => s.id === msg.serverId)
+                return (
+                  <div key={msg.id} id={`msg-${msg.serverId || msg.id}`} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
+
+                    {/* ── User bubble ── */}
+                    {msg.type === 'user' ? (
+                      editingId === (msg.serverId || msg.id) ? (
+                        <div className="max-w-sm w-full flex flex-col items-end gap-1">
+                          <textarea
+                            autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitEdit(msg) } }}
+                            className="input-field w-full text-sm" rows={2}
+                          />
+                          <div className="flex gap-2">
+                            <button onClick={() => setEditingId(null)} className="text-xs text-gray-500 px-2 py-1">Cancel</button>
+                            <button onClick={() => submitEdit(msg)} className="btn-primary text-xs px-3 py-1 flex items-center gap-1">
+                              <Check size={12} /> Send
+                            </button>
                           </div>
-                        )}
-                        {msg.serverId && (
-                          <button onClick={() => startEdit(msg)} className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-gray-600" title="Edit & branch">
-                            <Edit2 size={12} />
-                          </button>
-                        )}
-                        <div className="max-w-sm bg-brand text-white px-4 py-2.5 rounded-2xl rounded-tr-sm text-sm">
-                          {msg.content}
                         </div>
-                      </div>
-                    )
-                  ) : (
-                    <div className="max-w-2xl w-full">
-                      {msg.loading && (
-                        <div className="card p-4 flex items-center gap-3 text-gray-500">
-                          <Loader2 size={16} className="animate-spin text-brand" />
-                          <span className="text-sm">
-                            {msg.jobId && jobs[msg.jobId] ? getLoadingText(jobs[msg.jobId], msg.jobType) : 'Starting pipeline...'}
-                          </span>
-                        </div>
-                      )}
-
-                      {msg.error && (
-                        <div className="card p-4 flex items-center gap-3 text-red-600 bg-red-50 border border-red-100">
-                          <AlertCircle size={16} />
-                          <span className="text-sm">{msg.error}</span>
-                        </div>
-                      )}
-
-                      {msg.chartResult && (
-                        <div className="card p-4 space-y-3">
-                          <div className="flex items-center justify-between">
-                            <h4 className="font-semibold text-gray-900 font-display">{msg.chartResult.title}</h4>
-                            <div className="flex items-center gap-2">
-                              {msg.chartResult.low_confidence && (
-                                <span className="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full">Low confidence</span>
-                              )}
-                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                                msg.chartResult.score >= 0.8 ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
-                              }`}>
-                                Score: {(msg.chartResult.score * 100).toFixed(0)}%
-                              </span>
-                              <button
-                                onClick={() => openChatForChart(msg.chartResult!)}
-                                className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1 transition-colors"
-                              >
-                                <MessageSquare size={10} /> Ask about this
+                      ) : (
+                        <div className="group flex items-end gap-1.5">
+                          {/* Hover actions — left of bubble */}
+                          <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity mb-1">
+                            {sibs.length > 1 && (
+                              <div className="flex items-center gap-0.5 text-[11px] text-gray-400">
+                                <button disabled={sibIdx <= 0} onClick={() => switchSibling(msg.serverId!, -1)} className="disabled:opacity-30 hover:text-gray-700"><ChevronLeft size={13} /></button>
+                                <span>{sibIdx + 1}/{sibs.length}</span>
+                                <button disabled={sibIdx >= sibs.length - 1} onClick={() => switchSibling(msg.serverId!, 1)} className="disabled:opacity-30 hover:text-gray-700"><ChevronRight size={13} /></button>
+                              </div>
+                            )}
+                            <button onClick={() => copyText(msg.content, msg.serverId || msg.id)} className="p-1 text-gray-400 hover:text-gray-600 rounded" title="Copy">
+                              {copiedId === (msg.serverId || msg.id) ? <Check size={12} className="text-green-500" /> : <Copy size={12} />}
+                            </button>
+                            <button
+                              onClick={() => toggleStar(msg.serverId || msg.id)}
+                              className={`p-1 rounded ${starredIds.has(msg.serverId || msg.id) ? 'text-amber-400' : 'text-gray-400 hover:text-amber-400'}`}
+                            >
+                              <Star size={12} fill={starredIds.has(msg.serverId || msg.id) ? 'currentColor' : 'none'} />
+                            </button>
+                            {msg.serverId && (
+                              <button onClick={() => startEdit(msg)} className="p-1 text-gray-400 hover:text-gray-600 rounded" title="Edit & branch">
+                                <Edit2 size={12} />
                               </button>
-                            </div>
+                            )}
                           </div>
-
-                          {msg.chartResult.output_mode === 'text' ? (
-                            msg.chartResult.narrative ? (
-                              <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-line">{msg.chartResult.narrative}</p>
-                            ) : (
-                              <ChartRenderer result={msg.chartResult} />
-                            )
-                          ) : (
-                            <>
-                              <ChartRenderer result={msg.chartResult} />
-                              {msg.chartResult.narrative && (
-                                <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">
-                                  {msg.chartResult.narrative}
-                                </p>
-                              )}
-                            </>
+                          <div className={`max-w-sm px-4 py-2.5 rounded-2xl rounded-tr-sm text-sm ${
+                            starredIds.has(msg.serverId || msg.id)
+                              ? 'bg-brand/90 text-white ring-2 ring-amber-300/60'
+                              : 'bg-brand text-white'
+                          }`}>
+                            {msg.content}
+                          </div>
+                          {/* Timestamp on hover */}
+                          {msg.created_at && (
+                            <span className="opacity-0 group-hover:opacity-100 transition-opacity text-[10px] text-gray-400 self-end mb-0.5 whitespace-nowrap">
+                              {relativeTime(msg.created_at)}
+                            </span>
                           )}
                         </div>
-                      )}
+                      )
+                    ) : (
+                      /* ── Agent card ── */
+                      <div className="max-w-2xl w-full">
 
-                      {msg.dashboardResult && (
-                        <div className="space-y-3">
-                          <div className="flex items-center gap-2 text-sm text-gray-500">
-                            <LayoutDashboard size={14} />
-                            Dashboard — {msg.dashboardResult.charts.length} charts generated
+                        {/* Loading skeleton */}
+                        {msg.loading && (
+                          <div className="card p-4 space-y-3">
+                            <div className="h-3.5 rounded-md bg-gray-200 animate-pulse w-2/5" />
+                            <div className="h-[110px] rounded-lg bg-gray-200 animate-pulse" />
+                            <div className="flex items-center gap-2">
+                              <span className={`w-2 h-2 rounded-full flex-shrink-0 animate-pulse ${msg.jobId && jobs[msg.jobId] ? 'bg-brand' : 'bg-gray-300'}`} />
+                              <span className="text-xs text-gray-400">
+                                {msg.jobId && jobs[msg.jobId] ? getLoadingText(jobs[msg.jobId], msg.jobType) : 'Starting pipeline…'}
+                              </span>
+                            </div>
                           </div>
-                          <div className="grid grid-cols-2 gap-3">
-                            {msg.dashboardResult.charts.map((chart, i) => (
-                              <div key={i} className="card p-3 space-y-2">
-                                <div className="flex items-center justify-between">
-                                  <h5 className="text-sm font-medium text-gray-900 font-display truncate">{chart.title}</h5>
-                                  <button onClick={() => openChatForChart(chart)} className="text-xs text-gray-400 hover:text-brand flex-shrink-0 ml-2">
-                                    <MessageSquare size={12} />
-                                  </button>
-                                </div>
-                                <ChartRenderer result={chart} compact />
+                        )}
+
+                        {/* Error card */}
+                        {msg.error && (
+                          <div className="card p-4 space-y-2">
+                            <div className="flex items-center gap-3 text-red-600">
+                              <AlertCircle size={16} />
+                              <span className="text-sm">{msg.error}</span>
+                            </div>
+                            {msg.error !== 'Cancelled' && msg.serverId && !submitting && (
+                              <div className="flex justify-end gap-2">
+                                <button onClick={() => copyText(msg.error!, `${msg.serverId}-err`)} className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1 transition-colors">
+                                  {copiedId === `${msg.serverId}-err` ? <Check size={11} className="text-green-500" /> : <Copy size={11} />}
+                                </button>
+                                <button onClick={() => regenerateFromAssistant(msg)} className="text-xs text-gray-400 hover:text-brand flex items-center gap-1 transition-colors">
+                                  <RefreshCw size={11} /> Try again
+                                </button>
                               </div>
-                            ))}
+                            )}
                           </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )
-            })}
+                        )}
 
-            <div ref={messagesEndRef} />
+                        {/* Chart / text result */}
+                        {msg.chartResult && (() => {
+                          const cr = msg.chartResult!
+                          const msgKey = msg.serverId || msg.id
+                          const isStarred = starredIds.has(msgKey)
+                          const isSpeaking = speakingId === msgKey
+                          const responseText = cr.narrative || cr.title || ''
+                          const isTextMode = cr.output_mode === 'text'
+                          const activeChartType = chartTypeOverrides[msgKey] || cr.chart_type
+                          const compatTypes = compatibleChartTypes(cr)
+
+                          // Hover action strip (shared by both modes)
+                          const HoverActions = () => (
+                            <div className="opacity-0 group-hover:opacity-100 transition-all duration-150 flex items-center gap-1 flex-wrap pt-2 border-t border-gray-100 mt-1">
+                              {cr.low_confidence && (
+                                <span className="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full">Low confidence</span>
+                              )}
+                              {responseText && (
+                                <button
+                                  onClick={() => copyText(responseText, `${msgKey}-text`)}
+                                  className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1 transition-colors"
+                                >
+                                  {copiedId === `${msgKey}-text` ? <Check size={10} className="text-green-500" /> : <Copy size={10} />}
+                                  Copy
+                                </button>
+                              )}
+                              {responseText && (
+                                <button
+                                  onClick={() => isSpeaking ? stopSpeaking() : speakText(responseText, msgKey)}
+                                  className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 transition-colors ${isSpeaking ? 'bg-brand text-white' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'}`}
+                                >
+                                  {isSpeaking ? <VolumeX size={10} /> : <Volume2 size={10} />}
+                                  {isSpeaking ? 'Stop' : 'Listen'}
+                                </button>
+                              )}
+                              <button
+                                onClick={() => toggleStar(msgKey)}
+                                className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 transition-colors ${isStarred ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'}`}
+                              >
+                                <Star size={10} fill={isStarred ? 'currentColor' : 'none'} />
+                                {isStarred ? 'Starred' : 'Star'}
+                              </button>
+                              {cr.sql && (
+                                <button onClick={() => copyText(cr.sql, `${msgKey}-sql`)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1 transition-colors">
+                                  {copiedId === `${msgKey}-sql` ? <Check size={10} className="text-green-500" /> : <Code size={10} />}
+                                  SQL
+                                </button>
+                              )}
+                              {cr.chart_data?.rows?.length > 0 && (
+                                <button
+                                  onClick={() => downloadCsv(cr.chart_data.rows as Record<string, unknown>[], cr.chart_data.columns, cr.title)}
+                                  className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1 transition-colors"
+                                >
+                                  <Download size={10} /> CSV
+                                </button>
+                              )}
+                              {!isTextMode && (
+                                <button onClick={() => openChatForChart(cr)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1 transition-colors">
+                                  <MessageSquare size={10} /> Ask about this
+                                </button>
+                              )}
+                              {msg.serverId && !submitting && (
+                                <button onClick={() => regenerateFromAssistant(msg)} className="text-xs text-gray-400 hover:text-brand flex items-center gap-1 transition-colors ml-auto">
+                                  <RefreshCw size={11} /> Regenerate
+                                </button>
+                              )}
+                            </div>
+                          )
+
+                          // Text / prose mode
+                          if (isTextMode) {
+                            return (
+                              <div className={`group card p-4 space-y-2 ${isStarred ? 'ring-2 ring-amber-300/60' : ''}`}>
+                                <div className="flex items-start gap-2">
+                                  <div className="mt-0.5 p-1.5 bg-brand/10 rounded-lg flex-shrink-0">
+                                    <FileText size={14} className="text-brand" />
+                                  </div>
+                                  <div className="flex-1 min-w-0">
+                                    {cr.narrative ? (
+                                      <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-line">{cr.narrative}</p>
+                                    ) : (
+                                      <ChartRenderer result={cr} />
+                                    )}
+                                  </div>
+                                </div>
+                                <HoverActions />
+                              </div>
+                            )
+                          }
+
+                          // Chart mode
+                          return (
+                            <div className={`group card p-4 space-y-3 ${isStarred ? 'ring-2 ring-amber-300/60' : ''}`}>
+                              {/* Title row: score always visible; expand icon on hover */}
+                              <div className="flex items-center gap-2">
+                                <h4 className="font-semibold text-gray-900 font-display flex-1 min-w-0 truncate">{cr.title}</h4>
+                                <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 ${
+                                  cr.score >= 0.65 ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                                }`}>
+                                  {(cr.score * 100).toFixed(0)}%
+                                </span>
+                                <button
+                                  onClick={() => setExpandedChart({ ...cr, chart_type: activeChartType })}
+                                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 text-gray-400 hover:text-gray-600 rounded flex-shrink-0"
+                                  title="Expand (fullscreen)"
+                                >
+                                  <Maximize2 size={14} />
+                                </button>
+                              </div>
+
+                              <ChartRenderer result={{ ...cr, chart_type: activeChartType }} />
+
+                              {/* Chart type switcher */}
+                              {compatTypes.length > 1 && (
+                                <div className="flex gap-1.5 flex-wrap">
+                                  {compatTypes.map((t) => (
+                                    <button
+                                      key={t}
+                                      onClick={() => setChartTypeOverrides((prev) => ({ ...prev, [msgKey]: t }))}
+                                      className={`text-[11px] px-2 py-0.5 rounded-full border transition-colors capitalize ${
+                                        activeChartType === t
+                                          ? 'bg-brand/10 border-brand/30 text-brand font-medium'
+                                          : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300 hover:text-gray-600'
+                                      }`}
+                                    >
+                                      {t}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+
+                              {cr.narrative && (
+                                <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">
+                                  {cr.narrative}
+                                </p>
+                              )}
+
+                              <HoverActions />
+                            </div>
+                          )
+                        })()}
+
+                        {/* Dashboard result */}
+                        {msg.dashboardResult && (
+                          <div className="space-y-3">
+                            <div className="flex items-center gap-2 text-sm text-gray-500">
+                              <LayoutDashboard size={14} />
+                              Dashboard — {msg.dashboardResult.charts.length} charts generated
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                              {msg.dashboardResult.charts.map((chart, i) => (
+                                <div key={i} className="group card p-3 space-y-2">
+                                  <div className="flex items-center justify-between">
+                                    <h5 className="text-sm font-medium text-gray-900 font-display truncate">{chart.title}</h5>
+                                    <div className="flex items-center gap-1 flex-shrink-0 ml-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                      <button onClick={() => setExpandedChart(chart)} className="text-xs text-gray-400 hover:text-gray-600" title="Expand"><Maximize2 size={12} /></button>
+                                      {chart.sql && <button onClick={() => navigator.clipboard.writeText(chart.sql)} className="text-xs text-gray-400 hover:text-gray-600" title="Copy SQL"><Code size={11} /></button>}
+                                      {chart.chart_data?.rows?.length > 0 && (
+                                        <button onClick={() => downloadCsv(chart.chart_data.rows as Record<string, unknown>[], chart.chart_data.columns, chart.title)} className="text-xs text-gray-400 hover:text-gray-600" title="CSV"><Download size={11} /></button>
+                                      )}
+                                      <button onClick={() => openChatForChart(chart)} className="text-xs text-gray-400 hover:text-brand"><MessageSquare size={12} /></button>
+                                    </div>
+                                  </div>
+                                  <ChartRenderer result={chart} compact />
+                                </div>
+                              ))}
+                            </div>
+                            {msg.serverId && !submitting && (
+                              <div className="flex justify-end">
+                                <button onClick={() => regenerateFromAssistant(msg)} className="text-xs text-gray-400 hover:text-brand flex items-center gap-1 transition-colors">
+                                  <RefreshCw size={11} /> Regenerate
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Scroll-to-bottom FAB */}
+            {showScrollFab && (
+              <button
+                onClick={() => {
+                  scrollContainerRef.current?.scrollTo({ top: scrollContainerRef.current.scrollHeight, behavior: 'smooth' })
+                  setShowScrollFab(false); setHasNewMsg(false)
+                }}
+                className="absolute bottom-4 right-4 flex flex-col items-center gap-1 z-10"
+              >
+                {hasNewMsg && (
+                  <span className="bg-brand text-white text-[10px] font-semibold px-2 py-0.5 rounded-full shadow-md">New</span>
+                )}
+                <span className="w-8 h-8 rounded-full bg-brand text-white flex items-center justify-center shadow-lg hover:bg-brand-dark transition-colors">
+                  <ChevronDown size={16} />
+                </span>
+              </button>
+            )}
           </div>
 
-          <form onSubmit={handleSubmit} className="border-t border-gray-100 bg-white p-4">
-            <div className="flex gap-3 max-w-3xl mx-auto">
-              <input
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSubmit()}
-                className="input-field flex-1"
-                placeholder="Ask about your data... or 'give me a dashboard overview'"
-                disabled={submitting}
-              />
-              <button type="submit" disabled={submitting || !input.trim()} className="btn-primary px-4">
-                <Send size={16} />
-              </button>
+          {/* ── Input area ── */}
+          <div className="border-t border-gray-100 bg-white px-4 pt-3 pb-4">
+            <div className="max-w-3xl mx-auto space-y-2">
+              {/* Format chips + shortcut hints */}
+              <div className="flex items-center gap-1.5">
+                {(['auto', 'chart', 'table', 'text'] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setOutputMode(m)}
+                    className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                      outputMode === m
+                        ? 'bg-brand text-white border-brand'
+                        : 'bg-white text-gray-500 border-gray-200 hover:border-gray-300'
+                    }`}
+                  >
+                    {m === 'auto' ? 'Auto' : m === 'chart' ? 'Chart' : m === 'table' ? 'Table' : 'Text'}
+                  </button>
+                ))}
+                <span className="ml-auto text-[10px] text-gray-300 hidden sm:flex items-center gap-3">
+                  <span>⌘↵ send</span>
+                  <span>⌘K new</span>
+                  <span>⌘. stop</span>
+                </span>
+              </div>
+
+              {/* Textarea + send/stop */}
+              <div className="flex gap-2 items-end">
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={(e) => { setInput(e.target.value); autoResize() }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void handleSubmit() }
+                    else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handleSubmit() }
+                  }}
+                  className="input-field flex-1 resize-none overflow-y-auto"
+                  style={{ minHeight: '42px', maxHeight: '140px', lineHeight: '1.5' }}
+                  placeholder="Ask about your data… or 'give me a dashboard overview'"
+                  disabled={submitting}
+                  rows={1}
+                />
+                {submitting ? (
+                  <button
+                    type="button"
+                    onClick={cancelPipeline}
+                    className="flex-shrink-0 h-[42px] px-4 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors flex items-center gap-1.5"
+                    title="Cancel (⌘.)"
+                  >
+                    <Square size={14} fill="white" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleSubmit()}
+                    disabled={!input.trim()}
+                    className="btn-primary flex-shrink-0 h-[42px] px-4 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Send size={16} />
+                  </button>
+                )}
+              </div>
             </div>
-          </form>
+          </div>
         </div>
 
-        {/* Chat panel */}
+        {/* ── "Ask about this" chat panel ── */}
         {chatOpen && (
           <div className="w-80 border-l border-gray-100 flex flex-col bg-white">
             <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
               <div>
                 <p className="text-sm font-semibold text-gray-900">AI Assistant</p>
-                {activeChartContext && (
-                  <p className="text-xs text-gray-400 truncate max-w-56">{activeChartContext.title}</p>
-                )}
+                {activeChartContext && <p className="text-xs text-gray-400 truncate max-w-56">{activeChartContext.title}</p>}
               </div>
-              <button onClick={() => setChatOpen(false)} className="text-gray-400 hover:text-gray-600">
-                <X size={16} />
-              </button>
+              <button onClick={closeChatPanel} className="text-gray-400 hover:text-gray-600"><X size={16} /></button>
             </div>
-
             <div className="flex-1 overflow-y-auto p-3 space-y-3">
               {chatMessages.map((m) => (
                 <div key={m.id} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
                   <div className={`max-w-[85%] px-3 py-2 rounded-xl text-xs leading-relaxed ${
                     m.role === 'user' ? 'bg-brand text-white rounded-tr-sm' : 'bg-gray-100 text-gray-800 rounded-tl-sm'
                   }`}>
-                    {m.loading ? <Loader2 size={12} className="animate-spin" /> : m.content}
+                    {m.loading && !m.content ? <Loader2 size={12} className="animate-spin" /> : m.content || <Loader2 size={12} className="animate-spin" />}
                   </div>
                   {m.inlineChart && (
                     <div className="mt-2 w-full border border-gray-200 rounded-lg p-2 bg-white">
@@ -594,16 +1121,12 @@ export default function QueryPage() {
               ))}
               <div ref={chatEndRef} />
             </div>
-
             <div className="border-t border-gray-100 p-3">
               <div className="flex gap-2">
                 <input
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
+                  value={chatInput} onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleChatSend()}
-                  className="input-field flex-1 text-xs py-2"
-                  placeholder="Ask a follow-up..."
-                  disabled={chatLoading}
+                  className="input-field flex-1 text-xs py-2" placeholder="Ask a follow-up…" disabled={chatLoading}
                 />
                 <button onClick={handleChatSend} disabled={chatLoading || !chatInput.trim()} className="btn-primary px-3 py-2">
                   <Send size={13} />
@@ -615,22 +1138,72 @@ export default function QueryPage() {
 
         <ReasoningDrawer jobId={activeJobId} />
       </div>
+
+      {/* ── Chart expand modal ── */}
+      {expandedChart && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-6"
+          onClick={() => setExpandedChart(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4 p-5 border-b border-gray-100">
+              <h3 className="text-base font-semibold font-display text-gray-900">{expandedChart.title}</h3>
+              <button onClick={() => setExpandedChart(null)} className="text-gray-400 hover:text-gray-600 flex-shrink-0">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <ChartRenderer result={expandedChart} />
+              {expandedChart.narrative && (
+                <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">{expandedChart.narrative}</p>
+              )}
+              {expandedChart.sql && (
+                <details>
+                  <summary className="text-xs text-gray-400 cursor-pointer hover:text-gray-600 select-none">View SQL</summary>
+                  <pre className="mt-2 p-3 bg-gray-50 rounded-lg text-xs font-mono text-gray-700 overflow-x-auto whitespace-pre-wrap">{expandedChart.sql}</pre>
+                </details>
+              )}
+              <div className="flex gap-2 flex-wrap pt-1">
+                {expandedChart.chart_data?.rows?.length > 0 && (
+                  <button
+                    onClick={() => downloadCsv(expandedChart.chart_data.rows as Record<string, unknown>[], expandedChart.chart_data.columns, expandedChart.title)}
+                    className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1.5 transition-colors"
+                  >
+                    <Download size={12} /> Download CSV
+                  </button>
+                )}
+                {expandedChart.sql && (
+                  <button
+                    onClick={() => navigator.clipboard.writeText(expandedChart.sql)}
+                    className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1.5 transition-colors"
+                  >
+                    <Code size={12} /> Copy SQL
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
 function getLoadingText(job: unknown, jobType?: string): string {
-  if (!job) return 'Processing...'
+  if (!job) return 'Processing…'
   const steps = ((job as { steps?: Record<string, unknown> }).steps) || {}
   if (jobType === 'DASHBOARD') {
-    if (steps.dashboard_chart_done) return 'Building dashboard charts...'
-    if (steps.dashboard_decomposed) return 'Spawning chart pipelines...'
-    return 'Decomposing dashboard request...'
+    if (steps.dashboard_chart_done) return 'Building dashboard charts…'
+    if (steps.dashboard_decomposed) return 'Spawning chart pipelines…'
+    return 'Decomposing dashboard request…'
   }
-  if (steps.validate === 'active') return 'Validating result...'
-  if (steps.render === 'active') return 'Rendering chart...'
-  if (steps.execute === 'active') return 'Executing query...'
-  if (steps.query === 'active') return 'Generating SQL...'
-  if (steps.schema === 'active') return 'Loading schema...'
-  return 'Classifying intent...'
+  if (steps.validate === 'active') return 'Validating result…'
+  if (steps.render === 'active') return 'Rendering chart…'
+  if (steps.execute === 'active') return 'Executing query…'
+  if (steps.query === 'active') return 'Generating SQL…'
+  if (steps.schema === 'active') return 'Loading schema…'
+  return 'Classifying intent…'
 }

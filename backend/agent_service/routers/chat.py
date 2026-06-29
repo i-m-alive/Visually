@@ -24,6 +24,8 @@ from agent_service.agents.chat_agent import (
 )
 import agent_service.agents.schema_cache as _schema_cache
 from shared.bedrock_client import bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL
+from agent_service.agents.intent_parser import parse_intent
+from agent_service.agents.nl_schema_router import route_query
 
 router = APIRouter(tags=["chat"])
 _agent = ChatAgent()
@@ -107,6 +109,21 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
         effective_model_pref = "opus"
         print(f"[chat] auto-upgraded to opus (msg_len={len(req.message)} > 8000)", flush=True)
 
+    # ── NL2SQL two-stage pipeline (non-blocking; failures produce None) ──────
+    resolved_context = None
+    if enriched and req.message.strip():
+        try:
+            intent = await parse_intent(req.message)
+            if intent.needs_sql:
+                resolved_context = route_query(intent, enriched, req.message)
+                print(
+                    f"[chat] NL2SQL resolved  tables={resolved_context.primary_tables}"
+                    f"  entities={len(resolved_context.entity_resolutions)}",
+                    flush=True,
+                )
+        except Exception as _nl2sql_err:
+            print(f"[chat] ⚠ NL2SQL pipeline failed (non-fatal): {_nl2sql_err}", flush=True)
+
     return {
         "session_id": session_id,
         "history": history,
@@ -117,6 +134,7 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
         "priority_tables": priority_tables,
         "connection_id": effective_connection_id,
         "model_pref": effective_model_pref,
+        "resolved_context": resolved_context,
     }
 
 
@@ -208,6 +226,7 @@ async def chat(
         scope=req.scope or "database",
         selected_tables=req.selected_tables,
         selected_hops=req.selected_hops if req.selected_hops is not None else 2,
+        resolved_context=ctx.get("resolved_context"),
     )
 
     sql_spec = result.get("sql_to_execute")
@@ -270,6 +289,7 @@ async def chat_stream(
         scope=req.scope or "database",
         selected_tables=req.selected_tables,
         selected_hops=req.selected_hops if req.selected_hops is not None else 2,
+        resolved_context=ctx.get("resolved_context"),
     )
 
     def _sse(obj: dict) -> str:

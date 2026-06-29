@@ -61,7 +61,8 @@ interface PipelineJobState {
   tableUsed?: string
   validationScore?: number
   retryAttempt?: number
-  chartResult?: ChartResult
+  chartResult?: ChartResult          // last confirmed result (backward compat)
+  chartResults: ChartResult[]        // all confirmed results (multi-result display)
   dashboardResult?: DashboardResult
   error?: string
   events: unknown[]
@@ -93,13 +94,13 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
   resetJob: (jobId) => set((state) => ({
     jobs: {
       ...state.jobs,
-      [jobId]: { steps: defaultSteps(), screenshotSteps: {}, events: [] },
+      [jobId]: { steps: defaultSteps(), screenshotSteps: {}, events: [], chartResults: [] },
     },
   })),
 
   handleEvent: (jobId, event) => {
     set((state) => {
-      const job: PipelineJobState = state.jobs[jobId] || { steps: defaultSteps(), screenshotSteps: {}, events: [] }
+      const job: PipelineJobState = state.jobs[jobId] || { steps: defaultSteps(), screenshotSteps: {}, events: [], chartResults: [] }
       const type = event.type as string
       const updated = {
         ...job,
@@ -227,7 +228,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
             // Per-chart confirmation for screenshot pipeline
             updated.screenshotSteps[`chart_${event.chart_id}_status`] = 'confirmed'
           } else {
-            // Existing single-chart pipeline behaviour
+            // Main query-chat pipeline — accumulate all qualifying results
             updated.steps.validate = 'done'
             // event.chart_data is the whole final_result; the actual chart arrays
             // (rows/columns/labels/values + series/matrix/etc.) live one level
@@ -235,7 +236,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
             // through whole so every chart type renders.
             const fr = event.chart_data as Record<string, unknown>
             const cd = ((fr?.chart_data as Record<string, unknown>) || fr)
-            updated.chartResult = {
+            const newResult: ChartResult = {
               chart_type: (fr?.chart_type ?? cd?.chart_type) as string,
               title: (fr?.title ?? cd?.title) as string,
               chart_data: cd as ChartResult['chart_data'],
@@ -249,6 +250,8 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
               output_mode: (fr?.output_mode as string) || 'chart',
               narrative: (fr?.narrative as string) || '',
             }
+            updated.chartResult = newResult
+            updated.chartResults = [...(job.chartResults || []), newResult]
           }
           break
         case 'chart.low_confidence':

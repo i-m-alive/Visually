@@ -9,6 +9,7 @@ from agent_service.agents.sql_utils import expand_table_aliases, basic_sql_lint,
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
+    from agent_service.agents.graph_rag_retriever import RetrievedContext
 
 
 def _score_table(intent_text: str, table: dict) -> float:
@@ -316,9 +317,37 @@ class QueryAgent:
         retry_feedback: Optional[str] = None,
         attempt: int = 1,
         enriched: Optional["EnrichedSchema"] = None,
+        retrieved_context: Optional["RetrievedContext"] = None,
+        conversation_history: Optional[list] = None,
     ) -> QueryPlan:
-        # Prefer enriched compact_tables with TF-IDF ranking when available
-        if enriched and enriched.compact_tables:
+        # ── Table selection: Graph RAG > word-overlap > schema.important_tables ──
+        if retrieved_context and retrieved_context.primary_tables and enriched and enriched.compact_tables:
+            # Use Graph RAG ranked tables — most accurate path
+            ct_map = {t["name"]: t for t in enriched.compact_tables}
+            # Primary candidates first, then fill with any extras on retries
+            ordered = list(dict.fromkeys(retrieved_context.primary_tables))
+            if attempt > 1:
+                # On retries, add more context: top word-overlap fallback tables
+                intent_text = (intent.reasoning or "") + " " + " ".join(
+                    intent.entities.metrics + intent.entities.dimensions
+                )
+                fallback = sorted(
+                    enriched.compact_tables,
+                    key=lambda t: _score_table(intent_text, t),
+                    reverse=True,
+                )
+                for t in fallback:
+                    tn = t.get("name", "")
+                    if tn not in ordered:
+                        ordered.append(tn)
+                    if len(ordered) >= 12:
+                        break
+            top_n = min(len(ordered), 12 if attempt > 1 else 8)
+            top_tables = [ct_map[tn] for tn in ordered[:top_n] if tn in ct_map]
+            important = [t.get("name") for t in top_tables[:5]]
+            semantics = enriched.get_table_semantics_text(important)
+        elif enriched and enriched.compact_tables:
+            # Fallback: word-overlap scoring (old path)
             intent_text = (intent.reasoning or "") + " " + " ".join(
                 intent.entities.metrics + intent.entities.dimensions
             )
@@ -327,11 +356,19 @@ class QueryAgent:
                 key=lambda t: _score_table(intent_text, t),
                 reverse=True,
             )
-            # On retries widen to top 12; first attempt top 8
             top_n = 12 if attempt > 1 else 8
             top_tables = scored[:top_n]
-            tables_context = [
-                {
+            important = [t.get("name") for t in top_tables[:5]]
+            semantics = enriched.get_table_semantics_text(important)
+        else:
+            important = schema.important_tables[:5]
+            top_tables = []
+            semantics = ""
+
+        tables_context = []
+        if top_tables:
+            for t in top_tables:
+                tables_context.append({
                     "name": t.get("name"),
                     "description": t.get("description"),
                     "row_count": t.get("row_count", 0),
@@ -349,14 +386,8 @@ class QueryAgent:
                         {"column": r.get("column"), "references": r.get("references")}
                         for r in (t.get("relationships") or [])
                     ],
-                }
-                for t in top_tables
-            ]
-            important = [t.get("name") for t in top_tables[:5]]
-            semantics = enriched.get_table_semantics_text(important)
+                })
         else:
-            important = schema.important_tables[:5]
-            tables_context = []
             for table in schema.tables:
                 if table.name in important or attempt > 1:
                     tables_context.append({
@@ -369,7 +400,6 @@ class QueryAgent:
                         ],
                         "relationships": [{"column": r.column, "references": r.references} for r in table.relationships],
                     })
-            semantics = ""
 
         user_content: dict = {
             "user_intent": intent.reasoning,
@@ -387,6 +417,28 @@ class QueryAgent:
         }
         if semantics:
             user_content["table_semantics"] = semantics
+
+        # Inject Graph RAG hints when available — steers column/JOIN choices
+        if retrieved_context and retrieved_context.candidates:
+            from agent_service.agents.graph_rag_retriever import format_retrieval_hints
+            hints = format_retrieval_hints(retrieved_context)
+            if hints:
+                user_content["graph_rag_hints"] = hints
+
+        # Inject conversation history so the LLM can resolve follow-up references
+        # ("same table", "now add region", "break that down by X", "filter by last year", etc.)
+        if conversation_history:
+            # Keep the last 6 turns max to stay within token budget
+            trimmed = conversation_history[-6:]
+            user_content["conversation_history"] = trimmed
+            user_content["conversation_note"] = (
+                "The user may be asking a follow-up or refinement question. "
+                "Use conversation_history to interpret references like 'that chart', "
+                "'same table', 'now also by X', 'filter by last year', 'add a column', etc. "
+                "If the current query is self-contained ignore the history. "
+                "If it is a follow-up, build the SQL that satisfies both the prior intent "
+                "and the new refinement."
+            )
 
         if retry_feedback:
             user_content["retry_feedback"] = retry_feedback
