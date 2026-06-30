@@ -59,6 +59,7 @@ interface PipelineSteps {
 export interface DashboardResult {
   charts: ChartResult[]
   layout: { chart_index: number; x: number; y: number; w: number; h: number }[]
+  dashboardId?: string
 }
 
 export interface ScreenshotJobState {
@@ -85,6 +86,7 @@ interface PipelineJobState {
   candidates?: CandidateResult[]
   candidatesMessage?: string
   error?: string
+  streamingNarrative?: string
   events: unknown[]
 }
 
@@ -114,7 +116,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
   resetJob: (jobId) => set((state) => ({
     jobs: {
       ...state.jobs,
-      [jobId]: { steps: defaultSteps(), screenshotSteps: {}, events: [], chartResults: [] },
+      [jobId]: { steps: defaultSteps(), screenshotSteps: {}, events: [], chartResults: [], streamingNarrative: '' },
     },
   })),
 
@@ -184,6 +186,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
               table_used: c.table_used as string || '',
             })),
             layout: (res?.layout as DashboardResult['layout']) || [],
+            dashboardId: (res?.dashboard_id as string) || undefined,
           }
           updated.steps.validate = 'done'
           break
@@ -319,6 +322,13 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
           updated.candidatesMessage = (event.message as string) || 'I found multiple possible answers. Choose one:'
           break
         }
+        case 'narrative.token':
+          updated.streamingNarrative = (updated.streamingNarrative || '') + (event.token as string || '')
+          break
+        case 'result.narrated':
+          // Clear streaming narrative once the full narrative is confirmed
+          updated.streamingNarrative = ''
+          break
         case 'pipeline.error':
           updated.error = event.message as string
           Object.keys(updated.steps).forEach((k) => {

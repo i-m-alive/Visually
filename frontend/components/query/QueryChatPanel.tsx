@@ -4,14 +4,19 @@ import {
   Send, Loader2, AlertCircle, TrendingUp, MessageSquare, X, LayoutDashboard,
   Plus, Trash2, Edit2, Check, ChevronLeft, ChevronRight, Code, Download, RefreshCw,
   Copy, Volume2, VolumeX, FileText, Star, Maximize2, Square, Search, ChevronDown,
+  ExternalLink, StickyNote,
 } from 'lucide-react'
-import { agentApi, querySessionApi, streamChat, type ConversationTurn } from '@/lib/api'
+import { agentApi, querySessionApi, type ConversationTurn } from '@/lib/api'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { IntentStatusBar } from '@/components/pipeline/IntentStatusBar'
 import { ReasoningDrawer } from '@/components/pipeline/ReasoningDrawer'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
 import type { ChartResult, DashboardResult, CandidateResult } from '@/stores/pipelineStore'
+import { useRouter } from 'next/navigation'
+import { useAuthStore } from '@/stores/authStore'
+import { useTableScopeStore, DEFAULT_SCOPE } from '@/stores/tableScopeStore'
+import { AddToCanvasModal } from './AddToCanvasModal'
 
 interface Message {
   id: string
@@ -43,15 +48,6 @@ interface TreeNode {
 
 interface SessionMeta { id: string; title: string; updated_at?: string; message_count: number }
 
-interface ChatMessage {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  loading?: boolean
-  inlineChart?: ChartResult
-  candidates?: CandidateResult[]
-  candidatesMessage?: string
-}
 
 // ── tree helpers ──────────────────────────────────────────────────────────────
 function pathToLeaf(tree: Record<string, TreeNode>, leafId: string | null): TreeNode[] {
@@ -191,14 +187,15 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
   const [expandedChart, setExpandedChart] = useState<ChartResult | null>(null)
   const [chartTypeOverrides, setChartTypeOverrides] = useState<Record<string, string>>({})
 
-  const [chatOpen, setChatOpen] = useState(false)
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
-  const [chatInput, setChatInput] = useState('')
-  const [chatLoading, setChatLoading] = useState(false)
-  const [chartSessionMap, setChartSessionMap] = useState<Map<string, string>>(new Map())
+  const router = useRouter()
+  const _user = useAuthStore((s) => s.user)
+  const [addToCanvasChart, setAddToCanvasChart] = useState<ChartResult | null>(null)
+  const [messageNotes, setMessageNotes] = useState<Record<string, string>>({})
+  const [addNoteFor, setAddNoteFor] = useState<string | null>(null)
+  const [noteInput, setNoteInput] = useState('')
+  const loadTables = useTableScopeStore((s) => s.loadTables)
+  const scopeState = useTableScopeStore((s) => s.byCanvas[projectId]) ?? DEFAULT_SCOPE
   const [activeChartContext, setActiveChartContext] = useState<ChartResult | null>(null)
-  const chatEndRef = useRef<HTMLDivElement>(null)
-  const chatAbortRef = useRef<AbortController | null>(null)
   const activeChartContextRef = useRef<ChartResult | null>(null)
 
   const [starredIds, setStarredIds] = useState<Set<string>>(new Set())
@@ -208,8 +205,11 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
   usePipelineSocket(activeJobId)
 
   useEffect(() => {
+    loadTables(projectId, projectId)
+  }, [projectId, loadTables])
+
+  useEffect(() => {
     return () => {
-      chatAbortRef.current?.abort()
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
     }
   }, [])
@@ -332,6 +332,11 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
         text, project_id: projectId,
         conversation_history: conversationHistory.length > 0 ? conversationHistory : undefined,
         ...(outputMode !== 'auto' ? { output_mode: outputMode } : {}),
+        ...(scopeState.scope === 'selected' && scopeState.selectedTables.length > 0 ? {
+          scope: 'selected' as const,
+          selected_tables: scopeState.selectedTables,
+          selected_hops: scopeState.selectedHops,
+        } : {}),
       })
       const jobId = resp.data.job_id
       const jobType = resp.data.job_type || 'SINGLE_VIZ'
@@ -397,8 +402,6 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
     else setHasNewMsg(true)
   }, [messages])
 
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages])
-
   const siblingsOf = (serverId?: string): TreeNode[] => {
     if (!serverId || !tree[serverId]) return []
     const node = tree[serverId]
@@ -449,59 +452,13 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
     refreshSessions()
   }
 
-  const openChatForChart = (chartResult: ChartResult) => {
-    const prevKey = activeChartContext ? chartKey(activeChartContext) : null
-    const newKey = chartKey(chartResult)
-    const isNewChart = prevKey !== newKey
-    setActiveChartContext(chartResult); activeChartContextRef.current = chartResult; setChatOpen(true)
-    if (isNewChart) {
-      chatAbortRef.current?.abort(); chatAbortRef.current = null
-      setChatMessages([{ id: crypto.randomUUID(), role: 'assistant', content: `I can help you explore the "${chartResult.title}" chart. Ask me anything about the data, patterns, or trends.` }])
-      setChatInput(''); setChatLoading(false)
-    }
+  const handleAskAboutThis = (chartResult: ChartResult) => {
+    setActiveChartContext(chartResult)
+    activeChartContextRef.current = chartResult
+    setInput(`[About "${chartResult.title}"] `)
+    setTimeout(() => inputRef.current?.focus(), 50)
   }
 
-  const handleChatSend = async () => {
-    if (!chatInput.trim() || chatLoading) return
-    const userText = chatInput.trim(); setChatInput(''); setChatLoading(true)
-    const userMsgId = crypto.randomUUID(); const assistantMsgId = crypto.randomUUID()
-    setChatMessages((prev) => [...prev, { id: userMsgId, role: 'user', content: userText }, { id: assistantMsgId, role: 'assistant', content: '', loading: true }])
-    const ctx = activeChartContextRef.current
-    let messageToSend = userText
-    if (ctx) {
-      const rowSample = ctx.chart_data?.rows?.slice(0, 8) ?? []
-      messageToSend = `[Chart context: "${ctx.title}"${ctx.sql ? ` | SQL: ${ctx.sql}` : ''}${rowSample.length > 0 ? ` | Data sample: ${JSON.stringify(rowSample)}` : ''}]\nUser question: ${userText}`
-    }
-    const currentKey = ctx ? chartKey(ctx) : 'default'
-    const abort = new AbortController(); chatAbortRef.current = abort
-    let accumulated = ''
-    try {
-      await streamChat(
-        { session_id: chartSessionMap.get(currentKey), message: messageToSend, project_id: projectId },
-        {
-          onText: (delta) => { accumulated += delta; setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, content: accumulated, loading: false } : m)) },
-          onChart: (rawChart) => {
-            const ic = rawChart as Record<string, unknown>
-            const inlineChart: ChartResult = { chart_type: ic.chart_type as string, title: ic.title as string, sql: (ic.sql as string) || '', score: 1, low_confidence: false, x_axis_label: (ic.x_axis_label as string) || 'x', y_axis_label: (ic.y_axis_label as string) || 'y', table_used: '', chart_data: (ic.chart_data as ChartResult['chart_data']) || { rows: [], columns: [], labels: [], values: [] } }
-            setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, inlineChart } : m))
-          },
-          onCandidates: (rawCandidates, msg) => {
-            const candidates = rawCandidates as unknown as CandidateResult[]
-            setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, candidates, candidatesMessage: msg } : m))
-          },
-          onAction: (action) => {
-            const act = action as { action?: string; params?: { instruction?: string } }
-            if (act.action === 'filter_widget' && act.params?.instruction) setInput(act.params.instruction)
-          },
-          onDone: (meta) => { setChartSessionMap((prev) => new Map(prev).set(currentKey, meta.session_id)); setChatLoading(false) },
-          onError: () => { setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, content: 'Sorry, I could not process your request.', loading: false } : m)); setChatLoading(false) },
-        },
-        abort.signal,
-      )
-    } catch { if (!abort.signal.aborted) { setChatMessages((prev) => prev.map((m) => m.id === assistantMsgId ? { ...m, content: 'Sorry, I could not process your request.', loading: false } : m)); setChatLoading(false) } }
-  }
-
-  const closeChatPanel = () => { chatAbortRef.current?.abort(); chatAbortRef.current = null; setChatOpen(false) }
   const copyText = (text: string, id: string) => { navigator.clipboard.writeText(text).catch(() => {}); setCopiedId(id); setTimeout(() => setCopiedId((s) => (s === id ? null : s)), 1800) }
   const toggleStar = (id: string) => { setStarredIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next }) }
   const speakText = (text: string, id: string) => {
@@ -549,6 +506,48 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
             </div>
           </div>
         )}
+        {/* Scope picker — filter which tables the LLM sees */}
+        {scopeState.tables.length > 0 && (
+          <div className="border-t border-gray-100">
+            <details className="group">
+              <summary className="px-2.5 py-2 text-xs text-gray-500 flex items-center gap-1.5 cursor-pointer select-none hover:text-gray-700 list-none">
+                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${scopeState.scope === 'selected' && scopeState.selectedTables.length > 0 ? 'bg-brand' : 'bg-gray-300'}`} />
+                Table scope
+                {scopeState.scope === 'selected' && scopeState.selectedTables.length > 0 && (
+                  <span className="ml-auto text-[10px] font-semibold text-brand bg-brand/10 px-1.5 py-0.5 rounded-full">{scopeState.selectedTables.length}</span>
+                )}
+              </summary>
+              <div className="px-2.5 pb-2.5">
+                <div className="flex gap-1 mb-2">
+                  {(['database', 'selected'] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => useTableScopeStore.getState().setScope(projectId, m)}
+                      className={`text-[10px] px-2 py-1 rounded-md flex-1 transition-colors ${scopeState.scope === m ? 'bg-brand text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
+                    >
+                      {m === 'database' ? 'Full DB' : 'Selected'}
+                    </button>
+                  ))}
+                </div>
+                {scopeState.scope === 'selected' && (
+                  <div className="space-y-0.5 max-h-36 overflow-y-auto">
+                    {scopeState.tables.map((t) => (
+                      <label key={t.name} className="flex items-center gap-1.5 px-1 py-1 rounded hover:bg-gray-50 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={scopeState.selectedTables.includes(t.name)}
+                          onChange={() => useTableScopeStore.getState().toggleTable(projectId, t.name)}
+                          className="w-3 h-3 rounded text-brand accent-brand"
+                        />
+                        <span className="text-[10px] font-mono text-gray-600 truncate">{t.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </details>
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto px-1.5 pb-3 space-y-0.5">
           {sessions.length === 0 && !sidebarSearch && <p className="px-2 text-xs text-gray-400 mt-2">No chats yet</p>}
           {sidebarSearch && filteredSessionGroups.length === 0 && <p className="px-2 text-xs text-gray-400 mt-2">No results</p>}
@@ -585,7 +584,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
 
       {/* ── Main + chat panel ── */}
       <div className="flex flex-1 overflow-hidden">
-        <div className={`flex flex-col ${chatOpen ? 'flex-1' : 'w-full'} transition-all duration-300`}>
+        <div className="flex flex-col w-full">
           <IntentStatusBar jobId={activeJobId} />
 
           <div className="relative flex-1 overflow-hidden">
@@ -645,6 +644,12 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                               <span className={`w-2 h-2 rounded-full flex-shrink-0 animate-pulse ${msg.jobId && jobs[msg.jobId] ? 'bg-brand' : 'bg-gray-300'}`} />
                               <span className="text-xs text-gray-400">{msg.jobId && jobs[msg.jobId] ? getLoadingText(jobs[msg.jobId], msg.jobType) : 'Starting pipeline…'}</span>
                             </div>
+                            {msg.jobId && jobs[msg.jobId]?.streamingNarrative && (
+                              <p className="text-xs text-gray-500 italic border-l-2 border-brand/25 pl-2.5 leading-relaxed">
+                                {jobs[msg.jobId].streamingNarrative}
+                                <span className="inline-block w-0.5 h-3 bg-brand/50 animate-pulse ml-0.5 align-middle rounded-full" />
+                              </p>
+                            )}
                           </div>
                         )}
                         {msg.error && (
@@ -698,7 +703,14 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                               <button onClick={() => toggleStar(msgKey)} className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${isStarred ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'}`}><Star size={10} fill={isStarred ? 'currentColor' : 'none'} />{isStarred ? 'Starred' : 'Star'}</button>
                               {cr.sql && <button onClick={() => copyText(cr.sql, `${msgKey}-sql`)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1">{copiedId === `${msgKey}-sql` ? <Check size={10} className="text-green-500" /> : <Code size={10} />} SQL</button>}
                               {cr.chart_data?.rows?.length > 0 && <button onClick={() => downloadCsv(cr.chart_data.rows as Record<string, unknown>[], cr.chart_data.columns, cr.title)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1"><Download size={10} /> CSV</button>}
-                              {!isTextMode && <button onClick={() => openChatForChart(cr)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1"><MessageSquare size={10} /> Ask about this</button>}
+                              {!isTextMode && <button onClick={() => handleAskAboutThis(cr)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1"><MessageSquare size={10} /> Ask about this</button>}
+                              <button onClick={() => setAddToCanvasChart(cr)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1"><LayoutDashboard size={10} /> Add to Canvas</button>
+                              <button
+                                onClick={() => { setAddNoteFor(msgKey); setNoteInput(messageNotes[msgKey] || '') }}
+                                className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${messageNotes[msgKey] ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'}`}
+                              >
+                                <StickyNote size={10} /> {messageNotes[msgKey] ? 'Edit note' : 'Add note'}
+                              </button>
                               {msg.serverId && !submitting && <button onClick={() => regenerateFromAssistant(msg)} className="text-xs text-gray-400 hover:text-brand flex items-center gap-1 ml-auto"><RefreshCw size={11} /> Regenerate</button>}
                             </div>
                           )
@@ -732,6 +744,34 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                               )}
                               {cr.narrative && <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">{cr.narrative}</p>}
                               <HoverActions />
+                              {messageNotes[msgKey] && (
+                                <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                                  <StickyNote size={12} className="text-amber-500 mt-0.5 flex-shrink-0" />
+                                  <p className="text-xs text-amber-800 leading-relaxed">{messageNotes[msgKey]}</p>
+                                </div>
+                              )}
+                              {addNoteFor === msgKey && (
+                                <div className="flex gap-2 items-end">
+                                  <textarea
+                                    autoFocus
+                                    value={noteInput}
+                                    onChange={(e) => setNoteInput(e.target.value)}
+                                    placeholder="Add a note about this chart…"
+                                    className="input-field flex-1 text-xs resize-none"
+                                    rows={2}
+                                  />
+                                  <div className="flex flex-col gap-1">
+                                    <button
+                                      onClick={() => { setMessageNotes((p) => ({ ...p, [msgKey]: noteInput })); setAddNoteFor(null) }}
+                                      className="text-xs px-2 py-1 bg-brand text-white rounded-lg"
+                                    >Save</button>
+                                    <button
+                                      onClick={() => setAddNoteFor(null)}
+                                      className="text-xs px-2 py-1 text-gray-400 hover:text-gray-600"
+                                    >Cancel</button>
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           )
                         })()}
@@ -747,14 +787,28 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                                       <button onClick={() => setExpandedChart(chart)} className="text-xs text-gray-400 hover:text-gray-600"><Maximize2 size={12} /></button>
                                       {chart.sql && <button onClick={() => navigator.clipboard.writeText(chart.sql)} className="text-xs text-gray-400 hover:text-gray-600"><Code size={11} /></button>}
                                       {chart.chart_data?.rows?.length > 0 && <button onClick={() => downloadCsv(chart.chart_data.rows as Record<string, unknown>[], chart.chart_data.columns, chart.title)} className="text-xs text-gray-400 hover:text-gray-600"><Download size={11} /></button>}
-                                      <button onClick={() => openChatForChart(chart)} className="text-xs text-gray-400 hover:text-brand"><MessageSquare size={12} /></button>
+                                      <button onClick={() => handleAskAboutThis(chart)} className="text-xs text-gray-400 hover:text-brand" title="Ask about this chart"><MessageSquare size={12} /></button>
                                     </div>
                                   </div>
                                   <ChartRenderer result={chart} compact />
                                 </div>
                               ))}
                             </div>
-                            {msg.serverId && !submitting && <div className="flex justify-end"><button onClick={() => regenerateFromAssistant(msg)} className="text-xs text-gray-400 hover:text-brand flex items-center gap-1"><RefreshCw size={11} /> Regenerate</button></div>}
+                            <div className="flex items-center justify-between pt-1">
+                              {msg.dashboardResult.dashboardId ? (
+                                <button
+                                  onClick={() => router.push(`/projects/${projectId}/canvas/${msg.dashboardResult!.dashboardId}`)}
+                                  className="text-xs px-3 py-1.5 bg-brand/10 hover:bg-brand/20 text-brand rounded-full flex items-center gap-1.5 transition-colors"
+                                >
+                                  <ExternalLink size={11} /> View Dashboard
+                                </button>
+                              ) : <span />}
+                              {msg.serverId && !submitting && (
+                                <button onClick={() => regenerateFromAssistant(msg)} className="text-xs text-gray-400 hover:text-brand flex items-center gap-1">
+                                  <RefreshCw size={11} /> Regenerate
+                                </button>
+                              )}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -796,58 +850,17 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
           </div>
         </div>
 
-        {/* "Ask about this" panel */}
-        {chatOpen && (
-          <div className="w-72 border-l border-gray-100 flex flex-col bg-white">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-              <div>
-                <p className="text-sm font-semibold text-gray-900">AI Assistant</p>
-                {activeChartContext && <p className="text-xs text-gray-400 truncate max-w-52">{activeChartContext.title}</p>}
-              </div>
-              <button onClick={closeChatPanel} className="text-gray-400 hover:text-gray-600"><X size={16} /></button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-3">
-              {chatMessages.map((m) => (
-                <div key={m.id} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
-                  <div className={`max-w-[85%] px-3 py-2 rounded-xl text-xs leading-relaxed ${m.role === 'user' ? 'bg-brand text-white rounded-tr-sm' : 'bg-gray-100 text-gray-800 rounded-tl-sm'}`}>
-                    {m.loading && !m.content ? <Loader2 size={12} className="animate-spin" /> : m.content || <Loader2 size={12} className="animate-spin" />}
-                  </div>
-                  {m.inlineChart && <div className="mt-2 w-full border border-gray-200 rounded-lg p-2 bg-white"><p className="text-xs font-medium text-gray-700 mb-1">{m.inlineChart.title}</p><ChartRenderer result={m.inlineChart} compact /></div>}
-                  {m.candidates && m.candidates.length > 1 && (
-                    <div className="mt-2 w-full">
-                      <CandidatesCard
-                        candidates={m.candidates}
-                        message={m.candidatesMessage}
-                        compact
-                        onSelect={(chosen) => {
-                          const cr: ChartResult = {
-                            chart_type: chosen.chart_type, title: chosen.title, sql: chosen.sql,
-                            score: chosen.confidence, low_confidence: chosen.confidence < 0.65,
-                            x_axis_label: chosen.x_axis_label, y_axis_label: chosen.y_axis_label,
-                            table_used: chosen.table_used, chart_data: chosen.chart_data,
-                          }
-                          setChatMessages((prev) => prev.map((cm) =>
-                            cm.id === m.id ? { ...cm, inlineChart: cr, candidates: undefined } : cm
-                          ))
-                        }}
-                      />
-                    </div>
-                  )}
-                </div>
-              ))}
-              <div ref={chatEndRef} />
-            </div>
-            <div className="border-t border-gray-100 p-3">
-              <div className="flex gap-2">
-                <input value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleChatSend()} className="input-field flex-1 text-xs py-2" placeholder="Ask a follow-up…" disabled={chatLoading} />
-                <button onClick={handleChatSend} disabled={chatLoading || !chatInput.trim()} className="btn-primary px-3 py-2"><Send size={13} /></button>
-              </div>
-            </div>
-          </div>
-        )}
-
         <ReasoningDrawer jobId={activeJobId} />
       </div>
+
+      {/* Add to Canvas modal */}
+      {addToCanvasChart && (
+        <AddToCanvasModal
+          chart={addToCanvasChart}
+          projectId={projectId}
+          onClose={() => setAddToCanvasChart(null)}
+        />
+      )}
 
       {/* Chart expand modal */}
       {expandedChart && (

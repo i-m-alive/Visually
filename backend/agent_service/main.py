@@ -938,6 +938,12 @@ class IntentSubmitRequest(BaseModel):
     # Last N turns from the frontend — used to resolve follow-up queries in the pipeline.
     # Each turn: {role: "user"|"assistant", content: str, chart_title?: str, sql?: str}
     conversation_history: Optional[list] = None
+    # Schema scope — when "selected", only selected_tables (+ their FK neighbours) are used
+    scope: Optional[str] = None           # "selected" | "database" | None (= "database")
+    selected_tables: Optional[list[str]] = None
+    selected_hops: Optional[int] = 2
+    # Override output_mode from intent classification ("chart" | "table" | "text")
+    output_mode: Optional[str] = None
 
 
 _orchestrator = Orchestrator()
@@ -952,6 +958,10 @@ async def _run_pipeline(
     connection_id: str,
     job_type: str,
     conversation_history: Optional[list] = None,
+    scope: Optional[str] = None,
+    selected_tables: Optional[list[str]] = None,
+    selected_hops: Optional[int] = 2,
+    output_mode: Optional[str] = None,
 ):
     from shared.database import AsyncSessionLocal
     redis = await get_redis()
@@ -977,6 +987,10 @@ async def _run_pipeline(
                 job_id=job_id, user_text=user_text, project_id=project_id,
                 user_id=user_id, connection_id=connection_id, redis=redis, db=db,
                 conversation_history=conversation_history,
+                scope=scope,
+                selected_tables=selected_tables,
+                selected_hops=selected_hops,
+                output_mode_override=output_mode,
             )
     if redis is not None:
         await redis.aclose()
@@ -1016,6 +1030,7 @@ async def submit_intent(
     background_tasks.add_task(
         _run_pipeline, job_id, req.text, req.project_id, str(current_user.id),
         connection_id, job_type, req.conversation_history,
+        req.scope, req.selected_tables, req.selected_hops, req.output_mode,
     )
     return {"job_id": job_id, "status": "pending", "job_type": job_type}
 

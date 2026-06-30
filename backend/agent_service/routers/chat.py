@@ -129,6 +129,21 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
         except Exception as _nl2sql_err:
             print(f"[chat] ⚠ NL2SQL pipeline failed (non-fatal): {_nl2sql_err}", flush=True)
 
+    # Fetch project dashboards for navigation actions
+    dashboards_list: list[dict] = []
+    try:
+        proj_dash_result = await db.execute(
+            select(Dashboard)
+            .where(Dashboard.project_id == uuid.UUID(req.project_id))
+            .limit(20)
+        )
+        dashboards_list = [
+            {"id": str(d.id), "name": d.name}
+            for d in proj_dash_result.scalars().all()
+        ]
+    except Exception:
+        pass
+
     return {
         "session_id": session_id,
         "history": history,
@@ -140,6 +155,7 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
         "connection_id": effective_connection_id,
         "model_pref": effective_model_pref,
         "resolved_context": resolved_context,
+        "dashboards_list": dashboards_list,
     }
 
 
@@ -460,6 +476,20 @@ async def chat_stream(
         selected_hops=req.selected_hops if req.selected_hops is not None else 2,
         resolved_context=ctx.get("resolved_context"),
     )
+
+    # Inject navigation context when the project has dashboards
+    _dashboards_list = ctx.get("dashboards_list") or []
+    if _dashboards_list:
+        _nav_lines = "\n".join(
+            f'- "{d["name"]}" (id: {d["id"]})' for d in _dashboards_list[:15]
+        )
+        _nav_block = (
+            "AVAILABLE DASHBOARDS IN THIS PROJECT:\n" + _nav_lines + "\n\n"
+            "When the user asks to navigate to, open, go to, or show a specific dashboard, "
+            'emit a dashboard_action with: {"type": "navigate", "dashboard_id": "<id>", "dashboard_name": "<name>"}. '
+            "Use fuzzy/partial name matching to resolve the correct dashboard."
+        )
+        system_blocks = list(system_blocks) + [{"type": "text", "text": _nav_block}]
 
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"

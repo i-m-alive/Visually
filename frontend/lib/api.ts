@@ -162,6 +162,10 @@ export const agentApi = {
     project_id: string
     connection_id?: string
     conversation_history?: ConversationTurn[]
+    output_mode?: string
+    scope?: 'database' | 'selected'
+    selected_tables?: string[]
+    selected_hops?: number
   }) =>
     api.post('/agent/intent', data),
   getJob: (jobId: string) =>

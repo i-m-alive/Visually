@@ -58,6 +58,10 @@ class Orchestrator:
         redis,
         db: AsyncSession,
         conversation_history: Optional[list] = None,
+        scope: Optional[str] = None,
+        selected_tables: Optional[list[str]] = None,
+        selected_hops: Optional[int] = 2,
+        output_mode_override: Optional[str] = None,
     ) -> dict:
         async def emit(event: dict):
             # Direct in-process broadcast (works with or without Redis)
@@ -142,6 +146,57 @@ class Orchestrator:
                         "confidence": round(retrieved_context.confidence, 3),
                     })
 
+            # SCHEMA_EXPLORE: skip SQL pipeline, return a plain-English schema overview
+            if intent.intent_type == "SCHEMA_EXPLORE":
+                await set_pipeline_state(redis, job_id, "step", "schema_explored")
+                schema_overview = await self._build_schema_overview(user_text, schema, enriched)
+                schema_result = {
+                    "job_id": job_id,
+                    "score": 1.0,
+                    "chart_data": {"rows": [], "columns": [], "labels": [], "values": []},
+                    "low_confidence": False,
+                    "sql": "",
+                    "chart_type": "table",
+                    "title": "What data do you have?",
+                    "table_used": "",
+                    "x_axis_label": "",
+                    "y_axis_label": "",
+                    "output_mode": "text",
+                    "narrative": schema_overview,
+                    "validation_details": {},
+                }
+                await emit({
+                    "type": "chart.confirmed",
+                    "job_id": job_id,
+                    "score": 1.0,
+                    "chart_data": schema_result,
+                    "low_confidence": False,
+                })
+                if job:
+                    job.status = "completed"
+                    job.result_payload = schema_result
+                    job.completed_at = datetime.utcnow()
+                    await db.commit()
+                return schema_result
+
+            # Scope filtering: when scope="selected", restrict RAG candidates to chosen tables
+            if scope == "selected" and selected_tables and retrieved_context:
+                _norm = {t.lower() for t in selected_tables}
+                filtered_candidates = [
+                    c for c in (retrieved_context.candidates or [])
+                    if any(
+                        c.table_name.lower() == st or c.table_name.lower().endswith(f".{st}")
+                        for st in _norm
+                    )
+                ]
+                # Fallback: keep top candidate if none of the selected tables matched
+                retrieved_context.candidates = filtered_candidates or retrieved_context.candidates[:1]
+                filtered_primary = [
+                    t for t in (retrieved_context.primary_tables or [])
+                    if any(t.lower() == st or t.lower().endswith(f".{st}") for st in _norm)
+                ]
+                retrieved_context.primary_tables = filtered_primary or retrieved_context.primary_tables[:1]
+
             # ── Multi-candidate ambiguity check ───────────────────────────────────────
             # When the top-2 RAG candidates are close in score, run all in parallel
             # so the user sees every plausible answer — not just the first guess.
@@ -217,6 +272,9 @@ class Orchestrator:
             expected_chart_type: Optional[str] = getattr(intent.entities, "chart_type", None)
             # How the user wants the answer presented: "chart" (visualize) or "text" (prose answer)
             output_mode: str = (getattr(intent, "output_mode", "chart") or "chart").lower()
+            # Allow the request to override the LLM-classified output mode
+            if output_mode_override:
+                output_mode = output_mode_override.lower()
 
             for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1) if final_result is None else []:
                 # Step 3: Generate query — pass attempt so temperature scales on retries
@@ -271,6 +329,62 @@ class Orchestrator:
                     "duration_ms": execute_result.get("duration_ms", 0),
                 })
                 await set_pipeline_state(redis, job_id, "step", "query_executed")
+
+                # Post-execution: correct the chart title's year range to match actual data.
+                # Handles float years (2021.0), non-string columns, and falls back to
+                # scanning all columns for year-like values when column name is ambiguous.
+                try:
+                    import re as _re
+                    _rows = execute_result.get("rows") or []
+                    _cols = execute_result.get("columns") or []
+
+                    # Primary: find column by name containing a date keyword
+                    _date_col = next(
+                        (c for c in _cols if isinstance(c, str) and
+                         any(k in c.lower() for k in ["year", "date", "month", "period", "quarter"])),
+                        None,
+                    )
+
+                    # Fallback: scan each column's values — pick one whose first few rows
+                    # are all 4-digit year-range numbers (1990–2100)
+                    if not _date_col and _rows:
+                        for _c in _cols:
+                            if not isinstance(_c, str):
+                                continue
+                            _probe = [_rows[i].get(_c) for i in range(min(5, len(_rows)))]
+                            _probe = [v for v in _probe if v is not None]
+                            if _probe and all(
+                                isinstance(v, (int, float)) and 1990 <= float(v) <= 2100
+                                for v in _probe
+                            ):
+                                _date_col = _c
+                                break
+
+                    if _date_col and _rows:
+                        _year_ints = []
+                        for _r in _rows:
+                            _v = _r.get(_date_col)
+                            if _v is not None:
+                                try:
+                                    _year_ints.append(int(float(str(_v))))
+                                except (ValueError, TypeError):
+                                    pass
+                        if len(_year_ints) >= 2:
+                            _actual = f"{min(_year_ints)}–{max(_year_ints)}"
+                            _old_title = query_plan.title
+                            _new_title = _re.sub(
+                                r'\(\d{4}\s*[-–]\s*\d{4}\)',
+                                f'({_actual})',
+                                query_plan.title,
+                            )
+                            if _new_title != _old_title:
+                                query_plan.title = _new_title
+                                print(
+                                    f"[orchestrator] title corrected: '{_old_title}' → '{_new_title}'",
+                                    flush=True,
+                                )
+                except Exception as _te:
+                    print(f"[orchestrator] title correction error (non-fatal): {_te}", flush=True)
 
                 # Step 5: Render chart — only when the answer is meant to be a chart
                 if output_mode == "chart":
@@ -344,14 +458,71 @@ class Orchestrator:
                     "validation_details": {},
                 }
 
-            # Narrate the result: a concise chart caption, or a prose answer for text mode.
-            narrative = ""
-            if query_plan is not None:
+            # Correct final_result title: replace user-stated year range with actual data range.
+            # Works on the plain dict so Pydantic field-setting is not involved.
+            if final_result and execute_result:
                 try:
-                    from agent_service.agents.result_narrator import narrate as _narrate
-                    narrative = await _narrate(user_text, query_plan, execute_result, output_mode)
-                except Exception as _ne:
-                    print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
+                    import re as _re2
+                    _r2 = execute_result.get("rows") or []
+                    _c2 = execute_result.get("columns") or []
+                    _dc = next(
+                        (c for c in _c2 if isinstance(c, str) and
+                         any(k in c.lower() for k in ["year", "date", "month", "period", "quarter"])),
+                        None,
+                    )
+                    if not _dc and _r2:
+                        for _cc in _c2:
+                            if not isinstance(_cc, str):
+                                continue
+                            _pv = [_r2[i].get(_cc) for i in range(min(5, len(_r2)))]
+                            _pv = [v for v in _pv if v is not None]
+                            if _pv and all(isinstance(v, (int, float)) and 1990 <= float(v) <= 2100 for v in _pv):
+                                _dc = _cc
+                                break
+                    if _dc and _r2:
+                        _yi = []
+                        for _rr in _r2:
+                            _vv = _rr.get(_dc)
+                            if _vv is not None:
+                                try:
+                                    _yi.append(int(float(str(_vv))))
+                                except (ValueError, TypeError):
+                                    pass
+                        if len(_yi) >= 2:
+                            _act = f"{min(_yi)}–{max(_yi)}"
+                            _old = final_result.get("title", "")
+                            _new = _re2.sub(r'\(\d{4}\s*[-–]\s*\d{4}\)', f'({_act})', _old)
+                            if _new != _old:
+                                final_result["title"] = _new
+                                # Also update nested chart_data title if present
+                                if isinstance(final_result.get("chart_data"), dict):
+                                    final_result["chart_data"]["title"] = _new
+                                print(f"[orchestrator] title corrected: '{_old}' → '{_new}'", flush=True)
+                except Exception as _te2:
+                    print(f"[orchestrator] title correction (final_result) failed: {_te2}", flush=True)
+
+            # Narrate the result: stream tokens in real-time (single-viz path)
+            # or use the batch narrator (multi-candidate path where query_plan is None).
+            narrative = ""
+            try:
+                from agent_service.agents.result_narrator import (
+                    narrate_stream as _narrate_stream,
+                    narrate_from_result as _narrate_from_result,
+                )
+                if query_plan is not None:
+                    # Stream tokens for real-time display in the frontend
+                    async for token in _narrate_stream(user_text, query_plan, execute_result, output_mode):
+                        narrative += token
+                        await emit({
+                            "type": "narrative.token",
+                            "job_id": job_id,
+                            "token": token,
+                        })
+                else:
+                    # Multi-candidate path: query_plan is None, narrate from the result dict
+                    narrative = await _narrate_from_result(user_text, final_result, output_mode)
+            except Exception as _ne:
+                print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
             final_result["output_mode"] = output_mode
             final_result["narrative"] = narrative
             await emit({
@@ -750,6 +921,47 @@ class Orchestrator:
             render_result = await self._render_chart(query_plan, exec_result)
             chart_data = self._build_chart_data(query_plan, exec_result, render_result)
 
+            # Correct title: replace user-stated year range with actual data range
+            import re as _re_c
+            corrected_title = query_plan.title
+            try:
+                _dc = next(
+                    (c for c in cols if isinstance(c, str) and
+                     any(k in c.lower() for k in ["year", "date", "month", "period", "quarter"])),
+                    None,
+                )
+                if not _dc:
+                    for _cc in cols:
+                        if not isinstance(_cc, str):
+                            continue
+                        _pv = [rows[i].get(_cc) for i in range(min(5, len(rows)))]
+                        _pv = [v for v in _pv if v is not None]
+                        if _pv and all(isinstance(v, (int, float)) and 1990 <= float(v) <= 2100 for v in _pv):
+                            _dc = _cc
+                            break
+                if _dc:
+                    _yi = []
+                    for _r in rows:
+                        _v = _r.get(_dc)
+                        if _v is not None:
+                            try:
+                                _yi.append(int(float(str(_v))))
+                            except (ValueError, TypeError):
+                                pass
+                    if len(_yi) >= 2:
+                        _act = f"{min(_yi)}–{max(_yi)}"
+                        _new_t = _re_c.sub(r'\(\d{4}\s*[-–]\s*\d{4}\)', f'({_act})', query_plan.title)
+                        if _new_t != query_plan.title:
+                            corrected_title = _new_t
+                            chart_data["title"] = _new_t
+                            print(
+                                f"[pipeline:{job_id}] candidate title corrected: "
+                                f"'{query_plan.title}' → '{_new_t}'",
+                                flush=True,
+                            )
+            except Exception as _tce:
+                print(f"[pipeline:{job_id}] candidate title correction error: {_tce}", flush=True)
+
             return {
                 "table": candidate_table,
                 "rank_score": round(candidate_score, 4),
@@ -757,7 +969,7 @@ class Orchestrator:
                 "confidence": confidence,
                 "sql": query_plan.sql,
                 "chart_type": query_plan.chart_type,
-                "title": query_plan.title,
+                "title": corrected_title,
                 "x_axis_label": query_plan.x_axis_label,
                 "y_axis_label": query_plan.y_axis_label,
                 "table_used": query_plan.table_used,
@@ -787,6 +999,54 @@ class Orchestrator:
                 "result_quality": candidate["result_quality"],
             },
         }
+
+    async def _build_schema_overview(self, user_text: str, schema, enriched) -> str:
+        """Generate a plain-English overview of the database schema for SCHEMA_EXPLORE intent."""
+        tables_info: list[str] = []
+        if enriched and hasattr(enriched, "compact_tables"):
+            for t in (enriched.compact_tables or [])[:35]:
+                name = t.get("name", "")
+                description = t.get("description", "")
+                col_count = len(t.get("columns", []))
+                if name:
+                    tables_info.append(
+                        f"- {name}: {description or 'no description'} ({col_count} columns)"
+                    )
+        elif hasattr(schema, "tables"):
+            for t in (schema.tables or [])[:35]:
+                name = getattr(t, "table_name", getattr(t, "name", ""))
+                if name:
+                    tables_info.append(f"- {name}")
+
+        table_list = "\n".join(tables_info) if tables_info else "No tables found"
+        prompt = (
+            f"User asked: \"{user_text}\"\n\n"
+            f"Available tables and views:\n{table_list}\n\n"
+            f"Write a friendly 3-5 sentence overview of what data is available — what kinds of "
+            f"business questions can be answered, what domains the data covers. "
+            f"Then provide exactly 3 example questions the user could ask, formatted as:\n"
+            f"**Example questions you can ask:**\n- ...\n- ...\n- ..."
+        )
+        try:
+            overview = await bedrock_invoke(
+                model_id=BEDROCK_HAIKU_MODEL,
+                system_prompt=(
+                    "You are a helpful data analyst explaining what data is available. "
+                    "Be concise, friendly, and use plain language. "
+                    "Format example questions as a markdown list."
+                ),
+                user_message=prompt,
+                max_tokens=700,
+                temperature=0.3,
+            )
+            return (overview or "").strip()
+        except Exception as exc:
+            print(f"[orchestrator] schema overview failed: {exc}", flush=True)
+            total = len(tables_info)
+            return (
+                f"You have access to {total} tables and views. "
+                f"Ask me anything about your data, like revenue trends, user activity, or product performance."
+            )
 
     async def run_dashboard_pipeline(
         self,
