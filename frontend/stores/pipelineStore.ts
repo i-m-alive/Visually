@@ -30,6 +30,23 @@ export interface ChartResult {
   column_labels?: Record<string, string>
 }
 
+/** One entry in a multi-candidate response — each backed by a different table. */
+export interface CandidateResult {
+  table: string
+  rank_score: number
+  result_quality: number
+  confidence: number
+  label: string
+  sql: string
+  chart_type: string
+  title: string
+  x_axis_label: string
+  y_axis_label: string
+  table_used: string
+  row_count: number
+  chart_data: ChartResult['chart_data']
+}
+
 interface PipelineSteps {
   intent: StepStatus
   schema: StepStatus
@@ -64,6 +81,9 @@ interface PipelineJobState {
   chartResult?: ChartResult          // last confirmed result (backward compat)
   chartResults: ChartResult[]        // all confirmed results (multi-result display)
   dashboardResult?: DashboardResult
+  // Set when 2-3 candidate tables are competitive — user must pick one.
+  candidates?: CandidateResult[]
+  candidatesMessage?: string
   error?: string
   events: unknown[]
 }
@@ -292,6 +312,13 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
           break
         // --- End verification events ---
         // --- End screenshot events ---
+        case 'candidates.available': {
+          // Multiple tables scored similarly — surface all options for the user to pick.
+          const rawCandidates = (event.candidates as CandidateResult[]) || []
+          updated.candidates = rawCandidates
+          updated.candidatesMessage = (event.message as string) || 'I found multiple possible answers. Choose one:'
+          break
+        }
         case 'pipeline.error':
           updated.error = event.message as string
           Object.keys(updated.steps).forEach((k) => {

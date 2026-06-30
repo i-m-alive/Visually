@@ -127,6 +127,7 @@ export default function SchemaPage() {
   const [metaError, setMetaError] = useState('')
   const [expandedMeta, setExpandedMeta] = useState<Set<string>>(new Set())
   const [metaSearch, setMetaSearch] = useState('')
+  const [schemaSearch, setSchemaSearch] = useState('')
 
   // ── Data fetching ───────────────────────────────────────────────────────────
   const fetchSchema = async () => {
@@ -207,6 +208,15 @@ export default function SchemaPage() {
   const toggleMeta = (name: string) =>
     setExpandedMeta(prev => { const n = new Set(prev); n.has(name) ? n.delete(name) : n.add(name); return n })
 
+  const filteredSchema = schema?.tables.filter(t => {
+    if (!schemaSearch) return true
+    const q = schemaSearch.toLowerCase()
+    return (
+      t.name.toLowerCase().includes(q) ||
+      (t.description ?? '').toLowerCase().includes(q)
+    )
+  }) ?? []
+
   const filteredMeta = metadata?.tables.filter(t => {
     if (!metaSearch) return true
     const q = metaSearch.toLowerCase()
@@ -272,7 +282,7 @@ export default function SchemaPage() {
 
       {/* ── Raw Schema tab ───────────────────────────────────────────────── */}
       {tab === 'schema' && (
-        <div className="flex-1 overflow-y-auto p-4 space-y-2">
+        <div className="flex-1 overflow-y-auto flex flex-col">
           {schemaLoading && <p className="text-gray-400 text-sm p-4">Loading schema...</p>}
           {schemaError && !schemaLoading && (
             <div className="text-center py-12">
@@ -284,8 +294,29 @@ export default function SchemaPage() {
               </button>
             </div>
           )}
-          {schema?.tables.map((table) => {
-            const isImportant = schema.important_tables.includes(table.name)
+          {schema && !schemaLoading && (
+            <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100 bg-gray-50">
+              <div className="relative flex-1 max-w-xs">
+                <input
+                  value={schemaSearch}
+                  onChange={e => setSchemaSearch(e.target.value)}
+                  placeholder="Search tables..."
+                  className="w-full text-sm border border-gray-200 rounded-lg px-3 py-1.5 pr-7 focus:outline-none focus:ring-2 focus:ring-brand/30"
+                />
+                {schemaSearch && (
+                  <button onClick={() => setSchemaSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+              <span className="text-xs text-gray-400">
+                {filteredSchema.length} / {schema.tables.length} tables
+              </span>
+            </div>
+          )}
+          <div className="p-4 space-y-2">
+          {filteredSchema.map((table) => {
+            const isImportant = (schema?.important_tables ?? []).includes(table.name)
             const isExpanded = expandedTables.has(table.name)
             return (
               <div key={table.name} className="card overflow-hidden">
@@ -342,6 +373,10 @@ export default function SchemaPage() {
               </div>
             )
           })}
+          {schemaSearch && filteredSchema.length === 0 && (
+            <p className="text-center text-sm text-gray-400 py-8">No tables match &quot;{schemaSearch}&quot;</p>
+          )}
+          </div>
         </div>
       )}
 

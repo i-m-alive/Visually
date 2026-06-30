@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,14 +103,14 @@ async def _get_or_create_personal_project(current_user: User, db: AsyncSession):
 
 class EndUserConnectionRequest(BaseModel):
     db_type: str
-    host: str
-    database_name: str
-    username: str
+    host: str = Field(..., max_length=253)       # RFC 1123 hostname limit
+    database_name: str = Field(..., max_length=63)
+    username: str = Field(..., max_length=128)
     password: Optional[str] = None
-    port: Optional[int] = None
-    name: Optional[str] = None
+    port: Optional[int] = Field(None, ge=1, le=65535)
+    name: Optional[str] = Field(None, max_length=200)
     ssl_enabled: bool = False
-    iam_role_arn: Optional[str] = None   # Redshift IAM auth (optional)
+    iam_role_arn: Optional[str] = Field(None, max_length=2048)
 
 
 @router.post("/end-user/connections", status_code=201)
@@ -144,10 +144,11 @@ async def end_user_create_connection(
     if body.iam_role_arn:
         connection_options["iam_role_arn"] = body.iam_role_arn
 
+    conn_name = (body.name or f"{body.database_name} @ {body.host}")[:255]
     conn = DatabaseConnection(
         id=uuid.uuid4(),
         project_id=personal_project.id,
-        name=body.name or f"{body.database_name} @ {body.host}",
+        name=conn_name,
         db_type=db_type_enum,
         host=body.host,
         port=body.port,

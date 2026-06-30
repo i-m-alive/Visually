@@ -142,16 +142,83 @@ class Orchestrator:
                         "confidence": round(retrieved_context.confidence, 3),
                     })
 
-            # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
+            # ── Multi-candidate ambiguity check ───────────────────────────────────────
+            # When the top-2 RAG candidates are close in score, run all in parallel
+            # so the user sees every plausible answer — not just the first guess.
             final_result = None
+            _multi_candidate_results: list[dict] = []
+
+            if retrieved_context and len(retrieved_context.candidates) >= 2:
+                from agent_service.agents.candidate_ranker import (
+                    get_pipeline_candidates, is_ambiguous,
+                    should_auto_select, candidate_label,
+                )
+                cand_scores = get_pipeline_candidates(retrieved_context.candidates)
+                if is_ambiguous(cand_scores):
+                    print(
+                        f"[pipeline:{job_id}] multi-candidate ambiguity: "
+                        + " | ".join(
+                            f"{c.table_name.split('.')[-1]}={c.normalized_score:.2f}"
+                            for c in cand_scores
+                        ),
+                        flush=True,
+                    )
+                    await emit({
+                        "type": "candidates.ranking",
+                        "job_id": job_id,
+                        "tables": [
+                            {"table": c.table_name, "score": round(c.rank_score, 3)}
+                            for c in cand_scores
+                        ],
+                    })
+                    tasks = [
+                        asyncio.wait_for(
+                            self._run_single_candidate(
+                                c.table_name, c.rank_score, job_id, user_text,
+                                intent, schema, db_type, enriched,
+                                retrieved_context, connection_id,
+                            ),
+                            timeout=40.0,
+                        )
+                        for c in cand_scores
+                    ]
+                    raw = await asyncio.gather(*tasks, return_exceptions=True)
+                    cand_results = [r for r in raw if isinstance(r, dict) and r is not None]
+                    if len(cand_results) >= 2:
+                        for i, cr in enumerate(cand_results):
+                            cr["label"] = candidate_label(i, cr["table"])
+                        if should_auto_select(cand_results):
+                            best = max(cand_results, key=lambda x: x["confidence"])
+                            final_result = self._candidate_to_final_result(job_id, best)
+                            print(
+                                f"[pipeline:{job_id}] auto-selected "
+                                f"{best['table']!r} confidence={best['confidence']:.3f}",
+                                flush=True,
+                            )
+                        else:
+                            _multi_candidate_results = cand_results
+                            best = max(cand_results, key=lambda x: x["confidence"])
+                            final_result = self._candidate_to_final_result(job_id, best)
+                            print(
+                                f"[pipeline:{job_id}] surfacing {len(cand_results)} "
+                                "candidates to user",
+                                flush=True,
+                            )
+                    elif len(cand_results) == 1:
+                        final_result = self._candidate_to_final_result(job_id, cand_results[0])
+
+            # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
+            # Skipped when multi-candidate already produced a final_result.
             retry_feedback: Optional[str] = None
             _MAX_SINGLE_VIZ_ATTEMPTS = 4
+            query_plan = None           # guards narration / fallback below
+            execute_result: dict = {}
             # Extract user-requested chart type (None if user didn't specify one)
             expected_chart_type: Optional[str] = getattr(intent.entities, "chart_type", None)
             # How the user wants the answer presented: "chart" (visualize) or "text" (prose answer)
             output_mode: str = (getattr(intent, "output_mode", "chart") or "chart").lower()
 
-            for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1):
+            for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1) if final_result is None else []:
                 # Step 3: Generate query — pass attempt so temperature scales on retries
                 await set_pipeline_state(redis, job_id, "step", f"generating_query_attempt_{attempt}")
                 query_plan = await self._query.generate(
@@ -260,8 +327,8 @@ class Orchestrator:
                 }
                 break
 
-            if not final_result:
-                # All attempts failed — use last results with low confidence
+            if not final_result and query_plan is not None:
+                # All single-candidate attempts failed — use last results with low confidence
                 chart_data = self._build_chart_data(query_plan, execute_result, {})
                 final_result = {
                     "job_id": job_id,
@@ -279,11 +346,12 @@ class Orchestrator:
 
             # Narrate the result: a concise chart caption, or a prose answer for text mode.
             narrative = ""
-            try:
-                from agent_service.agents.result_narrator import narrate as _narrate
-                narrative = await _narrate(user_text, query_plan, execute_result, output_mode)
-            except Exception as _ne:
-                print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
+            if query_plan is not None:
+                try:
+                    from agent_service.agents.result_narrator import narrate as _narrate
+                    narrative = await _narrate(user_text, query_plan, execute_result, output_mode)
+                except Exception as _ne:
+                    print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
             final_result["output_mode"] = output_mode
             final_result["narrative"] = narrative
             await emit({
@@ -292,6 +360,19 @@ class Orchestrator:
                 "output_mode": output_mode,
                 "narrative": narrative,
             })
+
+            # When multiple candidates are competitive, surface them all so the user
+            # can pick the right answer before we commit to the best guess.
+            if _multi_candidate_results:
+                await emit({
+                    "type": "candidates.available",
+                    "job_id": job_id,
+                    "candidates": _multi_candidate_results,
+                    "message": (
+                        "I found multiple possible answers. "
+                        "Please choose the one that looks right:"
+                    ),
+                })
 
             await emit({
                 "type": "chart.confirmed",
@@ -607,6 +688,105 @@ class Orchestrator:
             "image_data": render_result.get("image_base64"),
         })
         return payload
+
+    # ── Multi-candidate helpers ────────────────────────────────────────────────
+
+    async def _run_single_candidate(
+        self,
+        candidate_table: str,
+        candidate_score: float,
+        job_id: str,
+        user_text: str,
+        intent,
+        schema,
+        db_type: str,
+        enriched,
+        retrieved_context,
+        connection_id: str,
+    ) -> Optional[dict]:
+        """Run query → execute → render for ONE candidate table.
+        Returns a result dict with confidence and chart_data, or None on failure.
+        Used by the multi-candidate parallel execution path."""
+        import copy
+        try:
+            # Build a focused RetrievedContext that only mentions this candidate.
+            local_ctx = copy.copy(retrieved_context) if retrieved_context else None
+            if local_ctx is not None:
+                focused = [c for c in (local_ctx.candidates or []) if c.table_name == candidate_table]
+                if not focused:
+                    from agent_service.agents.graph_rag_retriever import TableCandidate
+                    focused = [TableCandidate(table_name=candidate_table, score=candidate_score)]
+                local_ctx.candidates = focused
+                local_ctx.primary_tables = [candidate_table]
+
+            query_plan = await self._query.generate(
+                intent, schema, db_type, None, 1, enriched,
+                retrieved_context=local_ctx,
+                conversation_history=None,
+            )
+
+            exec_result = await self._execute_query(connection_id, query_plan.sql)
+            if exec_result.get("error"):
+                print(
+                    f"[pipeline:{job_id}] candidate {candidate_table!r} "
+                    f"exec error: {str(exec_result['error'])[:80]}",
+                    flush=True,
+                )
+                return None
+
+            rows = exec_result.get("rows") or []
+            cols = exec_result.get("columns") or []
+            if not rows:
+                return None
+
+            from agent_service.agents.candidate_ranker import (
+                score_result_quality, compute_final_confidence,
+            )
+            quality = score_result_quality(rows, cols)
+            if quality < 0.15:
+                return None
+            confidence = compute_final_confidence(candidate_score, quality, candidate_score)
+
+            render_result = await self._render_chart(query_plan, exec_result)
+            chart_data = self._build_chart_data(query_plan, exec_result, render_result)
+
+            return {
+                "table": candidate_table,
+                "rank_score": round(candidate_score, 4),
+                "result_quality": round(quality, 3),
+                "confidence": confidence,
+                "sql": query_plan.sql,
+                "chart_type": query_plan.chart_type,
+                "title": query_plan.title,
+                "x_axis_label": query_plan.x_axis_label,
+                "y_axis_label": query_plan.y_axis_label,
+                "table_used": query_plan.table_used,
+                "chart_data": chart_data,
+                "row_count": len(rows),
+            }
+        except Exception as exc:
+            print(f"[pipeline:{job_id}] candidate {candidate_table!r} failed: {exc}", flush=True)
+            return None
+
+    def _candidate_to_final_result(self, job_id: str, candidate: dict) -> dict:
+        """Convert a _run_single_candidate result dict into the final_result shape
+        expected by the narration + chart.confirmed steps."""
+        return {
+            "job_id": job_id,
+            "score": candidate["confidence"],
+            "chart_data": candidate["chart_data"],
+            "low_confidence": candidate["confidence"] < 0.65,
+            "sql": candidate["sql"],
+            "chart_type": candidate["chart_type"],
+            "title": candidate["title"],
+            "table_used": candidate["table"],
+            "x_axis_label": candidate["x_axis_label"],
+            "y_axis_label": candidate["y_axis_label"],
+            "validation_details": {
+                "rank_score": candidate["rank_score"],
+                "result_quality": candidate["result_quality"],
+            },
+        }
 
     async def run_dashboard_pipeline(
         self,

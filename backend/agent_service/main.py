@@ -719,7 +719,9 @@ async def trigger_schema_crawl(project_id: str, current_user: User = Depends(get
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(f"{SCHEMA_CRAWLER_URL}/crawl",
                 json={"connection_id": str(conn.id), "project_id": project_id})
-            return resp.json()
+            data = resp.json()
+            print(f"[agent] crawl triggered project={project_id[:8]} conn={str(conn.id)[:8]} job={data.get('job_id', '?')[:8]}", flush=True)
+            return data
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Schema crawler unavailable: {e}")
 
@@ -729,7 +731,10 @@ async def get_crawl_status(project_id: str, job_id: str, current_user: User = De
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{SCHEMA_CRAWLER_URL}/crawl/{job_id}")
-            return resp.json()
+            data = resp.json()
+            status = data.get("status", "?")
+            print(f"[agent] crawl-poll job={job_id[:8]} status={status}", flush=True)
+            return data
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Schema crawler unavailable: {e}")
 

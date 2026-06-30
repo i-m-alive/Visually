@@ -60,6 +60,7 @@ class CrawlRequest(BaseModel):
 async def _run_crawl(job_id: str, connection_id: str, project_id: str):
     from shared.database import AsyncSessionLocal
     _crawl_jobs[job_id] = {"status": "running", "result": None, "error": None}
+    print(f"[schema_crawler] JOB {job_id[:8]} STARTED  connection={connection_id[:8]} project={project_id[:8]}", flush=True)
 
     async with AsyncSessionLocal() as db:
         try:
@@ -69,6 +70,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
             conn = result.scalar_one_or_none()
             if not conn:
                 _crawl_jobs[job_id] = {"status": "failed", "result": None, "error": "Connection not found"}
+                print(f"[schema_crawler] JOB {job_id[:8]} FAILED — connection not found", flush=True)
                 return
 
             password = ""
@@ -80,6 +82,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                 iam_role_arn = conn.connection_options.get("iam_role_arn")
 
             db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+            print(f"[schema_crawler] JOB {job_id[:8]} crawling {db_type} db={conn.database_name!r} host={conn.host}", flush=True)
 
             # Build connection kwargs for metadata extractor (Phases B + C DB queries)
             db_conn_kwargs = {
@@ -225,6 +228,12 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                 )
             )
 
+            table_count = schema_doc.get("total_tables", 0)
+            print(
+                f"[schema_crawler] JOB {job_id[:8]} COMPLETED — {table_count} tables "
+                f"snapshot={str(new_snapshot.id)[:8]} — metadata extraction queued",
+                flush=True,
+            )
             _crawl_jobs[job_id] = {
                 "status": "completed",
                 "result": schema_doc,
@@ -235,7 +244,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
 
         except Exception as e:
             import traceback
-            print(f"\n[schema_crawler] JOB {job_id} FAILED:\n{traceback.format_exc()}\n")
+            print(f"\n[schema_crawler] JOB {job_id[:8]} FAILED:\n{traceback.format_exc()}\n", flush=True)
             _crawl_jobs[job_id] = {"status": "failed", "result": None, "error": str(e)}
 
 
@@ -244,6 +253,7 @@ async def start_crawl(req: CrawlRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     _crawl_jobs[job_id] = {"status": "pending", "result": None, "error": None}
     background_tasks.add_task(_run_crawl, job_id, req.connection_id, req.project_id)
+    print(f"[schema_crawler] JOB {job_id[:8]} QUEUED   connection={req.connection_id[:8]} project={req.project_id[:8]}", flush=True)
     return {"job_id": job_id}
 
 

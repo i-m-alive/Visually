@@ -8,9 +8,10 @@ import 'react-resizable/css/styles.css'
 import {
   RefreshCw, Loader2, AlertCircle, Sparkles, ArrowLeft,
   Download, Bookmark, Calendar, Terminal, MessageSquare, Database,
-  FileDown,
+  FileDown, TrendingUp, X, CheckCircle2, Link2, Plus,
 } from 'lucide-react'
-import { api, publicCanvasApi, analystApi, vlyApi, endUserApi } from '@/lib/api'
+import { api, publicCanvasApi, analystApi, vlyApi, endUserApi, dashboardApi, projectApi } from '@/lib/api'
+import { QueryChatPanel } from '@/components/query/QueryChatPanel'
 import type { FilterItem, AnnotationData } from '@/lib/api'
 import { ConnectionPromptModal } from '@/components/end-user/ConnectionPromptModal'
 import { ChartRenderer } from '@/components/charts/ChartRenderer'
@@ -97,6 +98,18 @@ export default function AuthedAnalystPage() {
   const [showConnect, setShowConnect] = useState(false)
   const lastRefresh = useRef<Date | null>(null)
 
+  // Query Chat panel
+  const [projectId, setProjectId] = useState<string | null>(null)       // canvas's project_id
+  const [queryChatProjectId, setQueryChatProjectId] = useState<string | null>(null) // used by QueryChatPanel
+  const [queryChatOpen, setQueryChatOpen] = useState(false)
+  const [queryChatStep, setQueryChatStep] = useState<'not-connected' | 'crawling' | 'ready'>('not-connected')
+  const [queryChatConnName, setQueryChatConnName] = useState('')
+  const [queryChatConnType, setQueryChatConnType] = useState('')
+  const [existingConns, setExistingConns] = useState<{ id: string; name: string; db_type: string }[]>([])
+  const [showNewConnForQuery, setShowNewConnForQuery] = useState(false)
+  const [queryCrawlPct, setQueryCrawlPct] = useState(0)
+  const [queryCrawlMsg, setQueryCrawlMsg] = useState('')
+
   // Panel state
   const [leftOpen, setLeftOpen] = useState(false)
   const [rightOpen, setRightOpen] = useState(false)
@@ -129,10 +142,14 @@ export default function AuthedAnalystPage() {
     setLoading(true)
     setTokenError(null)
 
-    api.post(`/dashboards/${id}/analyst-token`)
-      .then(r => {
-        const token: string = r.data.token
+    Promise.all([
+      api.post(`/dashboards/${id}/analyst-token`),
+      dashboardApi.get(String(id)).catch(() => ({ data: null })),
+    ])
+      .then(([tokenResp, dashResp]) => {
+        const token: string = tokenResp.data.token
         setAnalystToken(token)
+        if (dashResp.data?.project_id) setProjectId(String(dashResp.data.project_id))
         return publicCanvasApi.get(token)
       })
       .then(r => {
@@ -302,6 +319,129 @@ export default function AuthedAnalystPage() {
     if (canvas && canvas.pages[pageIndex]) setActivePageId(canvas.pages[pageIndex].id)
   }
 
+  // ── Query Chat helpers ────────────────────────────────────────────────────────
+
+  /** Poll a crawl job until completed/failed. Updates queryCrawlPct + queryCrawlMsg in place. */
+  const pollCrawl = async (pid: string, jobId: string, startPct = 25): Promise<void> => {
+    const MAX = 90 // 90 × 2 s = 3 min max
+    for (let i = 0; i < MAX; i++) {
+      await new Promise(r => setTimeout(r, 2000))
+      const statusResp = await projectApi.getCrawlStatus(pid, jobId)
+      const { status, error } = statusResp.data as { status: string; error?: string | null }
+      if (status === 'completed') { setQueryCrawlPct(100); setQueryCrawlMsg('Schema ready!'); return }
+      if (status === 'failed') throw new Error(error ?? 'Schema crawl failed')
+      const pct = Math.round(startPct + ((i + 1) / MAX) * (95 - startPct))
+      setQueryCrawlPct(pct)
+      if (pct < 45) setQueryCrawlMsg('Reading table schemas…')
+      else if (pct < 70) setQueryCrawlMsg('Reading column types and relationships…')
+      else if (pct < 88) setQueryCrawlMsg('Extracting metadata for query AI…')
+      else setQueryCrawlMsg('Finalising…')
+    }
+    // Timed out — crawl still running in background, proceed anyway
+  }
+
+  // ── Query Chat handlers ───────────────────────────────────────────────────────
+
+  const handleOpenQueryChat = async () => {
+    setQueryChatOpen(true)
+    if (!projectId || !canvas) return
+    const connectionId = (canvas.layout_config as Record<string, unknown>)?.connection_id as string | undefined
+    if (connectionId) {
+      // Canvas already has a live connection — schema was crawled when it was set up
+      try {
+        const r = await projectApi.listConnections(projectId)
+        const conns = (r.data as { id: string; name: string; db_type: string }[]) || []
+        const conn = conns.find(c => c.id === connectionId)
+        if (conn) { setQueryChatConnName(conn.name); setQueryChatConnType(conn.db_type) }
+      } catch { /* name is cosmetic — ignore */ }
+      setQueryChatProjectId(projectId)
+      setQueryChatStep('ready')
+      return
+    }
+    // Not yet connected — load the project's connections for the picker
+    setQueryChatStep('not-connected')
+    try {
+      const r = await projectApi.listConnections(projectId)
+      setExistingConns((r.data as { id: string; name: string; db_type: string }[]) || [])
+    } catch { setExistingConns([]) }
+  }
+
+  /** Use an existing connection from the canvas project: bind it, then crawl + poll. */
+  const handleConnectExistingForQuery = async (connId: string, connName: string, connType: string) => {
+    setQueryChatStep('crawling')
+    setQueryCrawlPct(5); setQueryCrawlMsg('Binding connection to canvas…')
+    try {
+      // Bind without crawl=true (we trigger crawl separately so we can poll it)
+      await vlyApi.bindConnection(String(id), connId, { crawl: false, refresh: true })
+      setQueryCrawlPct(15); setQueryCrawlMsg('Starting schema crawl…')
+
+      if (!projectId) throw new Error('Canvas project not loaded yet — please refresh and try again.')
+      const crawlResp = await projectApi.triggerCrawl(projectId)
+      const jobId = (crawlResp.data as { job_id: string }).job_id
+      setQueryCrawlPct(20); setQueryCrawlMsg('Crawling table schemas…')
+      await pollCrawl(projectId, jobId, 20)
+      setQueryChatProjectId(projectId)
+
+      await new Promise(r => setTimeout(r, 400))
+      setQueryChatConnName(connName); setQueryChatConnType(connType)
+      setQueryChatStep('ready'); setConnected(true)
+    } catch {
+      setQueryChatStep('not-connected')
+    }
+  }
+
+  /**
+   * New connection from the analyst (no project concept).
+   * Creates the connection in the analyst's personal project, crawls it there,
+   * and uses that project_id for QueryChatPanel (avoids the canvas project
+   * mismatch that would break vlyApi.bindConnection for shared canvases).
+   */
+  const handleConnectNewForQuery = async (details: {
+    db_type: string; host: string; port: string; database_name: string; username: string
+    password: string; ssl_enabled?: boolean; iam_role_arn?: string
+  }) => {
+    setShowNewConnForQuery(false)
+    setQueryChatStep('crawling')
+    setQueryCrawlPct(5); setQueryCrawlMsg('Creating connection…')
+    try {
+      // Step 1 — create in analyst's personal project
+      const connResp = await endUserApi.createConnection({
+        db_type: details.db_type, host: details.host,
+        port: details.port ? Number(details.port) : undefined,
+        database_name: details.database_name, username: details.username,
+        password: details.password, ssl_enabled: details.ssl_enabled,
+        iam_role_arn: details.iam_role_arn || undefined,
+      })
+      const personalPid = connResp.data.project_id
+      setQueryCrawlPct(15); setQueryCrawlMsg('Starting schema crawl…')
+
+      // Step 2 — trigger crawl, get job_id, poll to completion
+      const crawlResp = await projectApi.triggerCrawl(personalPid)
+      const jobId = (crawlResp.data as { job_id: string }).job_id
+      setQueryCrawlPct(25); setQueryCrawlMsg('Crawling table schemas…')
+      await pollCrawl(personalPid, jobId, 25)
+
+      await new Promise(r => setTimeout(r, 400))
+      setQueryChatProjectId(personalPid)
+      setQueryChatConnName(details.database_name)
+      setQueryChatConnType(details.db_type)
+      setQueryChatStep('ready')
+    } catch {
+      setQueryChatStep('not-connected')
+    }
+  }
+
+  const handleSwitchConnection = () => {
+    setQueryChatStep('not-connected')
+    setQueryChatConnName(''); setQueryChatConnType('')
+    setQueryCrawlPct(0); setQueryCrawlMsg('')
+    if (projectId) {
+      projectApi.listConnections(projectId)
+        .then(r => setExistingConns((r.data as { id: string; name: string; db_type: string }[]) || []))
+        .catch(() => setExistingConns([]))
+    }
+  }
+
   // ── Loading / Error states ────────────────────────────────────────────────────
 
   if (loading) {
@@ -457,6 +597,16 @@ export default function AuthedAnalystPage() {
               </div>
             )}
           </div>
+
+          {/* Query Chat */}
+          <button
+            onClick={handleOpenQueryChat}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-gray-200 transition-colors ${queryChatOpen ? 'bg-blue-100 border-blue-200 text-blue-600' : 'text-gray-600 hover:bg-gray-50'}`}
+            title="Query Chat — ask questions about your data"
+          >
+            <TrendingUp size={11} />
+            <span className="hidden sm:inline">Query Chat</span>
+          </button>
 
           {/* AI Chat toggle + annotation badge */}
           <button
@@ -673,6 +823,160 @@ export default function AuthedAnalystPage() {
           connectionHint={(canvas.layout_config as { connection_hint?: Record<string, string> })?.connection_hint}
           onConnect={connectLiveData}
           onClose={() => setShowConnect(false)}
+        />
+      )}
+
+      {/* ── Query Chat slide-over ─────────────────────────────────────────────── */}
+      {queryChatOpen && (
+        <div className="fixed inset-0 z-40 flex">
+          {/* Dim backdrop */}
+          <div className="flex-1 bg-black/20" onClick={() => setQueryChatOpen(false)} />
+
+          {/* Panel */}
+          <div className="w-[min(80vw,960px)] bg-white border-l border-gray-200 flex flex-col shadow-2xl overflow-hidden">
+
+            {/* Panel header */}
+            <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100 flex-shrink-0 bg-white">
+              <div className="p-1.5 bg-brand/10 rounded-lg"><TrendingUp size={14} className="text-brand" /></div>
+              <div className="flex-1 min-w-0">
+                <h2 className="text-sm font-semibold text-gray-900">Query Chat</h2>
+                {queryChatStep === 'ready' && queryChatConnName && (
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-400 flex-shrink-0" />
+                    <span className="text-xs text-gray-500 truncate">
+                      {queryChatConnType && <span className="font-medium text-gray-700">{queryChatConnType}</span>}
+                      {queryChatConnType && queryChatConnName && ' · '}
+                      {queryChatConnName}
+                    </span>
+                    <button onClick={handleSwitchConnection} className="text-xs text-brand hover:underline flex-shrink-0">Switch</button>
+                  </div>
+                )}
+              </div>
+              <button onClick={() => setQueryChatOpen(false)} className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 flex-shrink-0">
+                <X size={15} />
+              </button>
+            </div>
+
+            {/* ── Step: not-connected ── */}
+            {queryChatStep === 'not-connected' && (
+              <div className="flex-1 overflow-y-auto flex flex-col items-center justify-center p-8 gap-6">
+                <div className="w-14 h-14 rounded-2xl bg-brand/10 flex items-center justify-center">
+                  <Database size={24} className="text-brand" />
+                </div>
+                <div className="text-center max-w-sm">
+                  <h3 className="text-base font-semibold text-gray-900 mb-1">Connect a database first</h3>
+                  <p className="text-sm text-gray-500">Query Chat needs a live database connection to generate charts and answer questions about your data.</p>
+                </div>
+
+                {existingConns.length > 0 && (
+                  <div className="w-full max-w-md">
+                    <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Existing connections</p>
+                    <div className="space-y-2">
+                      {existingConns.map(conn => (
+                        <button
+                          key={conn.id}
+                          onClick={() => handleConnectExistingForQuery(conn.id, conn.name, conn.db_type)}
+                          className="w-full flex items-center gap-3 px-4 py-3 bg-white border border-gray-200 rounded-xl hover:border-brand/40 hover:bg-brand/5 transition-all text-left group"
+                        >
+                          <div className="w-8 h-8 rounded-lg bg-gray-100 group-hover:bg-brand/10 flex items-center justify-center flex-shrink-0 transition-colors">
+                            <Database size={14} className="text-gray-500 group-hover:text-brand" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-gray-900 truncate">{conn.name}</p>
+                            <p className="text-xs text-gray-400">{conn.db_type}</p>
+                          </div>
+                          <Link2 size={14} className="text-gray-300 group-hover:text-brand flex-shrink-0 transition-colors" />
+                        </button>
+                      ))}
+                    </div>
+                    <div className="relative flex items-center my-4">
+                      <div className="flex-1 border-t border-gray-100" />
+                      <span className="px-3 text-xs text-gray-400">or</span>
+                      <div className="flex-1 border-t border-gray-100" />
+                    </div>
+                  </div>
+                )}
+
+                <button
+                  onClick={() => setShowNewConnForQuery(true)}
+                  className="flex items-center gap-2 px-5 py-2.5 bg-brand text-white rounded-xl text-sm font-medium hover:bg-brand-dark transition-colors shadow-sm"
+                >
+                  <Plus size={14} /> New Connection
+                </button>
+              </div>
+            )}
+
+            {/* ── Step: crawling — real progress from pollCrawl ── */}
+            {queryChatStep === 'crawling' && (() => {
+              const stages = [
+                { label: 'Creating / testing connection', upTo: 15  },
+                { label: 'Reading table schemas',         upTo: 45  },
+                { label: 'Extracting column metadata',    upTo: 75  },
+                { label: 'Preparing query engine',        upTo: 100 },
+              ]
+              const activeIdx = stages.findIndex(s => queryCrawlPct < s.upTo)
+              const ai = activeIdx === -1 ? stages.length - 1 : activeIdx
+              return (
+                <div className="flex-1 flex flex-col items-center justify-center gap-5 p-8">
+                  <div className="relative w-16 h-16">
+                    <div className="absolute inset-0 rounded-full border-4 border-brand/20" />
+                    <div className="absolute inset-0 rounded-full border-4 border-brand border-t-transparent animate-spin" />
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <Database size={20} className="text-brand" />
+                    </div>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-sm font-semibold text-gray-900 mb-1">{queryCrawlMsg || 'Starting…'}</p>
+                    <p className="text-xs text-gray-400">Schema crawl usually takes 20–60 seconds.</p>
+                  </div>
+                  <div className="w-full max-w-xs bg-gray-200 rounded-full h-1.5 overflow-hidden">
+                    <div className="bg-brand h-1.5 rounded-full transition-all duration-700" style={{ width: `${queryCrawlPct}%` }} />
+                  </div>
+                  <p className="text-xs text-gray-400 -mt-3">{queryCrawlPct}%</p>
+                  <div className="w-full max-w-xs space-y-2.5">
+                    {stages.map(({ label }, i) => {
+                      const done = i < ai
+                      const current = i === ai
+                      return (
+                        <div key={label} className="flex items-center gap-2.5 text-xs">
+                          <div className={`w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 ${done ? 'bg-green-100' : current ? 'bg-brand/10' : 'bg-gray-100'}`}>
+                            {done
+                              ? <CheckCircle2 size={11} className="text-green-500" />
+                              : current
+                                ? <Loader2 size={10} className="animate-spin text-brand" />
+                                : <span className="w-1.5 h-1.5 rounded-full bg-gray-300" />
+                            }
+                          </div>
+                          <span className={done || current ? 'text-gray-700' : 'text-gray-400'}>{label}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* ── Step: ready ── */}
+            {queryChatStep === 'ready' && queryChatProjectId && (
+              <div className="flex-1 overflow-hidden">
+                <QueryChatPanel
+                  projectId={queryChatProjectId}
+                  connectionLabel={[queryChatConnType, queryChatConnName].filter(Boolean).join(' · ')}
+                  onSwitchConnection={handleSwitchConnection}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* New connection form triggered from within Query Chat */}
+      {showNewConnForQuery && (
+        <ConnectionPromptModal
+          fileName={canvas.name}
+          connectionHint={(canvas.layout_config as { connection_hint?: Record<string, string> })?.connection_hint}
+          onConnect={handleConnectNewForQuery}
+          onClose={() => setShowNewConnForQuery(false)}
         />
       )}
     </div>

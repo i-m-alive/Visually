@@ -1,6 +1,8 @@
+import calendar
 import json
 import os
 import re
+from datetime import date, timedelta
 from typing import Optional, TYPE_CHECKING
 from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL, BEDROCK_OPUS_MODEL
 from agent_service.agents import schema_scope as _scope
@@ -13,6 +15,85 @@ from agent_service.agents.nl_schema_router import format_routing_hints
 
 CHAT_MODEL = BEDROCK_SONNET_MODEL
 CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
+
+
+# ── Pre-compute date bounds for relative time expressions ──────────────────────
+
+def _months_ago(today: date, n: int) -> date:
+    month = today.month - n
+    year = today.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    max_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(today.day, max_day))
+
+
+def _extract_time_filter_hint(message: str) -> str:
+    """Detect a relative-date phrase in the user message and return a mandatory
+    SQL hint block (with pre-computed ISO date strings) that the LLM must apply
+    as a WHERE clause.  Returns an empty string when no phrase is found."""
+    lower = message.lower()
+    today = date.today()
+    start: date | None = None
+    end: date = today
+    label = ""
+
+    # "last N days / weeks / months / years"
+    m = re.search(r"\blast\s+(\d+)\s+(day|week|month|year)s?\b", lower)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        label = m.group(0)
+        if unit == "day":
+            start = today - timedelta(days=n)
+        elif unit == "week":
+            start = today - timedelta(weeks=n)
+        elif unit == "month":
+            start = _months_ago(today, n)
+        elif unit == "year":
+            start = _months_ago(today, n * 12)
+
+    elif re.search(r"\bthis\s+year\b|\bytd\b|\byear[- ]to[- ]date\b", lower):
+        start = date(today.year, 1, 1)
+        label = "year-to-date"
+
+    elif re.search(r"\blast\s+year\b|\bprevious\s+year\b", lower):
+        start = date(today.year - 1, 1, 1)
+        end   = date(today.year - 1, 12, 31)
+        label = f"last year ({today.year - 1})"
+
+    elif re.search(r"\bthis\s+month\b", lower):
+        start = date(today.year, today.month, 1)
+        label = today.strftime("%B %Y")
+
+    elif re.search(r"\blast\s+month\b|\bprevious\s+month\b", lower):
+        first_of_this = date(today.year, today.month, 1)
+        end_prev = first_of_this - timedelta(days=1)
+        start = date(end_prev.year, end_prev.month, 1)
+        end   = end_prev
+        label = start.strftime("%B %Y")
+
+    elif re.search(r"\blast\s+quarter\b|\bprevious\s+quarter\b", lower):
+        q = (today.month - 1) // 3          # current quarter index (0-based)
+        if q == 0:
+            start = date(today.year - 1, 10, 1)
+            end   = date(today.year - 1, 12, 31)
+        else:
+            sm = (q - 1) * 3 + 1
+            start = date(today.year, sm, 1)
+            end   = date(today.year, sm + 2, calendar.monthrange(today.year, sm + 2)[1])
+        label = "last quarter"
+
+    if start is None:
+        return ""
+
+    return (
+        f"⚠️ MANDATORY TIME FILTER (you MUST apply this WHERE clause to every SQL you generate):\n"
+        f"  Detected range: \"{label}\" → {start.isoformat()} to {end.isoformat()}\n"
+        f"  Required WHERE: {{date_col}} >= '{start.isoformat()}' AND {{date_col}} <= '{end.isoformat()}'\n"
+        f"  Replace {{date_col}} with the actual date/timestamp column name from the schema.\n"
+        f"  NEVER omit this filter — without it the query returns all historical data, not just {label}.\n"
+    )
 # Default FK reach for builder-selected "Selected tables" scope when the request
 # omits an explicit hop count.
 CHAT_SELECTED_HOPS_DEFAULT = int(os.getenv("CHAT_SELECTED_HOPS_DEFAULT", "2"))
@@ -106,6 +187,15 @@ A query that matches no rows renders as "N/A". Prevent it:
     Stored values often differ in case, punctuation, or suffixes (e.g. ", LLC", " Inc").
   - YEAR / date filters: filter the table's real date column —
     EXTRACT(YEAR FROM date_col) = 2023   or   date_col >= '2023-01-01' AND date_col < '2024-01-01'.
+  - RELATIVE TIME RANGES (CRITICAL — when the user says "last N months/days/years", "this year", "ytd", etc.):
+    ALWAYS add a WHERE clause to restrict the date column. NEVER return all history when a range is given.
+      "last 3 months"  →  WHERE date_col >= CURRENT_DATE - INTERVAL '3 months'     (PostgreSQL/Redshift)
+      "last 30 days"   →  WHERE date_col >= CURRENT_DATE - INTERVAL '30 days'
+      "last year"      →  WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM CURRENT_DATE) - 1
+      "this year/ytd"  →  WHERE date_col >= DATE_TRUNC('year', CURRENT_DATE)
+      "last quarter"   →  WHERE date_col >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '3 months'
+                           AND date_col < DATE_TRUNC('quarter', CURRENT_DATE)
+      MySQL: use CURDATE() and DATE_SUB(CURDATE(), INTERVAL N MONTH) instead of CURRENT_DATE/INTERVAL syntax.
   - Choose the column whose [semantic_type], name, description, or sample values best
     match the words the user used; do not guess a column that may not hold that value.
   - For a single-number KPI, guard against NULL so an empty match still returns a number:
@@ -702,7 +792,12 @@ class ChatAgent:
             selected_hops=selected_hops,
             resolved_context=resolved_context,
         )
-        messages = conversation_history[-20:] + [{"role": "user", "content": message}]
+        # Prepend pre-computed date bounds so the LLM can't miss or misinterpret them
+        time_hint = _extract_time_filter_hint(message)
+        effective_message = f"{time_hint}\n{message}" if time_hint else message
+        if time_hint:
+            print(f"[chat_agent] time_filter injected: {time_hint.splitlines()[1].strip()}", flush=True)
+        messages = conversation_history[-20:] + [{"role": "user", "content": effective_message}]
         effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else CHAT_MODEL
         effective_max_tokens = 8192 if model_override == "opus" else 2048  # Opus needs more
 

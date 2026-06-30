@@ -61,6 +61,8 @@ class ResolvedContext:
     chart_hint: Optional[str] = None
     routing_notes: list = field(default_factory=list)         # list[str]  human-readable
     fallback: bool = False    # True when routing had no useful signal
+    # Raw scores keyed by table name — used by candidate_ranker for ambiguity detection.
+    table_scores: dict = field(default_factory=dict)          # {table_name: float}
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -196,6 +198,7 @@ def _route(intent: "ParsedIntent", enriched: "EnrichedSchema", message: str, top
         chart_hint=chart_hint,
         routing_notes=notes,
         fallback=fallback,
+        table_scores={t: s for t, s in scored},
     )
 
 

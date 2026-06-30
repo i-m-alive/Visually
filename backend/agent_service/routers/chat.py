@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import uuid
 import json
 import re
@@ -56,6 +58,8 @@ class ChatResponse(BaseModel):
     inline_chart: Optional[dict] = None
     dashboard_action: Optional[dict] = None
     turn_count: int
+    # Present when 2-3 candidates are competitive — lets the user pick the right answer.
+    candidates: Optional[list[dict]] = None
 
 
 async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> dict:
@@ -117,8 +121,9 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
             if intent.needs_sql:
                 resolved_context = route_query(intent, enriched, req.message)
                 print(
-                    f"[chat] NL2SQL resolved  tables={resolved_context.primary_tables}"
-                    f"  entities={len(resolved_context.entity_resolutions)}",
+                    f"[chat] NL2SQL resolved  tables={resolved_context.relevant_tables[:4]}"
+                    f"  entities={len(resolved_context.entity_resolutions)}"
+                    f"  scores={len(resolved_context.table_scores)}",
                     flush=True,
                 )
         except Exception as _nl2sql_err:
@@ -204,6 +209,160 @@ def _no_sql_note() -> str:
             "the table/columns you'd like me to use.")
 
 
+async def _run_candidate_sql(
+    table_name: str,
+    rank_score: float,
+    top_rank_score: float,
+    message: str,
+    ctx: dict,
+) -> Optional[dict]:
+    """Generate → execute → score a single candidate table for the chat path.
+    Returns an inline_chart + confidence dict, or None on failure."""
+    from agent_service.agents.candidate_ranker import (
+        score_result_quality, compute_final_confidence,
+    )
+    try:
+        # Build a modified resolved_context focused on this candidate only.
+        base_rc = ctx.get("resolved_context")
+        if base_rc is not None:
+            local_rc = copy.copy(base_rc)
+            local_rc.focused_tables = [table_name]
+            local_rc.relevant_tables = [table_name]
+        else:
+            local_rc = None
+
+        # Inject a directive into the message so the LLM uses the right table.
+        directive = (
+            f"[CANDIDATE TABLE DIRECTIVE: generate SQL using '{table_name}' as the "
+            f"primary table. Relevance score: {rank_score:.3f}]\n"
+        )
+        directive_message = directive + message
+
+        system_blocks, messages, model_id, max_tokens = _agent.prepare(
+            message=directive_message,
+            conversation_history=ctx["history"],
+            schema_doc=ctx["schema_doc"],
+            dashboard_widgets=ctx["dashboard_widgets"],
+            dashboard_pages=ctx.get("dashboard_pages") or [],
+            priority_tables=ctx.get("priority_tables"),
+            enriched_schema=ctx["enriched"],
+            connection_id=ctx["connection_id"],
+            resolved_context=local_rc,
+        )
+        raw = await bedrock_invoke(
+            model_id,
+            "\n".join(b.get("text", "") for b in system_blocks),
+            messages[-1]["content"] if messages else directive_message,
+            max_tokens=1024,
+            temperature=0.1,
+        )
+        parsed = _agent.parse_raw(raw)
+        sql_spec = parsed.get("sql_to_execute")
+        if not sql_spec or not sql_spec.get("sql"):
+            return None
+
+        exec_result = await _execute_sql(ctx["connection_id"], sql_spec["sql"])
+        if exec_result.get("error") or not exec_result.get("rows"):
+            return None
+
+        rows = exec_result["rows"]
+        columns = exec_result.get("columns", [])
+        quality = score_result_quality(rows, columns)
+        if quality < 0.15:
+            return None
+        confidence = compute_final_confidence(rank_score, quality, top_rank_score)
+
+        render_result = await _render_chart(sql_spec, rows)
+        labels = [str(r.get(columns[0], "")) for r in rows] if columns else []
+        values = [r.get(columns[1]) for r in rows] if len(columns) > 1 else [r.get(columns[0]) for r in rows]
+        inline_chart = {
+            "chart_type": sql_spec.get("chart_type", "table"),
+            "title": sql_spec.get("title", f"Result from {table_name.split('.')[-1]}"),
+            "x_axis_label": sql_spec.get("x_label", columns[0] if columns else "x"),
+            "y_axis_label": sql_spec.get("y_label", columns[1] if len(columns) > 1 else "y"),
+            "chart_data": {"rows": rows, "columns": columns, "labels": labels, "values": values},
+            "sql": sql_spec["sql"],
+            "image_base64": render_result.get("image_base64"),
+        }
+        return {
+            "table": table_name,
+            "rank_score": round(rank_score, 4),
+            "result_quality": round(quality, 3),
+            "confidence": confidence,
+            "inline_chart": inline_chart,
+            "row_count": len(rows),
+        }
+    except Exception as exc:
+        print(f"[chat] candidate {table_name!r} failed: {exc}", flush=True)
+        return None
+
+
+async def _try_multi_candidate_chat(
+    message: str,
+    ctx: dict,
+    primary_inline_chart: Optional[dict],
+) -> Optional[list[dict]]:
+    """If the NL2SQL routing shows competitive alternatives, run them in parallel and
+    return a candidates list for the user to choose from.  Returns None when not needed."""
+    from agent_service.agents.candidate_ranker import (
+        get_chat_candidates, is_ambiguous, should_auto_select, candidate_label,
+    )
+    resolved = ctx.get("resolved_context")
+    if not resolved or not getattr(resolved, "table_scores", None):
+        return None
+    cand_scores = get_chat_candidates(resolved.table_scores)
+    if not is_ambiguous(cand_scores):
+        return None
+
+    top_score = cand_scores[0].rank_score
+    print(
+        f"[chat] multi-candidate ambiguity: "
+        + " | ".join(f"{c.table_name.split('.')[-1]}={c.normalized_score:.2f}" for c in cand_scores),
+        flush=True,
+    )
+
+    tasks = [
+        asyncio.wait_for(
+            _run_candidate_sql(c.table_name, c.rank_score, top_score, message, ctx),
+            timeout=25.0,
+        )
+        for c in cand_scores
+    ]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    results = [r for r in raw if isinstance(r, dict) and r is not None]
+
+    # If the primary chart was already generated via the normal path, splice it in
+    # as the first candidate (score it with the top candidate's rank_score).
+    if primary_inline_chart and results:
+        from agent_service.agents.candidate_ranker import score_result_quality, compute_final_confidence
+        primary_rows = (primary_inline_chart.get("chart_data") or {}).get("rows") or []
+        primary_cols = (primary_inline_chart.get("chart_data") or {}).get("columns") or []
+        primary_quality = score_result_quality(primary_rows, primary_cols)
+        primary_confidence = compute_final_confidence(cand_scores[0].rank_score, primary_quality, top_score)
+        primary_entry = {
+            "table": cand_scores[0].table_name,
+            "rank_score": round(cand_scores[0].rank_score, 4),
+            "result_quality": round(primary_quality, 3),
+            "confidence": primary_confidence,
+            "inline_chart": primary_inline_chart,
+            "row_count": len(primary_rows),
+        }
+        # Avoid duplicating if _run_candidate_sql already ran the same table
+        results = [r for r in results if r["table"] != cand_scores[0].table_name]
+        results = [primary_entry] + results
+
+    if len(results) < 2:
+        return None
+
+    for i, r in enumerate(results):
+        r["label"] = candidate_label(i, r["table"])
+
+    if should_auto_select(results):
+        return None  # gap is clear — just use the primary result
+
+    return results
+
+
 @router.post("/agent/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
@@ -238,10 +397,19 @@ async def chat(
     )
 
     inline_chart = None
+    candidates = None
     if sql_spec:
         inline_chart, warning = await _execute_and_build_chart(sql_spec, ctx["connection_id"])
         if warning:
             result["text"] = (result.get("text") or "").rstrip() + warning
+        # Multi-candidate check: run alternative tables in parallel when routing is ambiguous.
+        if inline_chart:
+            try:
+                candidates = await _try_multi_candidate_chat(req.message, ctx, inline_chart)
+                if candidates:
+                    print(f"[chat] surfacing {len(candidates)} candidates to user", flush=True)
+            except Exception as _mc_err:
+                print(f"[chat] multi-candidate check failed (non-fatal): {_mc_err}", flush=True)
     elif _is_data_query_request(req.message) or _is_chart_creation_request(req.message):
         result["text"] = (result.get("text") or "").rstrip() + _no_sql_note()
         print("[chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
@@ -258,6 +426,7 @@ async def chat(
         inline_chart=inline_chart,
         dashboard_action=result.get("dashboard_action"),
         turn_count=len(updated_history) // 2,
+        candidates=candidates,
     )
 
 
@@ -357,6 +526,15 @@ async def chat_stream(
                 yield _sse({"type": "text", "delta": warning})
             if inline_chart:
                 yield _sse({"type": "chart", "chart": inline_chart})
+                # Multi-candidate: run alternatives when routing is ambiguous.
+                try:
+                    candidates = await _try_multi_candidate_chat(req.message, ctx, inline_chart)
+                    if candidates:
+                        print(f"[chat] stream surfacing {len(candidates)} candidates", flush=True)
+                        yield _sse({"type": "candidates", "candidates": candidates,
+                                    "message": "I found multiple possible answers. Choose one:"})
+                except Exception as _mc_err:
+                    print(f"[chat] stream multi-candidate failed (non-fatal): {_mc_err}", flush=True)
         elif _is_data_query_request(req.message) or _is_chart_creation_request(req.message):
             note = _no_sql_note()
             final_text = (final_text or "").rstrip() + note
