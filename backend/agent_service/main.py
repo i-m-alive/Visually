@@ -714,7 +714,7 @@ async def trigger_schema_crawl(project_id: str, current_user: User = Depends(get
         DatabaseConnection.project_id == uuid.UUID(project_id), DatabaseConnection.is_active == True).limit(1))
     conn = result.scalar_one_or_none()
     if not conn:
-        raise HTTPException(status_code=404, detail="No active connection found for this project")
+        raise HTTPException(status_code=400, detail="No active connection found for this project. Please add a database connection first.")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(f"{SCHEMA_CRAWLER_URL}/crawl",
