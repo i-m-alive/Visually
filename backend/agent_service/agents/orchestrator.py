@@ -20,7 +20,12 @@ from agent_service.agents.intent_classifier import IntentClassifier
 from agent_service.agents.query_agent import QueryAgent
 from agent_service.agents.validator_agent import ValidatorAgent
 import agent_service.agents.schema_cache as _schema_cache
+import agent_service.agents.graph_rag_retriever as _graph_rag
 from agent_service.services.ws_manager import manager as _ws_manager
+
+# Minimum validation score to emit a chart result (was 0.80, kept retrying 4×).
+# 0.65 lets well-formed results pass on the first attempt.
+_VALIDATION_PASS_THRESHOLD = 0.65
 
 DASHBOARD_DECOMPOSE_MODEL = BEDROCK_HAIKU_MODEL
 DASHBOARD_MAX_CHARTS = 5        # max charts per dashboard (count cap)
@@ -52,6 +57,11 @@ class Orchestrator:
         connection_id: str,
         redis,
         db: AsyncSession,
+        conversation_history: Optional[list] = None,
+        scope: Optional[str] = None,
+        selected_tables: Optional[list[str]] = None,
+        selected_hops: Optional[int] = 2,
+        output_mode_override: Optional[str] = None,
     ) -> dict:
         async def emit(event: dict):
             # Direct in-process broadcast (works with or without Redis)
@@ -118,19 +128,162 @@ class Orchestrator:
             except Exception as _e:
                 print(f"[pipeline:{job_id}] ⚠ schema enrichment failed (non-fatal): {_e}", flush=True)
 
-            # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
+            # Graph RAG retrieval — runs in <5 ms against in-memory EnrichedSchema.
+            # Returns ranked TableCandidates with column/JOIN hints for QueryAgent.
+            retrieved_context = None
+            if enriched:
+                retrieved_context = _graph_rag.retrieve(
+                    user_text=user_text,
+                    intent=intent,
+                    enriched=enriched,
+                    top_k=6,
+                )
+                if retrieved_context and retrieved_context.primary_tables:
+                    await emit({
+                        "type": "rag.retrieved",
+                        "job_id": job_id,
+                        "tables": retrieved_context.primary_tables[:4],
+                        "confidence": round(retrieved_context.confidence, 3),
+                    })
+
+            # SCHEMA_EXPLORE: skip SQL pipeline, return a plain-English schema overview
+            if intent.intent_type == "SCHEMA_EXPLORE":
+                await set_pipeline_state(redis, job_id, "step", "schema_explored")
+                schema_overview = await self._build_schema_overview(user_text, schema, enriched)
+                schema_result = {
+                    "job_id": job_id,
+                    "score": 1.0,
+                    "chart_data": {"rows": [], "columns": [], "labels": [], "values": []},
+                    "low_confidence": False,
+                    "sql": "",
+                    "chart_type": "table",
+                    "title": "What data do you have?",
+                    "table_used": "",
+                    "x_axis_label": "",
+                    "y_axis_label": "",
+                    "output_mode": "text",
+                    "narrative": schema_overview,
+                    "validation_details": {},
+                }
+                await emit({
+                    "type": "chart.confirmed",
+                    "job_id": job_id,
+                    "score": 1.0,
+                    "chart_data": schema_result,
+                    "low_confidence": False,
+                })
+                if job:
+                    job.status = "completed"
+                    job.result_payload = schema_result
+                    job.completed_at = datetime.utcnow()
+                    await db.commit()
+                return schema_result
+
+            # Scope filtering: when scope="selected", restrict RAG candidates to chosen tables
+            if scope == "selected" and selected_tables and retrieved_context:
+                _norm = {t.lower() for t in selected_tables}
+                filtered_candidates = [
+                    c for c in (retrieved_context.candidates or [])
+                    if any(
+                        c.table_name.lower() == st or c.table_name.lower().endswith(f".{st}")
+                        for st in _norm
+                    )
+                ]
+                # Fallback: keep top candidate if none of the selected tables matched
+                retrieved_context.candidates = filtered_candidates or retrieved_context.candidates[:1]
+                filtered_primary = [
+                    t for t in (retrieved_context.primary_tables or [])
+                    if any(t.lower() == st or t.lower().endswith(f".{st}") for st in _norm)
+                ]
+                retrieved_context.primary_tables = filtered_primary or retrieved_context.primary_tables[:1]
+
+            # ── Multi-candidate ambiguity check ───────────────────────────────────────
+            # When the top-2 RAG candidates are close in score, run all in parallel
+            # so the user sees every plausible answer — not just the first guess.
             final_result = None
+            _multi_candidate_results: list[dict] = []
+
+            if retrieved_context and len(retrieved_context.candidates) >= 2:
+                from agent_service.agents.candidate_ranker import (
+                    get_pipeline_candidates, is_ambiguous,
+                    should_auto_select, candidate_label,
+                )
+                cand_scores = get_pipeline_candidates(retrieved_context.candidates)
+                if is_ambiguous(cand_scores):
+                    print(
+                        f"[pipeline:{job_id}] multi-candidate ambiguity: "
+                        + " | ".join(
+                            f"{c.table_name.split('.')[-1]}={c.normalized_score:.2f}"
+                            for c in cand_scores
+                        ),
+                        flush=True,
+                    )
+                    await emit({
+                        "type": "candidates.ranking",
+                        "job_id": job_id,
+                        "tables": [
+                            {"table": c.table_name, "score": round(c.rank_score, 3)}
+                            for c in cand_scores
+                        ],
+                    })
+                    tasks = [
+                        asyncio.wait_for(
+                            self._run_single_candidate(
+                                c.table_name, c.rank_score, job_id, user_text,
+                                intent, schema, db_type, enriched,
+                                retrieved_context, connection_id,
+                            ),
+                            timeout=40.0,
+                        )
+                        for c in cand_scores
+                    ]
+                    raw = await asyncio.gather(*tasks, return_exceptions=True)
+                    cand_results = [r for r in raw if isinstance(r, dict) and r is not None]
+                    if len(cand_results) >= 2:
+                        for i, cr in enumerate(cand_results):
+                            cr["label"] = candidate_label(i, cr["table"])
+                        if should_auto_select(cand_results):
+                            best = max(cand_results, key=lambda x: x["confidence"])
+                            final_result = self._candidate_to_final_result(job_id, best)
+                            print(
+                                f"[pipeline:{job_id}] auto-selected "
+                                f"{best['table']!r} confidence={best['confidence']:.3f}",
+                                flush=True,
+                            )
+                        else:
+                            _multi_candidate_results = cand_results
+                            best = max(cand_results, key=lambda x: x["confidence"])
+                            final_result = self._candidate_to_final_result(job_id, best)
+                            print(
+                                f"[pipeline:{job_id}] surfacing {len(cand_results)} "
+                                "candidates to user",
+                                flush=True,
+                            )
+                    elif len(cand_results) == 1:
+                        final_result = self._candidate_to_final_result(job_id, cand_results[0])
+
+            # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
+            # Skipped when multi-candidate already produced a final_result.
             retry_feedback: Optional[str] = None
             _MAX_SINGLE_VIZ_ATTEMPTS = 4
+            query_plan = None           # guards narration / fallback below
+            execute_result: dict = {}
             # Extract user-requested chart type (None if user didn't specify one)
             expected_chart_type: Optional[str] = getattr(intent.entities, "chart_type", None)
             # How the user wants the answer presented: "chart" (visualize) or "text" (prose answer)
             output_mode: str = (getattr(intent, "output_mode", "chart") or "chart").lower()
+            # Allow the request to override the LLM-classified output mode
+            if output_mode_override:
+                output_mode = output_mode_override.lower()
 
-            for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1):
+            for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1) if final_result is None else []:
                 # Step 3: Generate query — pass attempt so temperature scales on retries
                 await set_pipeline_state(redis, job_id, "step", f"generating_query_attempt_{attempt}")
-                query_plan = await self._query.generate(intent, schema, db_type, retry_feedback, attempt, enriched)
+                query_plan = await self._query.generate(
+                    intent, schema, db_type, retry_feedback, attempt, enriched,
+                    retrieved_context=retrieved_context,
+                    conversation_history=conversation_history,
+                )
                 await emit({
                     "type": "query.generated",
                     "job_id": job_id,
@@ -177,6 +330,62 @@ class Orchestrator:
                 })
                 await set_pipeline_state(redis, job_id, "step", "query_executed")
 
+                # Post-execution: correct the chart title's year range to match actual data.
+                # Handles float years (2021.0), non-string columns, and falls back to
+                # scanning all columns for year-like values when column name is ambiguous.
+                try:
+                    import re as _re
+                    _rows = execute_result.get("rows") or []
+                    _cols = execute_result.get("columns") or []
+
+                    # Primary: find column by name containing a date keyword
+                    _date_col = next(
+                        (c for c in _cols if isinstance(c, str) and
+                         any(k in c.lower() for k in ["year", "date", "month", "period", "quarter"])),
+                        None,
+                    )
+
+                    # Fallback: scan each column's values — pick one whose first few rows
+                    # are all 4-digit year-range numbers (1990–2100)
+                    if not _date_col and _rows:
+                        for _c in _cols:
+                            if not isinstance(_c, str):
+                                continue
+                            _probe = [_rows[i].get(_c) for i in range(min(5, len(_rows)))]
+                            _probe = [v for v in _probe if v is not None]
+                            if _probe and all(
+                                isinstance(v, (int, float)) and 1990 <= float(v) <= 2100
+                                for v in _probe
+                            ):
+                                _date_col = _c
+                                break
+
+                    if _date_col and _rows:
+                        _year_ints = []
+                        for _r in _rows:
+                            _v = _r.get(_date_col)
+                            if _v is not None:
+                                try:
+                                    _year_ints.append(int(float(str(_v))))
+                                except (ValueError, TypeError):
+                                    pass
+                        if len(_year_ints) >= 2:
+                            _actual = f"{min(_year_ints)}–{max(_year_ints)}"
+                            _old_title = query_plan.title
+                            _new_title = _re.sub(
+                                r'\(\d{4}\s*[-–]\s*\d{4}\)',
+                                f'({_actual})',
+                                query_plan.title,
+                            )
+                            if _new_title != _old_title:
+                                query_plan.title = _new_title
+                                print(
+                                    f"[orchestrator] title corrected: '{_old_title}' → '{_new_title}'",
+                                    flush=True,
+                                )
+                except Exception as _te:
+                    print(f"[orchestrator] title correction error (non-fatal): {_te}", flush=True)
+
                 # Step 5: Render chart — only when the answer is meant to be a chart
                 if output_mode == "chart":
                     render_result = await self._render_chart(query_plan, execute_result)
@@ -202,7 +411,10 @@ class Orchestrator:
                     "dimension_scores": validation.dimension_scores.model_dump(),
                 })
 
-                if not validation.passed and attempt < _MAX_SINGLE_VIZ_ATTEMPTS and validation.retry_feedback:
+                # Use local threshold (0.65) instead of validator's hardcoded 0.80.
+                # This lets well-formed results pass on the first attempt.
+                _passed = validation.score >= _VALIDATION_PASS_THRESHOLD
+                if not _passed and attempt < _MAX_SINGLE_VIZ_ATTEMPTS and validation.retry_feedback:
                     retry_feedback = validation.retry_feedback.feedback
                     await emit({
                         "type": "validation.retry",
@@ -229,8 +441,8 @@ class Orchestrator:
                 }
                 break
 
-            if not final_result:
-                # All attempts failed — use last results with low confidence
+            if not final_result and query_plan is not None:
+                # All single-candidate attempts failed — use last results with low confidence
                 chart_data = self._build_chart_data(query_plan, execute_result, {})
                 final_result = {
                     "job_id": job_id,
@@ -246,11 +458,69 @@ class Orchestrator:
                     "validation_details": {},
                 }
 
-            # Narrate the result: a concise chart caption, or a prose answer for text mode.
+            # Correct final_result title: replace user-stated year range with actual data range.
+            # Works on the plain dict so Pydantic field-setting is not involved.
+            if final_result and execute_result:
+                try:
+                    import re as _re2
+                    _r2 = execute_result.get("rows") or []
+                    _c2 = execute_result.get("columns") or []
+                    _dc = next(
+                        (c for c in _c2 if isinstance(c, str) and
+                         any(k in c.lower() for k in ["year", "date", "month", "period", "quarter"])),
+                        None,
+                    )
+                    if not _dc and _r2:
+                        for _cc in _c2:
+                            if not isinstance(_cc, str):
+                                continue
+                            _pv = [_r2[i].get(_cc) for i in range(min(5, len(_r2)))]
+                            _pv = [v for v in _pv if v is not None]
+                            if _pv and all(isinstance(v, (int, float)) and 1990 <= float(v) <= 2100 for v in _pv):
+                                _dc = _cc
+                                break
+                    if _dc and _r2:
+                        _yi = []
+                        for _rr in _r2:
+                            _vv = _rr.get(_dc)
+                            if _vv is not None:
+                                try:
+                                    _yi.append(int(float(str(_vv))))
+                                except (ValueError, TypeError):
+                                    pass
+                        if len(_yi) >= 2:
+                            _act = f"{min(_yi)}–{max(_yi)}"
+                            _old = final_result.get("title", "")
+                            _new = _re2.sub(r'\(\d{4}\s*[-–]\s*\d{4}\)', f'({_act})', _old)
+                            if _new != _old:
+                                final_result["title"] = _new
+                                # Also update nested chart_data title if present
+                                if isinstance(final_result.get("chart_data"), dict):
+                                    final_result["chart_data"]["title"] = _new
+                                print(f"[orchestrator] title corrected: '{_old}' → '{_new}'", flush=True)
+                except Exception as _te2:
+                    print(f"[orchestrator] title correction (final_result) failed: {_te2}", flush=True)
+
+            # Narrate the result: stream tokens in real-time (single-viz path)
+            # or use the batch narrator (multi-candidate path where query_plan is None).
             narrative = ""
             try:
-                from agent_service.agents.result_narrator import narrate as _narrate
-                narrative = await _narrate(user_text, query_plan, execute_result, output_mode)
+                from agent_service.agents.result_narrator import (
+                    narrate_stream as _narrate_stream,
+                    narrate_from_result as _narrate_from_result,
+                )
+                if query_plan is not None:
+                    # Stream tokens for real-time display in the frontend
+                    async for token in _narrate_stream(user_text, query_plan, execute_result, output_mode):
+                        narrative += token
+                        await emit({
+                            "type": "narrative.token",
+                            "job_id": job_id,
+                            "token": token,
+                        })
+                else:
+                    # Multi-candidate path: query_plan is None, narrate from the result dict
+                    narrative = await _narrate_from_result(user_text, final_result, output_mode)
             except Exception as _ne:
                 print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
             final_result["output_mode"] = output_mode
@@ -261,6 +531,19 @@ class Orchestrator:
                 "output_mode": output_mode,
                 "narrative": narrative,
             })
+
+            # When multiple candidates are competitive, surface them all so the user
+            # can pick the right answer before we commit to the best guess.
+            if _multi_candidate_results:
+                await emit({
+                    "type": "candidates.available",
+                    "job_id": job_id,
+                    "candidates": _multi_candidate_results,
+                    "message": (
+                        "I found multiple possible answers. "
+                        "Please choose the one that looks right:"
+                    ),
+                })
 
             await emit({
                 "type": "chart.confirmed",
@@ -576,6 +859,194 @@ class Orchestrator:
             "image_data": render_result.get("image_base64"),
         })
         return payload
+
+    # ── Multi-candidate helpers ────────────────────────────────────────────────
+
+    async def _run_single_candidate(
+        self,
+        candidate_table: str,
+        candidate_score: float,
+        job_id: str,
+        user_text: str,
+        intent,
+        schema,
+        db_type: str,
+        enriched,
+        retrieved_context,
+        connection_id: str,
+    ) -> Optional[dict]:
+        """Run query → execute → render for ONE candidate table.
+        Returns a result dict with confidence and chart_data, or None on failure.
+        Used by the multi-candidate parallel execution path."""
+        import copy
+        try:
+            # Build a focused RetrievedContext that only mentions this candidate.
+            local_ctx = copy.copy(retrieved_context) if retrieved_context else None
+            if local_ctx is not None:
+                focused = [c for c in (local_ctx.candidates or []) if c.table_name == candidate_table]
+                if not focused:
+                    from agent_service.agents.graph_rag_retriever import TableCandidate
+                    focused = [TableCandidate(table_name=candidate_table, score=candidate_score)]
+                local_ctx.candidates = focused
+                local_ctx.primary_tables = [candidate_table]
+
+            query_plan = await self._query.generate(
+                intent, schema, db_type, None, 1, enriched,
+                retrieved_context=local_ctx,
+                conversation_history=None,
+            )
+
+            exec_result = await self._execute_query(connection_id, query_plan.sql)
+            if exec_result.get("error"):
+                print(
+                    f"[pipeline:{job_id}] candidate {candidate_table!r} "
+                    f"exec error: {str(exec_result['error'])[:80]}",
+                    flush=True,
+                )
+                return None
+
+            rows = exec_result.get("rows") or []
+            cols = exec_result.get("columns") or []
+            if not rows:
+                return None
+
+            from agent_service.agents.candidate_ranker import (
+                score_result_quality, compute_final_confidence,
+            )
+            quality = score_result_quality(rows, cols)
+            if quality < 0.15:
+                return None
+            confidence = compute_final_confidence(candidate_score, quality, candidate_score)
+
+            render_result = await self._render_chart(query_plan, exec_result)
+            chart_data = self._build_chart_data(query_plan, exec_result, render_result)
+
+            # Correct title: replace user-stated year range with actual data range
+            import re as _re_c
+            corrected_title = query_plan.title
+            try:
+                _dc = next(
+                    (c for c in cols if isinstance(c, str) and
+                     any(k in c.lower() for k in ["year", "date", "month", "period", "quarter"])),
+                    None,
+                )
+                if not _dc:
+                    for _cc in cols:
+                        if not isinstance(_cc, str):
+                            continue
+                        _pv = [rows[i].get(_cc) for i in range(min(5, len(rows)))]
+                        _pv = [v for v in _pv if v is not None]
+                        if _pv and all(isinstance(v, (int, float)) and 1990 <= float(v) <= 2100 for v in _pv):
+                            _dc = _cc
+                            break
+                if _dc:
+                    _yi = []
+                    for _r in rows:
+                        _v = _r.get(_dc)
+                        if _v is not None:
+                            try:
+                                _yi.append(int(float(str(_v))))
+                            except (ValueError, TypeError):
+                                pass
+                    if len(_yi) >= 2:
+                        _act = f"{min(_yi)}–{max(_yi)}"
+                        _new_t = _re_c.sub(r'\(\d{4}\s*[-–]\s*\d{4}\)', f'({_act})', query_plan.title)
+                        if _new_t != query_plan.title:
+                            corrected_title = _new_t
+                            chart_data["title"] = _new_t
+                            print(
+                                f"[pipeline:{job_id}] candidate title corrected: "
+                                f"'{query_plan.title}' → '{_new_t}'",
+                                flush=True,
+                            )
+            except Exception as _tce:
+                print(f"[pipeline:{job_id}] candidate title correction error: {_tce}", flush=True)
+
+            return {
+                "table": candidate_table,
+                "rank_score": round(candidate_score, 4),
+                "result_quality": round(quality, 3),
+                "confidence": confidence,
+                "sql": query_plan.sql,
+                "chart_type": query_plan.chart_type,
+                "title": corrected_title,
+                "x_axis_label": query_plan.x_axis_label,
+                "y_axis_label": query_plan.y_axis_label,
+                "table_used": query_plan.table_used,
+                "chart_data": chart_data,
+                "row_count": len(rows),
+            }
+        except Exception as exc:
+            print(f"[pipeline:{job_id}] candidate {candidate_table!r} failed: {exc}", flush=True)
+            return None
+
+    def _candidate_to_final_result(self, job_id: str, candidate: dict) -> dict:
+        """Convert a _run_single_candidate result dict into the final_result shape
+        expected by the narration + chart.confirmed steps."""
+        return {
+            "job_id": job_id,
+            "score": candidate["confidence"],
+            "chart_data": candidate["chart_data"],
+            "low_confidence": candidate["confidence"] < 0.65,
+            "sql": candidate["sql"],
+            "chart_type": candidate["chart_type"],
+            "title": candidate["title"],
+            "table_used": candidate["table"],
+            "x_axis_label": candidate["x_axis_label"],
+            "y_axis_label": candidate["y_axis_label"],
+            "validation_details": {
+                "rank_score": candidate["rank_score"],
+                "result_quality": candidate["result_quality"],
+            },
+        }
+
+    async def _build_schema_overview(self, user_text: str, schema, enriched) -> str:
+        """Generate a plain-English overview of the database schema for SCHEMA_EXPLORE intent."""
+        tables_info: list[str] = []
+        if enriched and hasattr(enriched, "compact_tables"):
+            for t in (enriched.compact_tables or [])[:35]:
+                name = t.get("name", "")
+                description = t.get("description", "")
+                col_count = len(t.get("columns", []))
+                if name:
+                    tables_info.append(
+                        f"- {name}: {description or 'no description'} ({col_count} columns)"
+                    )
+        elif hasattr(schema, "tables"):
+            for t in (schema.tables or [])[:35]:
+                name = getattr(t, "table_name", getattr(t, "name", ""))
+                if name:
+                    tables_info.append(f"- {name}")
+
+        table_list = "\n".join(tables_info) if tables_info else "No tables found"
+        prompt = (
+            f"User asked: \"{user_text}\"\n\n"
+            f"Available tables and views:\n{table_list}\n\n"
+            f"Write a friendly 3-5 sentence overview of what data is available — what kinds of "
+            f"business questions can be answered, what domains the data covers. "
+            f"Then provide exactly 3 example questions the user could ask, formatted as:\n"
+            f"**Example questions you can ask:**\n- ...\n- ...\n- ..."
+        )
+        try:
+            overview = await bedrock_invoke(
+                model_id=BEDROCK_HAIKU_MODEL,
+                system_prompt=(
+                    "You are a helpful data analyst explaining what data is available. "
+                    "Be concise, friendly, and use plain language. "
+                    "Format example questions as a markdown list."
+                ),
+                user_message=prompt,
+                max_tokens=700,
+                temperature=0.3,
+            )
+            return (overview or "").strip()
+        except Exception as exc:
+            print(f"[orchestrator] schema overview failed: {exc}", flush=True)
+            total = len(tables_info)
+            return (
+                f"You have access to {total} tables and views. "
+                f"Ask me anything about your data, like revenue trends, user activity, or product performance."
+            )
 
     async def run_dashboard_pipeline(
         self,

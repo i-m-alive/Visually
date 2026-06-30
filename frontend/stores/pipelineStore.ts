@@ -30,6 +30,23 @@ export interface ChartResult {
   column_labels?: Record<string, string>
 }
 
+/** One entry in a multi-candidate response — each backed by a different table. */
+export interface CandidateResult {
+  table: string
+  rank_score: number
+  result_quality: number
+  confidence: number
+  label: string
+  sql: string
+  chart_type: string
+  title: string
+  x_axis_label: string
+  y_axis_label: string
+  table_used: string
+  row_count: number
+  chart_data: ChartResult['chart_data']
+}
+
 interface PipelineSteps {
   intent: StepStatus
   schema: StepStatus
@@ -42,6 +59,7 @@ interface PipelineSteps {
 export interface DashboardResult {
   charts: ChartResult[]
   layout: { chart_index: number; x: number; y: number; w: number; h: number }[]
+  dashboardId?: string
 }
 
 export interface ScreenshotJobState {
@@ -61,9 +79,14 @@ interface PipelineJobState {
   tableUsed?: string
   validationScore?: number
   retryAttempt?: number
-  chartResult?: ChartResult
+  chartResult?: ChartResult          // last confirmed result (backward compat)
+  chartResults: ChartResult[]        // all confirmed results (multi-result display)
   dashboardResult?: DashboardResult
+  // Set when 2-3 candidate tables are competitive — user must pick one.
+  candidates?: CandidateResult[]
+  candidatesMessage?: string
   error?: string
+  streamingNarrative?: string
   events: unknown[]
 }
 
@@ -93,13 +116,13 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
   resetJob: (jobId) => set((state) => ({
     jobs: {
       ...state.jobs,
-      [jobId]: { steps: defaultSteps(), screenshotSteps: {}, events: [] },
+      [jobId]: { steps: defaultSteps(), screenshotSteps: {}, events: [], chartResults: [], streamingNarrative: '' },
     },
   })),
 
   handleEvent: (jobId, event) => {
     set((state) => {
-      const job: PipelineJobState = state.jobs[jobId] || { steps: defaultSteps(), screenshotSteps: {}, events: [] }
+      const job: PipelineJobState = state.jobs[jobId] || { steps: defaultSteps(), screenshotSteps: {}, events: [], chartResults: [] }
       const type = event.type as string
       const updated = {
         ...job,
@@ -163,6 +186,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
               table_used: c.table_used as string || '',
             })),
             layout: (res?.layout as DashboardResult['layout']) || [],
+            dashboardId: (res?.dashboard_id as string) || undefined,
           }
           updated.steps.validate = 'done'
           break
@@ -227,7 +251,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
             // Per-chart confirmation for screenshot pipeline
             updated.screenshotSteps[`chart_${event.chart_id}_status`] = 'confirmed'
           } else {
-            // Existing single-chart pipeline behaviour
+            // Main query-chat pipeline — accumulate all qualifying results
             updated.steps.validate = 'done'
             // event.chart_data is the whole final_result; the actual chart arrays
             // (rows/columns/labels/values + series/matrix/etc.) live one level
@@ -235,7 +259,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
             // through whole so every chart type renders.
             const fr = event.chart_data as Record<string, unknown>
             const cd = ((fr?.chart_data as Record<string, unknown>) || fr)
-            updated.chartResult = {
+            const newResult: ChartResult = {
               chart_type: (fr?.chart_type ?? cd?.chart_type) as string,
               title: (fr?.title ?? cd?.title) as string,
               chart_data: cd as ChartResult['chart_data'],
@@ -249,6 +273,8 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
               output_mode: (fr?.output_mode as string) || 'chart',
               narrative: (fr?.narrative as string) || '',
             }
+            updated.chartResult = newResult
+            updated.chartResults = [...(job.chartResults || []), newResult]
           }
           break
         case 'chart.low_confidence':
@@ -289,6 +315,20 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
           break
         // --- End verification events ---
         // --- End screenshot events ---
+        case 'candidates.available': {
+          // Multiple tables scored similarly — surface all options for the user to pick.
+          const rawCandidates = (event.candidates as CandidateResult[]) || []
+          updated.candidates = rawCandidates
+          updated.candidatesMessage = (event.message as string) || 'I found multiple possible answers. Choose one:'
+          break
+        }
+        case 'narrative.token':
+          updated.streamingNarrative = (updated.streamingNarrative || '') + (event.token as string || '')
+          break
+        case 'result.narrated':
+          // Clear streaming narrative once the full narrative is confirmed
+          updated.streamingNarrative = ''
+          break
         case 'pipeline.error':
           updated.error = event.message as string
           Object.keys(updated.steps).forEach((k) => {

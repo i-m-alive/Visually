@@ -197,26 +197,41 @@ Return ONLY valid JSON with this exact structure (no prose, no markdown):
   ]
 }}"""
 
-    try:
-        raw = await asyncio.wait_for(
-            bedrock_invoke(
-                model_id=_EXTRACTION_MODEL,
-                system_prompt="You are a database schema analyst. Return only valid JSON.",
-                user_message=prompt,
-                temperature=0.0,
-                max_tokens=8000,
-            ),
-            timeout=90.0,
-        )
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
-            raw = re.sub(r"\n?```\s*$", "", raw)
-        parsed = json.loads(raw)
-        return parsed.get("tables", [])
-    except Exception as exc:
-        print(f"[metadata_extractor] LLM batch failed: {exc}", flush=True)
-        return []
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
+            raw = await asyncio.wait_for(
+                bedrock_invoke(
+                    model_id=_EXTRACTION_MODEL,
+                    system_prompt="You are a database schema analyst. Return only valid JSON.",
+                    user_message=prompt,
+                    temperature=0.0,
+                    max_tokens=12000,
+                ),
+                timeout=120.0,
+            )
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                raw = re.sub(r"\n?```\s*$", "", raw)
+            parsed = json.loads(raw)
+            results = parsed.get("tables", [])
+            if results:
+                return results
+            # LLM returned empty tables list — treat as soft failure and retry
+            print(
+                f"[metadata_extractor] LLM batch returned 0 tables"
+                f" (attempt {attempt + 1}/3), retrying…",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[metadata_extractor] LLM batch failed"
+                f" (attempt {attempt + 1}/3): {exc}",
+                flush=True,
+            )
+    return []
 
 
 # ── Main orchestrator ─────────────────────────────────────────────────────────
@@ -279,19 +294,53 @@ async def _do_extraction(
             "sample_rows": sample_rows_map.get(qualified, []),
         })
 
-    # ── Phase A: LLM extraction (3 tables per batch, all batches in parallel) ─
+    # ── Phase A: LLM extraction (3 tables per batch, max 5 concurrent) ─────────
     _BATCH = 3
+    # Limit to 100 table names in the prompt context (reduces token bloat per call)
+    _PROMPT_TABLE_NAMES = all_qualified[:100]
     batches = [table_payloads[i:i + _BATCH] for i in range(0, len(table_payloads), _BATCH)]
     print(
         f"[metadata_extractor] Phase A: {len(table_payloads)} tables"
-        f" → {len(batches)} LLM batch(es)",
+        f" → {len(batches)} LLM batch(es) (max 5 concurrent)",
         flush=True,
     )
-    batch_results = await asyncio.gather(
-        *[_call_llm_batch(b, all_qualified) for b in batches]
-    )
+    # Semaphore prevents thundering-herd rate-limit failures when there are many tables
+    _sem = asyncio.Semaphore(5)
+
+    async def _guarded_batch(b: list[dict]) -> list[dict]:
+        async with _sem:
+            return await _call_llm_batch(b, _PROMPT_TABLE_NAMES)
+
+    batch_results = await asyncio.gather(*[_guarded_batch(b) for b in batches])
     llm_results: list[dict] = [r for batch in batch_results for r in batch]
     print(f"[metadata_extractor] Phase A done: {len(llm_results)} tables extracted", flush=True)
+
+    # Mop-up: retry any tables that were silently dropped (solo, 1 per batch)
+    extracted_names = {t.get("table_name", "").lower() for t in llm_results}
+    missing_payloads = [
+        p for p in table_payloads
+        if p["qualified_name"].lower() not in extracted_names
+    ]
+    if missing_payloads:
+        print(
+            f"[metadata_extractor] Phase A mop-up: {len(missing_payloads)} tables"
+            " missing, retrying solo (1 per call)…",
+            flush=True,
+        )
+        mop_sem = asyncio.Semaphore(3)
+
+        async def _guarded_solo(p: dict) -> list[dict]:
+            async with mop_sem:
+                return await _call_llm_batch([p], _PROMPT_TABLE_NAMES)
+
+        mop_results = await asyncio.gather(*[_guarded_solo(p) for p in missing_payloads])
+        recovered = [r for batch in mop_results for r in batch]
+        print(
+            f"[metadata_extractor] Phase A mop-up recovered {len(recovered)}"
+            f" / {len(missing_payloads)} tables",
+            flush=True,
+        )
+        llm_results.extend(recovered)
 
     if not llm_results:
         print("[metadata_extractor] Phase A returned 0 tables — aborting", flush=True)

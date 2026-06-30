@@ -719,7 +719,9 @@ async def trigger_schema_crawl(project_id: str, current_user: User = Depends(get
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(f"{SCHEMA_CRAWLER_URL}/crawl",
                 json={"connection_id": str(conn.id), "project_id": project_id})
-            return resp.json()
+            data = resp.json()
+            print(f"[agent] crawl triggered project={project_id[:8]} conn={str(conn.id)[:8]} job={data.get('job_id', '?')[:8]}", flush=True)
+            return data
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Schema crawler unavailable: {e}")
 
@@ -729,7 +731,10 @@ async def get_crawl_status(project_id: str, job_id: str, current_user: User = De
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{SCHEMA_CRAWLER_URL}/crawl/{job_id}")
-            return resp.json()
+            data = resp.json()
+            status = data.get("status", "?")
+            print(f"[agent] crawl-poll job={job_id[:8]} status={status}", flush=True)
+            return data
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Schema crawler unavailable: {e}")
 
@@ -930,17 +935,49 @@ class IntentSubmitRequest(BaseModel):
     text: str
     project_id: str
     connection_id: Optional[str] = None
+    # Last N turns from the frontend — used to resolve follow-up queries in the pipeline.
+    # Each turn: {role: "user"|"assistant", content: str, chart_title?: str, sql?: str}
+    conversation_history: Optional[list] = None
+    # Schema scope — when "selected", only selected_tables (+ their FK neighbours) are used
+    scope: Optional[str] = None           # "selected" | "database" | None (= "database")
+    selected_tables: Optional[list[str]] = None
+    selected_hops: Optional[int] = 2
+    # Override output_mode from intent classification ("chart" | "table" | "text")
+    output_mode: Optional[str] = None
 
 
 _orchestrator = Orchestrator()
 _quick_classifier = QuickClassifier()
 
 
-async def _run_pipeline(job_id: str, user_text: str, project_id: str, user_id: str, connection_id: str, job_type: str):
+async def _run_pipeline(
+    job_id: str,
+    user_text: str,
+    project_id: str,
+    user_id: str,
+    connection_id: str,
+    job_type: str,
+    conversation_history: Optional[list] = None,
+    scope: Optional[str] = None,
+    selected_tables: Optional[list[str]] = None,
+    selected_hops: Optional[int] = 2,
+    output_mode: Optional[str] = None,
+):
     from shared.database import AsyncSessionLocal
     redis = await get_redis()
+
+    # Classify here (background) instead of blocking the HTTP response.
+    # If classification returns DASHBOARD we switch pipelines; otherwise SINGLE_VIZ.
+    resolved_type = job_type
+    if job_type == "SINGLE_VIZ":
+        try:
+            intent_preview = await _quick_classifier.classify(user_text)
+            resolved_type = intent_preview.intent_type or "SINGLE_VIZ"
+        except Exception:
+            resolved_type = "SINGLE_VIZ"
+
     async with AsyncSessionLocal() as db:
-        if job_type == "DASHBOARD":
+        if resolved_type == "DASHBOARD":
             await _orchestrator.run_dashboard_pipeline(
                 job_id=job_id, user_text=user_text, project_id=project_id,
                 user_id=user_id, connection_id=connection_id, redis=redis, db=db,
@@ -949,6 +986,11 @@ async def _run_pipeline(job_id: str, user_text: str, project_id: str, user_id: s
             await _orchestrator.run_single_viz_pipeline(
                 job_id=job_id, user_text=user_text, project_id=project_id,
                 user_id=user_id, connection_id=connection_id, redis=redis, db=db,
+                conversation_history=conversation_history,
+                scope=scope,
+                selected_tables=selected_tables,
+                selected_hops=selected_hops,
+                output_mode_override=output_mode,
             )
     if redis is not None:
         await redis.aclose()
@@ -971,12 +1013,9 @@ async def submit_intent(
             raise HTTPException(status_code=400, detail="No active database connection. Please add a connection and crawl first.")
         connection_id = str(conn.id)
 
-    # Pre-classify to decide pipeline type
-    try:
-        intent_preview = await _quick_classifier.classify(req.text)
-        job_type = intent_preview.intent_type  # SINGLE_VIZ | DASHBOARD | FOLLOWUP
-    except Exception:
-        job_type = "SINGLE_VIZ"
+    # Default to SINGLE_VIZ — classification now happens inside _run_pipeline (background)
+    # so the job_id is returned immediately without blocking on a Bedrock call.
+    job_type = "SINGLE_VIZ"
 
     job_id = str(uuid.uuid4())
     job = PipelineJob(
@@ -988,7 +1027,11 @@ async def submit_intent(
     db.add(job)
     await db.commit()
 
-    background_tasks.add_task(_run_pipeline, job_id, req.text, req.project_id, str(current_user.id), connection_id, job_type)
+    background_tasks.add_task(
+        _run_pipeline, job_id, req.text, req.project_id, str(current_user.id),
+        connection_id, job_type, req.conversation_history,
+        req.scope, req.selected_tables, req.selected_hops, req.output_mode,
+    )
     return {"job_id": job_id, "status": "pending", "job_type": job_type}
 
 

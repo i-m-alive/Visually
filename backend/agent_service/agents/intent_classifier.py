@@ -12,6 +12,7 @@ INTENT TYPES (choose exactly one):
 - SINGLE_VIZ: User wants one chart/visualization. Signals: "show me", "chart", "graph", "visualize", metric/dimension words.
 - DASHBOARD: User wants multiple charts, a full dashboard, or an overview. Signals: "dashboard", "overview", "summary", "report", multiple different metric words in one request.
 - FOLLOWUP: User is referring to a prior result with pronouns. Signals: "it", "that", "this chart", "the graph", "filter", "drill", "refine", "update", "change it", "why did it".
+- SCHEMA_EXPLORE: User wants to explore what data/tables are available, understand the database structure, or get example questions they can ask. Signals: "what tables do I have", "what data do I have", "explain my schema", "what can I ask", "what's in my database", "what data is available", "explore data", "list my tables", "what kind of questions", "what do I have access to", "show me what you know".
 
 OUTPUT MODE (choose exactly one) — how the answer is best presented:
 - "chart": the answer is best SHOWN as a visualization. Signals: "trend", "over time", "by <category>", "compare", "distribution", "breakdown", "top N", "show me a chart/graph", any explicit chart_type, or any request whose result is a series of values across a dimension/time.

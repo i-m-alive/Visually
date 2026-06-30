@@ -149,8 +149,24 @@ export const projectApi = {
     api.get(`/projects/${projectId}/schema/metadata`),
 }
 
+export interface ConversationTurn {
+  role: 'user' | 'assistant'
+  content: string          // user text or chart title/narrative
+  chart_title?: string     // if assistant turn had a chart
+  sql?: string             // SQL that produced the last chart
+}
+
 export const agentApi = {
-  submitIntent: (data: { text: string; project_id: string; connection_id?: string }) =>
+  submitIntent: (data: {
+    text: string
+    project_id: string
+    connection_id?: string
+    conversation_history?: ConversationTurn[]
+    output_mode?: string
+    scope?: 'database' | 'selected'
+    selected_tables?: string[]
+    selected_hops?: number
+  }) =>
     api.post('/agent/intent', data),
   getJob: (jobId: string) =>
     api.get(`/agent/jobs/${jobId}`),
@@ -198,6 +214,8 @@ export interface StreamChatHandlers {
   onAction?: (action: Record<string, unknown>) => void
   onDone?: (meta: { session_id: string; turn_count: number }) => void
   onError: (message: string) => void
+  /** Fired when multiple table candidates are competitive and the user must choose. */
+  onCandidates?: (candidates: Record<string, unknown>[], message: string) => void
 }
 
 /**
@@ -260,13 +278,15 @@ export async function streamChat(
     type?: string; delta?: string; chart?: Record<string, unknown>;
     action?: Record<string, unknown>; message?: string;
     session_id?: string; turn_count?: number
+    candidates?: Record<string, unknown>[]
   }) => {
     switch (evt.type) {
-      case 'text':   handlers.onText(evt.delta ?? ''); break
-      case 'chart':  if (evt.chart) handlers.onChart(evt.chart); break
-      case 'action': if (evt.action) handlers.onAction?.(evt.action); break
-      case 'error':  handlers.onError(evt.message ?? 'stream error'); break
-      case 'done':   handlers.onDone?.({ session_id: evt.session_id ?? '', turn_count: evt.turn_count ?? 0 }); break
+      case 'text':       handlers.onText(evt.delta ?? ''); break
+      case 'chart':      if (evt.chart) handlers.onChart(evt.chart); break
+      case 'action':     if (evt.action) handlers.onAction?.(evt.action); break
+      case 'error':      handlers.onError(evt.message ?? 'stream error'); break
+      case 'done':       handlers.onDone?.({ session_id: evt.session_id ?? '', turn_count: evt.turn_count ?? 0 }); break
+      case 'candidates': if (evt.candidates) handlers.onCandidates?.(evt.candidates, evt.message ?? ''); break
     }
   }
 

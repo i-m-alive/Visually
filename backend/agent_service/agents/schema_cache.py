@@ -131,6 +131,21 @@ class EnrichedSchema:
     compact_tables: list = field(default_factory=list)
     relationship_graph: RelationshipGraph = field(default_factory=RelationshipGraph)
 
+    # ── NL2SQL intelligence index (Phase 2–3) ─────────────────────────────────
+    # concept_index: maps business-vocabulary terms to table.column entries.
+    #   {concept_term: [{table, column, score, context}]}
+    #   e.g. {"revenue": [{"table": "billing.timesheetentry", "column": "billedgeneralrate", "score": 0.9, "context": "metric"}]}
+    concept_index: dict = field(default_factory=dict)
+
+    # entity_columns: maps entity types to their "name" columns.
+    #   {entity_type: [{table, column, is_primary, sample_values}]}
+    #   e.g. {"company": [{"table": "client_corporation", "column": "parentname", "is_primary": True, "sample_values": [...]}]}
+    entity_columns: dict = field(default_factory=dict)
+
+    # tfidf_index: pre-computed TF-IDF document vectors per table for Graph RAG retrieval.
+    #   {"idf": {term: idf_weight}, "tables": {table_name: {"tfidf_vec": {term: weight}}}}
+    tfidf_index: dict = field(default_factory=dict)
+
     def get_disambiguation_text(self) -> str:
         if not self.disambiguation:
             return ""
@@ -178,6 +193,10 @@ def _serialize_enriched(enriched: EnrichedSchema) -> str:
         "table_semantics": enriched.table_semantics,
         "compact_tables": enriched.compact_tables,
         "relationship_graph_edges": enriched.relationship_graph.edges,
+        # NL2SQL intelligence indexes
+        "concept_index": enriched.concept_index,
+        "entity_columns": enriched.entity_columns,
+        "tfidf_index": enriched.tfidf_index,
     }
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
@@ -196,6 +215,10 @@ def _deserialize_enriched(json_str: str) -> EnrichedSchema:
         table_semantics=data["table_semantics"],
         compact_tables=data["compact_tables"],
         relationship_graph=graph,
+        # NL2SQL intelligence indexes — default to {} for backward compat with old caches
+        concept_index=data.get("concept_index") or {},
+        entity_columns=data.get("entity_columns") or {},
+        tfidf_index=data.get("tfidf_index") or {},
     )
 
 
@@ -868,6 +891,40 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
         disambiguation = await _disambiguate_columns(ambiguous_columns, column_map, tables)
         table_semantics = db_covered_semantics
 
+    # ── NL2SQL intelligence indexes ───────────────────────────────────────────
+    # Build concept_index and entity_columns in parallel with everything else.
+    # concept_index uses both a heuristic pass (instant) and an LLM-enhanced pass
+    # (runs as a 3rd parallel task during cold build — zero extra wall-clock time).
+    heuristic_concept_index = _build_concept_index_heuristic(compact_tables, table_semantics)
+    heuristic_entity_columns = _build_entity_columns(compact_tables)
+
+    llm_concept_index: dict = {}
+    try:
+        llm_concept_index = await _build_concept_index_llm(compact_tables, db_type)
+    except Exception as exc:
+        print(f"[schema_cache] ⚠ LLM concept-index build failed (non-fatal): {exc}", flush=True)
+
+    # Merge: LLM entries take precedence over heuristic entries when present
+    concept_index = {**heuristic_concept_index}
+    for term, entries in llm_concept_index.items():
+        if term in concept_index:
+            # Deduplicate by (table, column), LLM wins on overlap
+            existing = {(e["table"], e["column"]): e for e in concept_index[term]}
+            for e in entries:
+                existing[(e["table"], e["column"])] = e
+            concept_index[term] = sorted(existing.values(), key=lambda x: x.get("score", 0), reverse=True)
+        else:
+            concept_index[term] = entries
+
+    print(
+        f"[schema_cache] concept_index built  terms={len(concept_index)}"
+        f"  entity_types={list(heuristic_entity_columns.keys())}",
+        flush=True,
+    )
+
+    # ── TF-IDF index for Graph RAG retrieval ─────────────────────────────────
+    tfidf_index = _build_tfidf_index(compact_tables, table_semantics)
+
     return EnrichedSchema(
         schema_doc=schema_doc,
         db_type=db_type,
@@ -877,6 +934,9 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
         table_semantics=table_semantics,
         compact_tables=compact_tables,
         relationship_graph=relationship_graph,
+        concept_index=concept_index,
+        entity_columns=heuristic_entity_columns,
+        tfidf_index=tfidf_index,
     )
 
 
@@ -1070,3 +1130,337 @@ Return ONLY valid JSON:
             print(f"[schema_cache] ⚠ table semantics batch failed: {e}", flush=True)
 
     return results
+
+
+# ── TF-IDF Index Builder (for Graph RAG retriever) ────────────────────────────
+
+def _build_tfidf_index(compact_tables: list, table_semantics: dict) -> dict:
+    """
+    Build a lightweight TF-IDF index over all table+column text blobs.
+    Pure Python — no numpy/sklearn. Runs at cache-build time (not query time).
+
+    Returns:
+      {
+        "idf": {term: float},
+        "tables": {table_name: {"tfidf_vec": {term: float}}}
+      }
+    """
+    import math as _math
+    import re as _re
+
+    def _tok(text: str) -> list:
+        return _re.findall(r"[a-z0-9]+", text.lower())
+
+    def _table_blob(t: dict, sem: dict) -> str:
+        tn = t.get("name", "")
+        s = sem.get(tn, {})
+        parts: list[str] = []
+        bare = tn.split(".")[-1].replace("_", " ")
+        parts += [bare, bare, bare]
+        if t.get("description"):
+            parts.append(t["description"])
+        if s.get("business_name"):
+            parts += [s["business_name"], s["business_name"]]
+        if s.get("purpose"):
+            parts.append(s["purpose"])
+        for u in (s.get("use_for") or []):
+            parts.append(u)
+        for col in (s.get("key_metric_cols") or []):
+            parts += [col.replace("_", " ")] * 2
+        for col in (s.get("key_dimension_cols") or []):
+            parts += [col.replace("_", " ")] * 2
+        for col in (s.get("key_date_cols") or []):
+            parts.append(col.replace("_", " "))
+        for c in t.get("columns", []):
+            cname = c.get("name", "")
+            cdesc = c.get("description", "")
+            stype = c.get("semantic_type", "")
+            parts.append(cname.replace("_", " "))
+            if cdesc:
+                parts.append(cdesc[:150])
+            if stype in ("metric", "dimension"):
+                parts.append(cname.replace("_", " "))
+        return " ".join(parts)
+
+    if not compact_tables:
+        return {}
+
+    # Build per-table term frequencies
+    table_tfs: dict[str, dict] = {}
+    for t in compact_tables:
+        tn = t.get("name", "")
+        if not tn:
+            continue
+        tokens = _tok(_table_blob(t, table_semantics))
+        if not tokens:
+            continue
+        freq: dict[str, int] = {}
+        for tok in tokens:
+            freq[tok] = freq.get(tok, 0) + 1
+        n = len(tokens)
+        table_tfs[tn] = {tok: c / n for tok, c in freq.items()}
+
+    if not table_tfs:
+        return {}
+
+    # IDF: log((N + 1) / (df + 1)) + 1
+    N = len(table_tfs)
+    df: dict[str, int] = {}
+    for tfs in table_tfs.values():
+        for tok in tfs:
+            df[tok] = df.get(tok, 0) + 1
+    idf = {tok: _math.log((N + 1) / (d + 1)) + 1.0 for tok, d in df.items()}
+
+    # TF-IDF vectors per table
+    tables_out: dict[str, dict] = {}
+    for tn, tfs in table_tfs.items():
+        tfidf_vec = {tok: tf * idf.get(tok, 1.0) for tok, tf in tfs.items()}
+        tables_out[tn] = {"tfidf_vec": tfidf_vec}
+
+    return {"idf": idf, "tables": tables_out}
+
+
+# ── NL2SQL Concept-Index & Entity-Column Builders ─────────────────────────────
+
+def _build_concept_index_heuristic(
+    compact_tables: list[dict],
+    table_semantics: dict,
+) -> dict:
+    """
+    Build concept_index without any LLM calls.
+
+    Maps business-vocabulary terms → [{table, column, score, context}] by
+    mining column names, descriptions, semantic_type tags, and the
+    key_metric / key_dimension / key_date arrays from table_semantics.
+    """
+    index: dict[str, list[dict]] = {}
+
+    def _add(term: str, table: str, column: str, score: float, context: str = "") -> None:
+        term = term.lower().strip()
+        if not term or len(term) < 2:
+            return
+        entry = {"table": table, "column": column, "score": score, "context": context}
+        if term not in index:
+            index[term] = []
+        # Avoid exact duplicates
+        if not any(e["table"] == table and e["column"] == column for e in index[term]):
+            index[term].append(entry)
+
+    for tbl in compact_tables:
+        tname: str = tbl.get("name", "")
+        sem: dict = table_semantics.get(tname, {})
+        key_metrics: list[str] = sem.get("key_metric_cols", [])
+        key_dims: list[str] = sem.get("key_dimension_cols", [])
+        key_dates: list[str] = sem.get("key_date_cols", [])
+
+        for col in tbl.get("columns", []):
+            cname: str = col.get("name", "")
+            ctype: str = col.get("type", "").lower()
+            desc: str = col.get("description", "") or ""
+            stype: str = col.get("semantic_type", "") or ""
+
+            # High-score: column is a known key-metric/dim/date
+            if cname in key_metrics:
+                # Add both the bare name and a human-readable "table metric" alias
+                _add(cname.replace("_", " "), tname, cname, 0.95, "key_metric")
+                pretty = f"{tname.replace('_', ' ')} {cname.replace('_', ' ')}"
+                _add(pretty, tname, cname, 0.90, "key_metric")
+            elif cname in key_dims:
+                _add(cname.replace("_", " "), tname, cname, 0.85, "key_dimension")
+            elif cname in key_dates:
+                _add(cname.replace("_", " "), tname, cname, 0.80, "key_date")
+            else:
+                _add(cname.replace("_", " "), tname, cname, 0.60, "column_name")
+
+            # Semantic-type tags → concept aliases
+            if stype:
+                for tag in stype.replace(",", " ").split():
+                    _add(tag, tname, cname, 0.75, f"semantic_type:{stype}")
+
+            # Description tokens → concept terms
+            if desc:
+                for token in re.findall(r"[a-zA-Z_]{3,}", desc):
+                    _add(token.replace("_", " ").lower(), tname, cname, 0.55, "description")
+
+            # Table-level concept: "table_name column_name" combined phrase
+            combined = f"{tname.replace('_', ' ')} {cname.replace('_', ' ')}"
+            _add(combined, tname, cname, 0.70, "combined")
+
+        # Table-name itself → all key columns
+        tname_term = tname.replace("_", " ")
+        for cname in key_metrics[:3]:
+            _add(tname_term, tname, cname, 0.65, "table_key_metric")
+
+    # Sort each term's list by score descending
+    for term in index:
+        index[term].sort(key=lambda e: e["score"], reverse=True)
+
+    return index
+
+
+def _build_entity_columns(compact_tables: list[dict]) -> dict:
+    """
+    Build entity_columns: {entity_type -> [{table, column, is_primary, sample_values}]}.
+
+    Pure heuristic — no LLM.  Finds "name" / "id" / identifier columns and infers
+    the entity type from the table name using a keyword vocabulary.
+    """
+    _ENTITY_TABLE_KEYWORDS: dict[str, list[str]] = {
+        "company":  ["company", "client", "account", "customer", "organization",
+                     "employer", "agency", "vendor", "partner"],
+        "person":   ["person", "employee", "candidate", "user", "contact", "staff",
+                     "worker", "recruiter", "manager", "applicant", "member"],
+        "job":      ["job", "role", "position", "vacancy", "opening", "order",
+                     "placement", "requisition"],
+        "product":  ["product", "item", "sku", "service", "offering", "plan",
+                     "package", "subscription"],
+        "location": ["location", "office", "city", "region", "territory", "address",
+                     "site", "branch"],
+        "invoice":  ["invoice", "bill", "payment", "transaction", "charge", "fee"],
+        "timesheet":["timesheet", "timeentry", "time_log", "attendance", "hour"],
+    }
+
+    # Column-name patterns that suggest a "name" / identifier column
+    _NAME_COL_PATTERNS = re.compile(
+        r"(^name$|_name$|^title$|_title$|^label$|^display_name$|^full_name$"
+        r"|^description$|^desc$|^caption$)",
+        re.IGNORECASE,
+    )
+    _ID_COL_PATTERNS = re.compile(r"(^id$|_id$|^uuid$|^code$|^key$)", re.IGNORECASE)
+
+    result: dict[str, list[dict]] = {}
+
+    for tbl in compact_tables:
+        tname: str = tbl.get("name", "").lower()
+        cols: list[dict] = tbl.get("columns", [])
+
+        # Detect entity type from table name
+        entity_type: str | None = None
+        for etype, keywords in _ENTITY_TABLE_KEYWORDS.items():
+            if any(kw in tname for kw in keywords):
+                entity_type = etype
+                break
+        if entity_type is None:
+            continue
+
+        # Find name columns (high priority) then id columns (lower priority)
+        name_cols = [c for c in cols if _NAME_COL_PATTERNS.match(c.get("name", ""))]
+        id_cols = [c for c in cols if _ID_COL_PATTERNS.match(c.get("name", ""))]
+
+        for col in name_cols:
+            entry = {
+                "table": tbl.get("name", ""),
+                "column": col["name"],
+                "is_primary": True,
+                "sample_values": col.get("sample_values") or [],
+            }
+            result.setdefault(entity_type, []).append(entry)
+
+        for col in id_cols:
+            entry = {
+                "table": tbl.get("name", ""),
+                "column": col["name"],
+                "is_primary": False,
+                "sample_values": col.get("sample_values") or [],
+            }
+            result.setdefault(entity_type, []).append(entry)
+
+    return result
+
+
+_CONCEPT_INDEX_LLM_SYSTEM = (
+    "You are a BI metadata analyst. Given a database table's columns, return a "
+    "JSON object mapping business-vocabulary terms to the column(s) that satisfy "
+    "them. Return ONLY valid JSON — no prose, no markdown fences."
+)
+
+_CONCEPT_INDEX_LLM_TEMPLATE = """Table: {table_name}
+Purpose: {purpose}
+Columns: {columns_json}
+
+Return a JSON object where each key is a SHORT business term (1-4 words, lowercase)
+that a business user might say, and each value is a list of objects:
+  {{"column": "<col_name>", "score": <0.5-1.0>, "context": "<brief why>"}}
+
+Cover at minimum:
+- Every numeric column (revenue, count, amount, rate …)
+- Every date column (date, period, created_at …)
+- Key dimension/category columns
+
+Example output format:
+{{
+  "revenue": [{{"column": "total_amount", "score": 0.95, "context": "billing revenue"}}],
+  "date": [{{"column": "invoice_date", "score": 0.9, "context": "when invoiced"}}]
+}}"""
+
+
+async def _build_concept_index_llm(compact_tables: list[dict], db_type: str) -> dict:
+    """
+    LLM-enhanced concept index.  Runs one small Haiku call per table (batched
+    where possible) and returns the merged result.  Failures are tolerated
+    per-table; any surviving entries are merged with the heuristic index.
+    """
+    from shared.bedrock_client import bedrock_invoke, BEDROCK_HAIKU_MODEL  # noqa: PLC0415
+
+    result: dict[str, list[dict]] = {}
+
+    async def _call_one(tbl: dict) -> None:
+        tname = tbl.get("name", "")
+        cols_summary = [
+            {"name": c["name"], "type": c.get("type", ""), "desc": c.get("description", "")}
+            for c in tbl.get("columns", [])[:30]  # cap at 30 cols per table
+        ]
+        prompt = _CONCEPT_INDEX_LLM_TEMPLATE.format(
+            table_name=tname,
+            purpose=tbl.get("description", ""),
+            columns_json=json.dumps(cols_summary, ensure_ascii=False),
+        )
+        try:
+            raw = await asyncio.wait_for(
+                bedrock_invoke(
+                    model_id=BEDROCK_HAIKU_MODEL,
+                    system_prompt=_CONCEPT_INDEX_LLM_SYSTEM,
+                    user_message=prompt,
+                    temperature=0.0,
+                    max_tokens=1024,
+                ),
+                timeout=12.0,
+            )
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                raw = re.sub(r"\n?```\s*$", "", raw).strip()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return
+            for term, entries in data.items():
+                term_lower = term.lower().strip()
+                if not term_lower or not isinstance(entries, list):
+                    continue
+                for e in entries:
+                    if not isinstance(e, dict) or not e.get("column"):
+                        continue
+                    entry = {
+                        "table": tname,
+                        "column": str(e["column"]),
+                        "score": float(e.get("score", 0.75)),
+                        "context": str(e.get("context", "")),
+                    }
+                    result.setdefault(term_lower, []).append(entry)
+        except Exception as exc:
+            print(f"[schema_cache] ⚠ concept LLM failed for {tname}: {exc}", flush=True)
+
+    # Run at most 8 tables concurrently to avoid hammering Bedrock
+    semaphore = asyncio.Semaphore(8)
+
+    async def _bounded(tbl: dict) -> None:
+        async with semaphore:
+            await _call_one(tbl)
+
+    await asyncio.gather(*[_bounded(t) for t in compact_tables])
+
+    # Sort entries per term by score desc
+    for term in result:
+        result[term].sort(key=lambda e: e["score"], reverse=True)
+
+    return result

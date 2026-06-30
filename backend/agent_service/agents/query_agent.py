@@ -1,5 +1,7 @@
+import calendar
 import json
 import re
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Optional
 from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
 from shared.schemas.agent import IntentResult
@@ -9,6 +11,54 @@ from agent_service.agents.sql_utils import expand_table_aliases, basic_sql_lint,
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
+    from agent_service.agents.graph_rag_retriever import RetrievedContext
+
+
+def _months_ago_q(today: date, n: int) -> date:
+    month, year = today.month - n, today.year
+    while month <= 0:
+        month += 12; year -= 1
+    return date(year, month, min(today.day, calendar.monthrange(year, month)[1]))
+
+
+def _compute_date_bounds(time_range_value: str) -> tuple[str, str] | None:
+    """Convert a relative time-range string to concrete (start_iso, end_iso) dates.
+    Returns None when the pattern is not recognised."""
+    lower = (time_range_value or "").lower().strip()
+    today = date.today()
+
+    m = re.search(r"\blast\s+(\d+)\s+(day|week|month|year)s?\b", lower)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit == "day":   start = today - timedelta(days=n)
+        elif unit == "week":start = today - timedelta(weeks=n)
+        elif unit == "month": start = _months_ago_q(today, n)
+        else:               start = _months_ago_q(today, n * 12)
+        return start.isoformat(), today.isoformat()
+
+    if re.search(r"\bthis\s+year\b|\bytd\b|\byear[- ]to[- ]date\b", lower):
+        return date(today.year, 1, 1).isoformat(), today.isoformat()
+
+    if re.search(r"\blast\s+year\b|\bprevious\s+year\b", lower):
+        return date(today.year - 1, 1, 1).isoformat(), date(today.year - 1, 12, 31).isoformat()
+
+    if re.search(r"\bthis\s+month\b", lower):
+        return date(today.year, today.month, 1).isoformat(), today.isoformat()
+
+    if re.search(r"\blast\s+month\b|\bprevious\s+month\b", lower):
+        first_this = date(today.year, today.month, 1)
+        end_prev   = first_this - timedelta(days=1)
+        return date(end_prev.year, end_prev.month, 1).isoformat(), end_prev.isoformat()
+
+    if re.search(r"\blast\s+quarter\b|\bprevious\s+quarter\b", lower):
+        q = (today.month - 1) // 3
+        if q == 0:
+            return date(today.year - 1, 10, 1).isoformat(), date(today.year - 1, 12, 31).isoformat()
+        sm = (q - 1) * 3 + 1
+        return (date(today.year, sm, 1).isoformat(),
+                date(today.year, sm + 2, calendar.monthrange(today.year, sm + 2)[1]).isoformat())
+
+    return None
 
 
 def _score_table(intent_text: str, table: dict) -> float:
@@ -167,6 +217,21 @@ RULES:
 8. Prefer the most important table from the schema unless user specified another.
 9. Phase 2: you MAY join 2 tables when the metric and dimension don't share a table. Max 1 join. Use INNER JOIN or LEFT JOIN only.
 10. For MySQL: use DATE_FORMAT instead of date_trunc.
+11. TIME RANGE FILTERING (CRITICAL — apply whenever "time_range" is present in entities):
+    - ALWAYS add a WHERE clause that restricts the date column to the requested range.
+    - "last N months"  →  WHERE date_col >= CURRENT_DATE - INTERVAL 'N months'          (PostgreSQL/Redshift)
+    - "last N days"    →  WHERE date_col >= CURRENT_DATE - INTERVAL 'N days'
+    - "last N years"   →  WHERE date_col >= CURRENT_DATE - INTERVAL 'N years'
+    - "this month"     →  WHERE DATE_TRUNC('month', date_col) = DATE_TRUNC('month', CURRENT_DATE)
+    - "this year"      →  WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM CURRENT_DATE)
+    - "last year"      →  WHERE EXTRACT(YEAR FROM date_col) = EXTRACT(YEAR FROM CURRENT_DATE) - 1
+    - "ytd"            →  WHERE date_col >= DATE_TRUNC('year', CURRENT_DATE)
+    - "last quarter"   →  WHERE date_col >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '3 months'
+                           AND date_col < DATE_TRUNC('quarter', CURRENT_DATE)
+    - MySQL equivalents: CURDATE() instead of CURRENT_DATE, DATE_SUB(CURDATE(), INTERVAL N MONTH) for intervals
+    - Redshift: same as PostgreSQL — CURRENT_DATE and INTERVAL work identically
+    - NEVER skip the WHERE clause when a time_range is given — without it the query returns ALL history.
+    - Place the date WHERE clause BEFORE GROUP BY.
 
 CHART TYPE SQL PATTERNS:
 - line: SELECT date_trunc('month', date_col) AS period, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 1
@@ -259,11 +324,19 @@ BAR CHART (counts by category):
          WHERE job_role IS NOT NULL
          GROUP BY job_role ORDER BY 2 DESC LIMIT 20
 
-LINE CHART (trend over time):
+LINE CHART (trend over time — NO time_range given, return all history):
   Chart: "Monthly Revenue", x="Month", y="Revenue ($)"
   SQL:   SELECT DATE_TRUNC('month', order_date) AS "Month",
                 SUM(amount) AS "Revenue"
          FROM orders
+         GROUP BY 1 ORDER BY 1
+
+LINE CHART with time_range "last 3 months" (MUST include WHERE to restrict to that window):
+  Chart: "Placement Trend – Last 3 Months"
+  SQL:   SELECT DATE_TRUNC('month', placement_date) AS "Month",
+                COUNT(*) AS "Placements"
+         FROM placements
+         WHERE placement_date >= CURRENT_DATE - INTERVAL '3 months'
          GROUP BY 1 ORDER BY 1
 
 KPI CARD (single aggregate — NO GROUP BY, NO WHERE unless chart shows a period):
@@ -316,9 +389,37 @@ class QueryAgent:
         retry_feedback: Optional[str] = None,
         attempt: int = 1,
         enriched: Optional["EnrichedSchema"] = None,
+        retrieved_context: Optional["RetrievedContext"] = None,
+        conversation_history: Optional[list] = None,
     ) -> QueryPlan:
-        # Prefer enriched compact_tables with TF-IDF ranking when available
-        if enriched and enriched.compact_tables:
+        # ── Table selection: Graph RAG > word-overlap > schema.important_tables ──
+        if retrieved_context and retrieved_context.primary_tables and enriched and enriched.compact_tables:
+            # Use Graph RAG ranked tables — most accurate path
+            ct_map = {t["name"]: t for t in enriched.compact_tables}
+            # Primary candidates first, then fill with any extras on retries
+            ordered = list(dict.fromkeys(retrieved_context.primary_tables))
+            if attempt > 1:
+                # On retries, add more context: top word-overlap fallback tables
+                intent_text = (intent.reasoning or "") + " " + " ".join(
+                    intent.entities.metrics + intent.entities.dimensions
+                )
+                fallback = sorted(
+                    enriched.compact_tables,
+                    key=lambda t: _score_table(intent_text, t),
+                    reverse=True,
+                )
+                for t in fallback:
+                    tn = t.get("name", "")
+                    if tn not in ordered:
+                        ordered.append(tn)
+                    if len(ordered) >= 12:
+                        break
+            top_n = min(len(ordered), 12 if attempt > 1 else 8)
+            top_tables = [ct_map[tn] for tn in ordered[:top_n] if tn in ct_map]
+            important = [t.get("name") for t in top_tables[:5]]
+            semantics = enriched.get_table_semantics_text(important)
+        elif enriched and enriched.compact_tables:
+            # Fallback: word-overlap scoring (old path)
             intent_text = (intent.reasoning or "") + " " + " ".join(
                 intent.entities.metrics + intent.entities.dimensions
             )
@@ -327,11 +428,19 @@ class QueryAgent:
                 key=lambda t: _score_table(intent_text, t),
                 reverse=True,
             )
-            # On retries widen to top 12; first attempt top 8
             top_n = 12 if attempt > 1 else 8
             top_tables = scored[:top_n]
-            tables_context = [
-                {
+            important = [t.get("name") for t in top_tables[:5]]
+            semantics = enriched.get_table_semantics_text(important)
+        else:
+            important = schema.important_tables[:5]
+            top_tables = []
+            semantics = ""
+
+        tables_context = []
+        if top_tables:
+            for t in top_tables:
+                tables_context.append({
                     "name": t.get("name"),
                     "description": t.get("description"),
                     "row_count": t.get("row_count", 0),
@@ -349,14 +458,8 @@ class QueryAgent:
                         {"column": r.get("column"), "references": r.get("references")}
                         for r in (t.get("relationships") or [])
                     ],
-                }
-                for t in top_tables
-            ]
-            important = [t.get("name") for t in top_tables[:5]]
-            semantics = enriched.get_table_semantics_text(important)
+                })
         else:
-            important = schema.important_tables[:5]
-            tables_context = []
             for table in schema.tables:
                 if table.name in important or attempt > 1:
                     tables_context.append({
@@ -369,7 +472,6 @@ class QueryAgent:
                         ],
                         "relationships": [{"column": r.column, "references": r.references} for r in table.relationships],
                     })
-            semantics = ""
 
         user_content: dict = {
             "user_intent": intent.reasoning,
@@ -388,10 +490,49 @@ class QueryAgent:
         if semantics:
             user_content["table_semantics"] = semantics
 
+        # Inject Graph RAG hints when available — steers column/JOIN choices
+        if retrieved_context and retrieved_context.candidates:
+            from agent_service.agents.graph_rag_retriever import format_retrieval_hints
+            hints = format_retrieval_hints(retrieved_context)
+            if hints:
+                user_content["graph_rag_hints"] = hints
+
+        # Inject conversation history so the LLM can resolve follow-up references
+        # ("same table", "now add region", "break that down by X", "filter by last year", etc.)
+        if conversation_history:
+            # Keep the last 6 turns max to stay within token budget
+            trimmed = conversation_history[-6:]
+            user_content["conversation_history"] = trimmed
+            user_content["conversation_note"] = (
+                "The user may be asking a follow-up or refinement question. "
+                "Use conversation_history to interpret references like 'that chart', "
+                "'same table', 'now also by X', 'filter by last year', 'add a column', etc. "
+                "If the current query is self-contained ignore the history. "
+                "If it is a follow-up, build the SQL that satisfies both the prior intent "
+                "and the new refinement."
+            )
+
         if retry_feedback:
             user_content["retry_feedback"] = retry_feedback
             user_content["attempt"] = attempt
             user_content["instruction"] = "This is a retry. Apply the retry_feedback to fix the previous query."
+
+        # Pre-compute concrete date bounds for relative time ranges so the LLM writes
+        # the correct WHERE clause instead of guessing INTERVAL syntax.
+        if intent.entities.time_range and intent.entities.time_range.type == "relative":
+            bounds = _compute_date_bounds(intent.entities.time_range.value)
+            if bounds:
+                start_iso, end_iso = bounds
+                user_content["time_filter_required"] = {
+                    "start_date": start_iso,
+                    "end_date": end_iso,
+                    "instruction": (
+                        f"MANDATORY: add WHERE {{date_col}} >= '{start_iso}' "
+                        f"AND {{date_col}} <= '{end_iso}' "
+                        f"to the query. Replace {{date_col}} with the actual date column. "
+                        f"NEVER omit this filter — without it you return all history."
+                    ),
+                }
 
         # Increase temperature on retries to force diverse SQL exploration
         _temp = 0.10 if attempt == 1 else min(0.20 + (attempt - 1) * 0.10, 0.45)
