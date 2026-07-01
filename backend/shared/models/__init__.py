@@ -19,6 +19,7 @@ from .snapshot_schedules import SnapshotSchedule
 from .query_chat import QuerySession, QueryMessage
 from .vly_offline import VlyOfflineTable
 from .intelligence_report import IntelligenceReport
+from .brainwave_user_profile import BrainwaveUserProfile
 
 __all__ = [
     "User", "Project", "ProjectMember", "DatabaseConnection",
@@ -33,4 +34,5 @@ __all__ = [
     "QuerySession", "QueryMessage",
     "VlyOfflineTable",
     "IntelligenceReport",
+    "BrainwaveUserProfile",
 ]

@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { agentApi, querySessionApi, type ConversationTurn } from '@/lib/api'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
+import { MarkdownRenderer } from './MarkdownRenderer'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { IntentStatusBar } from '@/components/pipeline/IntentStatusBar'
 import { ReasoningDrawer } from '@/components/pipeline/ReasoningDrawer'
@@ -645,10 +646,10 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                               <span className="text-xs text-gray-400">{msg.jobId && jobs[msg.jobId] ? getLoadingText(jobs[msg.jobId], msg.jobType) : 'Starting pipeline…'}</span>
                             </div>
                             {msg.jobId && jobs[msg.jobId]?.streamingNarrative && (
-                              <p className="text-xs text-gray-500 italic border-l-2 border-brand/25 pl-2.5 leading-relaxed">
-                                {jobs[msg.jobId].streamingNarrative}
+                              <div className="text-xs text-gray-500 italic border-l-2 border-brand/25 pl-2.5">
+                                <MarkdownRenderer text={jobs[msg.jobId].streamingNarrative} />
                                 <span className="inline-block w-0.5 h-3 bg-brand/50 animate-pulse ml-0.5 align-middle rounded-full" />
-                              </p>
+                              </div>
                             )}
                           </div>
                         )}
@@ -720,7 +721,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                               <div className={`group card p-4 space-y-2 ${isStarred ? 'ring-2 ring-amber-300/60' : ''}`}>
                                 <div className="flex items-start gap-2">
                                   <div className="mt-0.5 p-1.5 bg-brand/10 rounded-lg flex-shrink-0"><FileText size={14} className="text-brand" /></div>
-                                  <div className="flex-1 min-w-0">{cr.narrative ? <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-line">{cr.narrative}</p> : <ChartRenderer result={cr} />}</div>
+                                  <div className="flex-1 min-w-0">{cr.narrative ? <MarkdownRenderer text={cr.narrative} /> : <ChartRenderer result={cr} />}</div>
                                 </div>
                                 <HoverActions />
                               </div>
@@ -730,7 +731,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                           return (
                             <div className={`group card p-4 space-y-3 ${isStarred ? 'ring-2 ring-amber-300/60' : ''}`}>
                               <div className="flex items-center gap-2">
-                                <h4 className="font-semibold text-gray-900 font-display flex-1 min-w-0 truncate">{cr.title}</h4>
+                                <h4 className="font-semibold text-gray-900 font-display flex-1 min-w-0 truncate">{cr.title?.replace(/\*\*/g, '')}</h4>
                                 <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 ${cr.score >= 0.65 ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>{(cr.score * 100).toFixed(0)}%</span>
                                 <button onClick={() => setExpandedChart({ ...cr, chart_type: activeChartType })} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 text-gray-400 hover:text-gray-600 rounded flex-shrink-0" title="Expand"><Maximize2 size={14} /></button>
                               </div>
@@ -742,7 +743,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                                   ))}
                                 </div>
                               )}
-                              {cr.narrative && <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">{cr.narrative}</p>}
+                              {cr.narrative && <MarkdownRenderer text={cr.narrative} className="border-l-2 border-brand/30 pl-3 text-gray-600" />}
                               <HoverActions />
                               {messageNotes[msgKey] && (
                                 <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
@@ -872,7 +873,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
             </div>
             <div className="p-5 space-y-4">
               <ChartRenderer result={expandedChart} />
-              {expandedChart.narrative && <p className="text-sm text-gray-600 leading-relaxed border-l-2 border-brand/30 pl-3">{expandedChart.narrative}</p>}
+              {expandedChart.narrative && <MarkdownRenderer text={expandedChart.narrative} className="border-l-2 border-brand/30 pl-3 text-gray-600" />}
               {expandedChart.sql && <details><summary className="text-xs text-gray-400 cursor-pointer hover:text-gray-600 select-none">View SQL</summary><pre className="mt-2 p-3 bg-gray-50 rounded-lg text-xs font-mono text-gray-700 overflow-x-auto whitespace-pre-wrap">{expandedChart.sql}</pre></details>}
               <div className="flex gap-2 flex-wrap pt-1">
                 {expandedChart.chart_data?.rows?.length > 0 && <button onClick={() => downloadCsv(expandedChart.chart_data.rows as Record<string, unknown>[], expandedChart.chart_data.columns, expandedChart.title)} className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1.5"><Download size={12} /> Download CSV</button>}

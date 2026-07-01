@@ -5,7 +5,7 @@ import { projectApi } from '@/lib/api'
 import {
   ChevronDown, ChevronRight, RefreshCw, Database, Hash,
   Loader2, AlertCircle, Sparkles, Link2, Filter, BarChart2,
-  Calendar, Layers, Tag, X,
+  Calendar, Layers, Tag, X, Download,
 } from 'lucide-react'
 
 // ── Raw schema types ──────────────────────────────────────────────────────────
@@ -108,6 +108,16 @@ function Chips({ items, color = 'gray' }: { items: string[]; color?: string }) {
 export default function SchemaPage() {
   const { id: projectId } = useParams<{ id: string }>()
   const [tab, setTab] = useState<'schema' | 'metadata'>('schema')
+
+  function downloadJson(data: unknown, filename: string) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
 
   // Raw schema state
   const [schema, setSchema] = useState<SchemaData | null>(null)
@@ -257,7 +267,7 @@ export default function SchemaPage() {
       </div>
 
       {/* Tab bar */}
-      <div className="flex gap-1 px-6 pt-3 bg-white border-b border-gray-100">
+      <div className="flex items-center gap-1 px-6 pt-3 bg-white border-b border-gray-100">
         <button
           onClick={() => setTab('schema')}
           className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
@@ -277,6 +287,23 @@ export default function SchemaPage() {
           }`}
         >
           <span className="flex items-center gap-1.5"><Sparkles size={14} />AI Metadata</span>
+        </button>
+
+        {/* Download button — always visible, downloads whichever tab is active */}
+        <button
+          onClick={() => {
+            if (tab === 'schema') {
+              downloadJson(schema, 'schema.json')
+            } else {
+              downloadJson(metadata, 'ai-metadata.json')
+            }
+          }}
+          disabled={tab === 'schema' ? !schema : !metadata}
+          className="ml-auto mb-1 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          title={`Download ${tab === 'schema' ? 'schema' : 'AI metadata'} as JSON`}
+        >
+          <Download size={13} />
+          Download JSON
         </button>
       </div>
 

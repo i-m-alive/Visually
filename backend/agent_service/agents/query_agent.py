@@ -391,6 +391,7 @@ class QueryAgent:
         enriched: Optional["EnrichedSchema"] = None,
         retrieved_context: Optional["RetrievedContext"] = None,
         conversation_history: Optional[list] = None,
+        user_profile: Optional[dict] = None,
     ) -> QueryPlan:
         # ── Table selection: Graph RAG > word-overlap > schema.important_tables ──
         if retrieved_context and retrieved_context.primary_tables and enriched and enriched.compact_tables:
@@ -511,6 +512,31 @@ class QueryAgent:
                 "If it is a follow-up, build the SQL that satisfies both the prior intent "
                 "and the new refinement."
             )
+
+        # ── User profile filter (Brainwave role-based access control) ────────────
+        # If the user has a role that restricts data access (e.g. placement_specialist),
+        # inject a mandatory WHERE clause so the generated SQL is always filtered.
+        if user_profile:
+            from agent_service.agents.user_context_builder import get_sql_filter_clause
+            _sql_filter = get_sql_filter_clause(user_profile)
+            _role = user_profile.get("brainwave_role", "")
+            _name = user_profile.get("db_name") or user_profile.get("full_name", "")
+            print(
+                f"[query_agent] user_profile role={_role!r} db_name={_name!r} "
+                f"filter={_sql_filter!r}",
+                flush=True,
+            )
+            if _sql_filter:
+                user_content["mandatory_user_filter"] = {
+                    "instruction": (
+                        "MANDATORY ACCESS FILTER — you MUST include this WHERE clause "
+                        "in every SQL query you generate. Never omit it. This user can only "
+                        "see their own records."
+                    ),
+                    "where_clause": _sql_filter,
+                    "name_in_db":   _name,
+                    "role":         _role,
+                }
 
         if retry_feedback:
             user_content["retry_feedback"] = retry_feedback

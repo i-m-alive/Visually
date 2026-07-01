@@ -78,6 +78,7 @@ async def route_and_execute(
                 sql=sql,
                 iam_role_arn=iam_role_arn,
                 row_limit=row_limit,
+                timeout_seconds=timeout_seconds,
             )
         elif db_type == "postgresql":
             return await execute_postgres(

@@ -230,15 +230,28 @@ async def execute_redshift(
     sql: str,
     iam_role_arn: str | None = None,
     row_limit: int = 10000,
+    timeout_seconds: int = 120,
 ) -> dict:
     loop = asyncio.get_event_loop()
     # Prefer the Data API for Serverless when enabled — it needs no VPC/VPN access.
-    if _USE_DATA_API and "redshift-serverless" in (host or ""):
-        return await loop.run_in_executor(
-            None, _execute_data_api_sync, host, database, sql, row_limit,
+    try:
+        if _USE_DATA_API and "redshift-serverless" in (host or ""):
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, _execute_data_api_sync, host, database, sql, row_limit),
+                timeout=timeout_seconds,
+            )
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                _execute_sync,
+                host, port, database, user, password, ssl, sql, iam_role_arn, row_limit,
+            ),
+            timeout=timeout_seconds,
         )
-    return await loop.run_in_executor(
-        None,
-        _execute_sync,
-        host, port, database, user, password, ssl, sql, iam_role_arn, row_limit,
-    )
+    except asyncio.TimeoutError:
+        return {
+            "rows": [], "row_count": 0, "columns": [],
+            "duration_ms": timeout_seconds * 1000,
+            "truncated": False,
+            "error": f"Query timed out after {timeout_seconds}s (Redshift)",
+        }

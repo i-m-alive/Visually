@@ -203,6 +203,74 @@ async def bedrock_invoke_with_history(
     return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
 
 
+async def bedrock_invoke_with_tools(
+    model_id: str,
+    system_prompt,          # str | list[dict]  (cache_control blocks supported)
+    messages: list[dict],
+    tools: list[dict],      # Claude tool schema format: [{name, description, input_schema}]
+    max_tokens: int = 4096,
+    temperature: float = 0.2,
+) -> dict:
+    """Call Bedrock with tool_use support (Claude's function-calling API).
+
+    Returns a dict:
+        {
+            "stop_reason": "end_turn" | "tool_use",
+            "content": [
+                {"type": "text",     "text": "..."}                              |
+                {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
+            ]
+        }
+
+    The caller is responsible for appending the assistant content to messages,
+    dispatching tool_use blocks, and looping until stop_reason == "end_turn".
+    See agent_service/agents/tool_agent.py for the full loop implementation.
+    """
+    import time
+
+    def _invoke():
+        client = get_bedrock_client()
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "system":      system_prompt,
+            "tools":       tools,          # the only addition vs bedrock_invoke_with_history
+            "messages":    messages,
+        }
+        t0 = time.time()
+        tool_names = [t.get("name", "?") for t in (tools or [])]
+        print(
+            f"[bedrock-tools] → invoke_model  model={model_id}  "
+            f"tools={tool_names}  msgs={len(messages)}  max_tokens={max_tokens}",
+            flush=True,
+        )
+        response = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(response["body"].read())
+        usage  = result.get("usage", {})
+        stop   = result.get("stop_reason", "unknown")
+        print(
+            f"[bedrock-tools] ← done  {time.time() - t0:.1f}s  "
+            f"stop={stop}  "
+            f"in={usage.get('input_tokens', 0)}  out={usage.get('output_tokens', 0)}  "
+            f"cache_read={usage.get('cache_read_input_tokens', 0)}",
+            flush=True,
+        )
+        _track_usage(model_id, result)
+        return {
+            "stop_reason": stop,
+            "content":     result.get("content", []),
+        }
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+
+
 async def bedrock_invoke_stream(
     model_id: str,
     system_prompt,  # str | list[dict] (cache_control blocks supported)

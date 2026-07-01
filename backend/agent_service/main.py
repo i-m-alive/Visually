@@ -51,6 +51,7 @@ from agent_service.routers import end_user as end_user_module
 from agent_service.routers import intelligence as intelligence_module
 from agent_service.routers import intelligence_orchestrator as intelligence_orchestrator_module
 from agent_service.routers import intelligence_chat as intelligence_chat_module
+from agent_service.routers import brainwave_profiles as brainwave_profiles_module
 
 from contextlib import asynccontextmanager
 
@@ -161,6 +162,7 @@ app.include_router(end_user_module.router)
 app.include_router(intelligence_module.router)
 app.include_router(intelligence_orchestrator_module.router)
 app.include_router(intelligence_chat_module.router)
+app.include_router(brainwave_profiles_module.router)
 
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
@@ -962,6 +964,8 @@ async def _run_pipeline(
     selected_tables: Optional[list[str]] = None,
     selected_hops: Optional[int] = 2,
     output_mode: Optional[str] = None,
+    user_email: Optional[str] = None,
+    impersonate_email: Optional[str] = None,
 ):
     from shared.database import AsyncSessionLocal
     redis = await get_redis()
@@ -976,7 +980,94 @@ async def _run_pipeline(
         except Exception:
             resolved_type = "SINGLE_VIZ"
 
+    print(
+        f"[DIAG pipeline:{job_id[:8]}] "
+        f"quick_intent={resolved_type!r} "
+        f"user_email={user_email!r} "
+        f"impersonate={impersonate_email!r} "
+        f"text={user_text[:60]!r}",
+        flush=True,
+    )
+
     async with AsyncSessionLocal() as db:
+        # ── Load Brainwave user profile (platform-level, no project_id) ────────
+        user_profile = None
+        try:
+            from shared.models.brainwave_user_profile import BrainwaveUserProfile
+            lookup_email = user_email
+            if impersonate_email and impersonate_email != user_email:
+                # Verify the requesting user is allowed to impersonate
+                _req = (await db.execute(
+                    select(BrainwaveUserProfile)
+                    .where(BrainwaveUserProfile.user_email == user_email)
+                )).scalar_one_or_none()
+                if _req and _req.can_impersonate:
+                    lookup_email = impersonate_email
+                    print(
+                        f"[pipeline:{job_id}] impersonating {impersonate_email} "
+                        f"(requested by {user_email})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[pipeline:{job_id}] impersonation denied "
+                        f"(user {user_email} lacks can_impersonate)",
+                        flush=True,
+                    )
+            if lookup_email:
+                _p = (await db.execute(
+                    select(BrainwaveUserProfile)
+                    .where(BrainwaveUserProfile.user_email == lookup_email)
+                )).scalar_one_or_none()
+                if _p:
+                    # Also pull full_name from the users table for identity queries
+                    _user_rec = (await db.execute(
+                        select(User).where(User.email == lookup_email)
+                    )).scalar_one_or_none()
+                    user_profile = {
+                        "user_email":      _p.user_email,
+                        "full_name":       (_user_rec.full_name if _user_rec else None) or _p.db_name,
+                        "brainwave_role":  _p.brainwave_role,
+                        "db_name":         _p.db_name,
+                        "qualifier_id":    _p.qualifier_id,
+                        "can_impersonate": _p.can_impersonate,
+                    }
+        except Exception as _pe:
+            print(f"[pipeline:{job_id}] profile lookup failed (non-fatal): {_pe}", flush=True)
+
+        # ── DIAGNOSTIC LOG ────────────────────────────────────────────────────
+        print(
+            f"[DIAG pipeline:{job_id[:8]}] "
+            f"profile_found={user_profile is not None} "
+            f"lookup_email={lookup_email!r} "
+            f"DEV_MODE={DEV_MODE}",
+            flush=True,
+        )
+        if user_profile:
+            print(
+                f"[DIAG pipeline:{job_id[:8]}] "
+                f"role={user_profile['brainwave_role']!r} "
+                f"db_name={user_profile.get('db_name')!r} "
+                f"full_name={user_profile.get('full_name')!r}",
+                flush=True,
+            )
+
+        # ── Access guard — Step 8 ────────────────────────────────────────────
+        # Only Brainwave team members (who have a profile row) may use the agents.
+        # In DEV_MODE the check is skipped so the developer can test before
+        # their own profile row exists.
+        if user_profile is None and not DEV_MODE:
+            from agent_service.services.ws_manager import manager as _wsmgr
+            await _wsmgr.broadcast(job_id, {
+                "type":    "agent.complete",
+                "job_id":  job_id,
+                "answer":  (
+                    "Access restricted to Brainwave team members. "
+                    "Contact your administrator to get onboarded."
+                ),
+            })
+            return
+
         if resolved_type == "DASHBOARD":
             await _orchestrator.run_dashboard_pipeline(
                 job_id=job_id, user_text=user_text, project_id=project_id,
@@ -991,6 +1082,7 @@ async def _run_pipeline(
                 selected_tables=selected_tables,
                 selected_hops=selected_hops,
                 output_mode_override=output_mode,
+                user_profile=user_profile,
             )
     if redis is not None:
         await redis.aclose()
@@ -999,6 +1091,7 @@ async def _run_pipeline(
 @app.post("/agent/intent")
 async def submit_intent(
     req: IntentSubmitRequest,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -1027,10 +1120,14 @@ async def submit_intent(
     db.add(job)
     await db.commit()
 
+    impersonate_email = request.headers.get("X-Impersonate-Role")
+
     background_tasks.add_task(
         _run_pipeline, job_id, req.text, req.project_id, str(current_user.id),
         connection_id, job_type, req.conversation_history,
         req.scope, req.selected_tables, req.selected_hops, req.output_mode,
+        current_user.email,
+        impersonate_email,
     )
     return {"job_id": job_id, "status": "pending", "job_type": job_type}
 

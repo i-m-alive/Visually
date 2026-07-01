@@ -2,8 +2,26 @@
 import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthStore } from '@/stores/authStore'
-import { authApi } from '@/lib/api'
-import { User, Bell, Key, Shield, Check, Layers, BarChart2, Loader2, AlertCircle } from 'lucide-react'
+import { authApi, brainwaveApi } from '@/lib/api'
+import { User, Bell, Key, Shield, Check, Layers, BarChart2, Loader2, AlertCircle, Building2 } from 'lucide-react'
+
+const BRAINWAVE_ROLE_LABELS: Record<string, string> = {
+  qualifying_specialist: 'Qualifying Specialist',
+  client_advisor:        'Client Advisor',
+  placement_specialist:  'Placement Specialist',
+  relationship_manager:  'Relationship Manager',
+  vp:                    'VP',
+  admin:                 'Administrator',
+}
+
+const BRAINWAVE_ROLE_COLORS: Record<string, string> = {
+  qualifying_specialist: 'bg-violet-100 text-violet-700 border-violet-200',
+  client_advisor:        'bg-blue-100 text-blue-700 border-blue-200',
+  placement_specialist:  'bg-teal-100 text-teal-700 border-teal-200',
+  relationship_manager:  'bg-orange-100 text-orange-700 border-orange-200',
+  vp:                    'bg-rose-100 text-rose-700 border-rose-200',
+  admin:                 'bg-gray-100 text-gray-700 border-gray-300',
+}
 
 type Tab = 'profile' | 'notifications' | 'api' | 'security'
 
@@ -62,6 +80,8 @@ function ProfileTab({ user, updateUser, router }: any) {
   const [error, setError] = useState('')
   const roleChanged = selectedRole !== user?.role
 
+  const [bwProfile, setBwProfile] = useState<{ brainwave_role: string; db_name: string | null; can_impersonate: boolean } | null | 'loading'>('loading')
+
   // Older sessions (created before User IDs existed) may not have the username
   // cached locally — pull it from the server so the field is always populated.
   useEffect(() => {
@@ -74,6 +94,12 @@ function ProfileTab({ user, updateUser, router }: any) {
       }
     }).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    brainwaveApi.getMyProfile()
+      .then(r => setBwProfile(r.data ?? null))
+      .catch(() => setBwProfile(null))
   }, [])
 
   const handleSave = async () => {
@@ -159,6 +185,56 @@ function ProfileTab({ user, updateUser, router }: any) {
         <button onClick={handleSave} disabled={saving} className="btn-primary flex items-center gap-2 disabled:opacity-60">
           {saving ? <><Loader2 size={14} className="animate-spin" /> Saving…</> : saved ? <><Check size={14} /> Saved!</> : 'Save changes'}
         </button>
+      </div>
+
+      {/* ── Brainwave Access ── */}
+      <div className="pt-6 border-t border-gray-100">
+        <div className="flex items-center gap-2 mb-3">
+          <Building2 size={15} className="text-gray-400" />
+          <h4 className="text-sm font-semibold text-gray-900">Brainwave Access</h4>
+        </div>
+
+        {bwProfile === 'loading' ? (
+          <div className="flex items-center gap-2 text-sm text-gray-400 py-2">
+            <Loader2 size={13} className="animate-spin" /> Loading…
+          </div>
+        ) : bwProfile === null ? (
+          <div className="p-4 rounded-xl border border-dashed border-gray-200 bg-gray-50 text-center">
+            <p className="text-sm text-gray-400">No Brainwave role assigned yet.</p>
+            <p className="text-xs text-gray-400 mt-1">Contact your admin to get access.</p>
+          </div>
+        ) : (
+          <div className="p-4 rounded-xl border border-gray-100 bg-white space-y-3">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Role</p>
+              <span className={`text-xs font-medium px-2.5 py-1 rounded-full border ${
+                BRAINWAVE_ROLE_COLORS[bwProfile.brainwave_role] ?? 'bg-gray-100 text-gray-600 border-gray-200'
+              }`}>
+                {BRAINWAVE_ROLE_LABELS[bwProfile.brainwave_role] ?? bwProfile.brainwave_role}
+              </span>
+            </div>
+
+            {bwProfile.db_name && (
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Name in Database</p>
+                <p className="text-sm text-gray-700 font-medium">{bwProfile.db_name}</p>
+              </div>
+            )}
+
+            {bwProfile.can_impersonate && (
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Admin Access</p>
+                <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-200">
+                  Can impersonate
+                </span>
+              </div>
+            )}
+
+            <p className="text-xs text-gray-400 pt-1 border-t border-gray-50">
+              Assigned by your admin. Contact them to request changes.
+            </p>
+          </div>
+        )}
       </div>
     </div>
   )

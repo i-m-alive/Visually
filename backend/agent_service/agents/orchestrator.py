@@ -62,6 +62,7 @@ class Orchestrator:
         selected_tables: Optional[list[str]] = None,
         selected_hops: Optional[int] = 2,
         output_mode_override: Optional[str] = None,
+        user_profile: Optional[dict] = None,
     ) -> dict:
         async def emit(event: dict):
             # Direct in-process broadcast (works with or without Redis)
@@ -91,6 +92,165 @@ class Orchestrator:
                 "confidence": intent.confidence,
             })
             await set_pipeline_state(redis, job_id, "step", "intent_classified")
+
+            # ── Agent skill routing ──────────────────────────────────────────
+            # When the intent is an agent skill type, route to the tool-use loop
+            # instead of the SQL pipeline. These intents don't need schema fetch,
+            # GraphRAG, or query generation — they go directly to a ToolAgent.
+            _AGENT_INTENTS = frozenset({
+                "MATCH", "BRIEFING", "SCREEN", "ENRICH",
+                "VERIFY", "PRESENT", "AUDIT", "PROSPECT", "ACTION",
+            })
+            # ── DIAGNOSTIC LOG ──────────────────────────────────────────────
+            print(
+                f"[DIAG orchestrator:{job_id[:8]}] "
+                f"intent={intent.intent_type!r} confidence={intent.confidence:.2f} "
+                f"route={'AGENT_SKILL' if intent.intent_type in _AGENT_INTENTS else 'SQL_PIPELINE'} "
+                f"user_profile={'set(role=' + str(user_profile.get('brainwave_role')) + ')' if user_profile else 'None'}",
+                flush=True,
+            )
+            if intent.intent_type in _AGENT_INTENTS:
+                from agent_service.agents.tool_agent import AgentContext
+                from agent_service.agents import skill_agents
+
+                # ── Schema context injection ──────────────────────────────────
+                # Fetch and rank tables from the schema cache so the agent knows
+                # which tables exist on turn 1 — avoids blind probe loops.
+                # Completely non-fatal: a failure here still runs the agent, just
+                # without the schema preamble.
+                _schema_tables: list[dict] = []
+                agent_user_text = user_text
+                try:
+                    _schema_doc = await self._get_latest_schema(connection_id, db)
+                    if _schema_doc:
+                        _conn_r = await db.execute(
+                            select(DatabaseConnection).where(
+                                DatabaseConnection.id == uuid.UUID(connection_id)
+                            )
+                        )
+                        _conn_rec = _conn_r.scalar_one_or_none()
+                        _db_type  = _conn_rec.db_type.value if _conn_rec else "postgresql"
+                        _enriched = await _schema_cache.get_or_build(
+                            connection_id, _schema_doc, _db_type
+                        )
+                        if _enriched and _enriched.compact_tables:
+                            _rag = _graph_rag.retrieve(
+                                user_text, intent, _enriched, top_k=20
+                            )
+                            _candidates = (
+                                _rag.candidates if (_rag and _rag.candidates) else []
+                            )
+                            if _candidates:
+                                _ct_by_name = {
+                                    t["name"]: t for t in _enriched.compact_tables
+                                }
+                                _schema_tables = [
+                                    {
+                                        "name": c.table_name,
+                                        "columns": [
+                                            col["name"]
+                                            for col in _ct_by_name.get(
+                                                c.table_name, {}
+                                            ).get("columns", [])[:20]
+                                        ],
+                                    }
+                                    for c in _candidates
+                                ]
+                            else:
+                                _schema_tables = [
+                                    {
+                                        "name": t["name"],
+                                        "columns": [
+                                            c["name"]
+                                            for c in t.get("columns", [])[:20]
+                                        ],
+                                    }
+                                    for t in _enriched.compact_tables[:25]
+                                ]
+
+                            # Build schema preamble injected into the user message
+                            _lines = [
+                                "## Available database tables "
+                                "(ranked by relevance to your query):"
+                            ]
+                            for _t in _schema_tables[:20]:
+                                _cols = ", ".join(_t.get("columns", [])[:15])
+                                _lines.append(f"  - {_t['name']}  columns: [{_cols}]")
+                            _lines += ["", f"User request: {user_text}"]
+                            agent_user_text = "\n".join(_lines)
+                            print(
+                                f"[pipeline:{job_id}] schema context injected for agent: "
+                                f"{len(_schema_tables)} tables",
+                                flush=True,
+                            )
+                except Exception as _se:
+                    print(
+                        f"[pipeline:{job_id}] schema context fetch failed (non-fatal): {_se}",
+                        flush=True,
+                    )
+
+                ctx = AgentContext(
+                    project_id=project_id,
+                    connection_id=connection_id,
+                    job_id=job_id,
+                    db=db,
+                    redis=redis,
+                    emit=emit,
+                    schema_tables=_schema_tables,
+                    user_profile=user_profile,
+                )
+                await emit({
+                    "type":       "agent.started",
+                    "job_id":     job_id,
+                    "agent_type": intent.intent_type,
+                })
+                await set_pipeline_state(redis, job_id, "step", "agent_running")
+
+                try:
+                    agent_fn = skill_agents.get_agent(intent.intent_type)
+                    answer   = await agent_fn(agent_user_text, ctx)
+                except Exception as _ae:
+                    print(
+                        f"[pipeline:{job_id}] agent error "
+                        f"({intent.intent_type}): {_ae}",
+                        flush=True,
+                    )
+                    answer = (
+                        "I ran into an error processing that request. "
+                        "Please try again or rephrase your question."
+                    )
+
+                agent_result = {
+                    "job_id":             job_id,
+                    "score":              1.0,
+                    "chart_data":         {
+                        "rows": [], "columns": [], "labels": [], "values": [],
+                    },
+                    "low_confidence":     False,
+                    "sql":                "",
+                    "chart_type":         "text",
+                    "title":              intent.intent_type.replace("_", " ").title(),
+                    "table_used":         "",
+                    "x_axis_label":       "",
+                    "y_axis_label":       "",
+                    "output_mode":        "text",
+                    "narrative":          answer,
+                    "validation_details": {},
+                }
+                await emit({
+                    "type":           "chart.confirmed",
+                    "job_id":         job_id,
+                    "score":          1.0,
+                    "chart_data":     agent_result,
+                    "low_confidence": False,
+                })
+                if job:
+                    job.status           = "completed"
+                    job.result_payload   = agent_result
+                    job.completed_at     = datetime.utcnow()
+                    await db.commit()
+                await set_pipeline_state(redis, job_id, "step", "agent_done")
+                return agent_result
 
             # STEP 2: Fetch schema
             await set_pipeline_state(redis, job_id, "step", "fetching_schema")
@@ -283,6 +443,7 @@ class Orchestrator:
                     intent, schema, db_type, retry_feedback, attempt, enriched,
                     retrieved_context=retrieved_context,
                     conversation_history=conversation_history,
+                    user_profile=user_profile,
                 )
                 await emit({
                     "type": "query.generated",

@@ -3,9 +3,10 @@ import { useEffect, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import { useAuthStore } from '@/stores/authStore'
+import { brainwaveApi } from '@/lib/api'
 import {
   Database, MessageSquare, Settings, LogOut, BarChart2,
-  LayoutDashboard, Layers, Home, Link2, ChevronLeft, ChevronRight, TrendingUp,
+  LayoutDashboard, Layers, Home, Link2, ChevronLeft, ChevronRight, TrendingUp, Users,
 } from 'lucide-react'
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
@@ -14,10 +15,19 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const { user, clearAuth, _hasHydrated } = useAuthStore()
 
   // Persist collapsed state in localStorage so it survives navigation
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed,       setCollapsed]       = useState(false)
+  const [isBrainwaveAdmin, setIsBrainwaveAdmin] = useState(false)
+
   useEffect(() => {
     setCollapsed(localStorage.getItem('sidebar-collapsed') === 'true')
   }, [])
+
+  useEffect(() => {
+    if (!user) return
+    brainwaveApi.getMyProfile()
+      .then(r => setIsBrainwaveAdmin(r.data?.can_impersonate === true))
+      .catch(() => setIsBrainwaveAdmin(false))
+  }, [user])
 
   const toggleCollapsed = () => {
     setCollapsed(prev => {
@@ -112,8 +122,11 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                     <div style={{ height: 1, background: '#f1f5f9', margin: '6px 0' }} />
                   </>
                 )}
-                <NavLink href="/projects" icon={<BarChart2 size={17} />} label="Projects"  current={pathname} collapsed={collapsed} />
-                <NavLink href="/settings" icon={<Settings size={17} />}  label="Settings"  current={pathname} collapsed={collapsed} />
+                <NavLink href="/projects" icon={<BarChart2 size={17} />} label="Projects" current={pathname} collapsed={collapsed} />
+                {isBrainwaveAdmin && (
+                  <NavLink href="/team" icon={<Users size={17} />} label="Team Access" current={pathname} collapsed={collapsed} />
+                )}
+                <NavLink href="/settings" icon={<Settings size={17} />} label="Settings" current={pathname} collapsed={collapsed} />
               </>
             ) : (
               <>

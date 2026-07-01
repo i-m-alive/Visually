@@ -1063,3 +1063,35 @@ export const analystApi = {
   deleteSchedule: (token: string, scheduleId: string) =>
     publicApi.delete(`/analyst/canvas/${token}/schedules/${scheduleId}`),
 }
+
+// ─── Brainwave user profile / team access management ─────────────────────────
+
+export interface BrainwaveUserRow {
+  user_id:         string
+  email:           string
+  full_name:       string
+  visually_role:   string       // 'builder' | 'end_user'
+  brainwave_role:  string | null
+  db_name:         string | null
+  qualifier_id:    number | null
+  can_impersonate: boolean
+  has_profile:     boolean
+}
+
+export interface ProfileUpsertPayload {
+  user_email:      string
+  brainwave_role:  string
+  db_name?:        string | null
+  qualifier_id?:   number | null
+  can_impersonate: boolean
+}
+
+export const brainwaveApi = {
+  // No project_id — profiles are platform-wide, keyed by email
+  listUsers:     () =>
+    api.get<BrainwaveUserRow[]>('/brainwave-profiles/users'),
+  upsertProfile: (data: ProfileUpsertPayload) =>
+    api.put('/brainwave-profiles', data),
+  getMyProfile:  () =>
+    api.get('/brainwave-profiles/me'),
+}

@@ -14,6 +14,18 @@ INTENT TYPES (choose exactly one):
 - FOLLOWUP: User is referring to a prior result with pronouns. Signals: "it", "that", "this chart", "the graph", "filter", "drill", "refine", "update", "change it", "why did it".
 - SCHEMA_EXPLORE: User wants to explore what data/tables are available, understand the database structure, or get example questions they can ask. Signals: "what tables do I have", "what data do I have", "explain my schema", "what can I ask", "what's in my database", "what data is available", "explore data", "list my tables", "what kind of questions", "what do I have access to", "show me what you know".
 
+AGENT SKILL INTENTS — route to the tool-use agent layer, NOT the SQL pipeline.
+Use these when the user's request maps to a recruitment workflow action, not a data visualisation:
+- MATCH: Find, rank, or score candidates for a job using ML scores. Signals: "best candidates", "top candidates", "rank candidates", "who should I interview", "shortlist for", "score candidates", "find candidates for [role]", "strongest applicants", "recommend candidates".
+- BRIEFING: Give a daily overview of what needs attention in the recruitment pipeline, OR answer personal/role-specific queries when the user says "my". Signals: "briefing", "daily summary", "what should I focus on", "what needs attention today", "pipeline overview", "morning priorities", "what's urgent", "catch me up", "my placements", "my candidates", "my clients", "my accounts", "my pipeline", "my applications", "show me my", "what am I working on", "who am I placing", "my activity", "my performance", "my jobs", "my work", "what is my name", "who am I", "tell me about myself", "my data", "my focus", "my open roles".
+- SCREEN: Screen a specific candidate or generate screening questions based on their resume and the job. Signals: "screen [candidate]", "screening questions for", "interview questions for [person]", "evaluate this candidate", "assess [name]".
+- ENRICH: Enrich or complete a candidate's profile using their parsed resume data. Signals: "enrich profile", "fill in missing info", "complete [candidate]'s profile", "summarize [candidate]", "update profile from resume", "build profile for".
+- VERIFY: Verify a candidate's resume or profile for inconsistencies, gaps, or mismatches with their ML score. Signals: "verify [candidate]", "check resume", "validate skills", "inconsistencies in profile", "does the resume match", "anomalies", "red flags".
+- PRESENT: Generate a candidate submission packet or presentation for a client. Signals: "present candidates", "submission packet", "candidate report", "prepare presentation for client", "send candidates to", "client submission".
+- AUDIT: Audit the recruitment pipeline for data quality issues, missing scores, stale records, or financial/billing integrity. Signals: "audit pipeline", "data quality", "missing scores", "unscored candidates", "stale applications", "incomplete profiles", "compliance check", "what's missing", "billing issues", "billing rate", "bill rate", "pay rate", "rate mismatch", "inverted margin", "placement errors", "financial audit", "missing bill rate", "zero bill rate".
+- PROSPECT: Find pipeline gaps, jobs at risk, or business development opportunities. Signals: "pipeline gaps", "jobs with no candidates", "at-risk roles", "opportunities", "business development", "which jobs need attention", "roles without recommendations".
+- ACTION: Create a note, update a candidate or application status, or tag a record. Signals: "add note", "update status", "mark as", "move to [stage]", "create note for", "tag [candidate]", "change status of".
+
 OUTPUT MODE (choose exactly one) — how the answer is best presented:
 - "chart": the answer is best SHOWN as a visualization. Signals: "trend", "over time", "by <category>", "compare", "distribution", "breakdown", "top N", "show me a chart/graph", any explicit chart_type, or any request whose result is a series of values across a dimension/time.
 - "text": the answer is best stated in WORDS, with no chart. Signals: a single fact or aggregate ("how many", "what is the total", "what's the average", "which is highest/lowest"), yes/no questions, or "explain", "summarize", "describe", "tell me about". A single number or short fact -> "text".
@@ -36,7 +48,7 @@ VAGUENESS SCORE (0.0 to 1.0):
 
 Return ONLY valid JSON:
 {
-  "intent_type": "SINGLE_VIZ",
+  "intent_type": "SINGLE_VIZ | DASHBOARD | FOLLOWUP | SCHEMA_EXPLORE | MATCH | BRIEFING | SCREEN | ENRICH | VERIFY | PRESENT | AUDIT | PROSPECT | ACTION",
   "confidence": 0.0,
   "entities": {
     "metrics": [],
