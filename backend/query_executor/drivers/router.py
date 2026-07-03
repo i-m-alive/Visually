@@ -11,6 +11,7 @@ from shared.encryption import decrypt
 from .postgres import execute_postgres
 from .mysql import execute_mysql
 from .redshift import execute_redshift
+from .snowflake import execute_snowflake
 
 
 async def route_and_execute(
@@ -103,6 +104,23 @@ async def route_and_execute(
                 timeout_seconds=timeout_seconds,
                 row_limit=row_limit,
                 ssl=conn.ssl_enabled,
+            )
+        elif db_type == "snowflake":
+            opts = conn.connection_options or {}
+            warehouse = opts.get("warehouse") if isinstance(opts, dict) else None
+            role = opts.get("role") if isinstance(opts, dict) else None
+            sf_schema = opts.get("schema") if isinstance(opts, dict) else None
+            return await execute_snowflake(
+                account=conn.host or "",
+                user=conn.username or "",
+                password=password,
+                database=conn.database_name or None,
+                sql=sql,
+                warehouse=warehouse,
+                role=role,
+                schema=sf_schema,
+                row_limit=row_limit,
+                timeout_seconds=timeout_seconds,
             )
         else:
             return {

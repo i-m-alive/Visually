@@ -8,6 +8,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from shared.database import AsyncSessionLocal
 from shared.models.database_connections import DatabaseConnection
 from shared.models.schema_snapshots import SchemaSnapshot
 from shared.models.pipeline_jobs import PipelineJob
@@ -1241,28 +1242,29 @@ class Orchestrator:
         async def run_one(idx: int, sub_text: str):
             async with semaphore:
                 sub_job_id = f"{job_id}_chart_{idx}"
-                sub_job = PipelineJob(
-                    id=uuid.UUID(sub_job_id) if _is_valid_uuid(sub_job_id) else uuid.uuid4(),
-                    project_id=uuid.UUID(project_id),
-                    user_id=uuid.UUID(user_id),
-                    job_type="SINGLE_VIZ",
-                    status="pending",
-                    input_payload={"user_text": sub_text, "connection_id": connection_id},
-                    created_at=datetime.utcnow(),
-                )
-                db.add(sub_job)
-                await db.commit()
-                await db.refresh(sub_job)
+                async with AsyncSessionLocal() as sub_db:
+                    sub_job = PipelineJob(
+                        id=uuid.UUID(sub_job_id) if _is_valid_uuid(sub_job_id) else uuid.uuid4(),
+                        project_id=uuid.UUID(project_id),
+                        user_id=uuid.UUID(user_id),
+                        job_type="SINGLE_VIZ",
+                        status="pending",
+                        input_payload={"user_text": sub_text, "connection_id": connection_id},
+                        created_at=datetime.utcnow(),
+                    )
+                    sub_db.add(sub_job)
+                    await sub_db.commit()
+                    await sub_db.refresh(sub_job)
 
-                result = await self.run_single_viz_pipeline(
-                    job_id=str(sub_job.id),
-                    user_text=sub_text,
-                    project_id=project_id,
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    redis=redis,
-                    db=db,
-                )
+                    result = await self.run_single_viz_pipeline(
+                        job_id=str(sub_job.id),
+                        user_text=sub_text,
+                        project_id=project_id,
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        redis=redis,
+                        db=sub_db,
+                    )
                 await emit({
                     "type": "dashboard.chart_done",
                     "job_id": job_id,

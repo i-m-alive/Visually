@@ -310,6 +310,28 @@ async def test_connection(
                 password=password, connect_timeout=10,
             )
             my_conn.close()
+        elif conn.db_type.value == "snowflake":
+            import snowflake.connector as _sf
+            _opts = conn.connection_options or {}
+            _sf_kwargs = {
+                "account": conn.host or "",
+                "user": conn.username or "",
+                "password": password,
+                "login_timeout": 30,
+            }
+            if conn.database_name:
+                _sf_kwargs["database"] = conn.database_name
+            if isinstance(_opts, dict):
+                if _opts.get("warehouse"):
+                    _sf_kwargs["warehouse"] = _opts["warehouse"]
+                if _opts.get("role"):
+                    _sf_kwargs["role"] = _opts["role"]
+                if _opts.get("schema"):
+                    _sf_kwargs["schema"] = _opts["schema"]
+            def _sf_test():
+                sc = _sf.connect(**_sf_kwargs)
+                sc.close()
+            await _asyncio.get_event_loop().run_in_executor(None, _sf_test)
         else:
             return ConnectionTestResult(success=False, message=f"Cannot test {conn.db_type.value} connections yet")
 

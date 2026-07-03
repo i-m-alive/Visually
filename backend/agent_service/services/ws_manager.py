@@ -39,7 +39,7 @@ async def redis_listener(redis: aioredis.Redis, job_id: str):
                 except (json.JSONDecodeError, TypeError):
                     continue
                 await manager.broadcast(job_id, data)
-                if data.get("type") in ("chart.confirmed", "pipeline.error"):
+                if data.get("type") in ("chart.confirmed", "pipeline.error", "dashboard.complete"):
                     break
     finally:
         await pubsub.unsubscribe(f"pipeline:{job_id}")

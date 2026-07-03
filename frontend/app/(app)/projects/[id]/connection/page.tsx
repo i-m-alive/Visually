@@ -24,6 +24,7 @@ const DB_DEFAULTS: Record<string, number> = {
   postgresql: 5432,
   redshift: 5439,
   mysql: 3306,
+  snowflake: 443,
 }
 
 export default function ConnectionPage() {
@@ -38,6 +39,7 @@ export default function ConnectionPage() {
     name: '', db_type: 'redshift', host: '', port: '',
     database_name: '', username: '', password: '', ssl_enabled: true,
     iam_role_arn: '',
+    sf_warehouse: '', sf_role: '', sf_schema: '',
   })
   const [showPw, setShowPw] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -96,6 +98,7 @@ export default function ConnectionPage() {
       password: '',
       ssl_enabled: conn.ssl_enabled,
       iam_role_arn: '',
+      sf_warehouse: '', sf_role: '', sf_schema: '',
     })
     setSaveResult(null)
     setTestResult(null)
@@ -105,6 +108,17 @@ export default function ConnectionPage() {
     if (!editing) return
     setSaving(true); setSaveResult(null)
     try {
+      const buildConnectionOptions = () => {
+        if (form.db_type === 'redshift' && form.iam_role_arn) return { iam_role_arn: form.iam_role_arn }
+        if (form.db_type === 'snowflake') {
+          const opts: Record<string, string> = {}
+          if (form.sf_warehouse) opts.warehouse = form.sf_warehouse
+          if (form.sf_role) opts.role = form.sf_role
+          if (form.sf_schema) opts.schema = form.sf_schema
+          return Object.keys(opts).length ? opts : null
+        }
+        return null
+      }
       const payload: Record<string, unknown> = {
         name: form.name,
         db_type: form.db_type,
@@ -113,7 +127,7 @@ export default function ConnectionPage() {
         database_name: form.database_name.trim(),
         username: form.username.trim(),
         ssl_enabled: form.ssl_enabled,
-        connection_options: form.iam_role_arn ? { iam_role_arn: form.iam_role_arn } : null,
+        connection_options: buildConnectionOptions(),
         password: form.password, // empty string = clear stored password (use IAM auth)
       }
       const resp = await projectApi.updateConnection(projectId, editing, payload)
@@ -297,15 +311,19 @@ export default function ConnectionPage() {
                       <option value="redshift">Redshift</option>
                       <option value="postgresql">PostgreSQL</option>
                       <option value="mysql">MySQL</option>
+                      <option value="snowflake">Snowflake</option>
                     </select>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-3 gap-4">
                   <div className="col-span-2">
-                    <label className="block text-xs font-medium text-gray-600 mb-1">Host</label>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">
+                      {form.db_type === 'snowflake' ? 'Account identifier' : 'Host'}
+                    </label>
                     <input value={form.host} onChange={e => set('host', e.target.value)}
-                      className="input-field text-sm font-mono" placeholder="host.region.redshift-serverless.amazonaws.com" />
+                      className="input-field text-sm font-mono"
+                      placeholder={form.db_type === 'snowflake' ? 'orgname-accountname  or  xy12345.us-east-1' : 'host.region.redshift-serverless.amazonaws.com'} />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">Port</label>
@@ -315,9 +333,12 @@ export default function ConnectionPage() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Database name</label>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">
+                    Database name {form.db_type === 'snowflake' && <span className="text-gray-400 font-normal">(optional)</span>}
+                  </label>
                   <input value={form.database_name} onChange={e => set('database_name', e.target.value)}
-                    className="input-field text-sm font-mono" />
+                    className="input-field text-sm font-mono"
+                    placeholder={form.db_type === 'snowflake' ? 'Leave blank to connect without a default database' : ''} />
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
@@ -333,7 +354,10 @@ export default function ConnectionPage() {
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">
-                      Password <span className="text-gray-400 font-normal">(clear to use IAM auth)</span>
+                      Password{' '}
+                      <span className="text-gray-400 font-normal">
+                        {form.db_type === 'snowflake' ? '(re-enter to update)' : '(clear to use IAM auth)'}
+                      </span>
                     </label>
                     <div className="relative">
                       <input
@@ -341,7 +365,7 @@ export default function ConnectionPage() {
                         value={form.password}
                         onChange={e => set('password', e.target.value)}
                         className="input-field text-sm pr-9"
-                        placeholder="Leave blank for IAM / AWS credential auth"
+                        placeholder={form.db_type === 'snowflake' ? 'Enter password to save' : 'Leave blank for IAM / AWS credential auth'}
                       />
                       <button type="button" onClick={() => setShowPw(v => !v)}
                         className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
@@ -356,6 +380,29 @@ export default function ConnectionPage() {
                     <label className="block text-xs font-medium text-gray-600 mb-1">IAM Role ARN <span className="text-gray-400 font-normal">(optional — leave blank for password auth)</span></label>
                     <input value={form.iam_role_arn} onChange={e => set('iam_role_arn', e.target.value)}
                       className="input-field text-sm font-mono" placeholder="arn:aws:iam::123456789:role/RedshiftRole" />
+                  </div>
+                )}
+
+                {form.db_type === 'snowflake' && (
+                  <div className="space-y-3 p-3 bg-blue-50/40 border border-blue-100 rounded-xl">
+                    <p className="text-xs font-medium text-blue-700">Snowflake options</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-600 mb-1">Warehouse <span className="text-gray-400 font-normal">(optional)</span></label>
+                        <input value={form.sf_warehouse} onChange={e => set('sf_warehouse', e.target.value)}
+                          className="input-field text-sm font-mono" placeholder="COMPUTE_WH" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-600 mb-1">Role <span className="text-gray-400 font-normal">(optional)</span></label>
+                        <input value={form.sf_role} onChange={e => set('sf_role', e.target.value)}
+                          className="input-field text-sm font-mono" placeholder="ANALYST" />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-1">Schema filter <span className="text-gray-400 font-normal">(optional — crawls all schemas if blank)</span></label>
+                      <input value={form.sf_schema} onChange={e => set('sf_schema', e.target.value)}
+                        className="input-field text-sm font-mono" placeholder="PUBLIC" />
+                    </div>
                   </div>
                 )}
 

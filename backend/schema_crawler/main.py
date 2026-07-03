@@ -32,6 +32,7 @@ from shared.encryption import decrypt
 from schema_crawler.crawlers.postgres_crawler import crawl_postgres
 from schema_crawler.crawlers.mysql_crawler import crawl_mysql
 from schema_crawler.crawlers.redshift_crawler import crawl_redshift
+from schema_crawler.crawlers.snowflake_crawler import crawl_snowflake
 from schema_crawler.diff import compute_schema_diff, flag_affected_widgets
 from schema_crawler.metadata_extractor import run_metadata_extraction
 
@@ -127,6 +128,22 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     connection_id=connection_id,
                 )
                 sample_rows_map = {}
+            elif db_type == "snowflake":
+                opts = conn.connection_options or {}
+                warehouse = opts.get("warehouse") if isinstance(opts, dict) else None
+                role = opts.get("role") if isinstance(opts, dict) else None
+                sf_schema = opts.get("schema") if isinstance(opts, dict) else None
+                schema_doc, sample_rows_map = await crawl_snowflake(
+                    account=conn.host or "",
+                    database=conn.database_name or None,
+                    user=conn.username or "",
+                    password=password,
+                    connection_id=connection_id,
+                    warehouse=warehouse,
+                    role=role,
+                    schema_filter=sf_schema,
+                    ssl=conn.ssl_enabled,
+                )
             else:
                 _crawl_jobs[job_id] = {"status": "failed", "result": None, "error": f"Unsupported db_type: {db_type}"}
                 return

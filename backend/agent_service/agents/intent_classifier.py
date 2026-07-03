@@ -115,13 +115,19 @@ class IntentClassifier:
             filters=filters,
         )
 
+        raw_sub_intents = data.get("sub_intents", [])
+        sub_intents = [
+            s if isinstance(s, str) else json.dumps(s)
+            for s in raw_sub_intents
+        ]
+
         return IntentResult(
             intent_type=data.get("intent_type", "SINGLE_VIZ"),
             confidence=float(data.get("confidence", 0.5)),
             entities=entities,
             vagueness_score=float(data.get("vagueness_score", 0.5)),
             followup_ref=data.get("followup_ref"),
-            sub_intents=data.get("sub_intents", []),
+            sub_intents=sub_intents,
             reasoning=data.get("reasoning", ""),
             output_mode=(data.get("output_mode") or "chart").lower().strip(),
         )

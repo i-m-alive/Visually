@@ -1,0 +1,1518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 4 — AI Screening & Interview</title>
+<meta name="description" content="Complete implementation plan for Phase 4: AI Interviewer, Voice Engine, Human-in-the-Loop, Outreach, Verification, and Candidate Handoff.">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --ink:       #0C0F14;
+    --ink-mid:   #374151;
+    --ink-soft:  #6B7280;
+    --paper:     #F5F7FA;
+    --surface:   #FFFFFF;
+    --border:    #E3E7EF;
+    --border-mid:#CBD3DF;
+
+    /* Stage palette */
+    --s1: #2563EB; /* Assemble   — steel blue  */
+    --s2: #7C3AED; /* Generate   — violet      */
+    --s3: #D97706; /* Approve    — amber       */
+    --s4: #059669; /* Schedule   — forest      */
+    --s5: #DC2626; /* Interview  — red         */
+    --s6: #0891B2; /* Handoff    — teal        */
+
+    /* Semantic */
+    --warn:    #F59E0B;
+    --warn-bg: #FFFBEB;
+    --done:    #10B981;
+
+    --sidebar-w: 210px;
+    --content-max: 820px;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--ink);
+    background: var(--paper);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Layout ───────────────────────────────────────────────── */
+  .layout {
+    display: flex;
+    min-height: 100vh;
+    align-items: flex-start;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    width: var(--sidebar-w);
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 28px 0 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .sidebar-brand {
+    padding: 0 20px 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .sidebar-brand .phase-tag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--s1);
+    margin-bottom: 4px;
+  }
+  .sidebar-brand .brand-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 1.3;
+  }
+
+  .nav-section {
+    padding: 0 12px;
+    margin-bottom: 8px;
+  }
+  .nav-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    padding: 0 8px;
+    margin-bottom: 4px;
+  }
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 5px;
+    text-decoration: none;
+    color: var(--ink-mid);
+    font-size: 12.5px;
+    transition: background .12s, color .12s;
+  }
+  .nav-item:hover { background: var(--paper); color: var(--ink); }
+  .nav-item:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
+  .nav-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* Main content */
+  .main {
+    flex: 1;
+    min-width: 0;
+    padding: 0 0 80px;
+  }
+
+  /* ── Pipeline hero ───────────────────────────────────────── */
+  .pipeline-hero {
+    background: var(--ink);
+    padding: 40px 48px 44px;
+  }
+  .pipeline-hero h1 {
+    font-size: 22px;
+    font-weight: 800;
+    color: #FFFFFF;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin-bottom: 6px;
+  }
+  .pipeline-hero .subtitle {
+    font-size: 13px;
+    color: #8B9AB0;
+    margin-bottom: 36px;
+  }
+
+  .pipeline-flow {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .stage-card {
+    flex: 1;
+    min-width: 120px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.08);
+    border-radius: 8px;
+    padding: 14px 14px 16px;
+    position: relative;
+  }
+  .stage-card::after {
+    content: '→';
+    position: absolute;
+    right: -14px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: #4B5563;
+    font-size: 14px;
+    z-index: 1;
+    pointer-events: none;
+  }
+  .stage-card:last-child::after { display: none; }
+  .pipeline-flow .stage-card + .stage-card { margin-left: 8px; }
+
+  .stage-num {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .stage-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: #FFFFFF;
+    margin-bottom: 8px;
+    line-height: 1.2;
+  }
+  .stage-items {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .stage-items li {
+    font-size: 11px;
+    color: #9CA3AF;
+    line-height: 1.3;
+  }
+  .stage-items li::before {
+    content: '· ';
+    opacity: .6;
+  }
+
+  /* ── Content sections ────────────────────────────────────── */
+  .content-wrap {
+    max-width: var(--content-max);
+    padding: 0 48px;
+  }
+
+  .section {
+    padding-top: 52px;
+  }
+
+  .section-eyebrow {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .eyebrow-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .section h2 {
+    font-size: 21px;
+    font-weight: 800;
+    letter-spacing: -.02em;
+    color: var(--ink);
+    text-wrap: balance;
+    margin-bottom: 4px;
+  }
+  .section-desc {
+    font-size: 13.5px;
+    color: var(--ink-soft);
+    margin-bottom: 28px;
+    max-width: 58ch;
+    line-height: 1.55;
+  }
+
+  /* Divider */
+  .section + .section {
+    border-top: 1px solid var(--border);
+  }
+
+  /* ── Cards ───────────────────────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+  .card-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card-title .pill {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 4px;
+    color: #fff;
+  }
+  .card p {
+    font-size: 13px;
+    color: var(--ink-mid);
+    line-height: 1.55;
+    margin-bottom: 10px;
+  }
+  .card p:last-child { margin-bottom: 0; }
+
+  /* ── Two-col cards ───────────────────────────────────────── */
+  .card-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  /* ── Tables ──────────────────────────────────────────────── */
+  .table-wrap {
+    overflow-x: auto;
+    margin-bottom: 24px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+  thead th {
+    padding: 10px 14px;
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    background: var(--paper);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 10px 14px;
+    vertical-align: top;
+    color: var(--ink-mid);
+    border-bottom: 1px solid var(--border);
+    line-height: 1.45;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: #FAFBFD; }
+  td code, th code {
+    font-family: 'SF Mono', 'Consolas', 'Courier New', monospace;
+    font-size: 11.5px;
+    background: #F1F4F9;
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  /* ── Code blocks ─────────────────────────────────────────── */
+  .code-block {
+    background: #0C0F14;
+    border-radius: 8px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    margin-bottom: 16px;
+  }
+  .code-block pre {
+    font-family: 'SF Mono', 'Consolas', 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.65;
+    color: #CBD5E1;
+    white-space: pre;
+  }
+  .code-block .comment { color: #475569; }
+  .code-block .key     { color: #93C5FD; }
+  .code-block .val     { color: #86EFAC; }
+  .code-block .type    { color: #FCA5A5; }
+  .code-block .kw      { color: #C084FC; }
+
+  /* ── Agent flow ──────────────────────────────────────────── */
+  .flow-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .flow-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .flow-step:last-child { border-bottom: none; }
+  .step-turn {
+    flex-shrink: 0;
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: var(--paper);
+    border: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--ink-soft);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step-body { flex: 1; min-width: 0; }
+  .step-tool {
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 2px;
+  }
+  .step-desc {
+    font-size: 12px;
+    color: var(--ink-soft);
+    line-height: 1.4;
+  }
+
+  /* ── Milestone timeline ──────────────────────────────────── */
+  .milestones {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    position: relative;
+    padding-left: 32px;
+  }
+  .milestones::before {
+    content: '';
+    position: absolute;
+    left: 10px;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    background: var(--border);
+  }
+  .milestone {
+    position: relative;
+    padding-bottom: 28px;
+  }
+  .milestone:last-child { padding-bottom: 0; }
+  .milestone-dot {
+    position: absolute;
+    left: -26px;
+    top: 4px;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--surface);
+    box-shadow: 0 0 0 1px var(--border);
+  }
+  .milestone-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .milestone-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .milestone-weeks {
+    font-size: 11px;
+    color: var(--ink-soft);
+    font-weight: 500;
+  }
+  .milestone-items {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .milestone-items li {
+    font-size: 12.5px;
+    color: var(--ink-mid);
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .milestone-items li::before {
+    content: '—';
+    color: var(--border-mid);
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  /* ── Warning callout ─────────────────────────────────────── */
+  .warn-box {
+    background: var(--warn-bg);
+    border: 1px solid #FDE68A;
+    border-left: 3px solid var(--warn);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+  }
+  .warn-box .warn-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: #92400E;
+    margin-bottom: 8px;
+  }
+  .warn-box ol {
+    list-style: decimal;
+    padding-left: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .warn-box ol li {
+    font-size: 13px;
+    color: #78350F;
+    line-height: 1.5;
+  }
+  .warn-box ol li strong {
+    color: #451A03;
+    font-weight: 700;
+  }
+
+  /* ── Status badges ───────────────────────────────────────── */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+  .badge-done    { background: #ECFDF5; color: #065F46; }
+  .badge-phase4  { background: #EDE9FE; color: #4C1D95; }
+  .badge-future  { background: #F3F4F6; color: #374151; }
+  .badge-new     { background: #EFF6FF; color: #1E40AF; }
+  .badge-block   { background: #FEF2F2; color: #991B1B; }
+
+  /* ── Voice engine diagram ────────────────────────────────── */
+  .voice-loop {
+    background: var(--ink);
+    border-radius: 10px;
+    padding: 24px;
+    margin-bottom: 16px;
+    overflow-x: auto;
+  }
+  .voice-loop-inner {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    min-width: max-content;
+  }
+  .vl-node {
+    background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.1);
+    border-radius: 7px;
+    padding: 10px 14px;
+    text-align: center;
+    min-width: 100px;
+  }
+  .vl-node .vl-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: #6B7280;
+    margin-bottom: 3px;
+  }
+  .vl-node .vl-name {
+    font-size: 12px;
+    font-weight: 700;
+    color: #F1F5F9;
+  }
+  .vl-arrow {
+    flex-shrink: 0;
+    padding: 0 8px;
+    color: #374151;
+    font-size: 16px;
+  }
+
+  /* ── Malpractice flags ───────────────────────────────────── */
+  .flag-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .flag-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .flag-severity {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 4px;
+  }
+  .flag-item .flag-name {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 2px;
+  }
+  .flag-item .flag-how {
+    font-size: 11.5px;
+    color: var(--ink-soft);
+    line-height: 1.4;
+  }
+
+  /* Scrollbar polish */
+  .sidebar::-webkit-scrollbar { width: 4px; }
+  .sidebar::-webkit-scrollbar-track { background: transparent; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- ── Sidebar nav ──────────────────────────────────────── -->
+  <nav class="sidebar" aria-label="Page navigation">
+    <div class="sidebar-brand">
+      <div class="phase-tag">Visually · Bullhorn AI</div>
+      <div class="brand-title">Phase 4 Implementation Plan</div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Overview</div>
+      <a class="nav-item" href="#pipeline">
+        <span class="nav-dot" style="background:#4B5563"></span>6-Stage Pipeline
+      </a>
+      <a class="nav-item" href="#scope">
+        <span class="nav-dot" style="background:#4B5563"></span>Amplify Scorecard
+      </a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Stages</div>
+      <a class="nav-item" href="#s1-assemble">
+        <span class="nav-dot" style="background:var(--s1)"></span>Assemble
+      </a>
+      <a class="nav-item" href="#s2-generate">
+        <span class="nav-dot" style="background:var(--s2)"></span>Generate
+      </a>
+      <a class="nav-item" href="#s3-approve">
+        <span class="nav-dot" style="background:var(--s3)"></span>Approve
+      </a>
+      <a class="nav-item" href="#s4-schedule">
+        <span class="nav-dot" style="background:var(--s4)"></span>Schedule
+      </a>
+      <a class="nav-item" href="#s5-interview">
+        <span class="nav-dot" style="background:var(--s5)"></span>Interview
+      </a>
+      <a class="nav-item" href="#s6-handoff">
+        <span class="nav-dot" style="background:var(--s6)"></span>Handoff
+      </a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Design</div>
+      <a class="nav-item" href="#infrastructure">
+        <span class="nav-dot" style="background:#4B5563"></span>Infrastructure
+      </a>
+      <a class="nav-item" href="#database">
+        <span class="nav-dot" style="background:#4B5563"></span>Database Tables
+      </a>
+      <a class="nav-item" href="#agents">
+        <span class="nav-dot" style="background:#4B5563"></span>Agents
+      </a>
+      <a class="nav-item" href="#tools">
+        <span class="nav-dot" style="background:#4B5563"></span>Tools (16)
+      </a>
+      <a class="nav-item" href="#voice">
+        <span class="nav-dot" style="background:var(--s5)"></span>Voice Engine
+      </a>
+      <a class="nav-item" href="#frontend">
+        <span class="nav-dot" style="background:#4B5563"></span>Frontend
+      </a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Delivery</div>
+      <a class="nav-item" href="#milestones">
+        <span class="nav-dot" style="background:var(--done)"></span>Milestones
+      </a>
+      <a class="nav-item" href="#env">
+        <span class="nav-dot" style="background:#4B5563"></span>ENV Vars
+      </a>
+      <a class="nav-item" href="#required">
+        <span class="nav-dot" style="background:var(--warn)"></span>Required From You
+      </a>
+    </div>
+  </nav>
+
+  <!-- ── Main content ─────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Pipeline hero -->
+    <div class="pipeline-hero" id="pipeline">
+      <h1>Phase 4 — AI Screening &amp; Interview Engine</h1>
+      <p class="subtitle">6-stage autonomous hiring loop from profile assembly to hiring partner handoff</p>
+
+      <div class="pipeline-flow">
+        <div class="stage-card">
+          <div class="stage-num" style="color:var(--s1)">Stage 1</div>
+          <div class="stage-name">Assemble</div>
+          <ul class="stage-items">
+            <li>Parse resume (Lambda 2)</li>
+            <li>Application form data</li>
+            <li>Job description</li>
+            <li>ML score</li>
+          </ul>
+        </div>
+        <div class="stage-card">
+          <div class="stage-num" style="color:var(--s2)">Stage 2</div>
+          <div class="stage-name">Generate</div>
+          <ul class="stage-items">
+            <li>Question bank lookup</li>
+            <li>Web search</li>
+            <li>Claude generates Q set</li>
+            <li>Structured + scored</li>
+          </ul>
+        </div>
+        <div class="stage-card">
+          <div class="stage-num" style="color:var(--s3)">Stage 3</div>
+          <div class="stage-name">Approve</div>
+          <ul class="stage-items">
+            <li>Email to hiring person</li>
+            <li>In-app review UI</li>
+            <li>Edit / approve</li>
+            <li>Human in the loop</li>
+          </ul>
+        </div>
+        <div class="stage-card">
+          <div class="stage-num" style="color:var(--s4)">Stage 4</div>
+          <div class="stage-name">Schedule</div>
+          <ul class="stage-items">
+            <li>Invite email sent</li>
+            <li>Candidate books slot</li>
+            <li>Calendar invite</li>
+            <li>Reminder emails</li>
+          </ul>
+        </div>
+        <div class="stage-card">
+          <div class="stage-num" style="color:var(--s5)">Stage 5</div>
+          <div class="stage-name">Interview</div>
+          <ul class="stage-items">
+            <li>WebSocket voice session</li>
+            <li>STT → Claude → TTS</li>
+            <li>Dynamic follow-ups</li>
+            <li>Malpractice detection</li>
+          </ul>
+        </div>
+        <div class="stage-card">
+          <div class="stage-num" style="color:var(--s6)">Stage 6</div>
+          <div class="stage-name">Handoff</div>
+          <ul class="stage-items">
+            <li>Full profile compiled</li>
+            <li>Verify + risk flags</li>
+            <li>Report emailed</li>
+            <li>Hiring person acts</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Amplify scorecard ─────────────────────────────── -->
+    <div class="content-wrap">
+
+      <div class="section" id="scope">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Competitive Position
+        </div>
+        <h2>Bullhorn Amplify — 9 Skills Scorecard</h2>
+        <p class="section-desc">Where Visually stands today and what Phase 4 closes.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Amplify Skill</th>
+                <th>Visually Version</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>01</td>
+                <td><strong>Match</strong> — ML ranking via 60M placement history</td>
+                <td><code>match_agent.py</code> — ranks candidates against <code>job_profile_match_ml</code></td>
+                <td><span class="badge badge-done">Done · Phase 1</span></td>
+              </tr>
+              <tr>
+                <td>02</td>
+                <td><strong>Screen</strong> — structured async interviews</td>
+                <td><code>screen_agent.py</code> — voice AI interviewer + question generation + approval</td>
+                <td><span class="badge badge-phase4">Phase 4</span></td>
+              </tr>
+              <tr>
+                <td>03</td>
+                <td><strong>Enrich</strong> — auto-fill profile gaps, deduplicate</td>
+                <td><code>enrich_agent.py</code> — detects missing fields, suggests fills from resume</td>
+                <td><span class="badge badge-phase4">Phase 4</span></td>
+              </tr>
+              <tr>
+                <td>04</td>
+                <td><strong>Outreach</strong> — multi-channel email/SMS campaigns</td>
+                <td><code>outreach_agent.py</code> — email + notifications + scheduling (hiring loop only)</td>
+                <td><span class="badge badge-phase4">Phase 4</span></td>
+              </tr>
+              <tr>
+                <td>05</td>
+                <td><strong>Present</strong> — branded PDF submission packets</td>
+                <td><code>present_agent.py</code> — structured text report to hiring partner</td>
+                <td><span class="badge badge-phase4">Phase 4</span></td>
+              </tr>
+              <tr>
+                <td>06</td>
+                <td><strong>Prospect</strong> — LinkedIn/news external BD signals</td>
+                <td><code>prospect_agent.py</code> — internal pipeline gaps, stale jobs, ML blind spots</td>
+                <td><span class="badge badge-done">Done · Phase 3</span></td>
+              </tr>
+              <tr>
+                <td>07</td>
+                <td><strong>Verify</strong> — AI-resume detection, work history fraud</td>
+                <td><code>verify_agent.py</code> — cross-validates resume vs form vs interview vs ML score</td>
+                <td><span class="badge badge-phase4">Phase 4</span></td>
+              </tr>
+              <tr>
+                <td>08</td>
+                <td><strong>Audit</strong> — back-office billing/payroll compliance</td>
+                <td><code>audit_agent.py</code> — front-office data quality AND back-office financial integrity</td>
+                <td><span class="badge badge-done">Done · Phase 3</span></td>
+              </tr>
+              <tr>
+                <td>09</td>
+                <td><strong>Transcribe</strong> — call recording, auto CRM update</td>
+                <td>Not planned — needs voice call infrastructure outside this stack</td>
+                <td><span class="badge badge-future">Out of scope</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── Stage 1 ─────────────────────────────────────── -->
+      <div class="section" id="s1-assemble">
+        <div class="section-eyebrow" style="color:var(--s1)">
+          <span class="eyebrow-dot" style="background:var(--s1)"></span>Stage 1
+        </div>
+        <h2>Assemble</h2>
+        <p class="section-desc">Pull every data source about this candidate and job before generating a single question. This is the foundation all downstream stages build on.</p>
+
+        <div class="card-grid">
+          <div class="card">
+            <div class="card-title"><span class="pill" style="background:var(--s1)">Resume</span> Lambda 2 Bridge</div>
+            <p>Fast path: check S3 for pre-parsed JSON. Slow path: invoke Lambda 2 synchronously if cache miss. Returns structured resume: skills, work history, education, certifications, contact.</p>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="pill" style="background:var(--s2)">Form</span> Application Data</div>
+            <p>JSON blob that the candidate filled in when applying — self-reported skills, salary expectation, availability, references. Key for the Verify stage gap analysis.</p>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="pill" style="background:var(--s4)">JD</span> Job Description</div>
+            <p>Full job description text from <code>bullhorn_core_job_order</code>. Drives both question generation (what to ask) and scoring (what to evaluate against).</p>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="pill" style="background:var(--s6)">ML</span> Existing Score</div>
+            <p>Pull existing ML ranking from <code>job_profile_match_ml</code>. Used by verify_agent to cross-check whether interview performance matches the model's prediction.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Stage 2 ─────────────────────────────────────── -->
+      <div class="section" id="s2-generate">
+        <div class="section-eyebrow" style="color:var(--s2)">
+          <span class="eyebrow-dot" style="background:var(--s2)"></span>Stage 2
+        </div>
+        <h2>Generate</h2>
+        <p class="section-desc">Build a structured question set from three sources: the question bank (what worked before), web search (what's relevant now), and Claude's synthesis.</p>
+
+        <div class="card">
+          <div class="card-title">Question Bank</div>
+          <p>A <code>question_bank</code> table stores every question asked in previous interviews, tagged by job category, difficulty, and type. Semantic similarity search (pgvector) finds the 20 most relevant past questions for this role. Questions that scored well (high <code>avg_score</code>) are weighted more heavily.</p>
+          <p><strong>Purpose:</strong> builds institutional memory — the system learns what separates strong from weak candidates for each role over time without ever asking the same question twice.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Web Search — Tavily API</div>
+          <p>Searches for "interview questions for [job_title] [industry] [skill]" to supplement the bank with current, role-specific technical questions. Claude then filters to those actually testable in a voice interview.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Generated Question Set Structure</div>
+          <div class="code-block"><pre><span class="comment">// Output of screen_agent turn 6 — sent for approval</span>
+{
+  <span class="key">"sections"</span>: [
+    {
+      <span class="key">"name"</span>: <span class="val">"Technical"</span>,        <span class="comment">// 40% weight</span>
+      <span class="key">"questions"</span>: [{
+        <span class="key">"id"</span>: <span class="val">"Q1"</span>,
+        <span class="key">"text"</span>: <span class="val">"Walk me through an ETL pipeline you built end-to-end."</span>,
+        <span class="key">"type"</span>: <span class="val">"technical"</span>,
+        <span class="key">"difficulty"</span>: <span class="val">"mid"</span>,
+        <span class="key">"what_to_listen_for"</span>: <span class="val">"error handling, monitoring, scale awareness"</span>,
+        <span class="key">"follow_up_if_shallow"</span>: <span class="val">"What would you change if volume was 10x?"</span>
+      }]
+    },
+    { <span class="key">"name"</span>: <span class="val">"Behavioral"</span>,       <span class="comment">// 30% weight</span>  <span class="key">"questions"</span>: [<span class="type">...</span>] },
+    { <span class="key">"name"</span>: <span class="val">"Role-Specific"</span>,    <span class="comment">// 20% weight</span>  <span class="key">"questions"</span>: [<span class="type">...</span>] },
+    { <span class="key">"name"</span>: <span class="val">"Culture Fit"</span>,      <span class="comment">// 10% weight</span>  <span class="key">"questions"</span>: [<span class="type">...</span>] }
+  ],
+  <span class="key">"total_duration_estimate"</span>: <span class="val">"40 minutes"</span>,
+  <span class="key">"scoring_rubric"</span>: {
+    <span class="key">"technical"</span>: <span class="val">40</span>, <span class="key">"behavioral"</span>: <span class="val">30</span>, <span class="key">"communication"</span>: <span class="val">20</span>, <span class="key">"culture_fit"</span>: <span class="val">10</span>
+  }
+}</pre></div>
+        </div>
+      </div>
+
+      <!-- ── Stage 3 ─────────────────────────────────────── -->
+      <div class="section" id="s3-approve">
+        <div class="section-eyebrow" style="color:var(--s3)">
+          <span class="eyebrow-dot" style="background:var(--s3)"></span>Stage 3
+        </div>
+        <h2>Approve — Human in the Loop</h2>
+        <p class="section-desc">The hiring person reviews the proposed question set before any interview is scheduled. They can edit, delete, or add questions. Nothing moves to scheduling without explicit approval.</p>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="step-turn">1</div>
+            <div class="step-body">
+              <div class="step-tool">submit_question_for_approval(session_id, questions, reviewer_email)</div>
+              <div class="step-desc">Writes a row to <code>interview_question_approvals</code> with status=pending. Triggers outreach_agent to send the email.</div>
+            </div>
+          </div>
+          <div class="flow-step">
+            <div class="step-turn">2</div>
+            <div class="step-body">
+              <div class="step-tool">outreach_agent → send_email(type="approval_request")</div>
+              <div class="step-desc">Email to hiring person includes a direct link to <code>/approvals/[session_id]</code> in the app. They click, review, edit, and click Approve.</div>
+            </div>
+          </div>
+          <div class="flow-step">
+            <div class="step-turn">3</div>
+            <div class="step-body">
+              <div class="step-tool">get_approval_status(session_id)</div>
+              <div class="step-desc">screen_agent polls this tool. Once status=approved, it reads the (potentially modified) question set and proceeds to Stage 4.</div>
+            </div>
+          </div>
+          <div class="flow-step">
+            <div class="step-turn">4</div>
+            <div class="step-body">
+              <div class="step-tool">save approved_questions → interview_sessions row</div>
+              <div class="step-desc">The final approved set is frozen in the DB. The live interview uses exactly these questions.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Stage 4 ─────────────────────────────────────── -->
+      <div class="section" id="s4-schedule">
+        <div class="section-eyebrow" style="color:var(--s4)">
+          <span class="eyebrow-dot" style="background:var(--s4)"></span>Stage 4
+        </div>
+        <h2>Schedule</h2>
+        <p class="section-desc">Once the question set is approved, outreach_agent coordinates the calendar and sends the interview invitation.</p>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="step-turn">1</div>
+            <div class="step-body">
+              <div class="step-tool">schedule_interview(session_id, candidate_email, hiring_email)</div>
+              <div class="step-desc">Generates a Calendly booking link (or custom slot picker) and sets session status to INVITED.</div>
+            </div>
+          </div>
+          <div class="flow-step">
+            <div class="step-turn">2</div>
+            <div class="step-body">
+              <div class="step-tool">send_email(to=candidate, type="interview_invite")</div>
+              <div class="step-desc">Email includes the AI interviewer name ("Alex — AI Interviewer"), estimated duration, booking link, and prep instructions.</div>
+            </div>
+          </div>
+          <div class="flow-step">
+            <div class="step-turn">3</div>
+            <div class="step-body">
+              <div class="step-tool">Candidate books slot → webhook → update session status to SCHEDULED</div>
+              <div class="step-desc">Calendly fires a webhook. Backend updates the session row, creates a calendar invite (.ics) and sends it to both parties.</div>
+            </div>
+          </div>
+          <div class="flow-step">
+            <div class="step-turn">4</div>
+            <div class="step-body">
+              <div class="step-tool">send_email(type="reminder") — 24h and 1h before</div>
+              <div class="step-desc">APScheduler jobs (already exists in the codebase) handle timed reminders. No new scheduler infrastructure needed.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Stage 5 ─────────────────────────────────────── -->
+      <div class="section" id="s5-interview">
+        <div class="section-eyebrow" style="color:var(--s5)">
+          <span class="eyebrow-dot" style="background:var(--s5)"></span>Stage 5
+        </div>
+        <h2>Live Voice Interview</h2>
+        <p class="section-desc">The most technically complex stage. A new <code>interview_service</code> microservice manages the real-time WebSocket session between the candidate's browser and the AI interviewer.</p>
+
+        <div class="voice-loop">
+          <div class="voice-loop-inner">
+            <div class="vl-node">
+              <div class="vl-label">Browser</div>
+              <div class="vl-name">MediaRecorder</div>
+            </div>
+            <div class="vl-arrow">→</div>
+            <div class="vl-node">
+              <div class="vl-label">interview_service</div>
+              <div class="vl-name">WebSocket</div>
+            </div>
+            <div class="vl-arrow">→</div>
+            <div class="vl-node">
+              <div class="vl-label">AWS</div>
+              <div class="vl-name">Transcribe</div>
+            </div>
+            <div class="vl-arrow">→</div>
+            <div class="vl-node">
+              <div class="vl-label">Bedrock</div>
+              <div class="vl-name">Claude</div>
+            </div>
+            <div class="vl-arrow">→</div>
+            <div class="vl-node">
+              <div class="vl-label">AWS</div>
+              <div class="vl-name">Polly TTS</div>
+            </div>
+            <div class="vl-arrow">→</div>
+            <div class="vl-node">
+              <div class="vl-label">Browser</div>
+              <div class="vl-name">Audio stream</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Per-Turn Loop</div>
+          <p>1. TTS streams the current question as audio → browser plays it<br>
+          2. Candidate responds → browser streams audio chunks via WebSocket<br>
+          3. Chunks → AWS Transcribe Streaming → partial transcript shown live on screen<br>
+          4. Silence threshold (~1.5s) ends the candidate's turn<br>
+          5. Final transcript → Claude with: approved Q set + conversation history + scoring rubric<br>
+          6. Claude returns next question text OR <code>END_INTERVIEW</code> if all questions covered<br>
+          7. If follow-up needed (shallow answer detected) → Claude generates follow-up instead<br>
+          8. Next question → Polly Neural TTS → audio stream → browser plays<br>
+          9. Transcript chunk + per-answer score saved to DB; malpractice detector runs in background</p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Session State Machine</div>
+          <div class="code-block"><pre><span class="kw">PENDING</span>   → (approval received)    → <span class="kw">INVITED</span>
+<span class="kw">INVITED</span>   → (candidate books)      → <span class="kw">SCHEDULED</span>
+<span class="kw">SCHEDULED</span> → (candidate joins)      → <span class="kw">ACTIVE</span>
+<span class="kw">ACTIVE</span>    → (all questions done)   → <span class="kw">SCORING</span>
+<span class="kw">SCORING</span>   → (scores compiled)      → <span class="kw">COMPLETE</span>
+<span class="kw">ACTIVE</span>    → (candidate disconnects) → <span class="kw">INTERRUPTED</span> → can resume</pre></div>
+        </div>
+
+        <h3 style="font-size:14px; font-weight:700; color:var(--ink); margin-bottom:12px;">Malpractice Detection</h3>
+        <div class="flag-list">
+          <div class="flag-item">
+            <div class="flag-severity" style="background:#EF4444"></div>
+            <div>
+              <div class="flag-name">Multiple Voices</div>
+              <div class="flag-how">Two distinct speaker timbres in same audio segment detected by AWS Transcribe speaker diarization.</div>
+            </div>
+          </div>
+          <div class="flag-item">
+            <div class="flag-severity" style="background:#EF4444"></div>
+            <div>
+              <div class="flag-name">AI-Sounding Answers</div>
+              <div class="flag-how">Claude rates each answer 0–10 for AI-generation likelihood: overly formal, zero fillers, comprehensive without being asked. Score &gt;7 = flag.</div>
+            </div>
+          </div>
+          <div class="flag-item">
+            <div class="flag-severity" style="background:#F59E0B"></div>
+            <div>
+              <div class="flag-name">Background Typing</div>
+              <div class="flag-how">Audio classifier detects repetitive mechanical key-click sounds in background while candidate speaks.</div>
+            </div>
+          </div>
+          <div class="flag-item">
+            <div class="flag-severity" style="background:#F59E0B"></div>
+            <div>
+              <div class="flag-name">Ambient Noise Change</div>
+              <div class="flag-how">Background noise profile shifts significantly mid-session — could indicate room change or device switch.</div>
+            </div>
+          </div>
+          <div class="flag-item">
+            <div class="flag-severity" style="background:#6B7280"></div>
+            <div>
+              <div class="flag-name">Suspiciously Perfect Answer</div>
+              <div class="flag-how">Answer proactively covers every follow-up angle without being asked — pattern common with scripted responses.</div>
+            </div>
+          </div>
+          <div class="flag-item">
+            <div class="flag-severity" style="background:#6B7280"></div>
+            <div>
+              <div class="flag-name">Abnormal Pause Patterns</div>
+              <div class="flag-how">Long pauses (5s+) before technical questions that should be answered fluently — suggests lookup time.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Stage 6 ─────────────────────────────────────── -->
+      <div class="section" id="s6-handoff">
+        <div class="section-eyebrow" style="color:var(--s6)">
+          <span class="eyebrow-dot" style="background:var(--s6)"></span>Stage 6
+        </div>
+        <h2>Handoff</h2>
+        <p class="section-desc">Three agents collaborate to produce the final deliverable: verify_agent flags risks, present_agent writes the narrative, outreach_agent sends the report.</p>
+
+        <div class="card">
+          <div class="card-title">Complete Candidate Profile Structure</div>
+          <div class="code-block"><pre>{
+  <span class="key">"candidate"</span>:   { name, email, phone, location },
+  <span class="key">"ml_score"</span>:    { score, rank, category },          <span class="comment">// from job_profile_match_ml</span>
+  <span class="key">"resume"</span>:      { skills, experience, education },   <span class="comment">// from Lambda 2</span>
+  <span class="key">"application"</span>: { self_reported_skills, salary, availability },
+  <span class="key">"interview"</span>: {
+    <span class="key">"overall_score"</span>: <span class="val">7.4</span>,
+    <span class="key">"dimension_scores"</span>: { technical: <span class="val">8.0</span>, behavioral: <span class="val">7.5</span>, communication: <span class="val">6.8</span> },
+    <span class="key">"transcript_summary"</span>: <span class="val">"..."</span>,
+    <span class="key">"malpractice_flags"</span>: []
+  },
+  <span class="key">"verification"</span>: {
+    <span class="key">"ai_generated_resume"</span>: <span class="val">false</span>,
+    <span class="key">"skill_gaps"</span>: [<span class="val">"Claimed Python expert; answered beginner-level questions"</span>],
+    <span class="key">"risk_rating"</span>: <span class="val">"Low"</span>
+  },
+  <span class="key">"overall_rating"</span>: <span class="val">"Strong Hire"</span>,     <span class="comment">// Strong Hire | Hire | No Hire | Strong No Hire</span>
+  <span class="key">"narrative"</span>:   <span class="val">"..."</span>                   <span class="comment">// present_agent written summary</span>
+}</pre></div>
+        </div>
+      </div>
+
+      <!-- ── Infrastructure ─────────────────────────────── -->
+      <div class="section" id="infrastructure">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Infrastructure
+        </div>
+        <h2>New Services</h2>
+        <p class="section-desc">Phase 4 adds 2 new microservices to the 5 that already exist.</p>
+
+        <div class="card">
+          <div class="card-title">
+            <span class="badge badge-new">New</span>
+            interview_service (port 8005)
+          </div>
+          <p><strong>Why separate:</strong> agent_service is HTTP request/response. Voice interviews are long-lived WebSocket connections (30–60 min). A single dropped interview cannot crash the main service, and interview session state must persist independently across reconnects.</p>
+          <p><strong>Stack:</strong> FastAPI + WebSockets · AWS Transcribe Streaming (STT) · Amazon Polly Neural (TTS) · Claude via Bedrock · shared PostgreSQL models</p>
+          <p><strong>Key endpoints:</strong><br>
+          <code>GET  /interview/{session_id}/token</code> — issue short-lived session JWT<br>
+          <code>WS   /ws/interview/{session_id}?token=…</code> — live audio/text stream<br>
+          <code>GET  /interview/{session_id}/results</code> — transcript + scores (used by agent_service tools)</p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span class="badge badge-new">New</span>
+            outreach_service (or module inside agent_service)
+          </div>
+          <p><strong>Recommendation:</strong> start as a module inside agent_service (<code>agent_service/outreach/</code>). Move to its own service only if email volume/retry logic becomes complex. AWS SES handles transactional email reliably without a separate queue at this scale.</p>
+          <p><strong>Capabilities:</strong> send email via SES · generate .ics calendar invites · write <code>outreach_logs</code> rows · handle Calendly webhooks for booking confirmations</p>
+        </div>
+      </div>
+
+      <!-- ── Database ───────────────────────────────────── -->
+      <div class="section" id="database">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Database
+        </div>
+        <h2>5 New Tables</h2>
+        <p class="section-desc">All added via Alembic migrations to the existing PostgreSQL database.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Table</th>
+                <th>Key Columns</th>
+                <th>Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>question_bank</code></td>
+                <td><code>job_category</code>, <code>question_text</code>, <code>embedding vector(1536)</code>, <code>avg_score</code>, <code>times_used</code></td>
+                <td>Historical questions with pgvector embeddings for semantic similarity search. Institutional memory across all interviews.</td>
+              </tr>
+              <tr>
+                <td><code>interview_sessions</code></td>
+                <td><code>candidate_id</code>, <code>job_id</code>, <code>status</code>, <code>transcript jsonb</code>, <code>overall_score</code>, <code>dimension_scores jsonb</code>, <code>malpractice_flags jsonb</code>, <code>approved_questions jsonb</code></td>
+                <td>One row per interview. Stores full transcript, scores, malpractice flags, and the approved question set used.</td>
+              </tr>
+              <tr>
+                <td><code>interview_question_approvals</code></td>
+                <td><code>interview_session_id</code>, <code>proposed_questions jsonb</code>, <code>status</code>, <code>reviewer_email</code>, <code>modified_questions jsonb</code></td>
+                <td>Human-in-the-loop queue. Hiring person approves or edits the question set here before scheduling happens.</td>
+              </tr>
+              <tr>
+                <td><code>outreach_logs</code></td>
+                <td><code>recipient_email</code>, <code>type</code>, <code>status</code>, <code>ses_message_id</code>, <code>related_session uuid</code></td>
+                <td>Audit trail for every email sent. Tracks delivery status via SES bounce/complaint webhooks.</td>
+              </tr>
+              <tr>
+                <td><code>candidate_profiles_v2</code></td>
+                <td><code>candidate_id</code>, <code>job_id</code>, <code>ml_score</code>, <code>resume_data jsonb</code>, <code>interview_score</code>, <code>verification_flags jsonb</code>, <code>overall_rating</code>, <code>narrative</code></td>
+                <td>Final compiled profile. The deliverable that goes to the hiring partner. Written by present_agent after verification.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── Agents ─────────────────────────────────────── -->
+      <div class="section" id="agents">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Agents
+        </div>
+        <h2>5 Agents</h2>
+        <p class="section-desc">All follow the same pattern as <code>audit_agent.py</code>: system prompt template, tool list, max_turns, register() at the bottom.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Agent</th>
+                <th>Intent</th>
+                <th>Tools Used</th>
+                <th>Max Turns</th>
+                <th>Owns Stages</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>screen_agent.py</code></td>
+                <td>SCREEN</td>
+                <td><code>parse_resume</code>, <code>get_application_form_data</code>, <code>get_job_description</code>, <code>search_question_bank</code>, <code>web_search</code>, <code>submit_question_for_approval</code>, <code>get_approval_status</code>, <code>schedule_interview</code></td>
+                <td>10</td>
+                <td>1 → 2 → 3 → 4</td>
+              </tr>
+              <tr>
+                <td><code>outreach_agent.py</code></td>
+                <td>OUTREACH</td>
+                <td><code>send_email</code>, <code>create_calendar_invite</code>, <code>get_candidate_profile</code>, <code>get_job_description</code></td>
+                <td>5</td>
+                <td>3 → 4 → 6</td>
+              </tr>
+              <tr>
+                <td><code>enrich_agent.py</code></td>
+                <td>ENRICH</td>
+                <td><code>get_candidate_profile</code>, <code>run_sql</code></td>
+                <td>4</td>
+                <td>1 (profile gaps)</td>
+              </tr>
+              <tr>
+                <td><code>verify_agent.py</code></td>
+                <td>VERIFY</td>
+                <td><code>parse_resume</code>, <code>get_application_form_data</code>, <code>get_interview_scores</code>, <code>detect_malpractice</code>, <code>run_sql</code></td>
+                <td>7</td>
+                <td>6 (risk analysis)</td>
+              </tr>
+              <tr>
+                <td><code>present_agent.py</code></td>
+                <td>PRESENT</td>
+                <td><code>compile_full_profile</code>, <code>send_candidate_report</code></td>
+                <td>4</td>
+                <td>6 (handoff)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── Tools ──────────────────────────────────────── -->
+      <div class="section" id="tools">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Tools
+        </div>
+        <h2>16 New Tools</h2>
+        <p class="section-desc">Each registered in <code>registry.py</code> and routed in <code>dispatcher.py</code>.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Tool</th>
+                <th>Implemented In</th>
+                <th>What It Does</th>
+                <th>Blocks</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>parse_resume</code></td><td><code>lambda_bridge.py</code></td><td>S3 cache → Lambda 2 fallback. Returns structured resume JSON.</td><td><span class="badge badge-block">Blocks all</span></td></tr>
+              <tr><td><code>get_candidate_profile</code></td><td><code>lambda_bridge.py</code></td><td>Merges DB candidate row + parsed resume into unified profile dict.</td><td><span class="badge badge-block">Blocks all</span></td></tr>
+              <tr><td><code>get_job_description</code></td><td><code>lambda_bridge.py</code> or SQL</td><td>Full JD text from <code>bullhorn_core_job_order</code>.</td><td></td></tr>
+              <tr><td><code>get_application_form_data</code></td><td><code>lambda_bridge.py</code> or SQL</td><td>JSON blob from candidate's application form submission.</td><td></td></tr>
+              <tr><td><code>search_question_bank</code></td><td><code>question_bank_tool.py</code></td><td>pgvector similarity search for past questions by job category.</td><td></td></tr>
+              <tr><td><code>web_search</code></td><td><code>search_tool.py</code></td><td>Tavily API query for role-specific interview questions.</td><td></td></tr>
+              <tr><td><code>submit_question_for_approval</code></td><td><code>approval_tool.py</code></td><td>Writes approval row + triggers outreach_agent email.</td><td></td></tr>
+              <tr><td><code>get_approval_status</code></td><td><code>approval_tool.py</code></td><td>Returns approval status + modified_questions if editing was done.</td><td></td></tr>
+              <tr><td><code>schedule_interview</code></td><td><code>scheduling_tool.py</code></td><td>Generates Calendly booking link, updates session status to INVITED.</td><td></td></tr>
+              <tr><td><code>send_email</code></td><td><code>outreach_tool.py</code></td><td>AWS SES send with template rendering, writes to <code>outreach_logs</code>.</td><td></td></tr>
+              <tr><td><code>create_calendar_invite</code></td><td><code>outreach_tool.py</code></td><td>Generates .ics file, attaches to email to both parties.</td><td></td></tr>
+              <tr><td><code>get_interview_transcript</code></td><td><code>interview_client.py</code></td><td>HTTP GET to interview_service for full transcript.</td><td></td></tr>
+              <tr><td><code>get_interview_scores</code></td><td><code>interview_client.py</code></td><td>HTTP GET to interview_service for dimension scores + per-Q scores.</td><td></td></tr>
+              <tr><td><code>detect_malpractice</code></td><td><code>interview_client.py</code></td><td>HTTP GET to interview_service for malpractice flag list + severity.</td><td></td></tr>
+              <tr><td><code>compile_full_profile</code></td><td><code>profile_tool.py</code></td><td>Merges all phase data, writes <code>candidate_profiles_v2</code> row.</td><td></td></tr>
+              <tr><td><code>send_candidate_report</code></td><td><code>outreach_tool.py</code></td><td>Emails formatted complete profile to hiring person via SES.</td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── Frontend ───────────────────────────────────── -->
+      <div class="section" id="frontend">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Frontend
+        </div>
+        <h2>3 New Pages</h2>
+        <p class="section-desc">All built in the existing Next.js app.</p>
+
+        <div class="card-grid">
+          <div class="card">
+            <div class="card-title"><span class="pill" style="background:var(--s5)">New</span> /interviews/[session_id]</div>
+            <p><strong>Candidate-facing interview room.</strong> Microphone permission prompt on load. Audio waveform visualizer showing who is speaking. Live transcript panel with scrolling subtitles. Question progress tracker ("3 of 12"). AI interviewer name + status indicator. Manages WebSocket reconnect automatically.</p>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="pill" style="background:var(--s3)">New</span> /approvals</div>
+            <p><strong>Hiring person review queue.</strong> List of pending question sets. Per-question: edit text, change type/difficulty, delete, add new. Approve and Send Back buttons. Notification badge in sidebar nav showing pending count. Link sent directly via email.</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span class="pill" style="background:var(--s6)">New</span> /candidates/[id]/profile — Complete Profile View</div>
+          <p><strong>Tab 1 Overview:</strong> ML score, resume summary, application form highlights</p>
+          <p><strong>Tab 2 Interview:</strong> Full transcript with per-question scores, malpractice report, dimension score breakdown</p>
+          <p><strong>Tab 3 Verification:</strong> All flags and their severity — AI-generated risk, skill gaps, timeline inconsistencies</p>
+          <p><strong>Tab 4 Full Report:</strong> The formatted narrative that was sent to the hiring partner, with sent timestamp</p>
+        </div>
+      </div>
+
+      <!-- ── Milestones ─────────────────────────────────── -->
+      <div class="section" id="milestones">
+        <div class="section-eyebrow" style="color:var(--done)">
+          <span class="eyebrow-dot" style="background:var(--done)"></span>Delivery
+        </div>
+        <h2>Build Milestones</h2>
+        <p class="section-desc">Each milestone is independently shippable. Build in this order — later milestones depend on earlier ones.</p>
+
+        <div class="milestones">
+          <div class="milestone">
+            <div class="milestone-dot" style="background:var(--s1)"></div>
+            <div class="milestone-header">
+              <span class="milestone-name">M1 — Foundation</span>
+              <span class="milestone-weeks">Weeks 1–2</span>
+            </div>
+            <ul class="milestone-items">
+              <li><code>lambda_bridge.py</code> — parse_resume + get_candidate_profile</li>
+              <li><code>enrich_agent.py</code> ships immediately (no voice needed)</li>
+              <li>DB migration: all 5 new tables created</li>
+              <li><code>outreach_tool.py</code> with send_email via AWS SES (basic, no calendar)</li>
+              <li>Lambda 2 details required from you before this starts</li>
+            </ul>
+          </div>
+          <div class="milestone">
+            <div class="milestone-dot" style="background:var(--s2)"></div>
+            <div class="milestone-header">
+              <span class="milestone-name">M2 — Question Generation</span>
+              <span class="milestone-weeks">Weeks 2–3</span>
+            </div>
+            <ul class="milestone-items">
+              <li><code>question_bank_tool.py</code> — keyword search first, pgvector later</li>
+              <li><code>search_tool.py</code> — Tavily integration</li>
+              <li><code>screen_agent.py</code> — question generation half (turns 1–6)</li>
+              <li><code>approval_tool.py</code> — submit_question_for_approval</li>
+            </ul>
+          </div>
+          <div class="milestone">
+            <div class="milestone-dot" style="background:var(--s3)"></div>
+            <div class="milestone-header">
+              <span class="milestone-name">M3 — Human-in-Loop UI</span>
+              <span class="milestone-weeks">Week 3–4</span>
+            </div>
+            <ul class="milestone-items">
+              <li><code>/approvals</code> frontend page with question editing</li>
+              <li><code>get_approval_status</code> tool + notification badge</li>
+              <li>Outreach email templates for approval requests</li>
+            </ul>
+          </div>
+          <div class="milestone">
+            <div class="milestone-dot" style="background:var(--s4)"></div>
+            <div class="milestone-header">
+              <span class="milestone-name">M4 — Scheduling</span>
+              <span class="milestone-weeks">Weeks 4–5</span>
+            </div>
+            <ul class="milestone-items">
+              <li>Calendly API integration + webhook handler</li>
+              <li><code>schedule_interview</code> tool + .ics generation</li>
+              <li><code>outreach_agent.py</code> — interview invite + reminders (APScheduler)</li>
+            </ul>
+          </div>
+          <div class="milestone">
+            <div class="milestone-dot" style="background:var(--s5)"></div>
+            <div class="milestone-header">
+              <span class="milestone-name">M5 — Voice Interview Engine</span>
+              <span class="milestone-weeks">Weeks 5–8 (longest)</span>
+            </div>
+            <ul class="milestone-items">
+              <li><code>interview_service</code> microservice with FastAPI + WebSockets</li>
+              <li>AWS Transcribe Streaming integration (STT)</li>
+              <li>Amazon Polly Neural TTS integration</li>
+              <li>Real-time Claude conversation manager + follow-up logic</li>
+              <li>Malpractice detection running per turn</li>
+              <li><code>/interviews/[session_id]</code> frontend page</li>
+            </ul>
+          </div>
+          <div class="milestone">
+            <div class="milestone-dot" style="background:var(--s6)"></div>
+            <div class="milestone-header">
+              <span class="milestone-name">M6 — Scoring, Verify &amp; Handoff</span>
+              <span class="milestone-weeks">Weeks 8–10</span>
+            </div>
+            <ul class="milestone-items">
+              <li>Post-interview scoring compilation + dimension weighting</li>
+              <li><code>verify_agent.py</code> — full cross-validation across all data sources</li>
+              <li><code>present_agent.py</code> — profile builder + hiring partner narrative</li>
+              <li>Final report email + <code>/candidates/[id]/profile</code> page</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── ENV vars ───────────────────────────────────── -->
+      <div class="section" id="env">
+        <div class="section-eyebrow" style="color:var(--ink-soft)">
+          <span class="eyebrow-dot" style="background:#4B5563"></span>Configuration
+        </div>
+        <h2>ENV Variables</h2>
+        <p class="section-desc">All new environment variables Phase 4 requires.</p>
+
+        <div class="code-block"><pre><span class="comment"># ── Lambda 2 / Resume bridge (blocks Milestone 1) ──────────────</span>
+<span class="key">LAMBDA_PARSER_ARN</span>           = <span class="val">arn:aws:lambda:us-east-1:…:function:resume-parser</span>
+<span class="key">RESUME_S3_BUCKET</span>            = <span class="val">brainwave-resumes</span>
+<span class="key">RESUME_S3_PREFIX</span>            = <span class="val">parsed-resumes/</span>            <span class="comment"># confirm exact format</span>
+
+<span class="comment"># ── Email / outreach (blocks Milestone 1) ──────────────────────</span>
+<span class="key">AWS_SES_REGION</span>              = <span class="val">us-east-1</span>
+<span class="key">AWS_SES_FROM_ADDRESS</span>        = <span class="val">noreply@yourdomain.com</span>     <span class="comment"># must be SES-verified</span>
+
+<span class="comment"># ── Scheduling (blocks Milestone 4) ────────────────────────────</span>
+<span class="key">CALENDLY_API_KEY</span>            = <span class="val">…</span>
+<span class="key">CALENDLY_USER_URI</span>           = <span class="val">https://api.calendly.com/users/…</span>
+<span class="key">CALENDLY_WEBHOOK_SECRET</span>     = <span class="val">…</span>                           <span class="comment"># to verify booking webhooks</span>
+
+<span class="comment"># ── Voice interview (blocks Milestone 5) ───────────────────────</span>
+<span class="key">AWS_TRANSCRIBE_REGION</span>       = <span class="val">us-east-1</span>
+<span class="key">AWS_POLLY_REGION</span>            = <span class="val">us-east-1</span>
+<span class="key">POLLY_VOICE_ID</span>              = <span class="val">Joanna</span>                     <span class="comment"># Neural voice</span>
+<span class="key">INTERVIEW_SERVICE_URL</span>       = <span class="val">http://localhost:8005</span>
+<span class="key">INTERVIEW_SERVICE_JWT_SECRET</span>= <span class="val">…</span>                           <span class="comment"># shared secret for session tokens</span>
+<span class="key">AI_INTERVIEWER_NAME</span>         = <span class="val">Alex</span>                       <span class="comment"># shown in UI + mentioned in emails</span>
+
+<span class="comment"># ── Question generation (blocks Milestone 2) ───────────────────</span>
+<span class="key">TAVILY_API_KEY</span>              = <span class="val">…</span>                           <span class="comment"># leave blank to use Claude-only</span>
+<span class="key">PGVECTOR_ENABLED</span>            = <span class="val">true</span>                       <span class="comment"># if extension installed on Postgres</span>
+
+<span class="comment"># ── App base URL (for approval email links) ─────────────────────</span>
+<span class="key">APP_BASE_URL</span>                = <span class="val">https://yourapp.com</span></pre></div>
+      </div>
+
+      <!-- ── Required from you ──────────────────────────── -->
+      <div class="section" id="required">
+        <div class="section-eyebrow" style="color:var(--warn)">
+          <span class="eyebrow-dot" style="background:var(--warn)"></span>Action Required
+        </div>
+        <h2>Required From You</h2>
+        <p class="section-desc">In priority order. Items marked Blocking must be resolved before the corresponding milestone can begin.</p>
+
+        <div class="warn-box">
+          <div class="warn-label">Blocking Milestone 1 — must have first</div>
+          <ol>
+            <li><strong>Lambda 2 source code (or handler return statement).</strong> Need: (1) exact input payload format — <code>{"candidate_id": X}</code> or <code>{"applicant_id": X}</code>? (2) S3 key format — <code>parsed-resumes/{id}.json</code> or something else? (3) output JSON field names — what keys does the parsed resume contain?</li>
+            <li><strong>Application form JSON structure.</strong> What fields does the candidate fill when applying? Is this stored in a DB table? What's the table name and column for the JSON?</li>
+            <li><strong>Job description storage.</strong> Is the full JD text a column in <code>bullhorn_core_job_order</code>? Run <code>SELECT column_name FROM information_schema.columns WHERE table_name = 'bullhorn_core_job_order'</code> and share the output.</li>
+            <li><strong>Email sender domain.</strong> Which domain will emails come from? It must be verified in AWS SES (or you need to verify it — 5 minute setup).</li>
+          </ol>
+        </div>
+
+        <div class="warn-box">
+          <div class="warn-label">Blocking Milestone 2–4 — needed before scheduling</div>
+          <ol>
+            <li><strong>pgvector status.</strong> Run <code>SELECT * FROM pg_extension WHERE extname = 'vector';</code> on your PostgreSQL. If not installed, I'll use keyword search for now and upgrade to embeddings when it's available.</li>
+            <li><strong>Calendly account.</strong> Do you have a Calendly account we can use for self-scheduling? Or do you want a simple custom slot-picker page built instead?</li>
+            <li><strong>In-app vs email notification preference.</strong> For the approval workflow: (a) email only, (b) in-app badge only, or (c) both?</li>
+          </ol>
+        </div>
+
+        <div class="warn-box" style="background:#F0FDF4; border-color:#A7F3D0; border-left-color:var(--done);">
+          <div class="warn-label" style="color:#065F46;">Needed before Milestone 5 — voice interview</div>
+          <ol style="color:#064E3B;">
+            <li><strong style="color:#022C22;">STT provider.</strong> AWS Transcribe Streaming (already on AWS, recommended) or Deepgram (better accuracy on technical vocabulary, ~$0.004/min)?</li>
+            <li><strong style="color:#022C22;">TTS voice preference.</strong> Amazon Polly Neural "Joanna" (F) or "Matthew" (M) — both included in AWS free tier (4M chars/month). Or do you want ElevenLabs for more natural voice quality?</li>
+            <li><strong style="color:#022C22;">AI interviewer persona.</strong> Name, style (formal and precise, or conversational), language/accent preference?</li>
+            <li><strong style="color:#022C22;">Malpractice scope.</strong> Audio-only detection, or also video (camera feed for face/eye tracking)? Video adds significant frontend complexity.</li>
+            <li><strong style="color:#022C22;">Interview duration target.</strong> 20 minutes (5–6 questions) or 40 minutes (10–12 questions)?</li>
+            <li><strong style="color:#022C22;"><code>bullhorn_core_candidate</code> schema.</strong> Run <code>SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'bullhorn_core_candidate' ORDER BY ordinal_position;</code> and share the output. Determines what get_candidate_profile needs to merge.</li>
+          </ol>
+        </div>
+      </div>
+
+    </div><!-- /content-wrap -->
+  </main>
+</div>
+
+</body>
+</html>

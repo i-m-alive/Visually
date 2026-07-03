@@ -4,13 +4,14 @@ import { useRouter } from 'next/navigation'
 import { projectApi } from '@/lib/api'
 import { CheckCircle, XCircle, Loader2 } from 'lucide-react'
 
-type DbType = 'postgresql' | 'mysql' | 'redshift'
+type DbType = 'postgresql' | 'mysql' | 'redshift' | 'snowflake'
 type Step = 'project' | 'connection' | 'crawling'
 
 const DB_OPTIONS: { value: DbType; label: string; defaultPort: number }[] = [
   { value: 'postgresql', label: 'PostgreSQL', defaultPort: 5432 },
   { value: 'mysql', label: 'MySQL', defaultPort: 3306 },
   { value: 'redshift', label: 'Amazon Redshift', defaultPort: 5439 },
+  { value: 'snowflake', label: 'Snowflake', defaultPort: 443 },
 ]
 
 export default function NewProjectPage() {
@@ -33,6 +34,9 @@ export default function NewProjectPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [iamRoleArn, setIamRoleArn] = useState('')
+  const [sfWarehouse, setSfWarehouse] = useState('')
+  const [sfRole, setSfRole] = useState('')
+  const [sfSchema, setSfSchema] = useState('')
 
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null)
   const [testing, setTesting] = useState(false)
@@ -84,11 +88,22 @@ export default function NewProjectPage() {
       let targetConnId = connId
       if (!targetConnId) {
         // Create connection first if not yet saved
-        const connectionOptions = dbType === 'redshift' && iamRoleArn ? { iam_role_arn: iamRoleArn } : undefined
+        const buildOpts = () => {
+          if (dbType === 'redshift' && iamRoleArn) return { iam_role_arn: iamRoleArn }
+          if (dbType === 'snowflake') {
+            const o: Record<string, string> = {}
+            if (sfWarehouse) o.warehouse = sfWarehouse
+            if (sfRole) o.role = sfRole
+            if (sfSchema) o.schema = sfSchema
+            return Object.keys(o).length ? o : undefined
+          }
+          return undefined
+        }
+        const connectionOptions = buildOpts()
         const resp = await projectApi.addConnection(projectId, {
           name: connName, db_type: dbType, host, port: parseInt(port),
           database_name: dbName, username, password,
-          ssl_enabled: dbType === 'redshift', connection_options: connectionOptions,
+          ssl_enabled: dbType === 'redshift' || dbType === 'snowflake', connection_options: connectionOptions,
         })
         targetConnId = resp.data.id
         setConnId(targetConnId)
@@ -106,13 +121,22 @@ export default function NewProjectPage() {
     setError('')
     setSaving(true)
     try {
-      const connectionOptions = dbType === 'redshift' && iamRoleArn
-        ? { iam_role_arn: iamRoleArn }
-        : undefined
+      const buildSaveOpts = () => {
+        if (dbType === 'redshift' && iamRoleArn) return { iam_role_arn: iamRoleArn }
+        if (dbType === 'snowflake') {
+          const o: Record<string, string> = {}
+          if (sfWarehouse) o.warehouse = sfWarehouse
+          if (sfRole) o.role = sfRole
+          if (sfSchema) o.schema = sfSchema
+          return Object.keys(o).length ? o : undefined
+        }
+        return undefined
+      }
+      const connectionOptions = buildSaveOpts()
       const connData = {
         name: connName, db_type: dbType, host, port: parseInt(port),
         database_name: dbName, username, password,
-        ssl_enabled: dbType === 'redshift', connection_options: connectionOptions,
+        ssl_enabled: dbType === 'redshift' || dbType === 'snowflake', connection_options: connectionOptions,
       }
 
       let savedConnId = connId
@@ -212,9 +236,16 @@ export default function NewProjectPage() {
 
             <div className="grid grid-cols-3 gap-3">
               <div className="col-span-2">
-                <label className="block text-sm font-medium text-gray-700 mb-1">Host</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  {dbType === 'snowflake' ? 'Account identifier' : 'Host'}
+                </label>
                 <input value={host} onChange={(e) => setHost(e.target.value)}
-                  className="input-field" placeholder={dbType === 'redshift' ? 'cluster.region.redshift.amazonaws.com' : 'localhost'} />
+                  className="input-field"
+                  placeholder={
+                    dbType === 'redshift' ? 'cluster.region.redshift.amazonaws.com'
+                    : dbType === 'snowflake' ? 'orgname-accountname  or  xy12345.us-east-1'
+                    : 'localhost'
+                  } />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Port</label>
@@ -224,9 +255,12 @@ export default function NewProjectPage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Database name</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Database name {dbType === 'snowflake' && <span className="text-gray-400 font-normal">(optional)</span>}
+              </label>
               <input value={dbName} onChange={(e) => setDbName(e.target.value)}
-                className="input-field" placeholder="mydb" />
+                className="input-field"
+                placeholder={dbType === 'snowflake' ? 'Leave blank to connect without a default database' : 'mydb'} />
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -250,6 +284,36 @@ export default function NewProjectPage() {
                 <input value={iamRoleArn} onChange={(e) => setIamRoleArn(e.target.value)}
                   className="input-field" placeholder="arn:aws:iam::123456789012:role/RedshiftRole" />
                 <p className="text-xs text-gray-400 mt-1">For IAM-based authentication instead of password</p>
+              </div>
+            )}
+
+            {dbType === 'snowflake' && (
+              <div className="space-y-3 p-3 bg-blue-50 border border-blue-100 rounded-lg">
+                <p className="text-xs font-semibold text-blue-700">Snowflake options</p>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Warehouse <span className="text-gray-400 font-normal">(optional)</span>
+                    </label>
+                    <input value={sfWarehouse} onChange={(e) => setSfWarehouse(e.target.value)}
+                      className="input-field" placeholder="COMPUTE_WH" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Role <span className="text-gray-400 font-normal">(optional)</span>
+                    </label>
+                    <input value={sfRole} onChange={(e) => setSfRole(e.target.value)}
+                      className="input-field" placeholder="ANALYST" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Schema filter <span className="text-gray-400 font-normal">(optional)</span>
+                  </label>
+                  <input value={sfSchema} onChange={(e) => setSfSchema(e.target.value)}
+                    className="input-field" placeholder="PUBLIC" />
+                  <p className="text-xs text-gray-400 mt-1">Limit crawl to a specific Snowflake schema. Leave blank to crawl all schemas.</p>
+                </div>
               </div>
             )}
 

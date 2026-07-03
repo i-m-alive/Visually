@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 4 — Multi-Agent Architecture</title>
+<meta name="description" content="Orchestrator + MCP server design: every stage is an agent, every task is a tool.">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #F1F5FB;
+    --surface:  #FFFFFF;
+    --ink:      #0F172A;
+    --ink2:     #334155;
+    --ink3:     #64748B;
+    --border:   #E2E8F0;
+    --border2:  #CBD5E1;
+
+    --orch:     #7C3AED;   /* Orchestrator — purple */
+    --mcp:      #0D9488;   /* MCP Server   — teal   */
+    --exist:    #1D4ED8;   /* Existing agents — blue */
+    --p4:       #059669;   /* Phase 4 agents — green */
+    --iv:       #DC2626;   /* Interview agent — red  */
+    --warn:     #D97706;   /* Warnings        — amber*/
+    --done:     #16A34A;
+
+    --sidebar-w: 218px;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--ink);
+    background: var(--bg);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Layout ─────────────────────────────────────────── */
+  .layout { display: flex; min-height: 100vh; align-items: flex-start; }
+
+  .sidebar {
+    width: var(--sidebar-w);
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 24px 0 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  .sidebar::-webkit-scrollbar { width: 3px; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); }
+
+  .sb-brand {
+    padding: 0 18px 18px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .sb-tag { font-size: 10px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; color: var(--orch); margin-bottom: 3px; }
+  .sb-title { font-size: 12.5px; font-weight: 700; color: var(--ink); line-height: 1.35; }
+
+  .sb-section { padding: 0 10px; margin-bottom: 6px; }
+  .sb-label { font-size: 9.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--ink3); padding: 0 8px; margin-bottom: 3px; }
+  .sb-item {
+    display: flex; align-items: center; gap: 7px;
+    padding: 4px 8px; border-radius: 5px;
+    text-decoration: none; color: var(--ink2); font-size: 12px;
+    transition: background .1s;
+  }
+  .sb-item:hover { background: var(--bg); color: var(--ink); }
+  .sb-item:focus-visible { outline: 2px solid var(--orch); outline-offset: 1px; }
+  .sb-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+
+  .main { flex: 1; min-width: 0; }
+
+  .content { max-width: 900px; padding: 0 44px 80px; }
+
+  /* ── Hero ───────────────────────────────────────────── */
+  .hero {
+    background: var(--ink);
+    padding: 36px 44px 40px;
+  }
+  .hero h1 {
+    font-size: 22px; font-weight: 800; color: #FFF;
+    letter-spacing: -.02em; text-wrap: balance; margin-bottom: 6px;
+  }
+  .hero p { font-size: 13px; color: #94A3B8; max-width: 58ch; }
+
+  /* ── Sections ───────────────────────────────────────── */
+  .sec { padding-top: 48px; }
+  .sec + .sec { border-top: 1px solid var(--border); }
+
+  .eyebrow {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 10px; font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; margin-bottom: 6px;
+  }
+  .eyebrow-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  .sec h2 { font-size: 20px; font-weight: 800; letter-spacing: -.02em; color: var(--ink); text-wrap: balance; margin-bottom: 4px; }
+  .sec-desc { font-size: 13px; color: var(--ink3); margin-bottom: 24px; max-width: 60ch; line-height: 1.6; }
+
+  /* ── Before / After ─────────────────────────────────── */
+  .ba-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+  .ba-box {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .ba-header {
+    padding: 10px 16px;
+    font-size: 10.5px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; border-bottom: 1px solid var(--border);
+  }
+  .ba-body { padding: 16px; }
+  .ba-box.before .ba-header { background: #FEF2F2; color: #991B1B; }
+  .ba-box.after .ba-header { background: #F0FDF4; color: #166534; }
+
+  .flow-line {
+    display: flex; flex-direction: column; gap: 0;
+  }
+  .fl-node {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    margin-bottom: 4px;
+    font-size: 12px; color: var(--ink2); font-weight: 500;
+  }
+  .fl-node .fl-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .fl-arrow { font-size: 11px; color: var(--ink3); padding-left: 18px; margin-bottom: 4px; }
+  .fl-limit { font-size: 11px; color: #B45309; background: #FEF3C7; padding: 4px 8px; border-radius: 4px; margin-top: 4px; }
+
+  /* ── Architecture diagram ───────────────────────────── */
+  .arch-diagram {
+    background: var(--ink);
+    border-radius: 12px;
+    padding: 28px 24px;
+    margin-bottom: 20px;
+    overflow-x: auto;
+  }
+  .arch-layer {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 0;
+  }
+  .arch-layer + .arch-layer { margin-top: 6px; }
+  .arch-arrow-row {
+    display: flex; justify-content: center; align-items: center;
+    color: #374151; font-size: 13px; margin: 4px 0;
+  }
+  .arch-box {
+    border-radius: 8px;
+    padding: 10px 20px;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 700;
+    border: 1px solid rgba(255,255,255,.1);
+    color: #fff;
+  }
+  .arch-box .arch-sub { font-size: 10px; font-weight: 400; color: rgba(255,255,255,.55); margin-top: 2px; }
+  .arch-agents-row {
+    display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+  }
+  .arch-agent {
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 7px;
+    padding: 8px 14px;
+    text-align: center;
+  }
+  .arch-agent .aa-label { font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 2px; }
+  .arch-agent .aa-name { font-size: 11.5px; font-weight: 700; color: #F1F5F9; }
+
+  /* ── Cards ──────────────────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin-bottom: 14px;
+  }
+  .card-title { font-size: 14px; font-weight: 700; color: var(--ink); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .card p { font-size: 13px; color: var(--ink2); line-height: 1.55; margin-bottom: 8px; }
+  .card p:last-child { margin-bottom: 0; }
+
+  .card-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+
+  /* ── Badges / Pills ─────────────────────────────────── */
+  .badge {
+    display: inline-flex; align-items: center;
+    font-size: 10px; font-weight: 700; letter-spacing: .05em;
+    text-transform: uppercase; padding: 2px 7px; border-radius: 4px;
+  }
+  .badge-orch    { background: #EDE9FE; color: #5B21B6; }
+  .badge-mcp     { background: #CCFBF1; color: #134E4A; }
+  .badge-exist   { background: #DBEAFE; color: #1E3A8A; }
+  .badge-p4      { background: #DCFCE7; color: #14532D; }
+  .badge-iv      { background: #FEE2E2; color: #991B1B; }
+  .badge-warn    { background: #FEF3C7; color: #92400E; }
+  .badge-done    { background: #DCFCE7; color: #15803D; }
+  .badge-block   { background: #FEE2E2; color: #B91C1C; }
+  .badge-new     { background: #EFF6FF; color: #1D4ED8; }
+
+  /* ── Agent catalog ──────────────────────────────────── */
+  .agent-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+  .agent-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .agent-card-head {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+  }
+  .agent-name { font-size: 13.5px; font-weight: 700; color: var(--ink); margin-bottom: 2px; }
+  .agent-intent { font-size: 11px; color: var(--ink3); font-family: 'SF Mono', Consolas, monospace; }
+  .agent-card-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .ac-label { font-size: 9.5px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; color: var(--ink3); margin-bottom: 4px; }
+  .tool-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .tool-chip {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 10.5px; padding: 2px 6px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--ink2);
+  }
+  .io-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .io-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .io-val { font-family: 'SF Mono', Consolas, monospace; font-size: 10.5px; color: var(--ink); line-height: 1.5; }
+
+  /* ── Pipeline data-flow ─────────────────────────────── */
+  .pipeline-flow {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    margin-bottom: 20px;
+  }
+  .pf-node {
+    flex-shrink: 0;
+    min-width: 130px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    position: relative;
+  }
+  .pf-node + .pf-node { margin-left: 8px; }
+  .pf-node::after {
+    content: '→';
+    position: absolute; right: -12px; top: 50%; transform: translateY(-50%);
+    color: var(--border2); font-size: 14px; z-index: 1; pointer-events: none;
+  }
+  .pf-node:last-child::after { display: none; }
+  .pf-agent { font-size: 11px; font-weight: 700; color: var(--ink); margin-bottom: 4px; }
+  .pf-produces { font-size: 10px; color: var(--ink3); margin-bottom: 6px; }
+  .pf-fields { display: flex; flex-direction: column; gap: 2px; }
+  .pf-field { font-family: 'SF Mono', Consolas, monospace; font-size: 9.5px; color: var(--ink2); }
+
+  /* ── Tables ─────────────────────────────────────────── */
+  .tbl-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    margin-bottom: 20px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th {
+    padding: 9px 14px; text-align: left;
+    font-size: 10px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--ink3);
+    background: var(--bg); border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 9px 14px; vertical-align: top;
+    color: var(--ink2); border-bottom: 1px solid var(--border); line-height: 1.45;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: #FAFBFE; }
+  td code {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 11px; background: var(--bg); padding: 1px 5px;
+    border-radius: 3px; color: var(--ink); white-space: nowrap;
+  }
+
+  /* ── Code blocks ─────────────────────────────────────── */
+  .code-block {
+    background: #0C0F14; border-radius: 8px;
+    padding: 14px 18px; overflow-x: auto; margin-bottom: 14px;
+  }
+  .code-block pre {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 11.5px; line-height: 1.7; color: #CBD5E1; white-space: pre;
+  }
+  .cmt { color: #475569; } .ky { color: #93C5FD; }
+  .vl { color: #86EFAC; } .kw { color: #C084FC; }
+  .tp { color: #FCA5A5; } .pth { color: #FCD34D; }
+
+  /* ── Steps ───────────────────────────────────────────── */
+  .steps { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 14px; }
+  .step { display: flex; align-items: flex-start; gap: 12px; padding: 11px 16px; border-bottom: 1px solid var(--border); }
+  .step:last-child { border-bottom: none; }
+  .step-n { flex-shrink: 0; width: 24px; height: 24px; border-radius: 50%; background: var(--bg); border: 1px solid var(--border); font-size: 11px; font-weight: 700; color: var(--ink3); display: flex; align-items: center; justify-content: center; }
+  .step-body { flex: 1; min-width: 0; }
+  .step-tool { font-family: 'SF Mono', Consolas, monospace; font-size: 12px; font-weight: 600; color: var(--ink); margin-bottom: 2px; }
+  .step-desc { font-size: 12px; color: var(--ink3); line-height: 1.4; }
+
+  /* ── File tree ───────────────────────────────────────── */
+  .file-tree {
+    background: #0C0F14; border-radius: 8px;
+    padding: 16px 20px; margin-bottom: 14px; overflow-x: auto;
+  }
+  .file-tree pre {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 11.5px; line-height: 1.75; color: #94A3B8;
+  }
+  .file-tree .dir  { color: #FCD34D; }
+  .file-tree .new  { color: #86EFAC; }
+  .file-tree .mod  { color: #93C5FD; }
+  .file-tree .cmt2 { color: #475569; }
+
+  /* ── Warn callout ────────────────────────────────────── */
+  .warn-box {
+    background: #FFFBEB; border: 1px solid #FDE68A;
+    border-left: 3px solid var(--warn); border-radius: 8px;
+    padding: 14px 18px; margin-bottom: 14px;
+  }
+  .warn-box .wb-label { font-size: 9.5px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; color: #92400E; margin-bottom: 8px; }
+  .warn-box ol { list-style: decimal; padding-left: 16px; display: flex; flex-direction: column; gap: 7px; }
+  .warn-box ol li { font-size: 12.5px; color: #78350F; line-height: 1.5; }
+  .warn-box ol li strong { color: #451A03; }
+
+  /* ── Milestone timeline ──────────────────────────────── */
+  .milestones { padding-left: 28px; position: relative; }
+  .milestones::before { content: ''; position: absolute; left: 9px; top: 6px; bottom: 6px; width: 2px; background: var(--border); }
+  .milestone { position: relative; padding-bottom: 24px; }
+  .milestone:last-child { padding-bottom: 0; }
+  .ms-dot { position: absolute; left: -23px; top: 4px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--surface); box-shadow: 0 0 0 1px var(--border); }
+  .ms-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px; }
+  .ms-name { font-size: 13.5px; font-weight: 700; color: var(--ink); }
+  .ms-weeks { font-size: 11px; color: var(--ink3); }
+  .ms-list { list-style: none; display: flex; flex-direction: column; gap: 3px; }
+  .ms-list li { font-size: 12px; color: var(--ink2); display: flex; align-items: flex-start; gap: 7px; }
+  .ms-list li::before { content: '—'; color: var(--border2); flex-shrink: 0; margin-top: 1px; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── Sidebar ────────────────────────────────────────── -->
+<nav class="sidebar">
+  <div class="sb-brand">
+    <div class="sb-tag">Visually · Phase 4</div>
+    <div class="sb-title">Multi-Agent Architecture</div>
+  </div>
+
+  <div class="sb-section">
+    <div class="sb-label">Overview</div>
+    <a class="sb-item" href="#shift"><span class="sb-dot" style="background:#64748B"></span>Before vs After</a>
+    <a class="sb-item" href="#arch"><span class="sb-dot" style="background:#64748B"></span>System Diagram</a>
+  </div>
+
+  <div class="sb-section">
+    <div class="sb-label">Core Layer</div>
+    <a class="sb-item" href="#orchestrator"><span class="sb-dot" style="background:var(--orch)"></span>Orchestrator Agent</a>
+    <a class="sb-item" href="#mcp"><span class="sb-dot" style="background:var(--mcp)"></span>MCP Server</a>
+  </div>
+
+  <div class="sb-section">
+    <div class="sb-label">Agents</div>
+    <a class="sb-item" href="#catalog"><span class="sb-dot" style="background:#64748B"></span>Full Catalog (12)</a>
+    <a class="sb-item" href="#assemble"><span class="sb-dot" style="background:var(--p4)"></span>Assemble</a>
+    <a class="sb-item" href="#generate"><span class="sb-dot" style="background:var(--p4)"></span>Generate</a>
+    <a class="sb-item" href="#approve"><span class="sb-dot" style="background:var(--p4)"></span>Approve</a>
+    <a class="sb-item" href="#schedule"><span class="sb-dot" style="background:var(--p4)"></span>Schedule</a>
+    <a class="sb-item" href="#interview"><span class="sb-dot" style="background:var(--iv)"></span>Interview</a>
+    <a class="sb-item" href="#verify"><span class="sb-dot" style="background:var(--p4)"></span>Verify</a>
+    <a class="sb-item" href="#present"><span class="sb-dot" style="background:var(--p4)"></span>Present</a>
+    <a class="sb-item" href="#outreach"><span class="sb-dot" style="background:var(--p4)"></span>Outreach</a>
+  </div>
+
+  <div class="sb-section">
+    <div class="sb-label">Reference</div>
+    <a class="sb-item" href="#tools-table"><span class="sb-dot" style="background:#64748B"></span>All Tools (40+)</a>
+    <a class="sb-item" href="#dataflow"><span class="sb-dot" style="background:#64748B"></span>Data Flow</a>
+    <a class="sb-item" href="#standalone"><span class="sb-dot" style="background:#64748B"></span>Standalone Mode</a>
+    <a class="sb-item" href="#files"><span class="sb-dot" style="background:#64748B"></span>File Structure</a>
+    <a class="sb-item" href="#sequence"><span class="sb-dot" style="background:var(--done)"></span>Build Sequence</a>
+    <a class="sb-item" href="#required"><span class="sb-dot" style="background:var(--warn)"></span>Required From You</a>
+  </div>
+</nav>
+
+<!-- ── Main ───────────────────────────────────────────── -->
+<main class="main">
+
+<!-- Hero -->
+<div class="hero">
+  <h1>Phase 4 — Multi-Agent Architecture</h1>
+  <p>Every stage becomes an agent. Every task becomes a tool. An Orchestrator manages all agents across every phase. An MCP Server exposes all capabilities so any agent — or any external client — can discover and invoke them.</p>
+</div>
+
+<div class="content">
+
+<!-- ── Before / After ──────────────────────────────────── -->
+<div class="sec" id="shift">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>The Shift</div>
+  <h2>Before vs After</h2>
+  <p class="sec-desc">The current system is a routing switch — one intent, one agent, done. The new system is a planner that can coordinate any number of agents, in any order, standalone or as a pipeline.</p>
+
+  <div class="ba-grid">
+    <div class="ba-box before">
+      <div class="ba-header">Before — Simple Router</div>
+      <div class="ba-body">
+        <div class="flow-line">
+          <div class="fl-node"><span class="fl-dot" style="background:#94A3B8"></span>User message</div>
+          <div class="fl-arrow">↓</div>
+          <div class="fl-node"><span class="fl-dot" style="background:#EF4444"></span>IntentClassifier (LLM keyword match)</div>
+          <div class="fl-arrow">↓ one intent → one route</div>
+          <div class="fl-node"><span class="fl-dot" style="background:#3B82F6"></span>Single SkillAgent (_REGISTRY lookup)</div>
+          <div class="fl-arrow">↓ tools in sequence</div>
+          <div class="fl-node"><span class="fl-dot" style="background:#94A3B8"></span>Response</div>
+        </div>
+        <div class="fl-limit">Cannot chain agents. No pipeline state. No multi-step coordination.</div>
+      </div>
+    </div>
+    <div class="ba-box after">
+      <div class="ba-header">After — Orchestrator + MCP</div>
+      <div class="ba-body">
+        <div class="flow-line">
+          <div class="fl-node"><span class="fl-dot" style="background:#94A3B8"></span>User message</div>
+          <div class="fl-arrow">↓</div>
+          <div class="fl-node"><span class="fl-dot" style="background:var(--orch)"></span>OrchestratorAgent (plans via MCP)</div>
+          <div class="fl-arrow">↓ invokes 1 or N agents</div>
+          <div class="fl-node"><span class="fl-dot" style="background:var(--mcp)"></span>MCP Server (discovers + dispatches)</div>
+          <div class="fl-arrow">↓ each agent runs its tools</div>
+          <div class="fl-node"><span class="fl-dot" style="background:var(--p4)"></span>Agent(s) → results aggregated</div>
+          <div class="fl-arrow">↓</div>
+          <div class="fl-node"><span class="fl-dot" style="background:#94A3B8"></span>Response</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Architecture diagram ─────────────────────────────── -->
+<div class="sec" id="arch">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>System Design</div>
+  <h2>Full Architecture</h2>
+  <p class="sec-desc">Three layers: the Orchestrator decides what to run, the MCP Server exposes what's available, the Agent Pool executes with their tools.</p>
+
+  <div class="arch-diagram">
+    <!-- User -->
+    <div class="arch-layer">
+      <div class="arch-box" style="background:rgba(255,255,255,.08); min-width:180px;">
+        User Message
+        <div class="arch-sub">chat panel · CLI · any MCP client</div>
+      </div>
+    </div>
+    <div class="arch-arrow-row">↓</div>
+
+    <!-- Orchestrator -->
+    <div class="arch-layer">
+      <div class="arch-box" style="background:rgba(124,58,237,.35); border-color:rgba(124,58,237,.6); min-width:320px;">
+        Orchestrator Agent
+        <div class="arch-sub">plans pipeline · decides single vs multi-agent · manages session state</div>
+      </div>
+    </div>
+    <div class="arch-arrow-row">↕ invoke_agent · list_agents · run_pipeline</div>
+
+    <!-- MCP Server -->
+    <div class="arch-layer">
+      <div class="arch-box" style="background:rgba(13,148,136,.3); border-color:rgba(13,148,136,.6); min-width:520px;">
+        MCP Server (port 8006)
+        <div class="arch-sub">tools/list · tools/call · agents/list · agents/invoke · pipelines/list</div>
+      </div>
+    </div>
+    <div class="arch-arrow-row">↓ routes to correct agent</div>
+
+    <!-- Agent pool: existing -->
+    <div class="arch-layer">
+      <div class="arch-agents-row">
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#93C5FD">Phase 0–3</div>
+          <div class="aa-name">MatchAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#93C5FD">Phase 0–3</div>
+          <div class="aa-name">BriefingAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#93C5FD">Phase 0–3</div>
+          <div class="aa-name">ProspectAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#93C5FD">Phase 0–3</div>
+          <div class="aa-name">AuditAgent</div>
+        </div>
+      </div>
+    </div>
+    <div class="arch-arrow-row" style="margin:4px 0 4px"></div>
+
+    <!-- Agent pool: Phase 4 -->
+    <div class="arch-layer">
+      <div class="arch-agents-row">
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Stage 1</div>
+          <div class="aa-name">AssembleAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Stage 2</div>
+          <div class="aa-name">GenerateAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Stage 3</div>
+          <div class="aa-name">ApproveAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Stage 4</div>
+          <div class="aa-name">ScheduleAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#FCA5A5">Stage 5</div>
+          <div class="aa-name">InterviewAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Stage 6</div>
+          <div class="aa-name">VerifyAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Stage 6</div>
+          <div class="aa-name">PresentAgent</div>
+        </div>
+        <div class="arch-agent">
+          <div class="aa-label" style="color:#86EFAC">Cross</div>
+          <div class="aa-name">OutreachAgent</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Orchestrator ─────────────────────────────────────── -->
+<div class="sec" id="orchestrator">
+  <div class="eyebrow" style="color:var(--orch)"><span class="eyebrow-dot" style="background:var(--orch)"></span>Core Layer</div>
+  <h2>Orchestrator Agent</h2>
+  <p class="sec-desc">Replaces the current IntentClassifier + routing switch entirely. It's a full Claude ToolAgent that queries the MCP server for available agents, decides the plan, executes it, and returns the final answer to the user.</p>
+
+  <div class="card">
+    <div class="card-title">What it does that the current system cannot</div>
+    <p><strong>Multi-agent pipelines:</strong> "Screen candidate 12345 for Job 909" → orchestrator plans AssembleAgent → GenerateAgent → ApproveAgent → ScheduleAgent and chains them automatically.</p>
+    <p><strong>Dynamic discovery:</strong> calls <code>list_agents()</code> on the MCP server to know what's available — new agents are picked up automatically without changing the orchestrator's code.</p>
+    <p><strong>Partial pipelines:</strong> "Just generate questions for a data analyst role" → runs only GenerateAgent, standalone, with mock input.</p>
+    <p><strong>State across turns:</strong> holds session context so a follow-up "what's the approval status?" maps back to the correct pending session.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Orchestrator's own tools (what it calls via MCP)</div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-n">T1</div>
+        <div class="step-body">
+          <div class="step-tool">list_agents(filter?: phase|stage|intent)</div>
+          <div class="step-desc">Returns all registered agents with their description, input schema, output schema, and example trigger phrases. Called once at the start of every conversation turn.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-n">T2</div>
+        <div class="step-body">
+          <div class="step-tool">invoke_agent(agent_name, input, session_id?)</div>
+          <div class="step-desc">Runs a specific agent synchronously. Returns the agent's output dict. For long-running agents (InterviewAgent), returns a session handle instead.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-n">T3</div>
+        <div class="step-body">
+          <div class="step-tool">run_pipeline(pipeline_name, params)</div>
+          <div class="step-desc">Executes a named pipeline (e.g. "screen_candidate", "full_audit"). The pipeline definition lives in MCP server — orchestrator doesn't need to know the sequence.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-n">T4</div>
+        <div class="step-body">
+          <div class="step-tool">get_agent_output(session_id, agent_name)</div>
+          <div class="step-desc">Retrieves a previously completed agent's output from the session store (Redis). Used when chaining agents across multiple conversation turns.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-n">T5</div>
+        <div class="step-body">
+          <div class="step-tool">get_pipeline_status(session_id)</div>
+          <div class="step-desc">Returns which stages are complete, pending, or waiting for human input. Surfaced to the user when they ask "what's next for candidate 12345?"</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Orchestrator system prompt structure</div>
+    <div class="code-block"><pre><span class="cmt"># Orchestrator system prompt (injected at runtime)</span>
+
+You are the Orchestrator for a recruitment AI platform.
+You have access to the following agents via the MCP server:
+
+<span class="ky">{agent_list}</span>  <span class="cmt"># injected from list_agents() — always current</span>
+
+<span class="kw">Decision rules:</span>
+- If the user wants a single known capability → invoke_agent() directly
+- If the user's request spans multiple stages → run_pipeline()
+- If the intent is ambiguous → ask ONE clarifying question, then proceed
+- If a prior session exists for this candidate+job → load it, continue from last stage
+- Never expose internal tool names to the user — speak in plain terms
+
+<span class="kw">Context:</span>
+- user_email: <span class="ky">{user_email}</span>
+- user_role: <span class="ky">{role}</span>          <span class="cmt"># affects which agents they can invoke</span>
+- active_sessions: <span class="ky">{sessions}</span>    <span class="cmt"># ongoing pipelines for this user</span></pre></div>
+  </div>
+</div>
+
+<!-- ── MCP Server ───────────────────────────────────────── -->
+<div class="sec" id="mcp">
+  <div class="eyebrow" style="color:var(--mcp)"><span class="eyebrow-dot" style="background:var(--mcp)"></span>Protocol Layer</div>
+  <h2>MCP Server</h2>
+  <p class="sec-desc">A new FastAPI service (port 8006) that implements the Model Context Protocol. It is the single source of truth for what capabilities exist — atomic tools, agent skills, and pipeline definitions.</p>
+
+  <div class="card-grid2">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-title"><span class="badge badge-mcp">Resource type 1</span> Atomic Tools</div>
+      <p>Individual operations: <code>parse_resume</code>, <code>run_sql</code>, <code>send_email</code>, <code>search_question_bank</code>. Each tool has a name, description, and JSON Schema for its input. Any agent — or external MCP client — can call these directly.</p>
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="card-title"><span class="badge badge-mcp">Resource type 2</span> Agent Skills</div>
+      <p>Compound tools that invoke an entire agent: <code>run_assemble_agent</code>, <code>run_match_agent</code>, <code>run_audit_agent</code>. From the caller's perspective it's just a tool call — the MCP server handles spinning up the agent, running its tool loop, and returning the output.</p>
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="card-title"><span class="badge badge-mcp">Resource type 3</span> Pipelines</div>
+      <p>Named multi-agent sequences: <code>screen_candidate</code>, <code>full_audit</code>, <code>enrich_and_verify</code>. Defined in <code>mcp_server/pipelines.py</code> as ordered lists of agent invocations with data mapping between steps.</p>
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="card-title"><span class="badge badge-mcp">Endpoints</span> Protocol</div>
+      <p><code>POST /tools/list</code> → returns all tool schemas<br>
+      <code>POST /tools/call</code> → executes a tool by name<br>
+      <code>GET  /agents/list</code> → returns agent metadata<br>
+      <code>POST /agents/invoke</code> → runs an agent<br>
+      <code>GET  /pipelines/list</code> → pipeline definitions<br>
+      <code>POST /pipelines/run</code> → starts a pipeline</p>
+    </div>
+  </div>
+
+  <div style="margin-top:14px" class="code-block"><pre><span class="cmt"># mcp_server/pipelines.py — pipeline definitions</span>
+
+PIPELINES = {
+  <span class="ky">"screen_candidate"</span>: {
+    <span class="ky">"description"</span>: <span class="vl">"Full screening pipeline: assemble → generate → approve → schedule"</span>,
+    <span class="ky">"steps"</span>: [
+      { <span class="ky">"agent"</span>: <span class="vl">"AssembleAgent"</span>,  <span class="ky">"input_from"</span>: <span class="vl">"params"</span>,          <span class="ky">"output_key"</span>: <span class="vl">"candidate_package"</span> },
+      { <span class="ky">"agent"</span>: <span class="vl">"GenerateAgent"</span>,  <span class="ky">"input_from"</span>: <span class="vl">"candidate_package"</span>, <span class="ky">"output_key"</span>: <span class="vl">"question_set"</span> },
+      { <span class="ky">"agent"</span>: <span class="vl">"ApproveAgent"</span>,   <span class="ky">"input_from"</span>: <span class="vl">"question_set"</span>,      <span class="ky">"output_key"</span>: <span class="vl">"approved_questions"</span>, <span class="ky">"async"</span>: <span class="kw">true</span> },
+      { <span class="ky">"agent"</span>: <span class="vl">"ScheduleAgent"</span>,  <span class="ky">"input_from"</span>: <span class="vl">"approved_questions"</span>, <span class="ky">"output_key"</span>: <span class="vl">"session"</span> },
+    ],
+    <span class="ky">"required_params"</span>: [<span class="vl">"candidate_id"</span>, <span class="vl">"job_id"</span>]
+  },
+  <span class="ky">"post_interview"</span>: {
+    <span class="ky">"steps"</span>: [
+      { <span class="ky">"agent"</span>: <span class="vl">"VerifyAgent"</span>,   <span class="ky">"input_from"</span>: <span class="vl">"session"</span>,           <span class="ky">"output_key"</span>: <span class="vl">"verification"</span> },
+      { <span class="ky">"agent"</span>: <span class="vl">"PresentAgent"</span>,  <span class="ky">"input_from"</span>: <span class="vl">"verification"</span>,      <span class="ky">"output_key"</span>: <span class="vl">"report"</span> },
+      { <span class="ky">"agent"</span>: <span class="vl">"OutreachAgent"</span>, <span class="ky">"input_from"</span>: <span class="vl">"report"</span>,             <span class="ky">"output_key"</span>: <span class="vl">"sent"</span> },
+    ]
+  }
+}</pre></div>
+</div>
+
+<!-- ── Agent Catalog ─────────────────────────────────────── -->
+<div class="sec" id="catalog">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>Agent Catalog</div>
+  <h2>All 12 Agents</h2>
+  <p class="sec-desc">4 existing (phases 0–3) + 8 new (Phase 4). Each is self-contained: its own system prompt, tool list, input schema, output schema. Can be invoked standalone or as part of a pipeline.</p>
+
+  <div class="agent-grid">
+    <!-- MatchAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">MatchAgent</div><div class="agent-intent">intent: MATCH</div></div>
+        <span class="badge badge-exist">Phase 1</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">get_candidate_scores</span><span class="tool-chip">list_candidates</span><span class="tool-chip">build_shortlist</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">job_id<br>job_title?</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">shortlist_markdown<br>by_category{}</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- BriefingAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">BriefingAgent</div><div class="agent-intent">intent: BRIEFING</div></div>
+        <span class="badge badge-exist">Phase 2</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">get_pipeline_summary</span><span class="tool-chip">get_recent_activity</span><span class="tool-chip">get_my_placements</span><span class="tool-chip">get_jobs_dashboard</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">user_context<br>(auto-injected)</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">daily_brief<br>priorities[]</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- ProspectAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">ProspectAgent</div><div class="agent-intent">intent: PROSPECT</div></div>
+        <span class="badge badge-exist">Phase 3</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">get_jobs_dashboard</span><span class="tool-chip">run_sql</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">user_context</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">gap_report<br>at_risk_jobs[]</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- AuditAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">AuditAgent</div><div class="agent-intent">intent: AUDIT</div></div>
+        <span class="badge badge-exist">Phase 3</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">run_sql</span><span class="tool-chip">get_jobs_dashboard</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">user_context</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">section_a{}<br>section_b{}</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- AssembleAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">AssembleAgent</div><div class="agent-intent">intent: ASSEMBLE · Stage 1</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">parse_resume</span><span class="tool-chip">get_application_form_data</span><span class="tool-chip">get_job_description</span><span class="tool-chip">get_ml_scores</span><span class="tool-chip">get_candidate_db_record</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">candidate_id<br>job_id</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">CandidatePackage{<br>candidate, resume,<br>application, job,<br>ml_score }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- GenerateAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">GenerateAgent</div><div class="agent-intent">intent: GENERATE · Stage 2</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">search_question_bank</span><span class="tool-chip">web_search_questions</span><span class="tool-chip">save_questions_to_bank</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">CandidatePackage</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">QuestionSet{<br>sections[],<br>rubric,<br>duration_est }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- ApproveAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">ApproveAgent</div><div class="agent-intent">intent: APPROVE · Stage 3</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">submit_for_approval</span><span class="tool-chip">get_approval_status</span><span class="tool-chip">notify_reviewer</span><span class="tool-chip">update_question_set</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">QuestionSet<br>reviewer_email</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">ApprovedQuestionSet{<br>questions[],<br>approved_by,<br>approved_at }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- ScheduleAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">ScheduleAgent</div><div class="agent-intent">intent: SCHEDULE · Stage 4</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">generate_booking_link</span><span class="tool-chip">send_interview_invite</span><span class="tool-chip">create_calendar_event</span><span class="tool-chip">update_session_status</span><span class="tool-chip">send_reminder</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">session_id<br>ApprovedQuestionSet</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">ScheduledSession{<br>scheduled_at,<br>booking_link }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- InterviewAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">InterviewAgent</div><div class="agent-intent">intent: INTERVIEW · Stage 5</div></div>
+        <span class="badge badge-iv">interview_service</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools (runs inside interview_service)</div><div class="tool-chips"><span class="tool-chip">start_session</span><span class="tool-chip">get_next_question</span><span class="tool-chip">score_answer</span><span class="tool-chip">generate_follow_up</span><span class="tool-chip">detect_malpractice</span><span class="tool-chip">end_session</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">session_id<br>ApprovedQuestionSet</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">InterviewResult{<br>transcript[],<br>scores{},<br>malpractice[] }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- VerifyAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">VerifyAgent</div><div class="agent-intent">intent: VERIFY · Stage 6</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">cross_validate_data</span><span class="tool-chip">detect_ai_resume</span><span class="tool-chip">analyze_skill_gaps</span><span class="tool-chip">get_interview_scores</span><span class="tool-chip">compute_risk_score</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">CandidatePackage<br>+ InterviewResult</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">VerificationReport{<br>risk_rating,<br>flags[], gaps[] }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- PresentAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">PresentAgent</div><div class="agent-intent">intent: PRESENT · Stage 6</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">compile_full_profile</span><span class="tool-chip">write_narrative</span><span class="tool-chip">store_candidate_profile</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">All previous<br>agent outputs</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">CandidateReport{<br>profile, narrative,<br>overall_rating }</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- OutreachAgent -->
+    <div class="agent-card">
+      <div class="agent-card-head">
+        <div><div class="agent-name">OutreachAgent</div><div class="agent-intent">intent: OUTREACH · Cross-stage</div></div>
+        <span class="badge badge-p4">Phase 4</span>
+      </div>
+      <div class="agent-card-body">
+        <div><div class="ac-label">Tools</div><div class="tool-chips"><span class="tool-chip">send_email</span><span class="tool-chip">create_calendar_invite</span><span class="tool-chip">send_candidate_report</span><span class="tool-chip">send_approval_request</span><span class="tool-chip">send_reminder</span></div></div>
+        <div class="io-row">
+          <div class="io-box"><div class="ac-label">Input</div><div class="io-val">varies<br>(called by all)</div></div>
+          <div class="io-box"><div class="ac-label">Output</div><div class="io-val">CommunicationLog{<br>sent_at, status }</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── All Tools table ───────────────────────────────────── -->
+<div class="sec" id="tools-table">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>Reference</div>
+  <h2>All Tools — Complete List</h2>
+  <p class="sec-desc">Every tool registered in the MCP server. Each maps to a single Python function. Agents call tools; the MCP server dispatches them.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Owner Agent</th><th>Implemented In</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>run_sql</code></td><td>All agents</td><td><code>sql_tool.py</code></td><td>Execute read-only SELECT against project DB</td></tr>
+        <tr><td><code>get_candidate_scores</code></td><td>MatchAgent</td><td><code>candidate_tools.py</code></td><td>Query ML-scored candidates, schema-adaptive</td></tr>
+        <tr><td><code>list_candidates</code></td><td>MatchAgent</td><td><code>candidate_tools.py</code></td><td>Sort/filter candidates from scoring table</td></tr>
+        <tr><td><code>build_shortlist</code></td><td>MatchAgent</td><td><code>candidate_tools.py</code></td><td>Format ranked shortlist markdown</td></tr>
+        <tr><td><code>get_pipeline_summary</code></td><td>BriefingAgent</td><td><code>pipeline_tools.py</code></td><td>App counts grouped by pipeline stage</td></tr>
+        <tr><td><code>get_recent_activity</code></td><td>BriefingAgent</td><td><code>pipeline_tools.py</code></td><td>New apps + scoring events, last N days</td></tr>
+        <tr><td><code>get_my_placements</code></td><td>BriefingAgent</td><td><code>pipeline_tools.py</code></td><td>Current user's active placements/candidates</td></tr>
+        <tr><td><code>get_jobs_dashboard</code></td><td>Briefing, Prospect</td><td><code>pipeline_tools.py</code></td><td>Open jobs ranked by candidate volume</td></tr>
+        <tr><td><code>parse_resume</code></td><td>AssembleAgent</td><td><code>lambda_bridge.py</code></td><td>S3 cache → Lambda 2 fallback, structured resume JSON</td></tr>
+        <tr><td><code>get_candidate_db_record</code></td><td>AssembleAgent</td><td><code>lambda_bridge.py</code></td><td>DB row from <code>bullhorn_core_candidate</code></td></tr>
+        <tr><td><code>get_application_form_data</code></td><td>AssembleAgent</td><td><code>lambda_bridge.py</code></td><td>JSON blob candidate filled at application time</td></tr>
+        <tr><td><code>get_job_description</code></td><td>AssembleAgent</td><td><code>lambda_bridge.py</code></td><td>Full JD text from <code>bullhorn_core_job_order</code></td></tr>
+        <tr><td><code>get_ml_scores</code></td><td>AssembleAgent</td><td><code>lambda_bridge.py</code></td><td>ML rank + score from <code>job_profile_match_ml</code></td></tr>
+        <tr><td><code>search_question_bank</code></td><td>GenerateAgent</td><td><code>question_bank_tool.py</code></td><td>Semantic similarity search in historical questions</td></tr>
+        <tr><td><code>web_search_questions</code></td><td>GenerateAgent</td><td><code>search_tool.py</code></td><td>Tavily API for role-specific interview questions</td></tr>
+        <tr><td><code>save_questions_to_bank</code></td><td>GenerateAgent</td><td><code>question_bank_tool.py</code></td><td>Store new questions post-interview for future use</td></tr>
+        <tr><td><code>submit_for_approval</code></td><td>ApproveAgent</td><td><code>approval_tool.py</code></td><td>Write approval row, trigger outreach email</td></tr>
+        <tr><td><code>get_approval_status</code></td><td>ApproveAgent</td><td><code>approval_tool.py</code></td><td>Read approval row, return modified_questions if any</td></tr>
+        <tr><td><code>notify_reviewer</code></td><td>ApproveAgent</td><td><code>approval_tool.py</code></td><td>Re-send approval reminder if not acted on in 24h</td></tr>
+        <tr><td><code>update_question_set</code></td><td>ApproveAgent</td><td><code>approval_tool.py</code></td><td>Apply hiring person's edits to session question set</td></tr>
+        <tr><td><code>generate_booking_link</code></td><td>ScheduleAgent</td><td><code>scheduling_tool.py</code></td><td>Calendly API: create one-off event link</td></tr>
+        <tr><td><code>send_interview_invite</code></td><td>ScheduleAgent</td><td><code>scheduling_tool.py</code></td><td>Email invite with booking link to candidate</td></tr>
+        <tr><td><code>create_calendar_event</code></td><td>ScheduleAgent</td><td><code>scheduling_tool.py</code></td><td>Generate .ics and send to both parties</td></tr>
+        <tr><td><code>update_session_status</code></td><td>ScheduleAgent</td><td><code>scheduling_tool.py</code></td><td>Update <code>interview_sessions.status</code></td></tr>
+        <tr><td><code>send_reminder</code></td><td>ScheduleAgent</td><td><code>scheduling_tool.py</code></td><td>APScheduler job: 24h + 1h reminder emails</td></tr>
+        <tr><td><code>start_session</code></td><td>InterviewAgent</td><td><code>interview_service/</code></td><td>Init WebSocket session, load approved questions</td></tr>
+        <tr><td><code>get_next_question</code></td><td>InterviewAgent</td><td><code>interview_service/</code></td><td>Claude decides: next question or follow-up</td></tr>
+        <tr><td><code>score_answer</code></td><td>InterviewAgent</td><td><code>interview_service/</code></td><td>Per-answer scoring: depth, accuracy, confidence</td></tr>
+        <tr><td><code>generate_follow_up</code></td><td>InterviewAgent</td><td><code>interview_service/</code></td><td>Probe shallow answer with targeted follow-up</td></tr>
+        <tr><td><code>detect_malpractice</code></td><td>InterviewAgent</td><td><code>interview_service/</code></td><td>Audio + answer pattern analysis, per-turn flags</td></tr>
+        <tr><td><code>end_session</code></td><td>InterviewAgent</td><td><code>interview_service/</code></td><td>Finalize transcript, trigger post_interview pipeline</td></tr>
+        <tr><td><code>cross_validate_data</code></td><td>VerifyAgent</td><td><code>verify_tool.py</code></td><td>Resume vs form vs interview consistency check</td></tr>
+        <tr><td><code>detect_ai_resume</code></td><td>VerifyAgent</td><td><code>verify_tool.py</code></td><td>AI-generated content signals in resume text</td></tr>
+        <tr><td><code>analyze_skill_gaps</code></td><td>VerifyAgent</td><td><code>verify_tool.py</code></td><td>Skills claimed vs skills evidenced in interview</td></tr>
+        <tr><td><code>get_interview_scores</code></td><td>VerifyAgent</td><td><code>interview_client.py</code></td><td>HTTP GET dimension scores from interview_service</td></tr>
+        <tr><td><code>compute_risk_score</code></td><td>VerifyAgent</td><td><code>verify_tool.py</code></td><td>Aggregate all flags into Low/Medium/High risk rating</td></tr>
+        <tr><td><code>compile_full_profile</code></td><td>PresentAgent</td><td><code>profile_tool.py</code></td><td>Merge all outputs, write <code>candidate_profiles_v2</code></td></tr>
+        <tr><td><code>write_narrative</code></td><td>PresentAgent</td><td><code>profile_tool.py</code></td><td>Claude writes client-facing candidate summary</td></tr>
+        <tr><td><code>store_candidate_profile</code></td><td>PresentAgent</td><td><code>profile_tool.py</code></td><td>Persist final profile to DB</td></tr>
+        <tr><td><code>send_email</code></td><td>OutreachAgent</td><td><code>outreach_tool.py</code></td><td>AWS SES send, writes to <code>outreach_logs</code></td></tr>
+        <tr><td><code>create_calendar_invite</code></td><td>OutreachAgent</td><td><code>outreach_tool.py</code></td><td>.ics generation + email attachment</td></tr>
+        <tr><td><code>send_candidate_report</code></td><td>OutreachAgent</td><td><code>outreach_tool.py</code></td><td>Email formatted complete profile to hiring person</td></tr>
+        <tr><td><code>list_agents</code></td><td>OrchestratorAgent</td><td><code>mcp_server/</code></td><td>Discover all available agents + metadata</td></tr>
+        <tr><td><code>invoke_agent</code></td><td>OrchestratorAgent</td><td><code>mcp_server/</code></td><td>Run a specific agent, return its output</td></tr>
+        <tr><td><code>run_pipeline</code></td><td>OrchestratorAgent</td><td><code>mcp_server/</code></td><td>Execute a named multi-agent pipeline</td></tr>
+        <tr><td><code>get_agent_output</code></td><td>OrchestratorAgent</td><td><code>mcp_server/</code></td><td>Load prior agent result from session store</td></tr>
+        <tr><td><code>get_pipeline_status</code></td><td>OrchestratorAgent</td><td><code>mcp_server/</code></td><td>Return stage completion state for a session</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Data Flow ─────────────────────────────────────────── -->
+<div class="sec" id="dataflow">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>Data Flow</div>
+  <h2>CandidatePackage Through the Pipeline</h2>
+  <p class="sec-desc">Each agent receives the previous agent's output and adds to it. The session store (Redis) holds the growing package. Any agent can pick up from any stage.</p>
+
+  <div class="pipeline-flow">
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--p4)">AssembleAgent</div>
+      <div class="pf-produces">produces →</div>
+      <div class="pf-fields">
+        <span class="pf-field">candidate{}</span>
+        <span class="pf-field">resume{}</span>
+        <span class="pf-field">application{}</span>
+        <span class="pf-field">job{}</span>
+        <span class="pf-field">ml_score</span>
+      </div>
+    </div>
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--p4)">GenerateAgent</div>
+      <div class="pf-produces">adds →</div>
+      <div class="pf-fields">
+        <span class="pf-field">question_set{}</span>
+        <span class="pf-field">  sections[]</span>
+        <span class="pf-field">  rubric{}</span>
+        <span class="pf-field">  duration</span>
+      </div>
+    </div>
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--p4)">ApproveAgent</div>
+      <div class="pf-produces">adds →</div>
+      <div class="pf-fields">
+        <span class="pf-field">approved_questions[]</span>
+        <span class="pf-field">approved_by</span>
+        <span class="pf-field">approved_at</span>
+      </div>
+    </div>
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--p4)">ScheduleAgent</div>
+      <div class="pf-produces">adds →</div>
+      <div class="pf-fields">
+        <span class="pf-field">session_id</span>
+        <span class="pf-field">scheduled_at</span>
+        <span class="pf-field">booking_link</span>
+      </div>
+    </div>
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--iv)">InterviewAgent</div>
+      <div class="pf-produces">adds →</div>
+      <div class="pf-fields">
+        <span class="pf-field">transcript[]</span>
+        <span class="pf-field">scores{}</span>
+        <span class="pf-field">malpractice[]</span>
+      </div>
+    </div>
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--p4)">Verify + Present</div>
+      <div class="pf-produces">produces →</div>
+      <div class="pf-fields">
+        <span class="pf-field">risk_rating</span>
+        <span class="pf-field">flags[]</span>
+        <span class="pf-field">narrative</span>
+        <span class="pf-field">overall_rating</span>
+      </div>
+    </div>
+    <div class="pf-node">
+      <div class="pf-agent" style="color:var(--p4)">OutreachAgent</div>
+      <div class="pf-produces">delivers</div>
+      <div class="pf-fields">
+        <span class="pf-field">→ Hiring Partner</span>
+        <span class="pf-field">email + report</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Session Store — Redis + PostgreSQL</div>
+    <p><strong>Redis</strong> holds the live CandidatePackage per session (key: <code>session:{session_id}:package</code>, TTL 7 days). Fast reads between agent calls within a single pipeline run.</p>
+    <p><strong>PostgreSQL</strong> persists the final state. <code>interview_sessions</code> stores the transcript + scores. <code>candidate_profiles_v2</code> stores the final compiled profile. Both survive service restarts.</p>
+    <p><strong>When a pipeline is interrupted</strong> (approval waiting, interview not yet scheduled), the Orchestrator reads the session state from Redis and resumes from the correct stage on the next user interaction.</p>
+  </div>
+</div>
+
+<!-- ── Standalone mode ───────────────────────────────────── -->
+<div class="sec" id="standalone">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>Invocation Modes</div>
+  <h2>Standalone vs Orchestrated</h2>
+  <p class="sec-desc">Same agent, two ways to call it. The Orchestrator decides automatically based on the user's request.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>User Says</th><th>Orchestrator Plan</th><th>Mode</th></tr></thead>
+      <tbody>
+        <tr><td>"What should I focus on today?"</td><td>invoke BriefingAgent</td><td><span class="badge badge-exist">Single agent</span></td></tr>
+        <tr><td>"Who are the best candidates for Job 909?"</td><td>invoke MatchAgent(job_id=909)</td><td><span class="badge badge-exist">Single agent</span></td></tr>
+        <tr><td>"Enrich candidate 12345's profile"</td><td>invoke AssembleAgent → EnrichAgent</td><td><span class="badge badge-p4">Mini-pipeline (2)</span></td></tr>
+        <tr><td>"Verify candidate 12345 before submission"</td><td>invoke AssembleAgent → VerifyAgent</td><td><span class="badge badge-p4">Mini-pipeline (2)</span></td></tr>
+        <tr><td>"Generate screening questions for data analyst"</td><td>invoke GenerateAgent (mock CandidatePackage)</td><td><span class="badge badge-exist">Single agent</span></td></tr>
+        <tr><td>"Screen candidate 12345 for Job 909"</td><td>run_pipeline("screen_candidate", {candidate_id, job_id})</td><td><span class="badge badge-iv">Full pipeline (4 agents)</span></td></tr>
+        <tr><td>"What's the approval status for session abc123?"</td><td>invoke ApproveAgent.get_approval_status</td><td><span class="badge badge-exist">Single agent</span></td></tr>
+        <tr><td>"Send the final report to the hiring manager"</td><td>invoke PresentAgent → OutreachAgent</td><td><span class="badge badge-p4">Mini-pipeline (2)</span></td></tr>
+        <tr><td>(Interview ends — auto-triggered)</td><td>run_pipeline("post_interview", {session_id})</td><td><span class="badge badge-iv">Full pipeline (3 agents)</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── File structure ────────────────────────────────────── -->
+<div class="sec" id="files">
+  <div class="eyebrow" style="color:var(--ink3)"><span class="eyebrow-dot" style="background:#64748B"></span>Implementation</div>
+  <h2>File Structure</h2>
+  <p class="sec-desc">Green = new file. Blue = modify existing. Yellow = new directory.</p>
+
+  <div class="file-tree"><pre>
+<span class="dir">backend/</span>
+├── <span class="new">mcp_server/</span>                        <span class="cmt2"># new service — port 8006</span>
+│   ├── <span class="new">main.py</span>                        <span class="cmt2"># FastAPI app, lifespan, CORS</span>
+│   ├── <span class="new">router.py</span>                      <span class="cmt2"># /tools/list /tools/call /agents/* /pipelines/*</span>
+│   ├── <span class="new">tool_registry.py</span>               <span class="cmt2"># all tool schemas + Python handlers</span>
+│   ├── <span class="new">agent_registry.py</span>              <span class="cmt2"># agent metadata + invoke_agent() logic</span>
+│   └── <span class="new">pipelines.py</span>                   <span class="cmt2"># named pipeline definitions (see code above)</span>
+│
+├── <span class="dir">agent_service/</span>
+│   ├── <span class="dir">agents/</span>
+│   │   ├── <span class="new">orchestrator_agent.py</span>       <span class="cmt2"># replaces IntentClassifier routing</span>
+│   │   └── <span class="dir">skill_agents/</span>
+│   │       ├── <span class="new">assemble_agent.py</span>
+│   │       ├── <span class="new">generate_agent.py</span>
+│   │       ├── <span class="new">approve_agent.py</span>
+│   │       ├── <span class="new">schedule_agent.py</span>
+│   │       ├── <span class="new">interview_agent.py</span>       <span class="cmt2"># thin client → interview_service</span>
+│   │       ├── <span class="new">verify_agent.py</span>
+│   │       ├── <span class="new">present_agent.py</span>
+│   │       └── <span class="new">outreach_agent.py</span>
+│   └── <span class="dir">tools/</span>
+│       ├── <span class="new">lambda_bridge.py</span>            <span class="cmt2"># parse_resume, get_candidate_db_record, get_job_description</span>
+│       ├── <span class="new">question_bank_tool.py</span>       <span class="cmt2"># search_question_bank, save_questions_to_bank</span>
+│       ├── <span class="new">search_tool.py</span>              <span class="cmt2"># web_search_questions (Tavily)</span>
+│       ├── <span class="new">approval_tool.py</span>            <span class="cmt2"># submit_for_approval, get_approval_status</span>
+│       ├── <span class="new">scheduling_tool.py</span>          <span class="cmt2"># Calendly + calendar invites</span>
+│       ├── <span class="new">outreach_tool.py</span>            <span class="cmt2"># AWS SES send_email</span>
+│       ├── <span class="new">interview_client.py</span>         <span class="cmt2"># HTTP client → interview_service</span>
+│       ├── <span class="new">verify_tool.py</span>              <span class="cmt2"># cross_validate, detect_ai_resume, skill_gaps</span>
+│       ├── <span class="new">profile_tool.py</span>             <span class="cmt2"># compile_full_profile, write_narrative</span>
+│       ├── <span class="mod">registry.py</span>                 <span class="cmt2"># add all Phase 4 tool schemas</span>
+│       └── <span class="mod">dispatcher.py</span>               <span class="cmt2"># uncomment Phase 4 block + add new routes</span>
+│
+├── <span class="new">interview_service/</span>                 <span class="cmt2"># new service — port 8005</span>
+│   ├── <span class="new">main.py</span>
+│   ├── <span class="new">websocket_handler.py</span>           <span class="cmt2"># WS /ws/interview/{session_id}</span>
+│   ├── <span class="new">stt_client.py</span>                  <span class="cmt2"># AWS Transcribe Streaming</span>
+│   ├── <span class="new">tts_client.py</span>                  <span class="cmt2"># Amazon Polly Neural</span>
+│   ├── <span class="new">interview_manager.py</span>           <span class="cmt2"># session state machine + Claude conversation</span>
+│   ├── <span class="new">malpractice_detector.py</span>        <span class="cmt2"># per-turn audio + answer analysis</span>
+│   └── <span class="new">scoring_engine.py</span>              <span class="cmt2"># per-answer + dimension scoring</span>
+│
+└── <span class="mod">agent_service/routers/chat.py</span>      <span class="cmt2"># route to OrchestratorAgent instead of IntentClassifier</span>
+</pre></div>
+</div>
+
+<!-- ── Build sequence ────────────────────────────────────── -->
+<div class="sec" id="sequence">
+  <div class="eyebrow" style="color:var(--done)"><span class="eyebrow-dot" style="background:var(--done)"></span>Delivery</div>
+  <h2>Build Sequence</h2>
+  <p class="sec-desc">In strict dependency order. Each milestone is independently shippable — the system keeps working after each one.</p>
+
+  <div class="milestones">
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--mcp)"></div>
+      <div class="ms-head"><span class="ms-name">M1 — MCP Server Skeleton</span><span class="ms-weeks">Week 1</span></div>
+      <ul class="ms-list">
+        <li><code>mcp_server/</code> directory, FastAPI app on port 8006</li>
+        <li><code>tool_registry.py</code> — migrate all existing Phase 0–3 tool schemas here</li>
+        <li><code>agent_registry.py</code> — register 4 existing agents (Match, Briefing, Prospect, Audit)</li>
+        <li><code>GET /tools/list</code> and <code>POST /tools/call</code> endpoints working</li>
+        <li>Existing system unchanged — MCP runs in parallel, not yet wired to chat</li>
+      </ul>
+    </div>
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--orch)"></div>
+      <div class="ms-head"><span class="ms-name">M2 — Orchestrator Agent</span><span class="ms-weeks">Week 2</span></div>
+      <ul class="ms-list">
+        <li><code>orchestrator_agent.py</code> — ToolAgent that calls MCP for agent list + invocation</li>
+        <li>Wire <code>chat.py</code> router to use OrchestratorAgent instead of IntentClassifier</li>
+        <li>All existing agents still work — orchestrator delegates to them via MCP</li>
+        <li>Existing functionality fully preserved; new routing logic is additive</li>
+      </ul>
+    </div>
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--p4)"></div>
+      <div class="ms-head"><span class="ms-name">M3 — Lambda Bridge + AssembleAgent</span><span class="ms-weeks">Week 2–3</span></div>
+      <ul class="ms-list">
+        <li><code>lambda_bridge.py</code> — parse_resume, get_candidate_db_record, get_job_description</li>
+        <li><code>assemble_agent.py</code> — first Phase 4 agent, produces CandidatePackage</li>
+        <li>Register in MCP server; orchestrator can now invoke AssembleAgent standalone</li>
+        <li><strong>Requires Lambda 2 details from you before this starts</strong></li>
+      </ul>
+    </div>
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--p4)"></div>
+      <div class="ms-head"><span class="ms-name">M4 — Generate + Approve + OutreachAgent</span><span class="ms-weeks">Week 3–4</span></div>
+      <ul class="ms-list">
+        <li><code>question_bank_tool.py</code>, <code>search_tool.py</code> → GenerateAgent</li>
+        <li><code>approval_tool.py</code>, <code>outreach_tool.py</code> (AWS SES) → ApproveAgent + OutreachAgent</li>
+        <li><code>pipelines.py</code> — define "screen_candidate" pipeline (stages 1–3)</li>
+        <li>Approval UI in frontend (<code>/approvals</code> page)</li>
+        <li>First fully working pipeline: Assemble → Generate → Approve</li>
+      </ul>
+    </div>
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--p4)"></div>
+      <div class="ms-head"><span class="ms-name">M5 — ScheduleAgent + Calendly</span><span class="ms-weeks">Week 4–5</span></div>
+      <ul class="ms-list">
+        <li><code>scheduling_tool.py</code> — Calendly API + .ics generation</li>
+        <li><code>schedule_agent.py</code> — Calendly webhook handler updates session status</li>
+        <li>Full "screen_candidate" pipeline stages 1–4 now complete</li>
+        <li>APScheduler reminder jobs (reuses existing <code>scheduler.py</code>)</li>
+      </ul>
+    </div>
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--iv)"></div>
+      <div class="ms-head"><span class="ms-name">M6 — Interview Service (voice engine)</span><span class="ms-weeks">Weeks 5–8</span></div>
+      <ul class="ms-list">
+        <li><code>interview_service/</code> microservice: WebSocket + STT + TTS + scoring</li>
+        <li>AWS Transcribe Streaming + Amazon Polly Neural wired up</li>
+        <li>Real-time Claude conversation manager in <code>interview_manager.py</code></li>
+        <li>Malpractice detection running per turn</li>
+        <li><code>/interviews/[session_id]</code> frontend page (WebRTC + MediaRecorder)</li>
+        <li><code>interview_agent.py</code> thin client registers in MCP; full pipeline now runnable</li>
+      </ul>
+    </div>
+    <div class="milestone">
+      <div class="ms-dot" style="background:var(--done)"></div>
+      <div class="ms-head"><span class="ms-name">M7 — Verify + Present + Full Handoff</span><span class="ms-weeks">Weeks 8–10</span></div>
+      <ul class="ms-list">
+        <li><code>verify_tool.py</code>, <code>verify_agent.py</code> — full cross-validation</li>
+        <li><code>profile_tool.py</code>, <code>present_agent.py</code> — final profile compilation</li>
+        <li><code>pipelines.py</code> — "post_interview" pipeline (Verify → Present → Outreach)</li>
+        <li><code>/candidates/[id]/profile</code> frontend page — all tabs</li>
+        <li>All 12 agents registered, all pipelines working end-to-end</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ── Required ──────────────────────────────────────────── -->
+<div class="sec" id="required">
+  <div class="eyebrow" style="color:var(--warn)"><span class="eyebrow-dot" style="background:var(--warn)"></span>Action Required</div>
+  <h2>Required From You</h2>
+  <p class="sec-desc">In the order they block milestones. M1 and M2 need nothing from you — we can start immediately.</p>
+
+  <div class="warn-box">
+    <div class="wb-label">Blocking M3 (Lambda Bridge) — share before Week 2</div>
+    <ol>
+      <li><strong>Lambda 2 source code or handler return statement.</strong> Need: exact input payload (<code>{"candidate_id": X}</code> or <code>{"applicant_id": X}</code>?), exact S3 key format, output JSON field names.</li>
+      <li><strong>Application form JSON structure.</strong> What did the candidate fill in? Is it stored in your DB? Which table + column holds the JSON?</li>
+      <li><strong>Job description location.</strong> Run: <code>SELECT column_name FROM information_schema.columns WHERE table_name = 'bullhorn_core_job_order'</code> — share the output. Need to know if full JD text is stored or just title.</li>
+    </ol>
+  </div>
+
+  <div class="warn-box">
+    <div class="wb-label">Blocking M4 (Outreach) — share before Week 3</div>
+    <ol>
+      <li><strong>Email sender domain.</strong> Which domain sends emails? Must be verified in AWS SES. Takes 5 minutes to set up if not already done.</li>
+      <li><strong>Notification preference.</strong> Approval workflow: (a) email only, (b) in-app badge only, or (c) both?</li>
+    </ol>
+  </div>
+
+  <div class="warn-box">
+    <div class="wb-label">Blocking M5 (Scheduling) — share before Week 4</div>
+    <ol>
+      <li><strong>Calendly account.</strong> Do you have one? Or do you want a custom slot-picker page built inside the app?</li>
+      <li><strong>pgvector status.</strong> Run: <code>SELECT * FROM pg_extension WHERE extname = 'vector';</code> — if not installed I'll use keyword search for M4 and upgrade to embeddings when available.</li>
+    </ol>
+  </div>
+
+  <div class="warn-box" style="background:#F0FDF4; border-color:#A7F3D0; border-left-color:var(--done);">
+    <div class="wb-label" style="color:#065F46;">Blocking M6 (Voice) — share before Week 5</div>
+    <ol style="color:#064E3B;">
+      <li><strong style="color:#022C22;">STT provider choice.</strong> AWS Transcribe Streaming (on AWS already, recommended) vs Deepgram (better accuracy on technical vocab, ~$0.004/min)?</li>
+      <li><strong style="color:#022C22;">TTS voice.</strong> Amazon Polly Neural "Joanna" (F) or "Matthew" (M)? Or ElevenLabs for more natural sound?</li>
+      <li><strong style="color:#022C22;">AI interviewer persona.</strong> Name, style (formal/conversational), language preference?</li>
+      <li><strong style="color:#022C22;">Malpractice scope.</strong> Audio-only (recommended for Phase 4) or also camera/video detection?</li>
+      <li><strong style="color:#022C22;">Interview duration.</strong> 20 min (5–6 questions) or 40 min (10–12 questions)?</li>
+      <li><strong style="color:#022C22;"><code>bullhorn_core_candidate</code> schema.</strong> Run: <code>SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'bullhorn_core_candidate' ORDER BY ordinal_position;</code></li>
+    </ol>
+  </div>
+</div>
+
+</div><!-- /content -->
+</main>
+</div><!-- /layout -->
+</body>
+</html>
