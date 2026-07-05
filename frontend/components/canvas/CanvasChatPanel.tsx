@@ -125,7 +125,17 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   }])
   const [input, setInput]     = useState('')
   const [sending, setSending]   = useState(false)
-  const [sessionId]             = useState(() => `canvas-${canvasId}-${Date.now()}`)
+  // Stable per-canvas session id (persisted) so backend chat memory survives
+  // panel close / page reload instead of starting a fresh session every mount.
+  const [sessionId]             = useState(() => {
+    if (typeof window === 'undefined') return `canvas-${canvasId}`
+    const key = `canvas-chat-session-${canvasId}`
+    const existing = window.localStorage.getItem(key)
+    if (existing) return existing
+    const sid = `canvas-${canvasId}-${Math.random().toString(36).slice(2, 10)}`
+    window.localStorage.setItem(key, sid)
+    return sid
+  })
   const [showSuggestions, setShowSuggestions] = useState(true)
   // ── Schema scope (builder) — shared via the store with the canvas toolbar picker,
   // so a selection in either place reflects in both. The table list is fetched once

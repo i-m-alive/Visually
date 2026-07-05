@@ -240,9 +240,17 @@ export default function AnalystCanvasPage() {
   const handleExportPdf = async () => {
     setExportMenu(false)
     try {
-      await analystApi.exportPdf(token)
-      alert('PDF export queued. You will receive it via email or download when ready.')
-    } catch { /* ignore */ }
+      const resp = await analystApi.exportPdf(token)
+      const blob = new Blob([resp.data as BlobPart], { type: 'application/pdf' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${canvas?.name || 'dashboard'}.pdf`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      alert('PDF export failed — make sure the export service is running.')
+    }
   }
 
   const handleExportWidgetCsv = (widgetId: string) => {

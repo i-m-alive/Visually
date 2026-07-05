@@ -10,9 +10,11 @@ import {
   Layers, MessageSquare, Plus, Save, ChevronLeft,
   Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
-  FunctionSquare, Clock, Shield, FileDown, Zap, Table2, Database,
+  FunctionSquare, Clock, Shield, FileDown, Zap, Table2, Database, Type,
+  Bell, History as HistoryIcon, Image as ImageIcon,
 } from 'lucide-react'
-import { canvasApi, widgetApi, vlyApi, scheduleApi } from '@/lib/api'
+import { canvasApi, widgetApi, vlyApi, scheduleApi, versionsApi } from '@/lib/api'
+import { HistoryDrawer, AlertsModal, ExplainPopover } from '@/components/canvas/AgentPanels'
 import { CanvasWidget, type CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import { ZoomModal } from '@/components/canvas/ZoomModal'
 import { CanvasChatPanel } from '@/components/canvas/CanvasChatPanel'
@@ -172,8 +174,17 @@ export default function CanvasEditorPage() {
   const [lockedWidgets, setLockedWidgets]   = useState<Set<string>>(new Set())
   const [refreshingId, setRefreshingId]     = useState<string | null>(null)
   const [gridZoom, setGridZoom]             = useState(1)
+  const [chatPrefill, setChatPrefill]       = useState<string | undefined>(undefined)
+  // Fixed-width page sheet (Power BI-style document). Grid always lays out at
+  // this width; the sheet scales to fit the viewport (letterboxed).
+  const PAGE_W = 1280
+  const canvasScrollRef = useRef<HTMLDivElement>(null)
+  const hasAutoFitRef   = useRef(false)
   const [isViewOnly, setIsViewOnly]         = useState(false)
   const [showMeasures, setShowMeasures]     = useState(false)
+  const [showAlerts, setShowAlerts]         = useState(false)
+  const [showHistory, setShowHistory]       = useState(false)
+  const [explainTarget, setExplainTarget]   = useState<{ widgetId: string; column: string; value: string } | null>(null)
   const [showSchedule, setShowSchedule]     = useState(false)
   const [showRLS, setShowRLS]               = useState(false)
   const [toastMsg, setToastMsg]             = useState<string | null>(null)
@@ -204,6 +215,10 @@ export default function CanvasEditorPage() {
       setCanvas(data)
       const ws: WidgetWithPosition[] = (data.widgets || []) as WidgetWithPosition[]
       setWidgets(ws)
+
+      // Restore persisted widget locks (config.locked)
+      const locked = new Set(ws.filter(w => (w.config as Record<string, unknown> | undefined)?.locked === true).map(w => w.id))
+      setLockedWidgets(locked)
 
       // Initialize pages — create default "Page 1" for canvases without pages yet
       const loadedPages: CanvasPage[] = data.pages || []
@@ -244,6 +259,7 @@ export default function CanvasEditorPage() {
             h: w.height || 6,
             minW: 2,
             minH: 3,
+            static: locked.has(w.id),
           }))
       setLayout(computed)
       if (shouldAutoArrange) {
@@ -259,6 +275,20 @@ export default function CanvasEditorPage() {
   }, [canvasId])
 
   useEffect(() => { load() }, [load])
+
+  // Zoom-to-fit once on first render: scale the 1280px page to the available
+  // width (capped at 100%). Manual zoom controls still override afterwards.
+  useEffect(() => {
+    if (loading || hasAutoFitRef.current) return
+    const el = canvasScrollRef.current
+    if (!el) return
+    hasAutoFitRef.current = true
+    const avail = el.clientWidth - 56
+    if (avail > 0 && avail < PAGE_W) {
+      setGridZoom(Math.max(0.5, Math.round((avail / PAGE_W) * 100) / 100))
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading])
 
   // Preload the project's table list once on canvas open, into the shared store,
   // so the Canvas Assistant + toolbar table picker are instant (no re-fetch).
@@ -415,16 +445,60 @@ export default function CanvasEditorPage() {
     } catch { /* ignore */ }
   }, [canvasId, layout, load, activePageId])
 
+  // Insert a static text widget on the active page (also creatable via copilot)
+  const handleInsertText = useCallback(async () => {
+    try {
+      await canvasApi.addWidget(canvasId, {
+        title: 'Text',
+        chart_type: 'text',
+        chart_data: { rows: [], columns: [], labels: [], values: [] },
+        config: { page_id: activePageId, content: '# New text\nDouble-click to edit', widget_type: 'text' },
+        sql_query: '',
+        width: 4,
+        height: 3,
+        position_x: 0,
+        position_y: 0,
+      })
+      await load(true)
+      showToast('Text box added')
+    } catch { showToast('Failed to add text box') }
+  }, [canvasId, activePageId, load])
+
+  const handleInsertImage = useCallback(async () => {
+    const url = window.prompt('Image URL (or data URI) — you can also add it later by clicking the widget:') ?? ''
+    try {
+      await canvasApi.addWidget(canvasId, {
+        title: 'Image',
+        chart_type: 'image',
+        chart_data: { rows: [], columns: [], labels: [], values: [] },
+        config: { page_id: activePageId, src: url, widget_type: 'image' },
+        sql_query: '',
+        width: 4,
+        height: 4,
+        position_x: 0,
+        position_y: 0,
+      })
+      await load(true)
+      showToast('Image widget added')
+    } catch { showToast('Failed to add image') }
+  }, [canvasId, activePageId, load])
+
   const handleToggleLock = useCallback((widgetId: string) => {
+    const nowLocked = !lockedWidgets.has(widgetId)
     setLockedWidgets(prev => {
       const next = new Set(prev)
-      if (next.has(widgetId)) next.delete(widgetId)
-      else next.add(widgetId)
-      showToast(next.has(widgetId) ? 'Widget locked' : 'Widget unlocked')
+      if (nowLocked) next.add(widgetId)
+      else next.delete(widgetId)
+      showToast(nowLocked ? 'Widget locked' : 'Widget unlocked')
       return next
     })
     setLayout(prev => prev.map(l =>
-      l.i === widgetId ? { ...l, static: !lockedWidgets.has(widgetId) } : l
+      l.i === widgetId ? { ...l, static: nowLocked } : l
+    ))
+    // Persist so locks survive reload (previously in-memory only)
+    void widgetApi.update(widgetId, { config: { locked: nowLocked } }).catch(() => {})
+    setWidgets(prev => prev.map(w =>
+      w.id === widgetId ? { ...w, config: { ...(w.config || {}), locked: nowLocked } } : w
     ))
   }, [lockedWidgets])
 
@@ -486,6 +560,8 @@ export default function CanvasEditorPage() {
   const handleManualSave = () => {
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
     persistLayout(layout)
+    // Auto-capture a version on every explicit save (backend debounces dupes)
+    void versionsApi.snapshot(canvasId).catch(() => {})
   }
 
   // ── Page management ────────────────────────────────────────────────────────
@@ -745,6 +821,18 @@ export default function CanvasEditorPage() {
                 <span className="text-[9px]">Add Chart</span>
               </button>
             )}
+            {!isViewOnly && (
+              <button onClick={handleInsertText} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Insert text box">
+                <Type size={16} />
+                <span className="text-[9px]">Text</span>
+              </button>
+            )}
+            {!isViewOnly && (
+              <button onClick={handleInsertImage} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Insert image">
+                <ImageIcon size={16} />
+                <span className="text-[9px]">Image</span>
+              </button>
+            )}
             {widgets.length > 0 && (
               <button onClick={handleAutoArrange} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Auto-arrange">
                 <LayoutGrid size={16} />
@@ -794,6 +882,14 @@ export default function CanvasEditorPage() {
             <button onClick={() => setShowRLS(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-orange-50 hover:text-orange-700 transition-colors text-gray-600" title="Row-Level Security">
               <Shield size={16} />
               <span className="text-[9px]">RLS</span>
+            </button>
+            <button onClick={() => setShowAlerts(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-amber-50 hover:text-amber-600 transition-colors text-gray-600" title="Data alerts — the agent watches your charts">
+              <Bell size={16} />
+              <span className="text-[9px]">Alerts</span>
+            </button>
+            <button onClick={() => setShowHistory(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-blue-50 hover:text-blue-700 transition-colors text-gray-600" title="Version history">
+              <HistoryIcon size={16} />
+              <span className="text-[9px]">History</span>
             </button>
           </div>
           <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Configure</span>
@@ -929,18 +1025,26 @@ export default function CanvasEditorPage() {
       <div className="flex flex-1 min-h-0 overflow-hidden relative">
         {/* Canvas grid + page tabs — always full width, chat overlays on top */}
         <div className="flex flex-col flex-1 min-w-0 min-h-0">
-        <div className="flex-1 overflow-auto min-w-0" style={{
-          backgroundColor: '#f1f5f9',
-          backgroundImage: 'radial-gradient(circle, #cbd5e1 1px, transparent 1px)',
+        <div ref={canvasScrollRef} className="flex-1 overflow-auto min-w-0" style={{
+          backgroundColor: '#EBEEF3',
+          backgroundImage: 'radial-gradient(circle, #d8dee8 1px, transparent 1px)',
           backgroundSize: '24px 24px',
-          padding: '20px',
+          padding: '28px 28px 56px',
         }}>
-          {/* Power BI–style white page sheet */}
+          {/* Letterbox wrapper — centers the fixed-width page and reserves the
+              scaled footprint so scrollbars stay correct at any zoom */}
+          <div style={{ width: PAGE_W * gridZoom, margin: '0 auto', maxWidth: '100%' }}>
+          {/* Document-style page sheet (fixed 1280px, scaled to fit) */}
           <div style={{
+            width: PAGE_W,
+            transform: `scale(${gridZoom})`,
+            transformOrigin: 'top left',
+            transition: 'transform 0.15s ease',
             background: 'white',
-            border: '2px dashed #CBD5E1',
-            borderRadius: 4,
-            minHeight: '70vh',
+            border: '1px solid #E2E8F0',
+            borderRadius: 10,
+            boxShadow: '0 1px 3px rgba(16,24,40,0.06), 0 12px 40px rgba(16,24,40,0.10)',
+            minHeight: 720,
             overflow: 'hidden',
           }}>
           {(() => {
@@ -951,43 +1055,62 @@ export default function CanvasEditorPage() {
             })
             const activePageLayout = layout.filter(l => activePageWidgets.some(w => w.id === l.i))
             return activePageWidgets.length === 0 ? (
-            // Enhanced 3-step empty state
-            <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400 gap-6 py-12">
-              <div className="flex gap-2 opacity-30">
-                {[40, 60, 40, 80].map((h, i) => (
-                  <div key={i} className="w-8 rounded-t-sm bg-blue-400" style={{ height: h }} />
+            // Prompt-first empty state — the chat input IS the starting point
+            <div className="flex flex-col items-center justify-center text-gray-400 gap-7 py-12" style={{ minHeight: 660 }}>
+              <div className="flex items-end gap-2 opacity-25">
+                {[36, 56, 44, 72, 52].map((h, i) => (
+                  <div key={i} className="w-7 rounded-t-md bg-gradient-to-t from-blue-500 to-indigo-400" style={{ height: h }} />
                 ))}
               </div>
               <div className="text-center">
-                <p className="font-semibold text-gray-600 text-base">Your canvas is empty</p>
-                <p className="text-sm mt-1 text-gray-400 max-w-sm">
-                  Build your first visualization in 3 steps
+                <p className="font-bold text-gray-700 text-lg">What do you want to see?</p>
+                <p className="text-sm mt-1 text-gray-400 max-w-md">
+                  Describe a chart in plain language — the AI writes the SQL, builds the visual, and places it on this page.
                 </p>
               </div>
-              <div className="flex gap-4 flex-wrap justify-center">
+              {/* Command bar — opens the copilot with the typed question */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  const q = (new FormData(e.currentTarget).get('q') as string || '').trim()
+                  setChatPrefill(q || undefined)
+                  setShowChat(true)
+                }}
+                className="w-full max-w-xl"
+              >
+                <div className="flex items-center gap-2 bg-white border border-gray-300 rounded-2xl pl-4 pr-2 py-2 shadow-sm focus-within:border-blue-400 focus-within:ring-4 focus-within:ring-blue-100 transition-all">
+                  <MessageSquare size={16} className="text-blue-500 flex-shrink-0" />
+                  <input
+                    name="q"
+                    placeholder="e.g. Monthly placements trend for the last 12 months…"
+                    className="flex-1 text-sm text-gray-800 placeholder-gray-400 outline-none bg-transparent"
+                    autoComplete="off"
+                  />
+                  <button type="submit" className="px-3.5 py-1.5 bg-blue-600 text-white text-sm font-medium rounded-xl hover:bg-blue-700 transition-colors flex-shrink-0">
+                    Create
+                  </button>
+                </div>
+              </form>
+              {/* Suggestion chips */}
+              <div className="flex gap-2 flex-wrap justify-center max-w-xl">
                 {[
-                  { step: '1', label: 'Connect data', desc: 'Add a database or CSV in project settings' },
-                  { step: '2', label: 'Ask the AI', desc: 'Describe a chart in natural language' },
-                  { step: '3', label: 'Arrange & share', desc: 'Drag, resize, then open Visually' },
+                  'Top 10 by revenue',
+                  'Daily activity — last 7 days',
+                  'KPI card: total records',
+                  'Breakdown by category',
                 ].map(s => (
-                  <div key={s.step} className="flex flex-col items-center gap-1.5 w-36 text-center">
-                    <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-600 font-bold text-sm flex items-center justify-center">
-                      {s.step}
-                    </div>
-                    <span className="text-xs font-semibold text-gray-600">{s.label}</span>
-                    <span className="text-xs text-gray-400">{s.desc}</span>
-                  </div>
+                  <button
+                    key={s}
+                    onClick={() => { setChatPrefill(s); setShowChat(true) }}
+                    className="px-3 py-1.5 text-xs text-gray-600 bg-white border border-gray-200 rounded-full hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                  >
+                    {s}
+                  </button>
                 ))}
               </div>
-              <button
-                onClick={() => setShowChat(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                <MessageSquare size={14} /> Open AI Chat
-              </button>
             </div>
             ) : (
-              <div style={{ transform: `scale(${gridZoom})`, transformOrigin: 'top left', transition: 'transform 0.15s ease' }}>
+              <div>
                 <ResponsiveGrid
                   className="layout"
                   layouts={{ lg: activePageLayout, md: activePageLayout, sm: activePageLayout }}
@@ -1002,7 +1125,7 @@ export default function CanvasEditorPage() {
                   isResizable={!isViewOnly}
                   margin={[12, 12]}
                   containerPadding={[4, 4]}
-                  resizeHandles={['se', 'e', 's']}
+                  resizeHandles={['se', 'e', 's', 'sw', 'w', 'ne', 'nw', 'n']}
                 >
                   {activePageWidgets.map(widget => (
                     <div key={widget.id} className="overflow-hidden rounded-xl">
@@ -1016,6 +1139,8 @@ export default function CanvasEditorPage() {
                         onToggleLock={handleToggleLock}
                         isLocked={lockedWidgets.has(widget.id)}
                         isRefreshing={refreshingId === widget.id}
+                        onDataPointClick={(column, value) =>
+                          setExplainTarget({ widgetId: widget.id, column, value: String(value) })}
                       />
                     </div>
                   ))}
@@ -1024,6 +1149,7 @@ export default function CanvasEditorPage() {
             )
           })()}
           </div>{/* /page sheet */}
+          </div>{/* /letterbox wrapper */}
         </div>
 
         {/* Page tabs */}
@@ -1058,7 +1184,8 @@ export default function CanvasEditorPage() {
               widgets={widgets}
               pages={pages}
               activePageId={activePageId}
-              onClose={() => setShowChat(false)}
+              prefillMessage={chatPrefill}
+              onClose={() => { setShowChat(false); setChatPrefill(undefined) }}
               onWidgetAdded={() => load(true)}
               isOffline={canvas?.is_offline || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline'}
             />
@@ -1072,6 +1199,31 @@ export default function CanvasEditorPage() {
           widget={zoomTarget.widget}
           colors={zoomTarget.colors}
           onClose={() => setZoomTarget(null)}
+        />
+      )}
+
+      {/* Agent panels: version history, data alerts, explain-this-point */}
+      {showHistory && (
+        <HistoryDrawer
+          canvasId={canvasId}
+          onClose={() => setShowHistory(false)}
+          onRestored={() => { load(); showToast('Version restored') }}
+        />
+      )}
+      {showAlerts && (
+        <AlertsModal
+          canvasId={canvasId}
+          widgets={widgets.map(w => ({ id: w.id, title: w.title, chart_type: w.chart_type }))}
+          onClose={() => setShowAlerts(false)}
+        />
+      )}
+      {explainTarget && (
+        <ExplainPopover
+          canvasId={canvasId}
+          widgetId={explainTarget.widgetId}
+          column={explainTarget.column}
+          value={explainTarget.value}
+          onClose={() => setExplainTarget(null)}
         />
       )}
 

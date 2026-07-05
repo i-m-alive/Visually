@@ -101,11 +101,27 @@ async def _ensure_offline_tables() -> None:
         print(f"[startup] vly_offline_tables ensure warning: {e}", flush=True)
 
 
+async def _ensure_platform_tables() -> None:
+    """Create alert_rules / dashboard_versions if missing (checkfirst — never
+    touches existing tables). Keeps dev environments working without alembic."""
+    try:
+        from shared.database import engine
+        from shared.models.alerts import AlertRule
+        from shared.models.phase2 import DashboardVersion
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: AlertRule.__table__.create(bind=c, checkfirst=True))
+            await conn.run_sync(lambda c: DashboardVersion.__table__.create(bind=c, checkfirst=True))
+        print("[startup] alert_rules + dashboard_versions ensured", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[startup] platform tables ensure warning: {e}", flush=True)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     from agent_service.scheduler import start_scheduler, stop_scheduler
     await _backfill_project_members()
     await _ensure_offline_tables()
+    await _ensure_platform_tables()
     start_scheduler()
     yield
     stop_scheduler()
@@ -163,6 +179,13 @@ app.include_router(intelligence_module.router)
 app.include_router(intelligence_orchestrator_module.router)
 app.include_router(intelligence_chat_module.router)
 app.include_router(brainwave_profiles_module.router)
+from agent_service.routers import alerts as alerts_module          # noqa: E402
+from agent_service.routers import versions as versions_module      # noqa: E402
+from agent_service.routers import explain as explain_module        # noqa: E402
+import shared.models.alerts                                        # noqa: E402,F401  (register table)
+app.include_router(alerts_module.router)
+app.include_router(versions_module.router)
+app.include_router(explain_module.router)
 
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")

@@ -92,6 +92,15 @@ async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = 
                 dashboard_id, len(widgets), (fallback_conn_id or "none"),
             )
 
+            # RLS enforcement: scheduled refreshes persist chart_data that public
+            # snapshot links serve later — apply the dashboard's catch-all
+            # policies so cached data is never broader than any viewer may see.
+            from agent_service.utils.rls import fetch_rls_clauses, inject_rls
+            rls_clauses = await fetch_rls_clauses(db, dash_uuid)
+            if rls_clauses:
+                log.info("Scheduler: applying %d RLS clause(s) to dashboard %s",
+                         len(rls_clauses), dashboard_id)
+
             for w in widgets:
                 sql = w.base_sql or w.sql_query
                 conn_id = str(w.connection_id) if w.connection_id else fallback_conn_id
@@ -99,7 +108,7 @@ async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = 
                     summary["skipped"] += 1
                     continue
                 try:
-                    result = await call_query_executor(conn_id, sql, row_limit=500)
+                    result = await call_query_executor(conn_id, inject_rls(sql, rls_clauses), row_limit=500)
                     if result and not result.get("error"):
                         rows = result.get("rows", [])
                         columns = result.get("columns", [])
@@ -141,6 +150,178 @@ async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = 
     except Exception as exc:
         log.exception("Scheduler: refresh failed for dashboard %s: %s", dashboard_id, exc)
     return summary
+
+
+# ── Agent alerts evaluation ───────────────────────────────────────────────────
+
+async def evaluate_alerts() -> None:
+    """Evaluate every due, active AlertRule: run the widget SQL (RLS applied),
+    check the rule, and on trigger generate an LLM explanation + notify."""
+    try:
+        from shared.database import AsyncSessionLocal
+        from shared.models.alerts import AlertRule
+        from shared.models.widgets import Widget as WidgetModel
+        from agent_service.utils.http_clients import call_query_executor
+        from agent_service.utils.rls import fetch_rls_clauses, inject_rls
+        from sqlalchemy import select
+        from datetime import timedelta
+
+        now = datetime.utcnow()
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(AlertRule).where(AlertRule.is_active == True))  # noqa: E712
+            for alert in result.scalars().all():
+                due = (alert.last_evaluated_at is None or
+                       now - alert.last_evaluated_at >= timedelta(minutes=alert.cadence_minutes))
+                if not due or not alert.widget_id:
+                    continue
+                try:
+                    wr = await db.execute(select(WidgetModel).where(WidgetModel.id == alert.widget_id))
+                    w = wr.scalar_one_or_none()
+                    sql = (w.base_sql or w.sql_query) if w else None
+                    if not w or not sql or not w.connection_id:
+                        alert.last_evaluated_at = now
+                        continue
+                    clauses = await fetch_rls_clauses(db, alert.dashboard_id)
+                    res = await call_query_executor(str(w.connection_id), inject_rls(sql, clauses), row_limit=500)
+                    rows = res.get("rows") or []
+                    alert.last_evaluated_at = now
+                    if res.get("error") or not rows:
+                        continue
+                    # Latest numeric value: rule.column if present, else first numeric col
+                    cols = res.get("columns") or []
+                    rule = alert.rule or {}
+                    target_col = rule.get("column") or next(
+                        (c for c in cols if isinstance(rows[-1].get(c), (int, float))), None)
+                    if not target_col:
+                        continue
+                    series = [r.get(target_col) for r in rows if isinstance(r.get(target_col), (int, float))]
+                    if not series:
+                        continue
+                    latest = series[-1]
+                    triggered, reason = False, ""
+                    if rule.get("type") == "threshold":
+                        op, val = rule.get("op", "<"), float(rule.get("value", 0))
+                        triggered = ((op == "<" and latest < val) or (op == "<=" and latest <= val)
+                                     or (op == ">" and latest > val) or (op == ">=" and latest >= val)
+                                     or (op == "=" and latest == val))
+                        reason = f"latest {target_col} = {latest} (condition: {op} {val})"
+                    else:  # anomaly
+                        if len(series) >= 5:
+                            mean = sum(series) / len(series)
+                            var = sum((x - mean) ** 2 for x in series) / len(series)
+                            std = var ** 0.5
+                            sigma = float(rule.get("sigma", 2))
+                            triggered = std > 0 and abs(latest - mean) > sigma * std
+                            reason = f"latest {target_col} = {latest} vs mean {mean:.1f} (±{sigma}σ = {sigma * std:.1f})"
+                    if triggered:
+                        explanation = reason
+                        try:
+                            from shared.bedrock_client import bedrock_invoke, BEDROCK_HAIKU_MODEL
+                            explanation = await bedrock_invoke(
+                                model_id=BEDROCK_HAIKU_MODEL,
+                                system_prompt="You write 2-sentence data alert notifications. Be specific with numbers, plain language, no fluff.",
+                                user_message=(f"Alert '{alert.name}' on widget '{w.title}' fired. "
+                                              f"Condition: {alert.condition_text}. Evidence: {reason}. "
+                                              f"Recent values of {target_col}: {series[-10:]}"),
+                                max_tokens=200, temperature=0.2,
+                            )
+                        except Exception:
+                            pass
+                        alert.last_triggered_at = now
+                        alert.last_result = {"triggered": True, "value": latest,
+                                             "explanation": explanation, "at": now.isoformat()}
+                        log.info("Alert TRIGGERED: %s — %s", alert.name, reason)
+                        if alert.channel == "email" and alert.email:
+                            from shared.email import send_email
+                            await send_email(alert.email, f"⚠ Alert: {alert.name}",
+                                             f"<h3>{alert.name}</h3><p>{explanation}</p>")
+                    else:
+                        alert.last_result = {"triggered": False, "value": latest, "at": now.isoformat()}
+                except Exception as exc:
+                    log.warning("Alert %s evaluation failed: %s", alert.id, exc)
+            await db.commit()
+    except Exception as exc:
+        log.warning("evaluate_alerts tick failed: %s", exc)
+
+
+# ── Snapshot email delivery ───────────────────────────────────────────────────
+
+async def process_snapshot_schedules() -> None:
+    """Send due email snapshots. Rows are created on the share page; before
+    this job existed they were stored but never delivered."""
+    try:
+        from shared.database import AsyncSessionLocal
+        from shared.models.snapshot_schedules import SnapshotSchedule
+        from shared.models.dashboards import Dashboard
+        from shared.models.widgets import Widget as WidgetModel
+        from shared.email import send_email, is_email_configured
+        from sqlalchemy import select
+        from datetime import timedelta
+
+        if not is_email_configured():
+            return  # logged loudly on actual send attempts; skip the scan quietly
+        now = datetime.utcnow()
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(SnapshotSchedule).where(
+                SnapshotSchedule.is_active == True,          # noqa: E712
+                SnapshotSchedule.next_send_at <= now,
+            ))
+            for sched in result.scalars().all():
+                try:
+                    dr = await db.execute(select(Dashboard).where(Dashboard.id == sched.dashboard_id))
+                    dash = dr.scalar_one_or_none()
+                    if not dash:
+                        sched.is_active = False
+                        continue
+                    wr = await db.execute(select(WidgetModel).where(WidgetModel.dashboard_id == dash.id))
+                    widgets = wr.scalars().all()
+                    # Headline values from cached chart_data (KPIs first)
+                    lines = []
+                    for w in widgets[:12]:
+                        cd = w.chart_data if isinstance(w.chart_data, dict) else {}
+                        vals = cd.get("values") or []
+                        if w.chart_type in ("kpi", "gauge") and vals:
+                            lines.append(f"<li><strong>{w.title}:</strong> {vals[0]}</li>")
+                    digest = ""
+                    if getattr(sched, "include_ai_summary", False):
+                        try:
+                            from shared.bedrock_client import bedrock_invoke, BEDROCK_HAIKU_MODEL
+                            widget_summary = "; ".join(
+                                f"{w.title} ({w.chart_type}, {len((w.chart_data or {}).get('rows', []))} rows)"
+                                for w in widgets[:15]
+                            )
+                            digest = await bedrock_invoke(
+                                model_id=BEDROCK_HAIKU_MODEL,
+                                system_prompt="Write a 3-sentence executive digest of this dashboard for an email. Plain language.",
+                                user_message=f"Dashboard '{dash.name}' widgets: {widget_summary}",
+                                max_tokens=300, temperature=0.3,
+                            )
+                        except Exception:
+                            pass
+                    html = (
+                        f"<h2>{dash.name}</h2>"
+                        + (f"<p>{digest}</p>" if digest else "")
+                        + (f"<ul>{''.join(lines)}</ul>" if lines else "")
+                        + "<p style='color:#888;font-size:12px'>Scheduled snapshot from Visually.</p>"
+                    )
+                    ok = await send_email(sched.email, f"📊 {dash.name} — scheduled snapshot", html)
+                    if ok:
+                        sched.last_sent_at = now
+                    # Advance next_send_at by frequency
+                    freq = (getattr(sched, "frequency", None) or "daily").lower()
+                    step = {"daily": timedelta(days=1), "weekly": timedelta(weeks=1),
+                            "monthly": timedelta(days=30)}.get(freq, timedelta(days=1))
+                    base = sched.next_send_at or now
+                    while base <= now:
+                        base += step
+                    sched.next_send_at = base
+                    log.info("Snapshot email %s to %s (dashboard %s)",
+                             "sent" if ok else "FAILED", sched.email, dash.name)
+                except Exception as exc:
+                    log.warning("Snapshot schedule %s failed: %s", sched.id, exc)
+            await db.commit()
+    except Exception as exc:
+        log.warning("process_snapshot_schedules tick failed: %s", exc)
 
 
 def _make_job_id(dashboard_id: str) -> str:
@@ -201,7 +382,12 @@ def start_scheduler() -> None:
     _scheduler.start()
     # Load existing schedules after the event loop is running
     asyncio.get_event_loop().create_task(_load_all_schedules())
-    log.info("APScheduler started")
+    # Recurring platform jobs: alert evaluation + snapshot email delivery
+    _scheduler.add_job(evaluate_alerts, "interval", minutes=5,
+                       id="evaluate_alerts", replace_existing=True)
+    _scheduler.add_job(process_snapshot_schedules, "interval", minutes=1,
+                       id="snapshot_emails", replace_existing=True)
+    log.info("APScheduler started (with alerts + snapshot email jobs)")
 
 
 def stop_scheduler() -> None:

@@ -639,6 +639,66 @@ export const widgetApi = {
     api.delete(`/widgets/${widgetId}`),
 }
 
+// ─── Agent alerts (watch a widget, notify with an explanation) ────────────────
+
+export interface AlertRuleItem {
+  id: string
+  widget_id: string | null
+  name: string
+  condition_text: string
+  rule: Record<string, unknown>
+  cadence_minutes: number
+  channel: string
+  email: string | null
+  is_active: boolean
+  last_evaluated_at: string | null
+  last_triggered_at: string | null
+  last_result: { triggered?: boolean; value?: number; explanation?: string; at?: string } | null
+}
+
+export const alertsApi = {
+  list: (canvasId: string) =>
+    api.get<{ alerts: AlertRuleItem[] }>(`/dashboards/${canvasId}/alerts`),
+  create: (canvasId: string, data: {
+    name: string; condition_text: string; widget_id?: string
+    cadence_minutes?: number; channel?: string; email?: string
+  }) => api.post(`/dashboards/${canvasId}/alerts`, data),
+  update: (alertId: string, data: Partial<{ name: string; condition_text: string; cadence_minutes: number; channel: string; email: string; is_active: boolean }>) =>
+    api.patch(`/alerts/${alertId}`, data),
+  remove: (alertId: string) => api.delete(`/alerts/${alertId}`),
+}
+
+// ─── Dashboard version history ────────────────────────────────────────────────
+
+export interface VersionMeta {
+  id: string
+  version_number: number
+  created_at: string | null
+  change_summary: string | null
+  widget_count: number
+  name: string | null
+  theme: string | null
+}
+
+export const versionsApi = {
+  snapshot: (canvasId: string) =>
+    api.post<VersionMeta>(`/dashboards/${canvasId}/versions/snapshot`),
+  list: (canvasId: string) =>
+    api.get<{ versions: VersionMeta[] }>(`/dashboards/${canvasId}/versions`),
+  diff: (canvasId: string, versionId: string, against = 'current') =>
+    api.get<{ changes: string[]; prose: string }>(`/dashboards/${canvasId}/versions/${versionId}/diff`, { params: { against } }),
+  restore: (canvasId: string, versionId: string) =>
+    api.post(`/dashboards/${canvasId}/versions/${versionId}/restore`),
+}
+
+// ─── Explain-this-point ───────────────────────────────────────────────────────
+
+export const explainApi = {
+  explainPoint: (canvasId: string, data: { widget_id: string; column: string; value: string; metric_column?: string }) =>
+    api.post<{ explanation: string; evidence: Record<string, unknown>; sql_used: string[] }>(
+      `/dashboards/${canvasId}/explain-point`, data),
+}
+
 // ─── End-user (analyst) connections ───────────────────────────────────────────
 
 export interface EndUserConnectionInput {
@@ -1030,9 +1090,9 @@ export const analystApi = {
   csvExportUrl: (token: string, widgetId: string) =>
     `${API_URL}/analyst/canvas/${token}/widgets/${widgetId}/export/csv`,
 
-  // PDF export of full dashboard
+  // PDF export of full dashboard — returns the PDF bytes (download as blob)
   exportPdf: (token: string) =>
-    publicApi.post(`/analyst/canvas/${token}/export/pdf`),
+    publicApi.post(`/analyst/canvas/${token}/export/pdf`, undefined, { responseType: 'blob' }),
 
   // Annotations
   createAnnotation: (token: string, data: {

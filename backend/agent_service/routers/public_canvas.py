@@ -140,13 +140,19 @@ async def refresh_public_canvas(
     widgets = list(widget_result.scalars().all())
 
     from agent_service.utils.http_clients import call_query_executor
+    from agent_service.utils.rls import fetch_rls_clauses, inject_rls
     import asyncio
+
+    # RLS enforcement: anonymous viewers get the dashboard's catch-all policies.
+    # Without this, a public live link refreshed UNFILTERED data.
+    rls_clauses = await fetch_rls_clauses(db, dashboard.id)
 
     async def _refresh_widget(w: Widget) -> dict:
         sql = w.base_sql or w.sql_query
         if not sql or not w.connection_id:
             return {"widget_id": str(w.id), "chart_data": w.chart_data}
         try:
+            sql = inject_rls(sql, rls_clauses)
             result = await call_query_executor(str(w.connection_id), sql, row_limit=500)
             if result and not result.get("error"):
                 return {

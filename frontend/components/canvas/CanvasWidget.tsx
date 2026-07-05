@@ -105,6 +105,8 @@ interface Props {
   token?: string
   filterValue?: FilterItem | null
   onFilterChange?: (filter: FilterItem | null) => void
+  /** Explain-this-point: fired when the user clicks a bar/slice/table row */
+  onDataPointClick?: (column: string, value: unknown) => void
 }
 
 export function CanvasWidget({
@@ -112,6 +114,7 @@ export function CanvasWidget({
   onDuplicate, onRefresh, onToggleLock,
   isLocked = false, isRefreshing = false,
   token, filterValue = null, onFilterChange,
+  onDataPointClick,
 }: Props) {
   const [isEditingTitle, setIsEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState(widget.title)
@@ -385,14 +388,16 @@ export function CanvasWidget({
   return (
     <div
       ref={containerRef}
-      className="flex flex-col h-full bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden select-none"
+      className="group/card flex flex-col h-full bg-white rounded-xl border border-gray-200 overflow-hidden select-none hover:border-gray-300"
       style={{
-        borderLeft: `3px solid ${borderColor}`,
         opacity: mounted ? 1 : 0,
         transform: mounted ? 'translateY(0)' : 'translateY(8px)',
-        transition: 'opacity 0.22s ease, transform 0.22s ease',
+        transition: 'opacity 0.22s ease, transform 0.22s ease, box-shadow 0.18s ease, border-color 0.18s ease',
+        boxShadow: '0 1px 3px rgba(16,24,40,0.05), 0 3px 10px rgba(16,24,40,0.04)',
         outline: isLocked ? '2px solid #F59E0B' : undefined,
       }}
+      onMouseEnter={(e) => { e.currentTarget.style.boxShadow = '0 2px 6px rgba(16,24,40,0.07), 0 10px 28px rgba(16,24,40,0.10)' }}
+      onMouseLeave={(e) => { e.currentTarget.style.boxShadow = '0 1px 3px rgba(16,24,40,0.05), 0 3px 10px rgba(16,24,40,0.04)' }}
     >
       {/* Pending-delete banner */}
       {pendingDelete && (
@@ -407,15 +412,15 @@ export function CanvasWidget({
         </div>
       )}
 
-      {/* Drag handle + controls */}
+      {/* Drag handle + controls — chrome is quiet until the card is hovered */}
       <div
-        className="drag-handle flex items-center gap-1 px-2 py-1.5 bg-gray-50 border-b border-gray-100 cursor-grab active:cursor-grabbing flex-shrink-0"
+        className="drag-handle flex items-center gap-1 pl-2.5 pr-1.5 py-1.5 bg-transparent cursor-grab active:cursor-grabbing flex-shrink-0"
         style={{ height: HANDLE_H }}
       >
         {isLocked ? (
           <Lock size={12} className="text-amber-400 flex-shrink-0" />
         ) : (
-          <GripVertical size={14} className="text-gray-300 flex-shrink-0" />
+          <GripVertical size={14} className="text-gray-200 group-hover/card:text-gray-400 transition-colors flex-shrink-0" />
         )}
 
         {/* Staleness dot */}
@@ -454,16 +459,20 @@ export function CanvasWidget({
           ) : (
             <button
               onClick={() => !isLocked && setIsEditingTitle(true)}
-              className="flex items-center gap-1 group w-full text-left"
+              className="flex items-center gap-1.5 group w-full text-left"
               title={isLocked ? 'Unlock to edit' : 'Click to edit title'}
             >
-              <span className="text-xs font-medium text-gray-700 truncate">{widget.title}</span>
+              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: borderColor }} />
+              <span className="text-xs font-semibold text-gray-700 truncate">{widget.title}</span>
               {!isLocked && (
                 <Pencil size={10} className="text-gray-300 group-hover:text-blue-500 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
               )}
             </button>
           )}
         </div>
+
+        {/* Action cluster — fades in on card hover to keep the canvas quiet */}
+        <div className="flex items-center gap-0.5 flex-shrink-0 opacity-0 group-hover/card:opacity-100 focus-within:opacity-100 transition-opacity duration-150">
 
         {/* Chart type switcher — hidden in compact mode */}
         {typeSwitcherNode}
@@ -569,6 +578,7 @@ export function CanvasWidget({
         >
           <Trash2 size={13} />
         </button>
+        </div>{/* /action cluster */}
       </div>
 
       {notePanelNode as any}
@@ -598,12 +608,46 @@ export function CanvasWidget({
               <span className="text-[10px] text-gray-300">Active in live view</span>
             </div>
           )
+        ) : widget.chart_type === 'text' ? (
+          <TextWidgetBody
+            content={(widget.config?.content as string) || ''}
+            editable={!isLocked}
+            onSave={(content) => onUpdate(widget.id, { config: { content } })}
+          />
+        ) : widget.chart_type === 'image' ? (
+          (widget.config?.src as string) ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={widget.config?.src as string}
+              alt={widget.title}
+              className="w-full h-full object-contain cursor-pointer"
+              onDoubleClick={() => {
+                if (isLocked) return
+                const url = window.prompt('Image URL:', (widget.config?.src as string) || '')
+                if (url !== null) onUpdate(widget.id, { config: { src: url } })
+              }}
+            />
+          ) : (
+            <button
+              className="h-full w-full flex flex-col items-center justify-center gap-1 text-gray-300 hover:text-gray-400"
+              onClick={() => {
+                const url = window.prompt('Image URL (or data URI):')
+                if (url) onUpdate(widget.id, { config: { src: url } })
+              }}
+            >
+              <ImageIcon size={22} />
+              <span className="text-[11px]">Click to set image URL</span>
+            </button>
+          )
         ) : widget.chart_data ? (
           <ChartRenderer
             result={result}
             colors={colors}
             height={Math.max(60, chartHeight)}
             columnLabels={columnLabels}
+            format={widget.config?.format as import('../charts/ChartRenderer').ValueFormat | undefined}
+            rules={widget.config?.rules as import('../charts/ChartRenderer').ConditionalRule[] | undefined}
+            onDataPointClick={onDataPointClick}
           />
         ) : (
           <div className="h-full flex items-center justify-center text-gray-300 text-xs">
@@ -698,6 +742,72 @@ export function CanvasWidget({
           </div>
         </div>,
         document.body,
+      )}
+    </div>
+  )
+}
+
+
+/** Static text widget body — markdown-lite (# headings, **bold**), double-click to edit.
+ *  Content lives in widget.config.content; creatable from the Insert menu or by
+ *  asking the copilot ("add a title saying Q3 Review"). */
+function TextWidgetBody({
+  content,
+  editable,
+  onSave,
+}: {
+  content: string
+  editable: boolean
+  onSave: (content: string) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(content)
+  useEffect(() => { setDraft(content) }, [content])
+
+  if (editing) {
+    return (
+      <div className="h-full flex flex-col gap-1.5 p-1">
+        <textarea
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          autoFocus
+          className="flex-1 w-full text-sm text-gray-800 border border-blue-300 rounded-lg p-2 outline-none resize-none focus:ring-2 focus:ring-blue-100"
+          placeholder="# Heading&#10;Body text — **bold** supported"
+        />
+        <div className="flex justify-end gap-1.5">
+          <button onClick={() => { setDraft(content); setEditing(false) }} className="text-xs px-2.5 py-1 text-gray-500 hover:bg-gray-100 rounded">Cancel</button>
+          <button onClick={() => { onSave(draft); setEditing(false) }} className="text-xs px-2.5 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">Save</button>
+        </div>
+      </div>
+    )
+  }
+
+  const lines = (content || '').split('\n')
+  return (
+    <div
+      className={`h-full overflow-auto px-2 py-1 ${editable ? 'cursor-text' : ''}`}
+      onDoubleClick={() => editable && setEditing(true)}
+      title={editable ? 'Double-click to edit' : undefined}
+    >
+      {content ? lines.map((line, i) => {
+        const h = line.match(/^(#{1,3})\s+(.*)$/)
+        const render = (s: string) => {
+          const parts = s.split(/(\*\*[^*]+\*\*)/g)
+          return parts.map((p, j) =>
+            p.startsWith('**') && p.endsWith('**')
+              ? <strong key={j}>{p.slice(2, -2)}</strong>
+              : <React.Fragment key={j}>{p}</React.Fragment>
+          )
+        }
+        if (h) {
+          const sizes = ['text-2xl', 'text-xl', 'text-lg']
+          return <p key={i} className={`${sizes[h[1].length - 1]} font-bold text-gray-900 font-display leading-snug`}>{render(h[2])}</p>
+        }
+        return line.trim()
+          ? <p key={i} className="text-sm text-gray-600 leading-relaxed">{render(line)}</p>
+          : <div key={i} className="h-2" />
+      }) : (
+        <p className="text-sm text-gray-300 italic">Double-click to add text…</p>
       )}
     </div>
   )

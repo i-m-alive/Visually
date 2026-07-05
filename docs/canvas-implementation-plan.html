@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visually Canvas — Full Implementation Plan</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #fff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 48px 28px 96px; }
+
+  header.hero { background: linear-gradient(135deg, #064e3b 0%, #059669 55%, #0d9488 100%);
+    color: #fff; border-radius: 16px; padding: 44px 40px; margin-bottom: 40px;
+    box-shadow: 0 20px 50px rgba(5,150,105,.22); }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #d1fae5; max-width: 780px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #a7f3d0; display: flex; gap: 18px; flex-wrap: wrap; }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display: block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; }
+
+  section { margin-bottom: 56px; }
+  h2 { font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 880px; }
+  h3 { font-size: 17px; font-weight: 700; margin: 26px 0 10px; }
+
+  .phasebar { display: inline-block; padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 800; letter-spacing: .04em; margin-right: 8px; vertical-align: 2px; }
+  .phasebar.done { background: var(--green-soft); color: var(--green); }
+  .phasebar.ph1 { background: var(--red-soft); color: var(--red); }
+  .phasebar.ph2 { background: var(--amber-soft); color: var(--amber); }
+  .phasebar.ph3 { background: var(--brand-soft); color: var(--brand); }
+
+  .item { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 24px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  .item.done { border-left: 4px solid var(--green); }
+  .item h4 { font-size: 16px; font-weight: 750; margin-bottom: 6px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .effort { font-size: 11.5px; font-weight: 700; padding: 2px 9px; border-radius: 999px; background: #f1f4f9; color: var(--muted); }
+  .dep { font-size: 11.5px; font-weight: 600; padding: 2px 9px; border-radius: 999px; background: var(--amber-soft); color: var(--amber); }
+  .item p { margin-bottom: 8px; }
+  .item ul { margin: 6px 0 8px 22px; }
+  .item li { margin-bottom: 3px; }
+  .files { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #f6f8fb; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-top: 8px;
+    overflow-x: auto; white-space: nowrap; }
+  .files::before { content: "FILES  "; font-weight: 700; letter-spacing: .08em; font-size: 10.5px; color: #94a3b8; }
+  .accept { background: var(--green-soft); border-left: 3px solid var(--green); padding: 8px 14px;
+    border-radius: 0 8px 8px 0; margin-top: 10px; font-size: 14px; }
+  .accept::before { content: "✓ Done when: "; font-weight: 700; color: var(--green); }
+
+  .donegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .donecard { background: var(--surface); border: 1px solid #bbf7d0; border-radius: 10px; padding: 13px 16px; font-size: 14px; }
+  .donecard strong { color: var(--green); display: block; margin-bottom: 2px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; background: var(--surface); }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; margin: 14px 0; }
+  th { background: #f1f4f9; text-align: left; padding: 10px 14px; font-size: 12.5px; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); border-bottom: 1px solid var(--border); }
+  td { padding: 10px 14px; border-bottom: 1px solid #eef1f6; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f1f4f9; padding: 1px 6px; border-radius: 5px; font-size: 13px; }
+  .callout { background: linear-gradient(135deg, #ecfdf5, #eef2ff); border: 1px solid #a7f3d0;
+    border-radius: var(--radius); padding: 22px 26px; font-size: 15.5px; }
+  footer { margin-top: 60px; color: var(--muted); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>Visually Canvas — Full Implementation Plan</h1>
+  <p>The build sequence that turns the Canvas into an agent-native Power BI replacement. Companion to <em>canvas-bi-gap-analysis.html</em>: that document says <strong>what and why</strong>; this one says <strong>how, in what order, and where in the code</strong>.</p>
+  <div class="meta">
+    <span>📅 July 2026</span>
+    <span>🧭 4 phases · ~10–13 weeks of focused work</span>
+    <span>✅ Phase 0 already shipped</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#done">Phase 0 — Already shipped (baseline)</a></li>
+    <li><a href="#ph1">Phase 1 — Trust: make every promise real (2–3 wks)</a></li>
+    <li><a href="#ph2">Phase 2 — BI parity + editor experience (3–4 wks)</a></li>
+    <li><a href="#ph3">Phase 3 — Agentic differentiators (4–6 wks)</a></li>
+    <li><a href="#sequencing">Sequencing, risks &amp; working agreements</a></li>
+  </ol>
+</nav>
+
+<!-- ═══════════════ PHASE 0 ═══════════════ -->
+<section id="done">
+  <h2><span class="phasebar done">PHASE 0 · SHIPPED</span>Already implemented</h2>
+  <p class="lede">Completed in the current work stream — the plan below builds on top of these.</p>
+  <div class="donegrid">
+    <div class="donecard"><strong>Work-area redesign</strong>Document-style 1280px letterboxed page sheet (dashed border removed), quieter background, zoom-to-fit, 8-side resize handles.</div>
+    <div class="donecard"><strong>Quiet widget chrome</strong>Hover-reveal action cluster, transparent header, type-color dot instead of border, soft shadows + hover lift.</div>
+    <div class="donecard"><strong>Prompt-first empty state</strong>Command bar on empty pages → opens copilot with the question pre-filled + suggestion chips.</div>
+    <div class="donecard"><strong>RLS enforcement</strong>Catch-all policies now applied on public share refresh, scheduled cron refresh, and analyst-token widget data (<code>agent_service/utils/rls.py</code>).</div>
+    <div class="donecard"><strong>Chat session persistence</strong>Stable per-canvas session id in localStorage — copilot memory survives reload.</div>
+    <div class="donecard"><strong>Widget locks persist</strong><code>config.locked</code> saved and restored, including grid <code>static</code> flag.</div>
+    <div class="donecard"><strong>Query-engine accuracy stack</strong>Granularity contract, date-spine zero-fill, SQL/result shape checks, retrieval rework, metric registry (backend), query memory + thumbs feedback, golden-question eval harness.</div>
+  </div>
+</section>
+
+<!-- ═══════════════ PHASE 1 ═══════════════ -->
+<section id="ph1">
+  <h2><span class="phasebar ph1">PHASE 1 · WEEKS 1–3</span>Trust — make every promise in the UI real</h2>
+  <p class="lede">Everything here is a feature the UI already advertises but doesn't deliver. Ship these before adding anything new.</p>
+
+  <div class="item">
+    <h4>1.1 Real PDF / PNG export <span class="effort">4–5 days</span></h4>
+    <p><strong>Approach:</strong> headless-browser rendering in <code>export_service</code> (Python) using <code>playwright</code> — render the existing public report page for a short-lived internal token, then <code>page.pdf()</code> / <code>page.screenshot()</code>. Reuse the existing async job flow (<code>ExportJob</code> + <code>POST /export/trigger</code> + polling + download) — only the worker body changes from stub to real.</p>
+    <ul>
+      <li>Add <code>playwright</code> + chromium to export_service (Dockerfile: <code>playwright install --with-deps chromium</code>)</li>
+      <li>Mint an internal single-use share token for the render (revoke after)</li>
+      <li>Add the <strong>missing</strong> <code>POST /analyst/canvas/{token}/export/pdf</code> endpoint the share page already calls; return job id, let the page poll</li>
+      <li>Per-widget PNG in the builder can keep client-side html2canvas (already works)</li>
+      <li>Agentic hook: agent adds a cover page — title, date, executive summary from the existing <code>ai-summary</code> endpoint</li>
+    </ul>
+    <div class="files">backend/export_service/routers/pdf_export.py · png_export.py · backend/agent_service/routers/analyst.py · routers/exports.py · frontend app/share/canvas/[token]/page.tsx</div>
+    <div class="accept">"Export PDF" on a shared canvas downloads a real multi-page PDF with all charts rendered; export job status reflects reality.</div>
+  </div>
+
+  <div class="item">
+    <h4>1.2 Email sender for snapshot schedules <span class="effort">2–3 days</span> <span class="dep">needs 1.1 for images</span></h4>
+    <p><strong>Approach:</strong> new <code>shared/email.py</code> — Resend HTTP API by default (one env var), SMTP fallback. A per-minute APScheduler tick scans <code>SnapshotSchedule.next_send_at &lt;= now</code>, renders the PNG (1.1), asks the agent for a "what changed since last send" digest, sends, advances <code>next_send_at</code>.</p>
+    <ul>
+      <li>Env: <code>RESEND_API_KEY</code> or <code>SMTP_HOST/PORT/USER/PASS</code>; no-op with a loud log when unconfigured</li>
+      <li>Ship v1 as HTML email (headline numbers + AI digest + link); attach PNG once 1.1 lands</li>
+      <li>Record send history on the schedule row (last_sent_at, last_error) and surface it in ScheduleModal</li>
+    </ul>
+    <div class="files">backend/shared/email.py (new) · agent_service/scheduler.py · routers/analyst.py · frontend ScheduleModal (share page)</div>
+    <div class="accept">A schedule created on a share page actually delivers an email at the right time, with an agent-written summary of what changed.</div>
+  </div>
+
+  <div class="item">
+    <h4>1.3 Persist report-view state + server-side bookmarks/annotations <span class="effort">3–4 days</span></h4>
+    <p><strong>Approach:</strong> a <code>report_prefs</code> object inside <code>Dashboard.layout_config</code> (PATCH endpoint already exists): theme, layout mode, bg pattern, KPI density, per-widget chart-type overrides, AI table names. VisuallReport reads it on mount and writes debounced. Bookmarks/annotations move from localStorage to the existing <code>DashboardBookmark</code>/<code>DashboardAnnotation</code> tables via new owner-scoped endpoints (the analyst-token endpoints already exist — add authenticated dashboard-scoped twins).</p>
+    <div class="files">frontend components/canvas/VisuallReport.tsx · backend agent_service/main.py (bookmark/annotation endpoints) · shared/models/bookmarks.py · annotations.py (add user FK)</div>
+    <div class="accept">Reload the report view — theme, layout, overrides, bookmarks, annotations all restore; a collaborator sees the same bookmarks.</div>
+  </div>
+
+  <div class="item">
+    <h4>1.4 Full undo/redo command stack <span class="effort">4–6 days</span></h4>
+    <p><strong>Approach:</strong> replace the layout-snapshot stacks with a command pattern: <code>useCommandStack</code> hook where every mutation is <code>{label, do(), undo()}</code>. Commands: move/resize (batch per gesture), rename, chart-type change, palette, add/delete widget (delete stores the full widget payload for restore via <code>canvasApi.addWidget</code>), page add/rename/delete/reorder. <strong>Every AI copilot insertion pushes a command too</strong> — "undo what the AI did" becomes Ctrl+Z, which is the core trust story of the product.</p>
+    <ul>
+      <li>Keep the 4-second delete banner as UX sugar on top of the stack</li>
+      <li>Show the command label in the toast ("Undid: delete 'Revenue by Region'")</li>
+    </ul>
+    <div class="files">frontend app/(app)/projects/[id]/canvas/[canvasId]/page.tsx · new hooks/useCommandStack.ts · components/canvas/CanvasChatPanel.tsx</div>
+    <div class="accept">Any 10 consecutive mixed actions (edits, deletes, AI inserts, page ops) can be walked back with Ctrl+Z and forward with Ctrl+Y.</div>
+  </div>
+</section>
+
+<!-- ═══════════════ PHASE 2 ═══════════════ -->
+<section id="ph2">
+  <h2><span class="phasebar ph2">PHASE 2 · WEEKS 4–7</span>BI parity + editor experience</h2>
+  <p class="lede">The authoring depth that makes it feel like a real BI tool — built so every control is also reachable by the agent.</p>
+
+  <div class="item">
+    <h4>2.1 Widget selection + contextual property panel <span class="effort">5–8 days</span></h4>
+    <p><strong>Approach:</strong> introduce a selection model (click card → selected, Esc/click-canvas → deselect) with a 2px brand outline. A right-side panel (like the chat panel, 300px) with three tabs:</p>
+    <ul>
+      <li><strong>Format</strong> — title, palette, number format, conditional rules (2.3), axis labels — migrated out of the widget header</li>
+      <li><strong>Data</strong> — table used, SQL (read + "edit with AI"), refresh, row limit</li>
+      <li><strong>AI</strong> — the originating question (store it in <code>config.question</code> when the chat adds a widget), the agent's reasoning, one-click variants ("as line", "monthly", "top 10 only")</li>
+    </ul>
+    <p>Header keeps only: drag grip, title, lock, delete. Everything else moves to the panel. This is the single largest UX upgrade after the page redesign.</p>
+    <div class="files">frontend new components/canvas/PropertyPanel.tsx · CanvasWidget.tsx (slim header) · canvas page.tsx (selection state) · CanvasChatPanel.tsx (store config.question)</div>
+    <div class="accept">Selecting any widget shows its full story — what was asked, what SQL ran, why — and every format change previews live.</div>
+  </div>
+
+  <div class="item">
+    <h4>2.2 Text / image / button widgets <span class="effort">3–4 days</span></h4>
+    <p><strong>Approach:</strong> new <code>widget_type</code> values (<code>text</code>, <code>image</code>, <code>button</code>) with content in <code>config</code> (markdown string / image data-URI or URL / action spec). Renderer branch before ChartRenderer. Insert via a toolbar "Insert" menu <em>and</em> a chat tool so "add a title saying Q3 Review" works. Buttons fire agent actions ("refresh &amp; summarize this page") — the first taste of agent-native interactivity.</p>
+    <div class="files">frontend components/canvas/StaticWidgets.tsx (new) · CanvasWidget.tsx · canvas page.tsx (Insert menu) · backend: none (config JSONB already fits)</div>
+    <div class="accept">A page can carry a styled headline, a logo, and a "Refresh &amp; Summarize" button created either manually or by asking the copilot.</div>
+  </div>
+
+  <div class="item">
+    <h4>2.3 Number formats + conditional formatting <span class="effort">4–5 days</span></h4>
+    <p><strong>Approach:</strong> <code>config.format</code> (<code>{kind: number|currency|percent, decimals, prefix, compact}</code>) honored by a single shared formatter in ChartRenderer (replacing heuristic <code>fmtNum</code> when set), and <code>config.rules</code> (<code>[{when: "value &lt; 20", color, bold}]</code>) applied to table cells, KPI values, and bar colors. Add an agent tool <code>set_widget_format</code> so "show margin in red when below 20%" writes a rule — visible and editable in the Format tab.</p>
+    <div class="files">frontend components/charts/ChartRenderer.tsx · PropertyPanel.tsx · backend agent_service chat tool registry (tools/)</div>
+    <div class="accept">The same rule can be created by hand in the panel or by one sentence in chat, and both show identically in the Format tab.</div>
+  </div>
+
+  <div class="item">
+    <h4>2.4 Multi-select, align/distribute, "Tidy up" <span class="effort">4 days</span></h4>
+    <p><strong>Approach:</strong> shift-click + marquee selection over the grid; alignment toolbar (align left/right/top, distribute, match size) that computes new layout items and pushes ONE command (1.4). "Tidy up" button + chat command runs the existing <code>autoArrange</code> logic scoped to the selection.</p>
+    <div class="files">frontend canvas page.tsx · new components/canvas/SelectionToolbar.tsx</div>
+    <div class="accept">Select 4 KPIs → "align top + equal width" in one click or one sentence; Ctrl+Z restores.</div>
+  </div>
+
+  <div class="item">
+    <h4>2.5 Cross-filtering in the editor <span class="effort">4–5 days</span></h4>
+    <p><strong>Approach:</strong> port VisuallReport's <code>onDataPointClick</code> → <code>POST /dashboards/{id}/requery</code> flow into the editor grid, with an "edit interactions" mode: select a source widget → toggle per-target respond/ignore, stored as <code>config.interactions</code>. Active cross-filter shows the existing banner + chip.</p>
+    <div class="files">frontend canvas page.tsx · CanvasWidget.tsx · ChartRenderer.tsx (already has click handlers) · backend /requery (exists)</div>
+    <div class="accept">Clicking a bar in the editor filters the other widgets, respecting the interaction matrix, with a visible clear affordance.</div>
+  </div>
+
+  <div class="item">
+    <h4>2.6 Remaining visual polish <span class="effort">4 days total</span></h4>
+    <ul>
+      <li><strong>Editor theming</strong> — apply the 8 report themes in the editor; persist to the existing <code>Dashboard.theme</code> column (currently unused, defaults "frost")</li>
+      <li><strong>Alignment guides</strong> — overlay lines during drag computed from neighboring layout edges (custom overlay; react-grid-layout untouched)</li>
+      <li><strong>Page tabs</strong> — icons/colors per page, overflow scroll, template "+" menu</li>
+      <li><strong>In-canvas generation skeleton</strong> — while the copilot generates, drop a shimmering placeholder card at the next free grid slot; replace on arrival</li>
+    </ul>
+    <div class="files">frontend canvas page.tsx · CanvasPageTabs.tsx · CanvasChatPanel.tsx · backend PATCH /dashboards/{id} (theme — exists)</div>
+    <div class="accept">Edit mode and report mode share one visual language; generating a chart visibly happens ON the canvas.</div>
+  </div>
+</section>
+
+<!-- ═══════════════ PHASE 3 ═══════════════ -->
+<section id="ph3">
+  <h2><span class="phasebar ph3">PHASE 3 · WEEKS 8–13</span>Agentic differentiators — what Power BI can't copy</h2>
+  <p class="lede">Each of these turns an existing backend capability into a product-defining agent experience.</p>
+
+  <div class="item">
+    <h4>3.1 Metric registry UI + verified metrics <span class="effort">3 days</span></h4>
+    <p><strong>Approach:</strong> the backend already exists (<code>metric_registry.py</code> + CRUD endpoints, shipped in Phase 0). Build the "Metrics" settings page: metric cards (definition, table, expression, date column, synonyms), a verified badge, and <strong>agent proposals</strong> — mine query memory for frequently asked metric terms and suggest "pin this definition?" Registered metrics make the deterministic SQL templates fire (already wired).</p>
+    <div class="files">frontend new app/(app)/projects/[id]/metrics/page.tsx · lib/api.ts · backend endpoints (exist) · query_memory.py (term frequency helper)</div>
+    <div class="accept">Defining "placements" once makes every placement question answer identically, instantly, with a "verified metric" badge on the widget.</div>
+  </div>
+
+  <div class="item">
+    <h4>3.2 Agent alerts with explanations <span class="effort">6–8 days</span></h4>
+    <p><strong>Approach:</strong> <code>AlertRule</code> table (widget_id, plain-language condition, parsed rule JSON, cadence, channel, is_active). Bell icon on KPI/chart widgets → composer where the user types the condition ("tell me if daily applications drop below 5") — the agent parses it to a rule. Scheduler tick evaluates: run widget SQL, apply threshold or 2σ anomaly detection, and on trigger have the agent write a one-paragraph explanation (what happened, vs baseline, likely dimension driving it) → in-app notification + email (1.2).</p>
+    <div class="files">backend new shared/models/alerts.py + agent_service/routers/alerts.py · scheduler.py · frontend PropertyPanel/CanvasWidget bell + AlertComposer.tsx</div>
+    <div class="accept">"Watch this chart and tell me when something unusual happens" produces a working alert whose notifications explain, not just notify.</div>
+  </div>
+
+  <div class="item">
+    <h4>3.3 "Explain this point" everywhere <span class="effort">4–5 days</span></h4>
+    <p><strong>Approach:</strong> right-click any data point → "Why?" → <code>POST /dashboards/{id}/explain-point</code> with {widget, column, value}. The agent runs decomposition queries (same metric grouped by each other candidate dimension, plus prior-period comparison — deterministic SQL, LLM only for the narrative) and returns a ranked "what drove this" answer in an inline popover with the supporting mini-charts.</p>
+    <div class="files">backend new routers/explain.py (reuses graph_rag + query executor) · frontend ChartRenderer.tsx (context menu) · ExplainPopover.tsx (new)</div>
+    <div class="accept">Right-click the June spike → within seconds: "June's jump is 80% driven by the VCS channel; the other channels were flat."</div>
+  </div>
+
+  <div class="item">
+    <h4>3.4 Version history + prose diff <span class="effort">4 days</span></h4>
+    <p><strong>Approach:</strong> wire the existing dead <code>DashboardVersion</code> table: snapshot {widgets, layout, pages, theme} on meaningful saves (debounced, max 1/10min, keep 50). History drawer with timeline; restore = one command (1.4). The agent renders diffs in prose ("2 widgets added, revenue KPI switched from SUM to AVG") by comparing snapshot JSON.</p>
+    <div class="files">backend agent_service/main.py (snapshot on layout/widget writes, history + restore endpoints) · shared/models/phase2.py (exists) · frontend HistoryDrawer.tsx (new)</div>
+    <div class="accept">Any canvas can be restored to any of its last 50 states, and the timeline reads like a changelog, not JSON.</div>
+  </div>
+
+  <div class="item">
+    <h4>3.5 Agent-generated page layouts <span class="effort">5–6 days</span></h4>
+    <p><strong>Approach:</strong> "Generate page" flow (empty-state templates + page "+" menu): user states a goal → orchestrator plans 6–8 widget specs (reusing the dashboard pipeline) → renders 2–3 candidate arrangements as lightweight thumbnails (client-side, from chart_data) → user picks one → widgets + layout committed as one undoable command.</p>
+    <div class="files">backend orchestrator.run_dashboard_pipeline (exists — add layout-candidates step) · frontend PageTemplateModal.tsx (new) · canvas page.tsx</div>
+    <div class="accept">"Make an executive overview page for placements" yields a picked-from-candidates page in under a minute, fully undoable.</div>
+  </div>
+
+  <div class="item">
+    <h4>3.6 Data-model surfaces: relationship editor + drill hierarchies + cascading slicers <span class="effort">8–10 days</span></h4>
+    <ul>
+      <li><strong>Relationship editor</strong> — render the FK graph from <code>schema_cache.relationship_graph</code> as an interactive diagram; confirm/override/annotate edges; confirmed edges get a retrieval score boost and become preferred JOIN paths</li>
+      <li><strong>Drill hierarchies</strong> — agent infers (date and categorical) hierarchies once per connection, stores them beside the metric registry; DrillDownModal uses them deterministically, LLM only as fallback</li>
+      <li><strong>Cascading slicers</strong> — slicer-values endpoint accepts the other active slicer filters; empty-result combinations trigger an agent suggestion of the closest non-empty state</li>
+    </ul>
+    <div class="files">backend schema_cache.py · graph_rag_retriever.py · routers/analyst.py (slicer-values) · tier5.py (drilldown) · frontend ModelView.tsx (new) · SlicerWidget.tsx · DrillDownModal.tsx</div>
+    <div class="accept">Drill-down is instant on defined paths; slicers never strand the user on an empty page; confirmed joins measurably improve the golden-question eval.</div>
+  </div>
+</section>
+
+<!-- ═══════════════ SEQUENCING ═══════════════ -->
+<section id="sequencing">
+  <h2><span class="phasebar ph3" style="background:#f1f4f9;color:#5b6579">GOVERNANCE</span>Sequencing, risks &amp; working agreements</h2>
+
+  <h3>Why this order</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Rule</th><th>Rationale</th></tr>
+    <tr><td>Trust before features (Phase 1 first)</td><td>Every advertised-but-broken button actively costs credibility with each demo. Fix reality before adding surface.</td></tr>
+    <tr><td>Command stack (1.4) before the property panel (2.1)</td><td>Every new mutation surface should be born undoable — retrofitting undo is 3× the work.</td></tr>
+    <tr><td>Property panel (2.1) before formatting (2.3) and alerts (3.2)</td><td>They need a home; the panel is that home.</td></tr>
+    <tr><td>Email (1.2) before alerts (3.2)</td><td>Alerts need a delivery channel that works.</td></tr>
+    <tr><td>Metric registry UI (3.1) early in Phase 3</td><td>Backend is already live; smallest effort-to-differentiation ratio in the whole plan.</td></tr>
+  </table></div>
+
+  <h3>Key risks</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Risk</th><th>Mitigation</th></tr>
+    <tr><td>Playwright/chromium in export_service bloats the image and needs system deps</td><td>Isolate export_service in its own container (already separate); pin chromium; keep html2canvas as client-side fallback.</td></tr>
+    <tr><td>Command-stack refactor destabilizes the editor</td><td>Migrate one mutation type at a time behind the same hook; layout commands first (they already have snapshots).</td></tr>
+    <tr><td>Free-text RLS clauses + LLM drilldown SQL remain injection-adjacent</td><td>Phase 2 hardening: run all injected clauses through <code>basic_sql_lint</code>, and validate drilldown SQL with the same pre-execution checks as the main pipeline.</td></tr>
+    <tr><td>react-grid-layout limits (no overlap, no free positioning)</td><td>Accept for now — the 1280px document sheet already delivers the "real BI page" feel. Re-evaluate a custom drag layer only after Phase 2.</td></tr>
+  </table></div>
+
+  <h3>Working agreements (apply to every item)</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Agreement</th><th>Meaning</th></tr>
+    <tr><td>Agent-parity rule</td><td>Any new control added to the UI ships with a matching agent tool in the same PR — nothing is manual-only.</td></tr>
+    <tr><td>Undoable-by-default</td><td>Every mutation goes through the command stack, including agent actions.</td></tr>
+    <tr><td>Show-your-work</td><td>Anything the agent creates records its originating question + SQL + reasoning in <code>config</code>, surfaced in the AI tab.</td></tr>
+    <tr><td>Eval-gated</td><td>Retrieval/prompt changes must keep the golden-question harness green (<code>backend/scripts/eval_golden_questions.py</code>); add a golden question with every retrieval bug fixed.</td></tr>
+  </table></div>
+
+  <h3>Effort summary</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Phase</th><th>Scope</th><th>Estimate</th></tr>
+    <tr><td><strong>Phase 1</strong></td><td>PDF/PNG export · email sender · persisted report state · full undo/redo</td><td>≈ 13–18 days</td></tr>
+    <tr><td><strong>Phase 2</strong></td><td>Property panel · static widgets · formatting · multi-select · editor cross-filter · polish</td><td>≈ 24–30 days</td></tr>
+    <tr><td><strong>Phase 3</strong></td><td>Metrics UI · alerts · explain-point · versions · page generation · model surfaces</td><td>≈ 30–36 days</td></tr>
+  </table></div>
+
+  <div class="callout" style="margin-top:20px">
+    <strong>North star:</strong> after Phase 3, a user should be able to run their entire BI life through language — build pages, define metrics, set alerts, ask "why" — while every single agent action remains visible, editable by hand, and one Ctrl+Z from gone. That combination is the moat.
+  </div>
+</section>
+
+<footer>
+  Visually · Canvas Implementation Plan · companion to canvas-bi-gap-analysis.html · July 2026
+</footer>
+
+</div>
+</body>
+</html>

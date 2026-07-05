@@ -263,6 +263,59 @@ class ScheduleCreate(BaseModel):
     include_ai_summary: bool = True
 
 
+# ── 0b. PDF export of the full dashboard ─────────────────────────────────────
+# The share page's "Export PDF" button called this endpoint for months while it
+# didn't exist. Renders the dashboard's cached widget data to a real PDF via
+# export_service (Playwright headless Chromium) and streams it back.
+
+import os as _os
+_EXPORT_SERVICE_URL = _os.getenv("EXPORT_SERVICE_URL", "http://localhost:8005")
+
+
+@router.post("/analyst/canvas/{raw_token}/export/pdf")
+async def export_canvas_pdf(raw_token: str, db: AsyncSession = Depends(get_db)):
+    import httpx
+    from fastapi.responses import Response as _Response
+    dashboard, token_obj, widgets = await _get_canvas_and_token(raw_token, db)
+    widget_dicts = [
+        {
+            "id": str(w.id),
+            "title": w.title,
+            "widget_type": w.widget_type,
+            "chart_type": w.chart_type,
+            "position_x": w.position_x, "position_y": w.position_y,
+            "width": w.width, "height": w.height,
+            "x_axis_label": (w.config or {}).get("x_axis_label", ""),
+            "y_axis_label": (w.config or {}).get("y_axis_label", ""),
+            "chart_data": w.chart_data or {},
+        }
+        for w in widgets
+        if w.chart_type not in ("slicer",)
+    ]
+    payload = {
+        "dashboard_title": dashboard.name,
+        "theme": dashboard.theme or "frost",
+        "widgets": widget_dicts,
+        "page_size": "A4",
+        "landscape": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{_EXPORT_SERVICE_URL}/export/pdf", json=payload)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502,
+                                detail=f"Export service error {resp.status_code}: {resp.text[:300]}")
+        return _Response(
+            content=resp.content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{dashboard.name[:60]}.pdf"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"PDF export failed: {exc}")
+
+
 # ── 1. Live widget data ───────────────────────────────────────────────────────
 
 @router.post("/analyst/canvas/{raw_token}/widgets/{widget_id}/data")
@@ -285,6 +338,10 @@ async def get_widget_data_live(
         raise HTTPException(status_code=400, detail="No database connection configured")
     filter_clause = _build_filter_clause([f.dict() for f in req.filters])
     sql = _apply_filters_to_sql(base_sql, filter_clause)
+    # RLS enforcement: token viewers are anonymous — apply catch-all policies
+    from agent_service.utils.rls import fetch_rls_clauses, inject_rls
+    rls_clauses = await fetch_rls_clauses(db, dashboard.id)
+    sql = inject_rls(sql, rls_clauses)
     result = await call_query_executor(conn_id, sql, row_limit=10000)
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])

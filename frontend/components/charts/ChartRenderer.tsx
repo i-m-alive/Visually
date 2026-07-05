@@ -41,6 +41,69 @@ function SwatchLegend({ items, colors, height: h = 24 }: { items: string[]; colo
   )
 }
 
+/** Per-widget number formatting (widget.config.format) */
+export interface ValueFormat {
+  kind?: 'number' | 'currency' | 'percent'
+  decimals?: number
+  prefix?: string
+  suffix?: string
+  compact?: boolean
+  currency?: string   // e.g. "USD", "INR" — used when kind === 'currency'
+}
+
+/** Conditional formatting rule (widget.config.rules[]) — settable by hand or by the AI:
+ *  "show margin in red when below 20" → {column: "margin", op: "<", value: 20, color: "#DC2626", bold: true} */
+export interface ConditionalRule {
+  column?: string   // empty/undefined = any numeric column
+  op: '<' | '<=' | '>' | '>=' | '=' | '!='
+  value: number
+  color?: string
+  background?: string
+  bold?: boolean
+}
+
+export function formatValue(v: unknown, fmt?: ValueFormat): string {
+  if (v === null || v === undefined) return ''
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  if (isNaN(n) || !isFinite(n)) return String(v)
+  if (!fmt || Object.keys(fmt).length === 0) return String(v)
+  const decimals = fmt.decimals ?? (fmt.kind === 'percent' ? 1 : 2)
+  let out: string
+  if (fmt.compact && Math.abs(n) >= 1000) {
+    out = Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n)
+  } else if (fmt.kind === 'currency') {
+    out = Intl.NumberFormat('en', { style: 'currency', currency: fmt.currency || 'USD', maximumFractionDigits: decimals }).format(n)
+  } else if (fmt.kind === 'percent') {
+    out = `${n.toFixed(decimals)}%`
+  } else {
+    out = Intl.NumberFormat('en', { maximumFractionDigits: decimals }).format(n)
+  }
+  return `${fmt.prefix ?? ''}${out}${fmt.suffix ?? ''}`
+}
+
+export function evalRules(
+  colName: string, v: unknown, rules?: ConditionalRule[],
+): React.CSSProperties | undefined {
+  if (!rules?.length) return undefined
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  if (isNaN(n)) return undefined
+  for (const r of rules) {
+    if (r.column && r.column.toLowerCase() !== colName.toLowerCase()) continue
+    const hit =
+      (r.op === '<' && n < r.value) || (r.op === '<=' && n <= r.value) ||
+      (r.op === '>' && n > r.value) || (r.op === '>=' && n >= r.value) ||
+      (r.op === '=' && n === r.value) || (r.op === '!=' && n !== r.value)
+    if (hit) {
+      return {
+        color: r.color,
+        background: r.background,
+        fontWeight: r.bold ? 700 : undefined,
+      }
+    }
+  }
+  return undefined
+}
+
 interface Props {
   result: ChartResult | null | undefined
   compact?: boolean
@@ -57,9 +120,13 @@ interface Props {
   /** Display-only column renames { originalColumnName: "Display Name" }. Applied to
    *  table headers; data/cell lookups still use the original column name. */
   columnLabels?: Record<string, string>
+  /** Number formatting (widget.config.format) — applied to numeric cells/values */
+  format?: ValueFormat
+  /** Conditional formatting rules (widget.config.rules) — cell/value styling */
+  rules?: ConditionalRule[]
 }
 
-export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick, legend = false, columnLabels }: Props) {
+export function ChartRenderer({ result, compact = false, colors, height: heightProp, showAnomalies = false, anomalyIndices = [], onDataPointClick, legend = false, columnLabels, format, rules }: Props) {
   const COLORS = colors?.length ? colors : DEFAULT_COLORS
 
   // Table sort + search state — must be declared before any early return (React rules of hooks)
@@ -217,13 +284,16 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     const val = values.find((v) => v !== null && v !== undefined)
       ?? (r0 ? (r0[columns[0] ?? ''] ?? firstNumeric) : undefined)
     const displayVal = typeof val === 'number'
-      ? val.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      ? (format && Object.keys(format).length
+          ? formatValue(val, format)
+          : val.toLocaleString(undefined, { maximumFractionDigits: 2 }))
       : String(val ?? 'N/A')
+    const kpiRuleStyle = evalRules(columns[0] ?? 'value', val, rules)
     const fontSize = height < 120 ? 'text-2xl' : height < 200 ? 'text-4xl' : 'text-5xl'
     return (
       <div className="flex flex-col items-center justify-center w-full" style={{ height }}>
         {title && <p className="text-sm text-gray-500 mb-1 text-center truncate max-w-full px-2">{title}</p>}
-        <p className={`${fontSize} font-bold text-brand font-display`}>{displayVal}</p>
+        <p className={`${fontSize} font-bold text-brand font-display`} style={kpiRuleStyle}>{displayVal}</p>
       </div>
     )
   }
@@ -389,6 +459,8 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
                   >
                     {cols.map(c => {
                       const heat = heatmapBg(c, row[c])
+                      const ruleStyle = evalRules(c, row[c], rules)
+                      const display = colStats[c]?.isNum ? formatValue(row[c], format) : String(row[c] ?? '')
                       return (
                         <td
                           key={c}
@@ -401,9 +473,10 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
                             background: heat ?? undefined,
                             fontWeight: colStats[c]?.isNum ? 500 : undefined,
                             whiteSpace: 'nowrap',
+                            ...(ruleStyle || {}),
                           }}
                         >
-                          {String(row[c] ?? '')}
+                          {display}
                         </td>
                       )
                     })}
