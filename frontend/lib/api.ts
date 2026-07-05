@@ -147,6 +147,8 @@ export const projectApi = {
     ),
   getSchemaMetadata: (projectId: string) =>
     api.get(`/projects/${projectId}/schema/metadata`),
+  executeConnectionQuery: (projectId: string, connectionId: string, sql: string, rowLimit = 1000) =>
+    api.post(`/projects/${projectId}/connections/${connectionId}/query`, { sql, row_limit: rowLimit }),
 }
 
 export interface ConversationTurn {

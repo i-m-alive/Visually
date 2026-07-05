@@ -5,7 +5,7 @@ import { projectApi } from '@/lib/api'
 import {
   ChevronDown, ChevronRight, RefreshCw, Database, Hash,
   Loader2, AlertCircle, Sparkles, Link2, Filter, BarChart2,
-  Calendar, Layers, Tag, X, Download,
+  Calendar, Layers, Tag, X, Download, Terminal, Play,
 } from 'lucide-react'
 
 // ── Raw schema types ──────────────────────────────────────────────────────────
@@ -105,9 +105,24 @@ function Chips({ items, color = 'gray' }: { items: string[]; color?: string }) {
   )
 }
 
+interface QueryResult {
+  rows: Record<string, unknown>[]
+  columns: string[]
+  row_count: number
+  duration_ms: number
+  truncated: boolean
+  error?: string
+}
+
+interface ConnectionItem {
+  id: string
+  name: string
+  db_type: string
+}
+
 export default function SchemaPage() {
   const { id: projectId } = useParams<{ id: string }>()
-  const [tab, setTab] = useState<'schema' | 'metadata'>('schema')
+  const [tab, setTab] = useState<'schema' | 'metadata' | 'query'>('schema')
 
   function downloadJson(data: unknown, filename: string) {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
@@ -138,6 +153,15 @@ export default function SchemaPage() {
   const [expandedMeta, setExpandedMeta] = useState<Set<string>>(new Set())
   const [metaSearch, setMetaSearch] = useState('')
   const [schemaSearch, setSchemaSearch] = useState('')
+
+  // Query Editor state
+  const [connections, setConnections] = useState<ConnectionItem[]>([])
+  const [connsLoaded, setConnsLoaded] = useState(false)
+  const [queryConnId, setQueryConnId] = useState('')
+  const [querySql, setQuerySql] = useState('')
+  const [queryRunning, setQueryRunning] = useState(false)
+  const [queryResult, setQueryResult] = useState<QueryResult | null>(null)
+  const [queryError, setQueryError] = useState('')
 
   // ── Data fetching ───────────────────────────────────────────────────────────
   const fetchSchema = async () => {
@@ -172,6 +196,37 @@ export default function SchemaPage() {
 
   useEffect(() => { fetchSchema() }, [projectId])
   useEffect(() => { if (tab === 'metadata' && !metadata && !metaLoading) fetchMetadata() }, [tab])
+  useEffect(() => {
+    if (tab === 'query' && !connsLoaded) {
+      projectApi.listConnections(projectId).then(r => {
+        const list = (r.data as ConnectionItem[]) || []
+        setConnections(list)
+        if (list.length > 0) setQueryConnId(list[0].id)
+        setConnsLoaded(true)
+      }).catch(() => setConnsLoaded(true))
+    }
+  }, [tab])
+
+  const runQuery = async () => {
+    if (!queryConnId || !querySql.trim() || queryRunning) return
+    setQueryRunning(true)
+    setQueryError('')
+    setQueryResult(null)
+    try {
+      const resp = await projectApi.executeConnectionQuery(projectId, queryConnId, querySql)
+      const data = resp.data as QueryResult
+      if (data.error) {
+        setQueryError(data.error)
+      } else {
+        setQueryResult(data)
+      }
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } } }
+      setQueryError(err.response?.data?.detail || 'Query failed')
+    } finally {
+      setQueryRunning(false)
+    }
+  }
 
   const stopPoll = () => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
@@ -288,23 +343,35 @@ export default function SchemaPage() {
         >
           <span className="flex items-center gap-1.5"><Sparkles size={14} />AI Metadata</span>
         </button>
-
-        {/* Download button — always visible, downloads whichever tab is active */}
         <button
-          onClick={() => {
-            if (tab === 'schema') {
-              downloadJson(schema, 'schema.json')
-            } else {
-              downloadJson(metadata, 'ai-metadata.json')
-            }
-          }}
-          disabled={tab === 'schema' ? !schema : !metadata}
-          className="ml-auto mb-1 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          title={`Download ${tab === 'schema' ? 'schema' : 'AI metadata'} as JSON`}
+          onClick={() => setTab('query')}
+          className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
+            tab === 'query'
+              ? 'bg-white border border-b-white border-gray-200 text-gray-900 -mb-px'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
         >
-          <Download size={13} />
-          Download JSON
+          <span className="flex items-center gap-1.5"><Terminal size={14} />Query Editor</span>
         </button>
+
+        {/* Download button — visible on schema/metadata tabs */}
+        {tab !== 'query' && (
+          <button
+            onClick={() => {
+              if (tab === 'schema') {
+                downloadJson(schema, 'schema.json')
+              } else {
+                downloadJson(metadata, 'ai-metadata.json')
+              }
+            }}
+            disabled={tab === 'schema' ? !schema : !metadata}
+            className="ml-auto mb-1 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            title={`Download ${tab === 'schema' ? 'schema' : 'AI metadata'} as JSON`}
+          >
+            <Download size={13} />
+            Download JSON
+          </button>
+        )}
       </div>
 
       {/* ── Raw Schema tab ───────────────────────────────────────────────── */}
@@ -404,6 +471,102 @@ export default function SchemaPage() {
             <p className="text-center text-sm text-gray-400 py-8">No tables match &quot;{schemaSearch}&quot;</p>
           )}
           </div>
+        </div>
+      )}
+
+      {/* ── Query Editor tab ─────────────────────────────────────────────── */}
+      {tab === 'query' && (
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Toolbar */}
+          <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100 bg-gray-50">
+            <select
+              value={queryConnId}
+              onChange={e => setQueryConnId(e.target.value)}
+              className="text-sm border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-brand/30 bg-white"
+            >
+              {connections.length === 0 && <option value="">No connections</option>}
+              {connections.map(c => (
+                <option key={c.id} value={c.id}>{c.name} ({c.db_type})</option>
+              ))}
+            </select>
+            <span className="text-xs text-gray-400 ml-auto">⌘ + Enter to run</span>
+            <button
+              onClick={runQuery}
+              disabled={queryRunning || !queryConnId}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {queryRunning
+                ? <><Loader2 size={13} className="animate-spin" />Running...</>
+                : <><Play size={13} />Run</>}
+            </button>
+          </div>
+
+          {/* SQL editor */}
+          <div className="px-4 pt-3 pb-2">
+            <textarea
+              value={querySql}
+              onChange={e => setQuerySql(e.target.value)}
+              onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runQuery() } }}
+              placeholder="SELECT * FROM your_table LIMIT 100"
+              spellCheck={false}
+              className="w-full h-40 font-mono text-sm border border-gray-200 rounded-lg px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-brand/30 resize-y bg-gray-950 text-gray-100 placeholder-gray-600"
+            />
+          </div>
+
+          {/* Error */}
+          {queryError && (
+            <div className="mx-4 mb-3 flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2.5">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span className="font-mono text-xs break-all">{queryError}</span>
+            </div>
+          )}
+
+          {/* Results */}
+          {queryResult && !queryError && (
+            <div className="flex-1 flex flex-col overflow-hidden mx-4 mb-4">
+              <div className="flex items-center gap-3 mb-2">
+                <span className="text-xs text-gray-500">
+                  {queryResult.row_count.toLocaleString()} row{queryResult.row_count !== 1 ? 's' : ''}
+                  {queryResult.truncated && ' (truncated to 1000)'}
+                </span>
+                <span className="text-xs text-gray-400">{queryResult.duration_ms}ms</span>
+              </div>
+              <div className="overflow-auto flex-1 border border-gray-200 rounded-lg">
+                <table className="text-xs w-full">
+                  <thead className="bg-gray-50 sticky top-0">
+                    <tr>
+                      {queryResult.columns.map(col => (
+                        <th key={col} className="px-3 py-2 text-left font-semibold text-gray-600 whitespace-nowrap border-b border-gray-200">
+                          {col}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {queryResult.rows.map((row, i) => (
+                      <tr key={i} className="hover:bg-gray-50">
+                        {queryResult.columns.map(col => (
+                          <td key={col} className="px-3 py-1.5 font-mono text-gray-700 whitespace-nowrap max-w-xs truncate">
+                            {row[col] === null || row[col] === undefined
+                              ? <span className="text-gray-300 italic">null</span>
+                              : String(row[col])}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Empty state */}
+          {!queryResult && !queryError && !queryRunning && (
+            <div className="flex-1 flex flex-col items-center justify-center text-gray-400 gap-2">
+              <Terminal size={36} className="text-gray-200" />
+              <p className="text-sm">Run a query to see results</p>
+            </div>
+          )}
         </div>
       )}
 

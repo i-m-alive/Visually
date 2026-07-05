@@ -4,7 +4,7 @@ import {
   Send, Loader2, AlertCircle, TrendingUp, MessageSquare, X, LayoutDashboard,
   Plus, Trash2, Edit2, Check, ChevronLeft, ChevronRight, Code, Download, RefreshCw,
   Copy, Volume2, VolumeX, FileText, Star, Maximize2, Square, Search, ChevronDown,
-  ExternalLink, StickyNote,
+  ExternalLink, StickyNote, Mic, MicOff,
 } from 'lucide-react'
 import { agentApi, querySessionApi, type ConversationTurn } from '@/lib/api'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
@@ -18,6 +18,20 @@ import { useRouter } from 'next/navigation'
 import { useAuthStore } from '@/stores/authStore'
 import { useTableScopeStore, DEFAULT_SCOPE } from '@/stores/tableScopeStore'
 import { AddToCanvasModal } from './AddToCanvasModal'
+
+// Web Speech API — not in all TS DOM libs
+interface SpeechRecognitionResult { readonly isFinal: boolean; readonly 0: { readonly transcript: string } }
+interface SpeechRecognitionResultList { readonly length: number; [index: number]: SpeechRecognitionResult }
+interface SpeechRecognitionEvent extends Event { readonly resultIndex: number; readonly results: SpeechRecognitionResultList }
+interface SpeechRecognitionInstance extends EventTarget {
+  lang: string; interimResults: boolean; continuous: boolean; maxAlternatives: number
+  onstart: (() => void) | null
+  onresult: ((e: SpeechRecognitionEvent) => void) | null
+  onend: (() => void) | null
+  onerror: (() => void) | null
+  start(): void; stop(): void
+}
+type SpeechRecognitionCtor = new () => SpeechRecognitionInstance
 
 interface Message {
   id: string
@@ -293,6 +307,71 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
     el.style.height = Math.min(el.scrollHeight, 140) + 'px'
   }, [])
 
+  // ── Speech-to-text ─────────────────────────────────────────────────────────
+  // hi-IN handles Hinglish (code-switched Hindi+English) natively in Chrome
+  const [speechLang, setSpeechLang] = useState<'en-IN' | 'hi-IN'>('en-IN')
+  const [isListening, setIsListening] = useState(false)
+  const [speechSupported, setSpeechSupported] = useState(false)
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null)
+  const speechBaseRef = useRef('')
+
+  useEffect(() => {
+    const w = window as unknown as Record<string, unknown>
+    setSpeechSupported(!!(w['SpeechRecognition'] || w['webkitSpeechRecognition']))
+  }, [])
+
+  const stopListening = useCallback(() => {
+    recognitionRef.current?.stop()
+    recognitionRef.current = null
+    setIsListening(false)
+  }, [])
+
+  const toggleListening = useCallback(() => {
+    if (isListening) { stopListening(); return }
+
+    const w = window as unknown as Record<string, unknown>
+    const SR = (w['SpeechRecognition'] ?? w['webkitSpeechRecognition']) as SpeechRecognitionCtor | undefined
+    if (!SR) return
+
+    const rec = new SR()
+    recognitionRef.current = rec
+    rec.lang = speechLang
+    rec.interimResults = true
+    rec.continuous = false
+    rec.maxAlternatives = 1
+
+    speechBaseRef.current = input
+
+    rec.onstart = () => setIsListening(true)
+
+    rec.onresult = (event: SpeechRecognitionEvent) => {
+      let interim = ''
+      let final = ''
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript
+        if (event.results[i].isFinal) final += t
+        else interim += t
+      }
+      const base = speechBaseRef.current
+      const sep = base ? ' ' : ''
+      if (final) {
+        const next = base + sep + final.trim()
+        speechBaseRef.current = next
+        setInput(next)
+      } else if (interim) {
+        setInput(base + sep + interim)
+      }
+    }
+
+    rec.onend = () => { setIsListening(false); recognitionRef.current = null }
+    rec.onerror = () => { setIsListening(false); recognitionRef.current = null }
+
+    rec.start()
+  }, [isListening, input, speechLang, stopListening])
+
+  // stop recognition if component unmounts
+  useEffect(() => () => { recognitionRef.current?.stop() }, [])
+
   const runTurn = async (text: string, branchParentId?: string | null) => {
     if (!text.trim() || submitting) return
     setSubmitting(true); setEditingId(null)
@@ -355,6 +434,10 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
   const handleSubmit = async () => {
     const text = input.trim()
     if (!text) return
+    // Stop any in-flight speech recognition so its final onresult
+    // doesn't fire after setInput('') and restore the transcribed text.
+    stopListening()
+    speechBaseRef.current = ''
     setInput('')
     if (inputRef.current) inputRef.current.style.height = 'auto'
     await runTurn(text)
@@ -841,6 +924,42 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
               </div>
               <div className="flex gap-2 items-end">
                 <textarea ref={inputRef} value={input} onChange={(e) => { setInput(e.target.value); autoResize() }} onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void handleSubmit() } else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handleSubmit() } }} className="input-field flex-1 resize-none overflow-y-auto" style={{ minHeight: '42px', maxHeight: '140px', lineHeight: '1.5' }} placeholder="Ask about your data…" disabled={submitting} rows={1} />
+
+                {/* Mic button + language picker */}
+                {speechSupported && !submitting && (
+                  <div className="flex flex-col items-center gap-1 flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={toggleListening}
+                      title={isListening ? 'Stop recording' : 'Speak your query'}
+                      className={`h-[42px] w-[42px] rounded-lg flex items-center justify-center transition-colors ${
+                        isListening
+                          ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse'
+                          : 'bg-gray-100 hover:bg-gray-200 text-gray-500'
+                      }`}
+                    >
+                      {isListening ? <MicOff size={16} /> : <Mic size={16} />}
+                    </button>
+                    <div className="flex gap-0.5">
+                      {([['en-IN', 'EN'], ['hi-IN', 'HI']] as const).map(([code, label]) => (
+                        <button
+                          key={code}
+                          type="button"
+                          onClick={() => setSpeechLang(code)}
+                          title={code === 'en-IN' ? 'English' : 'Hindi / Hinglish'}
+                          className={`text-[9px] px-1.5 py-0.5 rounded font-semibold transition-colors ${
+                            speechLang === code
+                              ? 'bg-brand text-white'
+                              : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {submitting ? (
                   <button type="button" onClick={cancelPipeline} className="flex-shrink-0 h-[42px] px-4 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors flex items-center gap-1.5" title="Cancel (⌘.)"><Square size={14} fill="white" /></button>
                 ) : (

@@ -71,6 +71,140 @@ async def _open_user_db(db_conn_kwargs: dict):
     )
 
 
+# ── Snowflake Phase B + C (sync connector run in executor) ────────────────────
+
+def _sf_normalize_account(account: str) -> str:
+    suffix = ".snowflakecomputing.com"
+    return account[: -len(suffix)] if account.lower().endswith(suffix) else account
+
+
+def _sf_open_conn(db_conn_kwargs: dict):
+    import snowflake.connector
+    raw_account = db_conn_kwargs.get("account", db_conn_kwargs.get("host", ""))
+    account = _sf_normalize_account(raw_account)
+    if account != raw_account:
+        print(
+            f"[metadata_extractor] Snowflake account normalized: {raw_account!r} → {account!r}",
+            flush=True,
+        )
+    print(
+        f"[metadata_extractor] Snowflake connecting"
+        f"  account={account!r}  user={db_conn_kwargs.get('user')!r}"
+        f"  database={db_conn_kwargs.get('database')!r}"
+        f"  warehouse={db_conn_kwargs.get('warehouse')!r}"
+        f"  role={db_conn_kwargs.get('role')!r}",
+        flush=True,
+    )
+    conn = snowflake.connector.connect(
+        account=account,
+        user=db_conn_kwargs.get("user", ""),
+        password=db_conn_kwargs.get("password", ""),
+        database=db_conn_kwargs.get("database") or None,
+        warehouse=db_conn_kwargs.get("warehouse") or None,
+        role=db_conn_kwargs.get("role") or None,
+        login_timeout=30,
+        network_timeout=60,
+    )
+    print("[metadata_extractor] Snowflake connection established", flush=True)
+    return conn
+
+
+def _snowflake_run_fk_checks_sync(db_conn_kwargs: dict, fk_candidates: list) -> set:
+    """Confirm FK candidates using Snowflake connector (synchronous — runs in executor)."""
+    print(
+        f"[metadata_extractor] Snowflake Phase B: checking {len(fk_candidates)} FK candidate(s)",
+        flush=True,
+    )
+    confirmed: set = set()
+    conn = _sf_open_conn(db_conn_kwargs)
+    cursor = conn.cursor()
+    try:
+        for fk in fk_candidates:
+            src_q = _quote(fk["src_table"])
+            tgt_q = _quote(fk["tgt_table"])
+            fk_col, pk_col = fk["fk_col"], fk["pk_col"]
+            try:
+                cursor.execute(
+                    f'SELECT DISTINCT "{fk_col}" FROM {src_q} '
+                    f'WHERE "{fk_col}" IS NOT NULL LIMIT 100'
+                )
+                rows = cursor.fetchall()
+                fk_vals = [r[0] for r in rows if r[0] is not None]
+                if not fk_vals:
+                    continue
+                in_clause = ", ".join(["%s"] * len(fk_vals))
+                cursor.execute(
+                    f'SELECT COUNT(DISTINCT "{pk_col}") FROM {tgt_q}'
+                    f' WHERE "{pk_col}" IN ({in_clause})',
+                    fk_vals,
+                )
+                result = cursor.fetchone()
+                score = float(result[0] or 0) / len(fk_vals)
+                key = (fk["src_table"], fk_col, fk["tgt_table"], pk_col)
+                if score >= _FK_CONFIRM_THRESHOLD:
+                    confirmed.add(key)
+                    print(
+                        f"[metadata_extractor] ✓ Snowflake FK {fk['src_table']}.{fk_col}"
+                        f" → {fk['tgt_table']}  overlap={score:.2f}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[metadata_extractor] ✗ Snowflake FK {fk['src_table']}.{fk_col}"
+                        f" → {fk['tgt_table']}  overlap={score:.2f} (below threshold)",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[metadata_extractor] Snowflake FK check {fk}: {exc}", flush=True)
+    finally:
+        cursor.close()
+        conn.close()
+    print(
+        f"[metadata_extractor] Snowflake Phase B done:"
+        f"  confirmed={len(confirmed)}/{len(fk_candidates)}",
+        flush=True,
+    )
+    return confirmed
+
+
+def _snowflake_run_filter_collection_sync(db_conn_kwargs: dict, filter_candidates: list) -> dict:
+    """Collect DISTINCT values for filter-eligible columns (synchronous — runs in executor)."""
+    print(
+        f"[metadata_extractor] Snowflake Phase C: collecting distinct values"
+        f" for {len(filter_candidates)} column(s)",
+        flush=True,
+    )
+    filter_values: dict = {}
+    conn = _sf_open_conn(db_conn_kwargs)
+    cursor = conn.cursor()
+    try:
+        for tname, cname in filter_candidates:
+            try:
+                cursor.execute(
+                    f'SELECT DISTINCT "{cname}" FROM {_quote(tname)} '
+                    f'WHERE "{cname}" IS NOT NULL LIMIT 200'
+                )
+                vals = [str(r[0]) for r in cursor.fetchall() if r[0] is not None]
+                if vals:
+                    filter_values[(tname, cname)] = vals
+                    print(
+                        f"[metadata_extractor] ✓ Snowflake {tname}.{cname}"
+                        f" → {len(vals)} distinct value(s)",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[metadata_extractor] Snowflake distinct {tname}.{cname}: {exc}", flush=True)
+    finally:
+        cursor.close()
+        conn.close()
+    print(
+        f"[metadata_extractor] Snowflake Phase C done:"
+        f"  columns_with_values={len(filter_values)}/{len(filter_candidates)}",
+        flush=True,
+    )
+    return filter_values
+
+
 async def _confirm_fk(conn, src_table: str, fk_col: str, tgt_table: str, pk_col: str) -> float:
     """
     Measure FK overlap: what fraction of distinct FK values from src_table
@@ -383,66 +517,96 @@ async def _do_extraction(
     confirmed_fks: set[tuple] = set()    # (src_table, fk_col, tgt_table, pk_col)
     filter_values: dict[tuple, list[str]] = {}
 
-    db_phases_supported = db_type in ("postgresql", "redshift")
+    db_phases_supported = db_type in ("postgresql", "redshift", "snowflake")
 
-    if (fk_candidates or filter_candidates) and db_phases_supported:
-        try:
-            user_conn = await _open_user_db(db_conn_kwargs)
-        except Exception as exc:
-            print(f"[metadata_extractor] cannot open user DB for Phases B/C: {exc}", flush=True)
-
-    if user_conn and fk_candidates:
-        print(
-            f"[metadata_extractor] Phase B: confirming {len(fk_candidates)} FK candidate(s)",
-            flush=True,
-        )
-        for fk in fk_candidates:
-            score = await _confirm_fk(
-                user_conn,
-                fk["src_table"], fk["fk_col"],
-                fk["tgt_table"], fk["pk_col"],
-            )
-            key = (fk["src_table"], fk["fk_col"], fk["tgt_table"], fk["pk_col"])
-            if score >= _FK_CONFIRM_THRESHOLD:
-                confirmed_fks.add(key)
-                print(
-                    f"[metadata_extractor] ✓ FK {fk['src_table']}.{fk['fk_col']}"
-                    f" → {fk['tgt_table']}  overlap={score:.2f}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[metadata_extractor] ✗ FK {fk['src_table']}.{fk['fk_col']}"
-                    f" → {fk['tgt_table']}  overlap={score:.2f} (below threshold)",
-                    flush=True,
-                )
+    if not (fk_candidates or filter_candidates):
+        pass  # nothing to do
     elif not db_phases_supported:
         print(
             f"[metadata_extractor] Phase B/C skipped (db_type={db_type} not supported)",
             flush=True,
         )
-
-    if user_conn and filter_candidates:
-        print(
-            f"[metadata_extractor] Phase C: collecting distinct values"
-            f" for {len(filter_candidates)} filter column(s)",
-            flush=True,
-        )
-        for tname, cname in filter_candidates:
-            vals = await _collect_distinct_values(user_conn, tname, cname)
-            if vals:
-                filter_values[(tname, cname)] = vals
-                print(
-                    f"[metadata_extractor] ✓ {tname}.{cname}"
-                    f" → {len(vals)} distinct value(s)",
-                    flush=True,
+    elif db_type == "snowflake":
+        # Snowflake uses a sync connector — run both phases in the thread executor.
+        loop = asyncio.get_running_loop()
+        if fk_candidates:
+            print(
+                f"[metadata_extractor] Phase B (Snowflake): confirming"
+                f" {len(fk_candidates)} FK candidate(s)",
+                flush=True,
+            )
+            try:
+                confirmed_fks = await loop.run_in_executor(
+                    None, _snowflake_run_fk_checks_sync, db_conn_kwargs, fk_candidates
                 )
-
-    if user_conn:
+            except Exception as exc:
+                print(f"[metadata_extractor] Snowflake Phase B failed: {exc}", flush=True)
+        if filter_candidates:
+            print(
+                f"[metadata_extractor] Phase C (Snowflake): collecting distinct values"
+                f" for {len(filter_candidates)} filter column(s)",
+                flush=True,
+            )
+            try:
+                filter_values = await loop.run_in_executor(
+                    None, _snowflake_run_filter_collection_sync, db_conn_kwargs, filter_candidates
+                )
+            except Exception as exc:
+                print(f"[metadata_extractor] Snowflake Phase C failed: {exc}", flush=True)
+    else:
+        # PostgreSQL / Redshift — asyncpg path
         try:
-            await user_conn.close()
-        except Exception:
-            pass
+            user_conn = await _open_user_db(db_conn_kwargs)
+        except Exception as exc:
+            print(f"[metadata_extractor] cannot open user DB for Phases B/C: {exc}", flush=True)
+
+        if user_conn and fk_candidates:
+            print(
+                f"[metadata_extractor] Phase B: confirming {len(fk_candidates)} FK candidate(s)",
+                flush=True,
+            )
+            for fk in fk_candidates:
+                score = await _confirm_fk(
+                    user_conn,
+                    fk["src_table"], fk["fk_col"],
+                    fk["tgt_table"], fk["pk_col"],
+                )
+                key = (fk["src_table"], fk["fk_col"], fk["tgt_table"], fk["pk_col"])
+                if score >= _FK_CONFIRM_THRESHOLD:
+                    confirmed_fks.add(key)
+                    print(
+                        f"[metadata_extractor] ✓ FK {fk['src_table']}.{fk['fk_col']}"
+                        f" → {fk['tgt_table']}  overlap={score:.2f}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[metadata_extractor] ✗ FK {fk['src_table']}.{fk['fk_col']}"
+                        f" → {fk['tgt_table']}  overlap={score:.2f} (below threshold)",
+                        flush=True,
+                    )
+
+        if user_conn and filter_candidates:
+            print(
+                f"[metadata_extractor] Phase C: collecting distinct values"
+                f" for {len(filter_candidates)} filter column(s)",
+                flush=True,
+            )
+            for tname, cname in filter_candidates:
+                vals = await _collect_distinct_values(user_conn, tname, cname)
+                if vals:
+                    filter_values[(tname, cname)] = vals
+                    print(
+                        f"[metadata_extractor] ✓ {tname}.{cname}"
+                        f" → {len(vals)} distinct value(s)",
+                        flush=True,
+                    )
+
+        if user_conn:
+            try:
+                await user_conn.close()
+            except Exception:
+                pass
 
     # ── Persist all results to app DB ─────────────────────────────────────────
     conn_uuid = uuid.UUID(connection_id)

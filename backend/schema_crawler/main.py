@@ -94,6 +94,19 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                 "password": password,
                 "ssl": conn.ssl_enabled,
             }
+            if db_type == "snowflake":
+                opts = conn.connection_options or {}
+                db_conn_kwargs["account"] = conn.host or ""
+                db_conn_kwargs["warehouse"] = opts.get("warehouse") if isinstance(opts, dict) else None
+                db_conn_kwargs["role"] = opts.get("role") if isinstance(opts, dict) else None
+                print(
+                    f"[schema_crawler] Snowflake metadata kwargs:"
+                    f"  account={db_conn_kwargs['account']!r}"
+                    f"  warehouse={db_conn_kwargs['warehouse']!r}"
+                    f"  role={db_conn_kwargs['role']!r}"
+                    f"  database={db_conn_kwargs['database']!r}",
+                    flush=True,
+                )
 
             if db_type == "redshift":
                 schema_doc, sample_rows_map = await crawl_redshift(

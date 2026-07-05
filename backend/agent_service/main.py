@@ -407,6 +407,7 @@ from shared.schemas.projects import (
 import httpx
 
 SCHEMA_CRAWLER_URL = os.getenv("SCHEMA_CRAWLER_URL", "http://localhost:8003")
+QUERY_EXECUTOR_URL  = os.getenv("QUERY_EXECUTOR_URL",  "http://localhost:8002")
 
 
 @app.post("/projects", response_model=ProjectResponse, status_code=201)
@@ -731,6 +732,57 @@ async def test_connection(project_id: str, conn_id: str, current_user: User = De
     except Exception as e:
         print(f"[connection-test] {conn.db_type.value} test failed: {e}")
         return ConnectionTestResult(success=False, message=str(e))
+
+
+class ConnectionQueryRequest(BaseModel):
+    sql: str
+    row_limit: int = 1000
+
+
+@app.post("/projects/{project_id}/connections/{conn_id}/query")
+async def execute_connection_query(
+    project_id: str,
+    conn_id: str,
+    req: ConnectionQueryRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.id == uuid.UUID(conn_id),
+        DatabaseConnection.project_id == uuid.UUID(project_id),
+    ))
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    sql_upper = req.sql.strip().upper()
+    if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH") or sql_upper.startswith("SHOW")):
+        raise HTTPException(status_code=400, detail="Only SELECT / WITH / SHOW queries are allowed")
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{QUERY_EXECUTOR_URL}/execute",
+                json={
+                    "connection_id": conn_id,
+                    "sql": req.sql,
+                    "row_limit": min(req.row_limit, 1000),
+                    "timeout_seconds": 30,
+                },
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            return {
+                "rows": [], "row_count": 0, "columns": [],
+                "duration_ms": 0, "truncated": False,
+                "error": f"Query executor error {resp.status_code}: {resp.text[:300]}",
+            }
+    except Exception as exc:
+        return {
+            "rows": [], "row_count": 0, "columns": [],
+            "duration_ms": 0, "truncated": False,
+            "error": str(exc),
+        }
 
 
 @app.post("/projects/{project_id}/schema/crawl")

@@ -15,7 +15,7 @@ def validate_sql(sql: str) -> Tuple[bool, str]:
             return False, f"Query contains disallowed operation matching: {pattern}"
 
     upper = sql_stripped.upper().lstrip()
-    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
-        return False, "Only SELECT or WITH queries are allowed"
+    if not (upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("SHOW") or upper.startswith("DESCRIBE") or upper.startswith("DESC ")):
+        return False, "Only SELECT / WITH / SHOW / DESCRIBE queries are allowed"
 
     return True, ""

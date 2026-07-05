@@ -20,11 +20,28 @@ SEMANTIC_TABLE_KEYWORDS = {
 }
 
 
+def _normalize_account(account: str) -> str:
+    """Strip trailing .snowflakecomputing.com — the connector appends it automatically."""
+    suffix = ".snowflakecomputing.com"
+    return account[: -len(suffix)] if account.lower().endswith(suffix) else account
+
+
 def _connect_snowflake(account: str, user: str, password: str, database: Optional[str],
                        warehouse: Optional[str], role: Optional[str]):
     import snowflake.connector
+    normalized = _normalize_account(account)
+    if normalized != account:
+        print(
+            f"[snowflake_crawler] account normalized: {account!r} → {normalized!r}",
+            flush=True,
+        )
+    print(
+        f"[snowflake_crawler] connecting  account={normalized!r}  user={user!r}"
+        f"  database={database!r}  warehouse={warehouse!r}  role={role!r}",
+        flush=True,
+    )
     kwargs = {
-        "account": account,
+        "account": normalized,
         "user": user,
         "password": password,
         "login_timeout": 30,
@@ -36,18 +53,47 @@ def _connect_snowflake(account: str, user: str, password: str, database: Optiona
         kwargs["warehouse"] = warehouse
     if role:
         kwargs["role"] = role
-    return snowflake.connector.connect(**kwargs)
+    conn = snowflake.connector.connect(**kwargs)
+    print("[snowflake_crawler] connection established", flush=True)
+    return conn
 
 
 def _get_databases(cursor) -> list[str]:
     """Return user-owned databases, skipping Snowflake system databases."""
     cursor.execute("SHOW DATABASES")
     rows = cursor.fetchall()
-    # Column 1 = name, column 4 = origin (non-empty means shared/system DB)
-    return [
-        r[1] for r in rows
-        if r[1].upper() not in _SYSTEM_DATABASES and not r[4]  # skip shared/system
+    # Use cursor.description to look up column positions by name — positional
+    # indexing is fragile across Snowflake versions that add/reorder columns.
+    col_names = [d[0].lower() for d in cursor.description]
+    try:
+        name_idx = col_names.index("name")
+        origin_idx = col_names.index("origin")
+        print(
+            f"[snowflake_crawler] SHOW DATABASES columns={col_names}"
+            f"  name_idx={name_idx}  origin_idx={origin_idx}",
+            flush=True,
+        )
+    except ValueError:
+        name_idx, origin_idx = 1, 4
+        print(
+            f"[snowflake_crawler] SHOW DATABASES: 'name'/'origin' not in description"
+            f" {col_names} — falling back to positional idx name={name_idx} origin={origin_idx}",
+            flush=True,
+        )
+    all_dbs = [r[name_idx] for r in rows]
+    system_skipped = [r[name_idx] for r in rows if r[name_idx].upper() in _SYSTEM_DATABASES]
+    shared_skipped = [r[name_idx] for r in rows if r[origin_idx]]
+    result = [
+        r[name_idx] for r in rows
+        if r[name_idx].upper() not in _SYSTEM_DATABASES and not r[origin_idx]
     ]
+    print(
+        f"[snowflake_crawler] SHOW DATABASES: total={len(all_dbs)}"
+        f"  system_skipped={system_skipped}  shared_skipped={shared_skipped}"
+        f"  will_crawl={result}",
+        flush=True,
+    )
+    return result
 
 
 def _crawl_one_database(cursor, db_name: str, schema_filter: Optional[str]) -> dict:
@@ -57,6 +103,11 @@ def _crawl_one_database(cursor, db_name: str, schema_filter: Optional[str]) -> d
     """
     cursor.execute(f'USE DATABASE "{db_name}"')
     schema_clause = f"AND TABLE_SCHEMA = '{schema_filter.upper()}'" if schema_filter else ""
+    print(
+        f"[snowflake_crawler] [{db_name}] crawling"
+        + (f"  schema_filter={schema_filter.upper()!r}" if schema_filter else "  schema_filter=<all>"),
+        flush=True,
+    )
 
     cursor.execute(f"""
         SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
@@ -68,6 +119,11 @@ def _crawl_one_database(cursor, db_name: str, schema_filter: Optional[str]) -> d
         ORDER BY TABLE_SCHEMA, TABLE_NAME
     """)
     tables_raw = cursor.fetchall()
+    print(
+        f"[snowflake_crawler] [{db_name}] tables={len(tables_raw)}"
+        f"  schemas={sorted({r[0] for r in tables_raw})}",
+        flush=True,
+    )
 
     cursor.execute(f"""
         SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION,
@@ -81,38 +137,65 @@ def _crawl_one_database(cursor, db_name: str, schema_filter: Optional[str]) -> d
     """)
     columns_raw = cursor.fetchall()
     col_col_names = [d[0] for d in cursor.description]
-
-    cursor.execute(f"""
-        SELECT kc.TABLE_SCHEMA, kc.TABLE_NAME, kc.COLUMN_NAME
-        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kc
-          ON tc.CONSTRAINT_NAME = kc.CONSTRAINT_NAME
-         AND tc.TABLE_SCHEMA = kc.TABLE_SCHEMA
-        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-        {schema_clause.replace('AND TABLE_SCHEMA', 'AND tc.TABLE_SCHEMA')}
-    """)
-    pk_raw = cursor.fetchall()
+    print(f"[snowflake_crawler] [{db_name}] columns={len(columns_raw)}", flush=True)
 
     try:
         cursor.execute(f"""
+            SELECT kc.TABLE_SCHEMA, kc.TABLE_NAME, kc.COLUMN_NAME
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kc
+              ON tc.CONSTRAINT_NAME = kc.CONSTRAINT_NAME
+             AND tc.TABLE_SCHEMA = kc.TABLE_SCHEMA
+            WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+            {schema_clause.replace('AND TABLE_SCHEMA', 'AND tc.TABLE_SCHEMA')}
+        """)
+        pk_raw = cursor.fetchall()
+        print(f"[snowflake_crawler] [{db_name}] primary_key_cols={len(pk_raw)}", flush=True)
+    except Exception as exc:
+        pk_raw = []
+        print(
+            f"[snowflake_crawler] [{db_name}] PK query failed (permission?): {exc}"
+            f" — continuing without PK info",
+            flush=True,
+        )
+
+    try:
+        # CONSTRAINT_COLUMN_USAGE holds the REFERENCED (PK) columns, not the FK columns.
+        # The link between an FK constraint and the PK it references is REFERENTIAL_CONSTRAINTS.
+        # Joining ccu directly on FK constraint name (old code) returns wrong/empty results.
+        cursor.execute(f"""
             SELECT kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME,
-                   ccu.TABLE_NAME AS FOREIGN_TABLE_NAME, ccu.COLUMN_NAME AS FOREIGN_COLUMN_NAME
+                   ccu.TABLE_NAME  AS FOREIGN_TABLE_NAME,
+                   ccu.COLUMN_NAME AS FOREIGN_COLUMN_NAME
             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-              ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-             AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+              ON  tc.CONSTRAINT_NAME   = kcu.CONSTRAINT_NAME
+             AND tc.TABLE_SCHEMA       = kcu.TABLE_SCHEMA
+            JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+              ON  rc.CONSTRAINT_NAME   = tc.CONSTRAINT_NAME
+             AND rc.CONSTRAINT_SCHEMA  = tc.TABLE_SCHEMA
             JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
-              ON ccu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+              ON  ccu.CONSTRAINT_NAME  = rc.UNIQUE_CONSTRAINT_NAME
             WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
             {schema_clause.replace('AND TABLE_SCHEMA', 'AND tc.TABLE_SCHEMA')}
         """)
         fk_raw = cursor.fetchall()
-    except Exception:
+        print(
+            f"[snowflake_crawler] [{db_name}] foreign_keys={len(fk_raw)}"
+            + (
+                "  " + ", ".join(f"{r[1]}.{r[2]}→{r[3]}.{r[4]}" for r in fk_raw[:5])
+                if fk_raw else "  (none — Snowflake FKs are rarely enforced)"
+            ),
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[snowflake_crawler] [{db_name}] FK query failed: {exc}", flush=True)
         fk_raw = []
 
     # Row counts and sample rows per table
     row_counts: dict[str, int] = {}
     sample_rows_map: dict[str, list] = {}
+    count_errors, sample_errors = 0, 0
 
     for tschema, tname, _ in tables_raw:
         tkey = f"{tschema}.{tname}"
@@ -122,14 +205,18 @@ def _crawl_one_database(cursor, db_name: str, schema_filter: Optional[str]) -> d
             cursor.execute(f'SELECT COUNT(*) FROM {full_name}')
             row = cursor.fetchone()
             row_counts[tkey] = int(row[0]) if row else 0
-        except Exception:
+        except Exception as exc:
             row_counts[tkey] = 0
+            count_errors += 1
+            print(f"[snowflake_crawler] [{db_name}] COUNT(*) failed for {tkey}: {exc}", flush=True)
 
         try:
             cursor.execute(f'SELECT * FROM {full_name} LIMIT 25')
             rows = cursor.fetchall()
             col_names = [d[0] for d in cursor.description]
             pii_cols = {c for c in col_names if any(sig in c.lower() for sig in _PII_SIGNALS)}
+            if pii_cols:
+                print(f"[snowflake_crawler] [{db_name}] {tkey}: redacting PII cols {pii_cols}", flush=True)
             dicts = [dict(zip(col_names, r)) for r in rows]
             for row in dicts:
                 for pii_col in pii_cols:
@@ -140,9 +227,17 @@ def _crawl_one_database(cursor, db_name: str, schema_filter: Optional[str]) -> d
                  for k, v in row.items()}
                 for row in dicts
             ]
-        except Exception:
+        except Exception as exc:
             sample_rows_map[tkey] = []
+            sample_errors += 1
+            print(f"[snowflake_crawler] [{db_name}] sample rows failed for {tkey}: {exc}", flush=True)
 
+    print(
+        f"[snowflake_crawler] [{db_name}] done"
+        f"  row_counts_ok={len(tables_raw) - count_errors}/{len(tables_raw)}"
+        f"  samples_ok={len(tables_raw) - sample_errors}/{len(tables_raw)}",
+        flush=True,
+    )
     return {
         "tables_raw": tables_raw,
         "columns_raw": [dict(zip(col_col_names, r)) for r in columns_raw],
@@ -165,10 +260,11 @@ def _fetch_all_sync(account: str, user: str, password: str, database: Optional[s
     try:
         if database:
             databases_to_crawl = [database]
+            print(f"[snowflake_crawler] crawling specified database: {database!r}", flush=True)
         else:
             databases_to_crawl = _get_databases(cursor)
-            print(f"[snowflake_crawler] auto-discovered databases: {databases_to_crawl}", flush=True)
             if not databases_to_crawl:
+                print("[snowflake_crawler] no user databases found — check account permissions", flush=True)
                 return {"tables_raw": [], "columns_raw": [], "pk_raw": [], "fk_raw": [],
                         "row_counts": {}, "sample_rows_map": {}}
 
@@ -221,8 +317,14 @@ async def crawl_snowflake(
     Crawl Snowflake schema. Returns (schema_doc, sample_rows_map).
     When database is None/empty, auto-discovers all user databases.
     """
+    print(
+        f"[snowflake_crawler] crawl_snowflake START"
+        f"  account={account!r}  database={database!r}"
+        f"  warehouse={warehouse!r}  role={role!r}  schema_filter={schema_filter!r}",
+        flush=True,
+    )
     start = datetime.now(timezone.utc)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     raw = await loop.run_in_executor(
         None,
@@ -338,6 +440,15 @@ async def crawl_snowflake(
         "version": 1,
         "crawl_duration_seconds": crawl_duration,
     }
+    explicit_rels = sum(len(t["relationships"]) for t in tables_out)
+    print(
+        f"[snowflake_crawler] crawl_snowflake DONE"
+        f"  tables={len(tables_out)}"
+        f"  relationships={explicit_rels}"
+        f"  sample_tables={len(sample_rows_map)}"
+        f"  duration={crawl_duration:.1f}s",
+        flush=True,
+    )
     return schema_doc, sample_rows_map
 
 
