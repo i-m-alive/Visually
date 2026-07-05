@@ -146,6 +146,10 @@ class EnrichedSchema:
     #   {"idf": {term: idf_weight}, "tables": {table_name: {"tfidf_vec": {term: weight}}}}
     tfidf_index: dict = field(default_factory=dict)
 
+    # join_templates: pre-computed JOIN snippets for FK-connected table pairs.
+    # {(table_a, table_b): "table_a JOIN table_b ON table_a.fk = table_b.pk"}
+    join_templates: dict = field(default_factory=dict)
+
     def get_disambiguation_text(self) -> str:
         if not self.disambiguation:
             return ""
@@ -197,6 +201,7 @@ def _serialize_enriched(enriched: EnrichedSchema) -> str:
         "concept_index": enriched.concept_index,
         "entity_columns": enriched.entity_columns,
         "tfidf_index": enriched.tfidf_index,
+        "join_templates": enriched.join_templates,
     }
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
@@ -219,6 +224,7 @@ def _deserialize_enriched(json_str: str) -> EnrichedSchema:
         concept_index=data.get("concept_index") or {},
         entity_columns=data.get("entity_columns") or {},
         tfidf_index=data.get("tfidf_index") or {},
+        join_templates=data.get("join_templates") or {},
     )
 
 
@@ -819,6 +825,13 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
             "columns": enriched_cols,
             "all_column_names": [c.get("name") for c in all_cols if c.get("name")],
             "relationships": t.get("relationships", [])[:10],
+            "is_view": (
+                t.get("table_type", "").upper() == "VIEW"
+                or t.get("name", "").lower().split(".")[-1].startswith("vw_")
+                or t.get("name", "").lower().split(".")[-1].endswith("_view")
+                or t.get("name", "").lower().split(".")[-1].endswith("_v")
+                or (t.get("row_count", 1) == 0 and len(t.get("columns", [])) > 8)
+            ),
         })
 
     # relationship_graph — Pass 1 (declared) + Pass 2 (heuristic)
@@ -847,6 +860,14 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
             f" from DB metadata",
             flush=True,
         )
+
+    # Pre-compute JOIN templates for all FK-connected table pairs
+    join_templates: dict = {}
+    for table_a, neighbors in relationship_graph.edges.items():
+        for table_b, condition in neighbors.items():
+            key = f"{table_a}|{table_b}"
+            if key not in join_templates:
+                join_templates[key] = f"{table_a} JOIN {table_b} ON {condition}"
 
     # Table semantics — build from DB metadata first, then run LLM only for uncovered tables.
     db_covered_semantics: dict = {}
@@ -937,6 +958,7 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
         concept_index=concept_index,
         entity_columns=heuristic_entity_columns,
         tfidf_index=tfidf_index,
+        join_templates=join_templates,
     )
 
 
@@ -1233,6 +1255,8 @@ def _build_concept_index_heuristic(
     mining column names, descriptions, semantic_type tags, and the
     key_metric / key_dimension / key_date arrays from table_semantics.
     """
+    from agent_service.agents.graph_rag_retriever import STOPWORDS
+
     index: dict[str, list[dict]] = {}
 
     def _add(term: str, table: str, column: str, score: float, context: str = "") -> None:
@@ -1277,10 +1301,13 @@ def _build_concept_index_heuristic(
                 for tag in stype.replace(",", " ").split():
                     _add(tag, tname, cname, 0.75, f"semantic_type:{stype}")
 
-            # Description tokens → concept terms
+            # Description tokens → concept terms (skip stop words — indexing
+            # "how"/"and"/"were" lets query filler boost random tables)
             if desc:
                 for token in re.findall(r"[a-zA-Z_]{3,}", desc):
-                    _add(token.replace("_", " ").lower(), tname, cname, 0.55, "description")
+                    term = token.replace("_", " ").lower()
+                    if term not in STOPWORDS:
+                        _add(term, tname, cname, 0.55, "description")
 
             # Table-level concept: "table_name column_name" combined phrase
             combined = f"{tname.replace('_', ' ')} {cname.replace('_', ' ')}"

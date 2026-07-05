@@ -1,0 +1,57 @@
+{
+  "_comment": "Golden question set for offline retrieval accuracy evaluation. Each entry: question + expected tables (any match counts as pass). cache_glob picks the schema cache file. Add new questions whenever a retrieval bug is found and fixed.",
+  "suites": [
+    {
+      "name": "bullhorn-redshift",
+      "cache_glob": ".schema_cache/schema_27060dc5-*_8a29b3298816.json",
+      "questions": [
+        {
+          "q": "How many candidates applied for jobs last seven days?",
+          "expected_tables": ["staging.bqp_applications", "staging.bqp_applicant"]
+        },
+        {
+          "q": "Tell me the total number of placement happened in last 7 days in a day wise graph",
+          "expected_tables": ["staging.bullhorn_core_placement"]
+        },
+        {
+          "q": "show me revenue by customer for last 12 months",
+          "expected_tables": ["target.trailing_12m_revenue_by_customer"]
+        },
+        {
+          "q": "average interview score by department",
+          "expected_tables": ["staging.bqp_interview_departments_ratings", "staging.bqp_interview_scores"]
+        },
+        {
+          "q": "how many open job orders do we have by industry",
+          "expected_tables": ["staging.bullhorn_core_job_order"]
+        },
+        {
+          "q": "candidate status breakdown",
+          "expected_tables": ["staging.bullhorn_core_candidate", "target.candidate_status_history", "staging.bqp_candidate"]
+        },
+        {
+          "q": "monthly billable hours trend",
+          "expected_tables": ["staging.bullhorn_timesheet2", "target.customer_billable_hours_yoy_view", "target.firmtype_billable_hours_yoy_view"]
+        }
+      ]
+    },
+    {
+      "name": "snowflake-financial",
+      "cache_glob": ".schema_cache/schema_e3bffdba-*_50f550bbbfd7.json",
+      "questions": [
+        {
+          "q": "total transaction value by channel last month",
+          "expected_tables": ["STG_POC.TRNSCTN"]
+        },
+        {
+          "q": "top 10 assets by number of units sold",
+          "expected_tables": ["STG_POC.TRNSCTN"]
+        },
+        {
+          "q": "how many assets per sector",
+          "expected_tables": ["STG_POC.ASST_INFO"]
+        }
+      ]
+    }
+  ]
+}

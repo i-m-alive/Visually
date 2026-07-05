@@ -38,6 +38,7 @@ class TableCandidate:
     dimension_columns: list = field(default_factory=list)
     date_columns: list = field(default_factory=list)
     join_conditions: list = field(default_factory=list)
+    is_view: bool = False
 
 
 @dataclass
@@ -57,12 +58,103 @@ class RetrievedContext:
     metric_hints: list = field(default_factory=list)     # "table.column"
     date_hints: list = field(default_factory=list)
     confidence: float = 0.0
+    needs_join: bool = False
+    join_path: list = field(default_factory=list)   # list of (from, to, condition) hops
 
 
 # ── Tokenisation ──────────────────────────────────────────────────────────────
 
 def _tokenize(text: str) -> list:
     return re.findall(r"[a-z0-9]+", text.lower())
+
+
+# English stop words + query filler that must never drive concept lookups.
+# Without this, tokens like "how"/"and"/"were" match description-mined concept
+# entries and boost random tables (observed: "were" → bullhorn_timesheet2).
+STOPWORDS = frozenset({
+    "a", "an", "and", "any", "are", "all", "also", "as", "at", "be", "been",
+    "but", "by", "can", "did", "do", "does", "each", "for", "from", "get",
+    "give", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it",
+    "its", "last", "many", "me", "much", "my", "no", "not", "now", "of", "on",
+    "or", "our", "out", "per", "please", "show", "so", "some", "tell", "than",
+    "that", "the", "their", "them", "then", "there", "these", "they", "this",
+    "those", "to", "us", "was", "we", "were", "what", "when", "where", "which",
+    "who", "why", "will", "with", "would", "you", "your",
+    # time-range filler — handled by intent time_range extraction, not retrieval
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "today", "yesterday", "seven", "thirty", "individually", "wise",
+})
+
+# Tables that are backups / temp copies / test scratch — they duplicate the
+# columns of their production twin and must never outrank it.
+_JUNK_TABLE_PAT = re.compile(
+    r"(_temp$|_tmp$|_test$|_bkp$|_backup$|_old$|_copy$|_temporary_table$"
+    r"|_bkp_|_test_|temporary)",
+    re.IGNORECASE,
+)
+JUNK_TABLE_PENALTY = 0.4  # multiplier applied to the final composite score
+
+
+def _is_junk_table(table_name: str) -> bool:
+    bare = table_name.split(".")[-1]
+    return bool(_JUNK_TABLE_PAT.search(bare))
+
+
+def _stem(token: str) -> str:
+    """Crude plural stemmer so 'candidates' matches 'candidate', 'applications'
+    matches 'application'. Good enough for table/column name matching."""
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 3 and token.endswith("es") and not token.endswith("ses"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+# Source-system / layer prefixes that carry no business meaning — dropped
+# before computing name-match fraction so 'bqp_applications' scores as
+# 'applications' (full match), not half a match.
+_NAME_NOISE_TOKENS = frozenset({
+    "bqp", "stg", "staging", "target", "bullhorn", "classic", "core",
+    "quickbooks", "dim", "fact", "tbl", "raw", "src", "vw",
+})
+
+
+def _stem_variants(token: str) -> set:
+    """All plausible stems of a query token, bridging verb/noun forms:
+    'applied' → {'applied', 'appli'} so it can prefix-match 'application'."""
+    out = {token, _stem(token)}
+    if len(token) > 5 and token.endswith("ied"):
+        out.add(token[:-3] + "y")
+    if len(token) > 4 and token.endswith("ed"):
+        out.add(token[:-2])
+    if len(token) > 5 and token.endswith("ing"):
+        out.add(token[:-3])
+    return out
+
+
+def _stems_match(name_stem: str, query_stems: set) -> bool:
+    if name_stem in query_stems:
+        return True
+    # prefix bridge (≥5 chars): 'appli(ed)' ↔ 'application'
+    for q in query_stems:
+        if len(q) >= 5 and (name_stem.startswith(q) or q.startswith(name_stem)):
+            return True
+    return False
+
+
+def _name_match_score(query_stems: set, table_name: str) -> float:
+    """Fraction of the table's meaningful name tokens that appear in the query.
+    A table NAMED 'applications' is much stronger evidence than a satellite
+    table that merely carries an application_id FK column."""
+    bare = table_name.split(".")[-1].lower()
+    tokens = [t for t in re.split(r"[_\W]+", bare) if len(t) >= 3]
+    meaningful = [t for t in tokens if t not in _NAME_NOISE_TOKENS] or tokens
+    if not meaningful:
+        return 0.0
+    matched = sum(1 for t in meaningful if _stems_match(_stem(t), query_stems))
+    return matched / len(meaningful)
 
 
 def _table_text(table: dict, table_semantics: dict) -> str:
@@ -205,23 +297,73 @@ def _retrieve(
 
     # ── Signal 2: concept_index ───────────────────────────────────────────────
     concept_idx = enriched.concept_index or {}
-    all_terms = metrics + [t for t in query_tokens if len(t) >= 3]
+    all_terms = metrics + [
+        t for t in query_tokens if len(t) >= 3 and t not in STOPWORDS
+    ]
     for term in all_terms:
-        # exact match first
-        entries = concept_idx.get(term, [])
+        term_stem = _stem(term)
+        # exact match on the term AND its stem ('candidates' must also consult
+        # the 'candidate' concept — the plural key often holds only junk)
+        entries = list(concept_idx.get(term, []))
+        if term_stem != term:
+            entries += concept_idx.get(term_stem, [])
         if not entries:
-            # prefix match
-            for key, ents in concept_idx.items():
-                if key.startswith(term) or term.startswith(key):
-                    entries = ents
-                    break
-        for entry in entries[:3]:
+            # prefix match (min 4 chars — short prefixes match too loosely)
+            if len(term) >= 4:
+                for key, ents in concept_idx.items():
+                    if key.startswith(term) or term.startswith(key):
+                        entries = ents
+                        break
+        # Dedupe by table and boost up to 5 DISTINCT tables per concept.
+        # The old entries[:3] let one table occupy all slots (duplicate
+        # column entries) and starved the real production table of its boost.
+        # Prefer entries whose TABLE NAME contains the term (hub tables like
+        # bqp_applications) over tables that merely carry a matching FK column
+        # (ml_score_temp.application_id); among in-name tables prefer the
+        # SHORTEST name — the hub is 'applications', the satellites are
+        # 'application_areas_of_expertise'.
+        def _entry_rank(e: dict) -> tuple:
+            tn_bare = (e.get("table", "").split(".")[-1]).lower()
+            in_name = term_stem in tn_bare or term in tn_bare
+            return (
+                0 if in_name else 1,
+                1 if _is_junk_table(e.get("table", "")) else 0,
+                len(tn_bare) if in_name else 0,
+                -float(e.get("score", 0.8)),
+            )
+
+        seen_tables: set = set()
+        for entry in sorted(entries, key=_entry_rank):
             tn = entry.get("table", "")
+            if not tn or tn in seen_tables:
+                continue
+            seen_tables.add(tn)
             if tn in table_signals:
                 bonus = float(entry.get("score", 0.8))
+                # A match on a bare id/FK column ("application_id" on an ML
+                # scoring table) says the table REFERENCES the concept, not
+                # that it's ABOUT it — halve the boost.
+                col = (entry.get("column") or "").lower()
+                if col.endswith("id") or col.endswith("_id"):
+                    bonus *= 0.5
                 table_signals[tn]["concept"] = max(
                     table_signals[tn].get("concept", 0.0), bonus
                 )
+            if len(seen_tables) >= 5:
+                break
+
+    # ── Signal 2b: table-name token match ─────────────────────────────────────
+    # 'candidates' should surface bqp_candidate / bullhorn_core_candidate even
+    # when the concept index is polluted by FK-column matches on other tables.
+    query_stems: set = set()
+    for t in query_tokens:
+        if len(t) >= 3 and t not in STOPWORDS:
+            query_stems |= _stem_variants(t)
+    if query_stems:
+        for tn in tnames:
+            ns = _name_match_score(query_stems, tn)
+            if ns > 0:
+                table_signals[tn]["name"] = ns
 
     # ── Signal 3: entity_columns (fuzzy named-entity → sample values) ─────────
     filter_hints: list[FilterHint] = []
@@ -273,18 +415,85 @@ def _retrieve(
                     )
                     break
 
-    # ── Composite score: TF-IDF 40 | concept 30 | entity 20 | graph 10 ────────
-    W = {"tfidf": 0.40, "concept": 0.30, "entity": 0.20, "graph": 0.10}
+    # ── 2-hop FK expansion (extend 1-hop to 2-hop) ────────────────────────────
+    high_score_2hop = {
+        tn for tn, sigs in table_signals.items()
+        if max(sigs.values(), default=0.0) > 0.35
+    }
+    if rg and high_score_2hop:
+        for tn in list(table_signals.keys()):
+            if tn in high_score_2hop:
+                continue
+            for hs in high_score_2hop:
+                # 1-hop already handled above; check 2-hop via intermediate
+                for intermediate, _ in (rg.edges.get(hs) or {}).items():
+                    if intermediate == tn:
+                        continue
+                    if rg.get_join_condition(intermediate, tn) or rg.get_join_condition(tn, intermediate):
+                        table_signals[tn]["graph"] = max(
+                            table_signals[tn].get("graph", 0.0), 0.20
+                        )
+                        break
+
+    # ── Composite: TF-IDF 35 | name 25 | concept 20 | entity 15 | graph 5 ─────
+    W = {"tfidf": 0.35, "name": 0.25, "concept": 0.20, "entity": 0.15, "graph": 0.05}
     ranked: list[tuple] = []
     for tn, sigs in table_signals.items():
-        score = sum(sigs.get(sig, 0.0) * w for sig, w in W.items())
+        # A concept hit with near-zero TF-IDF means the table merely shares a
+        # column name (e.g. application_id on an ML scoring table) but its
+        # name/description have nothing to do with the question — halve it.
+        adj = dict(sigs)
+        if adj.get("concept", 0.0) > 0 and adj.get("tfidf", 0.0) < 0.01:
+            adj["concept"] = adj["concept"] * 0.5
+        score = sum(adj.get(sig, 0.0) * w for sig, w in W.items())
+        # Backup/temp/test copies must never outrank their production twin.
+        if _is_junk_table(tn):
+            score *= JUNK_TABLE_PENALTY
         ranked.append((score, tn, list(sigs.keys())))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
+
+    # ── View-first boost: views are pre-joined / pre-aggregated — prefer them ──
+    view_names: set[str] = set()
+    for t in enriched.compact_tables:
+        tname = t.get("name", "")
+        is_v = t.get("is_view", False)
+        bare = tname.split(".")[-1].lower()
+        if is_v or bare.startswith("vw_") or bare.endswith("_view") or bare.endswith("_v"):
+            view_names.add(tname)
+    if view_names:
+        boosted = []
+        for score, tn, sigs in ranked:
+            extra = 0.18 if tn in view_names and score >= 0.25 else 0.0
+            boosted.append((min(score + extra, 1.0), tn, sigs))
+        boosted.sort(key=lambda x: x[0], reverse=True)
+        ranked = boosted
+
     top = [(s, tn, ss) for s, tn, ss in ranked[:top_k] if s > 0.01]
 
     if not top:
         return RetrievedContext()
+
+    # ── JOIN need detection: does the query span multiple semantic domains? ────
+    needs_join = False
+    join_path_result: list = []
+    if len(top) >= 2 and rg:
+        t1_name, t2_name = top[0][1], top[1][1]
+        # Both tables scored meaningfully AND they are FK-connected → JOIN query
+        if top[1][0] >= 0.25:
+            cond = rg.get_join_condition(t1_name, t2_name) or rg.get_join_condition(t2_name, t1_name)
+            if cond:
+                needs_join = True
+                join_path_result = [(t1_name, t2_name, cond)]
+            else:
+                # Check 2-hop path
+                for intermediate in (rg.edges.get(t1_name) or {}):
+                    mid_cond = rg.get_join_condition(t1_name, intermediate)
+                    end_cond = rg.get_join_condition(intermediate, t2_name) or rg.get_join_condition(t2_name, intermediate)
+                    if mid_cond and end_cond:
+                        needs_join = True
+                        join_path_result = [(t1_name, intermediate, mid_cond), (intermediate, t2_name, end_cond)]
+                        break
 
     # ── Build TableCandidates ─────────────────────────────────────────────────
     ct_map = {t["name"]: t for t in enriched.compact_tables}
@@ -330,6 +539,7 @@ def _retrieve(
             dimension_columns=list(sem.get("key_dimension_cols") or []),
             date_columns=list(sem.get("key_date_cols") or []),
             join_conditions=join_conds[:5],
+            is_view=tn in view_names,
         ))
 
     primary_tables = [c.table_name for c in candidates]
@@ -353,6 +563,8 @@ def _retrieve(
         metric_hints=metric_hints[:8],
         date_hints=date_hints[:4],
         confidence=confidence,
+        needs_join=needs_join,
+        join_path=join_path_result,
     )
 
 
@@ -391,5 +603,14 @@ def format_retrieval_hints(ctx: Optional[RetrievedContext]) -> str:
         lines.append("\nWHERE clause hints (entity matches from user query):")
         for fh in ctx.filter_hints[:4]:
             lines.append(f"  {fh.table}.{fh.column} = '{fh.value}'  ('{fh.entity_text}')")
+
+    if ctx.needs_join and ctx.join_path:
+        lines.append("\nJOIN PATH (pre-verified, use this exact structure):")
+        for from_t, to_t, cond in ctx.join_path:
+            lines.append(f"  {from_t} JOIN {to_t} ON {cond}")
+
+    view_tables = [c.table_name for c in ctx.candidates if c.is_view]
+    if view_tables:
+        lines.append(f"\nVIEWS detected (pre-aggregated, prefer these): {', '.join(view_tables)}")
 
     return "\n".join(lines)

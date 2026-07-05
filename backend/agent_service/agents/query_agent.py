@@ -76,6 +76,40 @@ def _score_table(intent_text: str, table: dict) -> float:
 
 QUERY_AGENT_MODEL = BEDROCK_SONNET_MODEL
 
+from shared.bedrock_client import BEDROCK_HAIKU_MODEL as _HAIKU_MODEL
+
+def _pick_model(
+    intent,
+    retrieved_context,
+    attempt: int,
+    retry_feedback,
+) -> str:
+    """
+    Use Haiku (fast, cheap) for simple single-table queries with high RAG confidence.
+    Fall back to Sonnet for complex, multi-table, low-confidence, or retry scenarios.
+    """
+    if attempt > 1 or retry_feedback:
+        return QUERY_AGENT_MODEL  # Sonnet on retries — needs more reasoning
+    if retrieved_context is None:
+        return QUERY_AGENT_MODEL
+    confidence = getattr(retrieved_context, "confidence", 0.0)
+    needs_join = getattr(retrieved_context, "needs_join", False)
+    num_candidates = len(getattr(retrieved_context, "candidates", []))
+    num_metrics = len(getattr(intent.entities, "metrics", []))
+    has_filters = bool(getattr(intent.entities, "filters", []))
+    # Date-spine queries (granularity breakdowns) need CTE reasoning — Sonnet only
+    has_granularity = bool(getattr(intent.entities, "time_granularity", None))
+    is_simple = (
+        confidence >= 0.65
+        and not needs_join
+        and num_candidates <= 1
+        and num_metrics <= 2
+        and not has_filters
+        and not has_granularity
+    )
+    return _HAIKU_MODEL if is_simple else QUERY_AGENT_MODEL
+
+
 # 4096 tokens: context-enriched prompts (Mode 3) produce larger SQL with CTEs,
 # multi-table JOINs, CASE expressions, and date filters that can exceed 1024 tokens.
 _SQL_MAX_TOKENS = 4096
@@ -232,6 +266,74 @@ RULES:
     - Redshift: same as PostgreSQL — CURRENT_DATE and INTERVAL work identically
     - NEVER skip the WHERE clause when a time_range is given — without it the query returns ALL history.
     - Place the date WHERE clause BEFORE GROUP BY.
+12. DATE SPINE — ZERO-FILL (CRITICAL for day-wise / date-grouped charts):
+    When a user asks for a day-wise, date-wise, or daily breakdown (e.g. "last 7 days",
+    "last 30 days", "each day this month") and the chart has a DATE column on the X-axis,
+    you MUST generate a date spine and LEFT JOIN the actual data to it.
+    This ensures every day in the requested range appears on the chart even when count = 0.
+    NEVER use plain GROUP BY date — it silently drops zero-count days.
+
+    Snowflake pattern (use when db_dialect is "snowflake" or connection is Snowflake):
+      WITH date_spine AS (
+          SELECT DATEADD(day, seq4(), DATEADD(day, -(N-1), CURRENT_DATE())) AS dt
+          FROM TABLE(GENERATOR(ROWCOUNT => N))
+      )
+      SELECT ds.dt AS "Date", COUNT(t.id) AS "Count"
+      FROM date_spine ds
+      LEFT JOIN schema_name.table_name t ON DATE(t.date_column) = ds.dt
+      GROUP BY ds.dt ORDER BY ds.dt
+
+    PostgreSQL / Redshift pattern:
+      WITH date_spine AS (
+          SELECT generate_series(
+              CURRENT_DATE - INTERVAL 'N-1 days',
+              CURRENT_DATE,
+              INTERVAL '1 day'
+          )::date AS dt
+      )
+      SELECT ds.dt AS "Date", COUNT(t.id) AS "Count"
+      FROM date_spine ds
+      LEFT JOIN table_name t ON DATE(t.date_column) = ds.dt
+      GROUP BY ds.dt ORDER BY ds.dt
+
+    MySQL pattern:
+      WITH RECURSIVE date_spine AS (
+          SELECT CURDATE() - INTERVAL (N-1) DAY AS dt
+          UNION ALL
+          SELECT dt + INTERVAL 1 DAY FROM date_spine WHERE dt < CURDATE()
+      )
+      SELECT ds.dt AS "Date", COUNT(t.id) AS "Count"
+      FROM date_spine ds
+      LEFT JOIN table_name t ON DATE(t.date_column) = ds.dt
+      GROUP BY ds.dt ORDER BY ds.dt
+
+    Replace N with the actual number of days requested (e.g. 7 for "last 7 days").
+    Use COUNT(t.primary_key_col) — NOT COUNT(*) — so that unmatched LEFT JOIN rows return 0.
+
+    THE SAME ZERO-FILL RULE APPLIES TO WEEK-WISE AND MONTH-WISE CHARTS:
+    months/weeks with no data MUST still appear with value 0.
+    Snowflake month spine ("last 12 months"):
+      WITH month_spine AS (
+          SELECT DATE_TRUNC('month', DATEADD(month, -seq4(), CURRENT_DATE())) AS mth
+          FROM TABLE(GENERATOR(ROWCOUNT => 12))
+      )
+      SELECT ms.mth AS "Month", COUNT(t.id) AS "Count"
+      FROM month_spine ms
+      LEFT JOIN schema.table_name t ON DATE_TRUNC('month', t.date_column) = ms.mth
+      GROUP BY ms.mth ORDER BY ms.mth
+    PostgreSQL/Redshift month spine: generate_series(DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months', DATE_TRUNC('month', CURRENT_DATE), INTERVAL '1 month')
+    For week spines use DATE_TRUNC('week', ...) with 1-week steps.
+
+13. TIME GRANULARITY (CRITICAL — when "time_granularity" is present in entities):
+    The user explicitly asked for that time bucket. You MUST group dates at EXACTLY
+    that unit — no other:
+    - "day"     → DATE_TRUNC('day', date_col)  or DATE(date_col)
+    - "week"    → DATE_TRUNC('week', date_col)
+    - "month"   → DATE_TRUNC('month', date_col)
+    - "quarter" → DATE_TRUNC('quarter', date_col)
+    - "year"    → DATE_TRUNC('year', date_col)  or EXTRACT(YEAR FROM date_col)
+    NEVER substitute a different unit. "month wise" with daily rows or yearly totals
+    is WRONG. Combine with the date-spine rule so empty buckets appear as 0.
 
 CHART TYPE SQL PATTERNS:
 - line: SELECT date_trunc('month', date_col) AS period, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 1
@@ -355,6 +457,20 @@ GROUPED KPI / MULTI-ROW CARD (multiple metric values broken down by a category):
          FROM bullhorn_core_job_order
          GROUP BY source ORDER BY 2 DESC LIMIT 20
 
+DAY-WISE BAR/LINE CHART with date spine (ALWAYS use this for "last N days" with daily granularity):
+  Chart: "Daily Placements – Last 7 Days", x="Date", y="Placements"
+  Snowflake SQL:
+    WITH date_spine AS (
+        SELECT DATEADD(day, seq4(), DATEADD(day, -6, CURRENT_DATE())) AS dt
+        FROM TABLE(GENERATOR(ROWCOUNT => 7))
+    )
+    SELECT ds.dt AS "Date", COUNT(t.id) AS "Placements"
+    FROM date_spine ds
+    LEFT JOIN STG_POC.TRNSCTN t ON DATE(t.created_at) = ds.dt
+    GROUP BY ds.dt
+    ORDER BY ds.dt
+  ← All 7 days appear, zero-count days show 0 instead of being omitted.
+
 WATERFALL CHART (bridge / variance decomposition — positive=gain, negative=loss, last row=total):
   Chart: "Revenue Bridge Q1→Q2", steps=cost categories
   SQL:   SELECT step_name AS "Category", delta AS "Change"
@@ -392,6 +508,8 @@ class QueryAgent:
         retrieved_context: Optional["RetrievedContext"] = None,
         conversation_history: Optional[list] = None,
         user_profile: Optional[dict] = None,
+        metric_definitions: Optional[list] = None,
+        few_shot_examples: Optional[list] = None,
     ) -> QueryPlan:
         # ── Table selection: Graph RAG > word-overlap > schema.important_tables ──
         if retrieved_context and retrieved_context.primary_tables and enriched and enriched.compact_tables:
@@ -481,6 +599,7 @@ class QueryAgent:
                 "metrics": intent.entities.metrics,
                 "dimensions": intent.entities.dimensions,
                 "time_range": intent.entities.time_range.model_dump() if intent.entities.time_range else None,
+                "time_granularity": getattr(intent.entities, "time_granularity", None),
                 "chart_type_hint": intent.entities.chart_type,
                 "filters": [f.model_dump() for f in intent.entities.filters],
             },
@@ -498,6 +617,34 @@ class QueryAgent:
             if hints:
                 user_content["graph_rag_hints"] = hints
 
+        # Column-exact injection: give the LLM the precise column names/types
+        # for the top candidate so it copies rather than guesses
+        if enriched and enriched.compact_tables and retrieved_context and retrieved_context.candidates:
+            top_tname = retrieved_context.candidates[0].table_name
+            ct_map = {t["name"]: t for t in enriched.compact_tables}
+            top_ct = ct_map.get(top_tname)
+            if top_ct:
+                exact_cols = [
+                    {
+                        "name": c.get("name"),
+                        "type": c.get("type"),
+                        "semantic_type": c.get("semantic_type"),
+                        "description": c.get("description") or "",
+                    }
+                    for c in top_ct.get("columns", [])
+                ]
+                user_content["exact_column_schema"] = {
+                    "table": top_tname,
+                    "is_view": top_ct.get("is_view", False),
+                    "columns": exact_cols,
+                    "instruction": (
+                        "IMPORTANT: use ONLY the column names listed in exact_column_schema.columns. "
+                        "Never invent column names. If a needed column is missing, say so in your reasoning."
+                    ),
+                }
+                if getattr(retrieved_context, "needs_join", False) and getattr(retrieved_context, "join_path", []):
+                    user_content["exact_column_schema"]["join_path"] = retrieved_context.join_path
+
         # Inject conversation history so the LLM can resolve follow-up references
         # ("same table", "now add region", "break that down by X", "filter by last year", etc.)
         if conversation_history:
@@ -512,6 +659,27 @@ class QueryAgent:
                 "If it is a follow-up, build the SQL that satisfies both the prior intent "
                 "and the new refinement."
             )
+
+        # Recently-used table memory: tables used in recent turns get priority
+        if conversation_history:
+            import re as _re
+            recent_tables: list[str] = []
+            for turn in conversation_history[-4:]:
+                sql_text = turn.get("sql") or ""
+                if sql_text:
+                    for m in _re.finditer(r'\bFROM\s+([\w.]+)\b', sql_text, _re.IGNORECASE):
+                        tname = m.group(1).strip('"').strip("'")
+                        if tname and tname not in recent_tables:
+                            recent_tables.append(tname)
+                    for m in _re.finditer(r'\bJOIN\s+([\w.]+)\b', sql_text, _re.IGNORECASE):
+                        tname = m.group(1).strip('"').strip("'")
+                        if tname and tname not in recent_tables:
+                            recent_tables.append(tname)
+            if recent_tables:
+                user_content["recently_used_tables"] = {
+                    "tables": recent_tables[:4],
+                    "note": "These tables were used in recent turns of this conversation. Prefer them when ambiguous.",
+                }
 
         # ── User profile filter (Brainwave role-based access control) ────────────
         # If the user has a role that restricts data access (e.g. placement_specialist),
@@ -538,6 +706,42 @@ class QueryAgent:
                     "role":         _role,
                 }
 
+        # ── Authoritative metric definitions (metric registry) ───────────────────
+        # When the project has canonical definitions for the metrics mentioned,
+        # the LLM must use them verbatim instead of re-deriving table/column/agg.
+        if metric_definitions:
+            user_content["metric_definitions"] = {
+                "definitions": metric_definitions,
+                "instruction": (
+                    "AUTHORITATIVE: these are this project's canonical metric definitions. "
+                    "Use the specified table, aggregation expression, and date column EXACTLY "
+                    "as defined — do not substitute other tables or columns for these metrics."
+                ),
+            }
+
+        # ── Few-shot examples from query memory (past successful queries) ────────
+        if few_shot_examples:
+            user_content["similar_past_queries"] = {
+                "examples": few_shot_examples,
+                "note": (
+                    "These similar questions were answered successfully before on THIS database. "
+                    "Reuse their table choices and SQL patterns when applicable."
+                ),
+            }
+
+        # ── Hard granularity constraint ───────────────────────────────────────────
+        _gran = getattr(intent.entities, "time_granularity", None)
+        if _gran:
+            user_content["granularity_required"] = {
+                "unit": _gran,
+                "instruction": (
+                    f"MANDATORY: the user asked for a {_gran}-wise breakdown. "
+                    f"GROUP BY DATE_TRUNC('{_gran}', date_col) (or dialect equivalent) — "
+                    f"exactly one row per {_gran}. Use a date spine (rule 12) so {_gran}s "
+                    f"with zero activity still appear with value 0. Do NOT use any other time unit."
+                ),
+            }
+
         if retry_feedback:
             user_content["retry_feedback"] = retry_feedback
             user_content["attempt"] = attempt
@@ -562,8 +766,10 @@ class QueryAgent:
 
         # Increase temperature on retries to force diverse SQL exploration
         _temp = 0.10 if attempt == 1 else min(0.20 + (attempt - 1) * 0.10, 0.45)
+        _model = _pick_model(intent, retrieved_context, attempt, retry_feedback)
+        print(f"[query_agent] model={_model.split('.')[-1]} attempt={attempt} confidence={getattr(retrieved_context, 'confidence', 0):.2f}", flush=True)
         raw = await bedrock_invoke(
-            model_id=QUERY_AGENT_MODEL,
+            model_id=_model,
             system_prompt=SYSTEM_PROMPT,
             user_message=json.dumps(user_content, default=str),
             max_tokens=_SQL_MAX_TOKENS,

@@ -155,7 +155,10 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     ? rows
     : labels.map((l, i) => ({ [xKey]: l, [yKey]: values[i] }))
 
-  // Strip trailing all-zero rows (SQL often returns future months with 0 values)
+  // Strip trailing all-zero rows (SQL often returns future months with 0 values).
+  // EXCEPTION: zero-filled date spines are intentional — a past day/month with 0
+  // activity must still appear on the axis ("last 7 days" must show 7 bars).
+  // Only trim trailing zeros that are future-dated, or on non-date axes.
   const lastNonZeroIdx = (() => {
     for (let i = rawRechartData.length - 1; i >= 0; i--) {
       const v = Number(rawRechartData[i][yKey] ?? 0)
@@ -163,7 +166,14 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     }
     return rawRechartData.length - 1
   })()
-  const trimmedData = rawRechartData.slice(0, lastNonZeroIdx + 1)
+  const todayIso = new Date().toISOString().slice(0, 10)
+  const trimmedData = rawRechartData.filter((r, i) => {
+    if (i <= lastNonZeroIdx) return true
+    const xv = String(r[xKey] ?? '')
+    // Date-valued x: keep zero rows up to and including today
+    if (/^\d{4}-\d{2}-\d{2}/.test(xv)) return xv.slice(0, 10) <= todayIso
+    return false
+  })
 
   // Format ISO datetime labels to a readable short form (e.g. "2026-03-01T00:00:00" → "Mar 2026")
   const formatXLabel = (val: unknown): string => {

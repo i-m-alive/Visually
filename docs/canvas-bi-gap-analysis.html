@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visually Canvas — BI Gap Analysis &amp; Agentic Platform Roadmap</title>
+<style>
+  :root {
+    --bg: #f6f8fb;
+    --surface: #ffffff;
+    --ink: #1a2233;
+    --muted: #5b6579;
+    --brand: #4f46e5;
+    --brand-soft: #eef2ff;
+    --red: #dc2626;
+    --red-soft: #fef2f2;
+    --amber: #d97706;
+    --amber-soft: #fffbeb;
+    --green: #059669;
+    --green-soft: #ecfdf5;
+    --border: #e5e9f0;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 96px; }
+
+  header.hero {
+    background: linear-gradient(135deg, #312e81 0%, #4f46e5 55%, #7c3aed 100%);
+    color: #fff; border-radius: 16px; padding: 44px 40px; margin-bottom: 40px;
+    box-shadow: 0 20px 50px rgba(79,70,229,.25);
+  }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 760px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+
+  nav.toc {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 56px; }
+  h2 {
+    font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px;
+    padding-top: 12px; scroll-margin-top: 24px;
+  }
+  h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 9px; background: var(--brand);
+    color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px;
+  }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 860px; }
+  h3 { font-size: 17px; font-weight: 700; margin: 26px 0 10px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 22px 26px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+
+  ul.checklist { list-style: none; }
+  ul.checklist li { padding: 5px 0 5px 28px; position: relative; }
+  ul.checklist li::before {
+    content: "✓"; position: absolute; left: 4px; top: 5px;
+    color: var(--green); font-weight: 700;
+  }
+
+  .broken-item {
+    background: var(--red-soft); border: 1px solid #fecaca; border-left: 4px solid var(--red);
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 12px;
+  }
+  .broken-item strong { color: var(--red); }
+  .broken-item .where { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 4px; display: block; }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0 6px; font-size: 14.5px; background: var(--surface); border-radius: 10px; overflow: hidden; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; }
+  th { background: #f1f4f9; text-align: left; padding: 11px 14px; font-size: 12.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); border-bottom: 1px solid var(--border); }
+  td { padding: 12px 14px; border-bottom: 1px solid #eef1f6; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.feat { font-weight: 600; white-space: nowrap; }
+
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .02em; }
+  .pill.p0 { background: var(--red-soft); color: var(--red); }
+  .pill.p1 { background: var(--amber-soft); color: var(--amber); }
+  .pill.p2 { background: var(--brand-soft); color: var(--brand); }
+
+  .agentic {
+    background: var(--brand-soft); border-left: 3px solid var(--brand);
+    padding: 10px 14px; border-radius: 0 8px 8px 0; margin-top: 8px; font-size: 14.5px;
+  }
+  .agentic::before { content: "🤖 Agentic twist: "; font-weight: 700; color: var(--brand); }
+
+  .fix-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .fix {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px;
+  }
+  .fix h4 { font-size: 15px; margin-bottom: 6px; }
+  .fix .before-after { font-size: 13px; color: var(--muted); }
+  .fix code { background: #f1f4f9; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+
+  .roadmap { display: grid; gap: 14px; }
+  .phase { border-radius: 12px; padding: 20px 24px; border: 1px solid var(--border); background: var(--surface); }
+  .phase.p0 { border-left: 5px solid var(--red); }
+  .phase.p1 { border-left: 5px solid var(--amber); }
+  .phase.p2 { border-left: 5px solid var(--brand); }
+  .phase h3 { margin-top: 0; }
+  .phase ul { margin-left: 20px; }
+  .phase li { margin-bottom: 4px; }
+
+  .callout {
+    background: linear-gradient(135deg, #eef2ff, #faf5ff); border: 1px solid #ddd6fe;
+    border-radius: var(--radius); padding: 22px 26px; font-size: 16px;
+  }
+  .callout strong { color: var(--brand); }
+
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  footer { margin-top: 60px; color: var(--muted); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>Visually Canvas — BI Gap Analysis &amp; Agentic Platform Roadmap</h1>
+  <p>A full audit of the Canvas editor, VisuallReport view, sharing surfaces, and backend API — measured against Power BI–class platforms — with a design direction for making every capability agent-native, robust, and UX-friendly.</p>
+  <div class="meta">
+    <span>📅 July 2026</span>
+    <span>🔍 Scope: 19 canvas components · ChartRenderer · 3 public token surfaces · full backend API</span>
+    <span>📄 Research only — no implementation</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#have">What the platform already has</a></li>
+    <li><a href="#broken">Broken or half-built features (fix first)</a></li>
+    <li><a href="#gaps">Missing BI features + agentic integration</a></li>
+    <li><a href="#workarea">Work-area visual enhancement plan</a></li>
+    <li><a href="#roadmap">Prioritized roadmap</a></li>
+    <li><a href="#thesis">The strategic through-line</a></li>
+  </ol>
+</nav>
+
+<!-- ══════════════════════════ 1 ══════════════════════════ -->
+<section id="have">
+  <h2><span class="num">1</span>What the platform already has</h2>
+  <p class="lede">Roughly Power BI's surface area at 30–40% depth. This is a serious foundation:</p>
+  <div class="card">
+    <ul class="checklist">
+      <li><strong>42 chart types</strong> (bar/line/pie through sankey, chord, gantt, choropleth, org chart, word cloud) rendered via recharts + custom SVG</li>
+      <li><strong>Multi-page canvases</strong> — add, rename, delete, duplicate, drag-reorder (bottom tab strip, Power BI convention)</li>
+      <li><strong>Drag/resize grid editor</strong> (react-grid-layout, 12 columns, 70px rows) with auto-arrange by widget type</li>
+      <li><strong>AI copilot in the canvas</strong> — chat generates widgets, streams responses, adds to the active page</li>
+      <li><strong>Cross-filtering + AI drill-down</strong> (report view) — click a bar/slice → server-side requery of all widgets</li>
+      <li><strong>Slicers</strong> — dropdown / checkbox / date-range, token-scoped on public pages</li>
+      <li><strong>Calculated measures</strong> with an AI generator (description → SQL expression)</li>
+      <li><strong>Row-Level Security policies</strong> (per-user WHERE clauses)</li>
+      <li><strong>Sharing</strong> — live/snapshot tokens with expiry, collaborators (viewer/editor), embed iframes, three public skins (share / embed / executive report)</li>
+      <li><strong>.vly / .ovly export-import</strong> — portable canvas bundles, offline mode with DuckDB + Parquet</li>
+      <li><strong>Scheduled refresh</strong> (cron presets via APScheduler) + per-widget manual refresh</li>
+      <li><strong>8 report themes</strong> incl. glassmorphism, dark, accessible; 4 background patterns; slide/story mode; focus mode; newspaper layout</li>
+      <li><strong>Client-side analytics</strong> — linear forecast, prior-period comparison, 2σ anomaly highlighting, auto-captions, key-driver callouts</li>
+      <li><strong>Annotations &amp; bookmarks</strong> (share view), SQL sandbox, schema browser, email-snapshot schedule UI</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 2 ══════════════════════════ -->
+<section id="broken">
+  <h2><span class="num">2</span>Broken or half-built features — fix before adding anything</h2>
+  <p class="lede">Found during the code audit. These matter more than new features because users will hit them and lose trust.</p>
+
+  <div class="broken-item">
+    <strong>PDF / PNG export is a stub.</strong> <code>export_service</code> returns <code>not_implemented</code>, <code>render_service</code> returns empty images, and the share page's "Export PDF" button calls an endpoint that <em>does not exist</em> — the "PDF export queued…" alert is misleading. Only per-widget CSV works.
+    <span class="where">export_service/routers/pdf_export.py:33 · png_export.py:31 · render_service/src/index.js · share page.tsx:244</span>
+  </div>
+  <div class="broken-item">
+    <strong>Email snapshot schedules are stored but never sent.</strong> <code>SnapshotSchedule</code> rows get <code>next_send_at</code> computed, but there is no SMTP / SES / Resend sender anywhere in the backend.
+    <span class="where">routers/analyst.py:727-767 · shared/models/snapshot_schedules.py</span>
+  </div>
+  <div class="broken-item">
+    <strong>RLS is not enforced on public or scheduled paths.</strong> Policies apply only when the owner manually triggers requery-RLS. Anonymous share-link refreshes and cron refreshes run unfiltered SQL. A governance feature that doesn't govern is a security gap.
+    <span class="where">routers/tier5.py:497 (only enforcement point) · public_canvas.py · scheduler.py (no RLS references)</span>
+  </div>
+  <div class="broken-item">
+    <strong>Version history is a dead table.</strong> <code>DashboardVersion</code> exists as a model; zero endpoints or code reference it.
+    <span class="where">shared/models/phase2.py:9</span>
+  </div>
+  <div class="broken-item">
+    <strong>Report-view state is ephemeral.</strong> Chart-type overrides, forecast/compare toggles, per-chart date filters, layout mode, AI table names vanish on reload. Theme, bookmarks, annotations live in localStorage only — never shared across users or devices.
+    <span class="where">VisuallReport.tsx:581-619</span>
+  </div>
+  <div class="broken-item">
+    <strong>Canvas chat history is lost on every reload</strong> — session ID is minted per mount (<code>canvas-{id}-{Date.now()}</code>). Widget locks are in-memory only.
+    <span class="where">CanvasChatPanel.tsx:128 · canvas page.tsx:418-429</span>
+  </div>
+  <div class="broken-item">
+    <strong>Undo/redo covers layout only</strong> — not title/type/palette edits or deletions (beyond a 4-second banner), and none at all in the report view.
+    <span class="where">canvas page.tsx:283-352</span>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 3 ══════════════════════════ -->
+<section id="gaps">
+  <h2><span class="num">3</span>Missing BI features — and how an agentic platform should integrate them</h2>
+  <p class="lede">Grouped by domain. Each row: what standard BI platforms do, and the agent-native version with its UI treatment.</p>
+
+  <h3>A. Authoring &amp; layout <span class="pill p1">biggest gap vs Power BI</span></h3>
+  <div class="tablewrap"><table>
+    <tr><th style="width:22%">Missing</th><th style="width:34%">Standard BI treatment</th><th>Agentic integration + UI</th></tr>
+    <tr>
+      <td class="feat">Fixed-size pages</td>
+      <td>16:9 / 4:3 / custom page canvas instead of a fluid sheet</td>
+      <td>Page-size picker in a page-format panel; agent auto-fits existing widgets when the size changes</td>
+    </tr>
+    <tr>
+      <td class="feat">Text / image / shape / button widgets</td>
+      <td>Insert menu with static content elements</td>
+      <td>"Add a title saying Q3 Review" in chat → agent inserts a styled text widget. Buttons trigger <em>agent actions</em> ("refresh &amp; summarize this page")</td>
+    </tr>
+    <tr>
+      <td class="feat">Multi-select, align / distribute, smart guides</td>
+      <td>Marquee selection, alignment toolbar, snap lines while dragging</td>
+      <td>Plus a "Tidy up" command: "align these KPIs and equalize spacing" — a layout agent computes the grid</td>
+    </tr>
+    <tr>
+      <td class="feat">Conditional formatting &amp; number formats</td>
+      <td>Per-widget format pane: currency, decimals, data bars, color rules</td>
+      <td>Agent sets rules from language: "show margin in red when below 20%" → writes a formatting rule object, visible and editable in the format pane</td>
+    </tr>
+    <tr>
+      <td class="feat">Full undo/redo + copy/paste</td>
+      <td>Command stack over <em>all</em> widget mutations, cross-page paste</td>
+      <td><strong>Every agent action goes through the same command stack</strong> — "undo what the AI just did" is one Ctrl+Z. The single most trust-building feature an agentic BI tool can ship</td>
+    </tr>
+    <tr>
+      <td class="feat">Templates / layout gallery</td>
+      <td>Template picker on new page</td>
+      <td>Agent generates a full page from a goal: "make an executive overview for sales" → proposes 2–3 layout candidates as thumbnails, user picks one</td>
+    </tr>
+  </table></div>
+  <div class="agentic">Replace per-widget header dropdowns with a <strong>contextual right-side property panel</strong> (Figma / Power BI pattern): select a widget → Format / Data / AI tabs. The AI tab shows <em>why the chart exists</em> — the question that created it, the SQL, the agent's reasoning — plus one-click variants. Widget chrome stays minimal.</div>
+
+  <h3>B. Data modeling &amp; semantics</h3>
+  <div class="tablewrap"><table>
+    <tr><th style="width:22%">Missing</th><th style="width:34%">Standard BI treatment</th><th>Agentic integration + UI</th></tr>
+    <tr>
+      <td class="feat">Semantic model UI</td>
+      <td>Dataset / metric definitions with owners and certification</td>
+      <td>A "Metrics" page over the existing backend metric registry: each metric is a card (definition, owner, verified badge). Agent <em>proposes</em> definitions from usage: "you've asked about 'placements' 14 times — pin this definition?"</td>
+    </tr>
+    <tr>
+      <td class="feat">Relationship / model editor</td>
+      <td>Star-schema diagram with join editing</td>
+      <td>Render the existing FK graph as an interactive diagram; agent explains joins; user-confirmed edges feed straight back into Graph RAG retrieval accuracy</td>
+    </tr>
+    <tr>
+      <td class="feat">Drill hierarchies</td>
+      <td>Predefined year→quarter→month, region→city paths</td>
+      <td>Agent infers hierarchies once, persists them → drill-down becomes instant and deterministic, LLM fallback only for undefined paths (today every level is a fresh LLM call)</td>
+    </tr>
+    <tr>
+      <td class="feat">Measure editing &amp; validation</td>
+      <td>Edit, dry-run preview, syntax checks</td>
+      <td>Panel is create/delete only today; add edit + a dry-run "preview result" that the agent sanity-checks ("this returns 0 rows — the filter may be wrong")</td>
+    </tr>
+  </table></div>
+
+  <h3>C. Interactivity</h3>
+  <div class="tablewrap"><table>
+    <tr><th style="width:22%">Missing</th><th style="width:34%">Standard BI treatment</th><th>Agentic integration + UI</th></tr>
+    <tr>
+      <td class="feat">Cross-filtering in the editor</td>
+      <td>Configurable interactions: which widgets respond, highlight vs filter mode</td>
+      <td>Bring the report-view cross-filter to the editor with Power BI's "edit interactions" affordance</td>
+    </tr>
+    <tr>
+      <td class="feat">Cascading slicers</td>
+      <td>Slicer values narrow based on other active slicers</td>
+      <td>Same, agent warns when slicer combinations produce empty results and suggests the closest non-empty state</td>
+    </tr>
+    <tr>
+      <td class="feat">Server-side bookmarks</td>
+      <td>Shareable saved views; bookmark navigation as stories</td>
+      <td>Move bookmarks/annotations from localStorage to the existing DB models → shareable; bookmark navigation powers the existing slide-mode as a story feature</td>
+    </tr>
+    <tr>
+      <td class="feat">Explain-this-point</td>
+      <td>Power BI "key influencers" visual (single chart type)</td>
+      <td><strong>A "why?" affordance on every data point</strong>: right-click → "explain this spike" → agent runs decomposition queries and answers inline. Conversational and universal — the interaction incumbents can't match</td>
+    </tr>
+  </table></div>
+
+  <h3>D. Distribution &amp; consumption</h3>
+  <div class="tablewrap"><table>
+    <tr><th style="width:22%">Missing</th><th style="width:34%">Standard BI treatment</th><th>Agentic integration + UI</th></tr>
+    <tr>
+      <td class="feat">Real PDF / PNG export</td>
+      <td>Server-side rendering</td>
+      <td>Playwright/Puppeteer render in the existing <code>render_service</code> skeleton; agent picks page breaks and adds a summary cover page</td>
+    </tr>
+    <tr>
+      <td class="feat">Email subscriptions that send</td>
+      <td>Scheduled static snapshot emails</td>
+      <td>Wire Resend/SES into the existing scheduler — and let the agent write the body: a "what changed since last week" digest, not just an image</td>
+    </tr>
+    <tr>
+      <td class="feat">Data alerts</td>
+      <td>"KPI &lt; X" threshold rules</td>
+      <td>"Watch this chart and tell me when something unusual happens" → agent runs the query on schedule, applies anomaly detection (2σ logic already exists client-side), notifies with a natural-language explanation. UI: bell icon on every KPI/chart → plain-language alert composer</td>
+    </tr>
+    <tr>
+      <td class="feat">Mobile layout</td>
+      <td>Per-breakpoint layouts (react-grid-layout supports this; today one layout is reused for all breakpoints)</td>
+      <td>Agent auto-generates the phone layout; user tweaks it in a phone-frame preview</td>
+    </tr>
+  </table></div>
+
+  <h3>E. Governance &amp; trust</h3>
+  <div class="tablewrap"><table>
+    <tr><th style="width:22%">Missing</th><th style="width:34%">Standard BI treatment</th><th>Agentic integration + UI</th></tr>
+    <tr>
+      <td class="feat">RLS enforcement everywhere</td>
+      <td>Policies applied on every data path</td>
+      <td>Enforce on public-token and scheduled refresh paths (blocker for real deployment); agent offers a "view as user X" preview</td>
+    </tr>
+    <tr>
+      <td class="feat">Version history + diff</td>
+      <td>Snapshot timeline, restore</td>
+      <td>Wire the existing dead <code>DashboardVersion</code> table on save; agent diffs versions in prose: "Rahul added 2 charts; revenue KPI definition changed"</td>
+    </tr>
+    <tr>
+      <td class="feat">Certified content</td>
+      <td>Verified dataset / report badges</td>
+      <td>Badge for widgets whose SQL a human approved; the thumbs-up feedback loop is the natural input signal</td>
+    </tr>
+    <tr>
+      <td class="feat">Lineage</td>
+      <td>Source → transformation → visual graph</td>
+      <td>Per widget: table → SQL → chart, rendered from data already stored (<code>sql_query</code>, <code>table_used</code>); agent narrates it on demand</td>
+    </tr>
+  </table></div>
+
+  <h3>F. Collaboration</h3>
+  <div class="tablewrap"><table>
+    <tr><th style="width:22%">Missing</th><th style="width:34%">Standard BI treatment</th><th>Agentic integration + UI</th></tr>
+    <tr>
+      <td class="feat">Comments on the builder canvas</td>
+      <td>Threaded comments, @mentions, resolve</td>
+      <td>Annotation model exists only on the share view — extend to the editor with user FKs; agent can answer questions asked in a comment thread</td>
+    </tr>
+    <tr>
+      <td class="feat">Real-time presence</td>
+      <td>Live cursors, co-editing</td>
+      <td>Defer — a simple "someone else edited, reload" conflict guard is 90% of the value at 5% of the cost</td>
+    </tr>
+  </table></div>
+</section>
+
+<!-- ══════════════════════════ 4 ══════════════════════════ -->
+<section id="workarea">
+  <h2><span class="num">4</span>Work-area visual enhancement plan</h2>
+  <p class="lede">Current state, factually: workspace is <code>#f1f5f9</code> with a dotted pattern; the page is a fluid white sheet with a <strong>2px dashed border</strong>; widgets are white cards with a 3px chart-type colored left border and a permanent 34px gray header bar. Ten concrete fixes:</p>
+
+  <div class="fix-grid">
+    <div class="fix"><h4>1 · Kill the dashed border</h4>
+      <p class="before-after">Dashed = "drop zone placeholder" in every design language. Make the page read like a document: solid white, <code>border-radius: 8px</code>, layered shadow <code>0 1px 3px rgba(0,0,0,.06), 0 12px 40px rgba(0,0,0,.08)</code>. VisuallReport already does exactly this — steal its page treatment.</p></div>
+    <div class="fix"><h4>2 · Fixed-aspect page + letterboxing</h4>
+      <p class="before-after">A 1280×720 (16:9) page centered with generous letterbox margin instantly reads "professional BI tool". Zoom-to-fit by default; keep the 0.5–1.5× zoom.</p></div>
+    <div class="fix"><h4>3 · Quieter workspace background</h4>
+      <p class="before-after">Flat <code>#EBEEF3</code>, or dots at ~40% of current contrast. The page should be the only bright thing on screen.</p></div>
+    <div class="fix"><h4>4 · Hover-reveal widget chrome</h4>
+      <p class="before-after">The permanent 34px gray header × N widgets = visual noise. Headers transparent until hover/selection; title floats in the card's own typography; grip/actions fade in. Selected widget: 2px brand outline + resize handles on all 8 sides (currently only se/e/s).</p></div>
+    <div class="fix"><h4>5 · One card language for edit + view</h4>
+      <p class="before-after">Adopt VisuallReport's <code>cardBase</code> (softer shadow, 10–12px radius, hover lift) in the editor so both modes feel like one product. Make the colored type-border optional — it fights with data colors.</p></div>
+    <div class="fix"><h4>6 · Theming in the editor</h4>
+      <p class="before-after">8 report themes don't touch the editor. Persist theme on the dashboard row (a <code>theme</code> column already exists, defaulting to "frost"!) and apply it in both surfaces.</p></div>
+    <div class="fix"><h4>7 · Alignment guides + drop preview</h4>
+      <p class="before-after">Smart guides while dragging plus a ghost placeholder showing the exact drop cell. react-grid-layout won't provide this — render guide overlays from layout math, or move to a custom drag layer.</p></div>
+    <div class="fix"><h4>8 · Page tabs polish</h4>
+      <p class="before-after">Bottom strip is the right convention — add per-page icons/colors, overflow scrolling, a compact "+" with a template menu, drag-reorder animation.</p></div>
+    <div class="fix"><h4>9 · Prompt-first empty state</h4>
+      <p class="before-after">Replace the static 3-step card with a centered command bar ("Describe the page you want…") + 3 template thumbnails. For an agent-native product, the empty state <em>is</em> the chat input.</p></div>
+    <div class="fix"><h4>10 · In-canvas generation skeletons</h4>
+      <p class="before-after">While the agent generates a chart, show a skeleton card animating in place on the canvas — not just in the chat panel — so the canvas feels alive.</p></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 5 ══════════════════════════ -->
+<section id="roadmap">
+  <h2><span class="num">5</span>Prioritized roadmap</h2>
+  <div class="roadmap">
+    <div class="phase p0">
+      <h3><span class="pill p0">P0</span> &nbsp;Broken / trust</h3>
+      <ul>
+        <li>Real PDF/PNG export (server-side Playwright render)</li>
+        <li>Email sender for snapshot schedules</li>
+        <li>RLS enforcement on public + scheduled paths</li>
+        <li>Persist report-view state and canvas chat sessions</li>
+        <li>Full undo/redo command stack (all mutations, agent actions included)</li>
+      </ul>
+    </div>
+    <div class="phase p1">
+      <h3><span class="pill p1">P1</span> &nbsp;Core BI parity + work-area redesign</h3>
+      <ul>
+        <li>Fixed 16:9 page + new page/card visuals (§4)</li>
+        <li>Contextual property panel (Format / Data / AI tabs)</li>
+        <li>Text / image widgets</li>
+        <li>Multi-select + alignment tools</li>
+        <li>Number formats + conditional formatting</li>
+        <li>Cross-filtering in the editor</li>
+        <li>Server-side bookmarks &amp; annotations</li>
+      </ul>
+    </div>
+    <div class="phase p2">
+      <h3><span class="pill p2">P2</span> &nbsp;Agentic differentiators</h3>
+      <ul>
+        <li>Metric registry UI + verified metrics</li>
+        <li>Agent alerts with natural-language explanations</li>
+        <li>"Explain this point" on every data point</li>
+        <li>Agent-generated page layouts (template candidates)</li>
+        <li>Version diff in prose</li>
+        <li>Relationship editor feeding retrieval accuracy</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 6 ══════════════════════════ -->
+<section id="thesis">
+  <h2><span class="num">6</span>The strategic through-line</h2>
+  <div class="callout">
+    Power BI's moat is the <strong>format pane</strong>. Yours is that <strong>every capability is reachable through language, and every agent action is inspectable and undoable</strong>. Build the property panel so humans can do everything manually — but make the agent the fastest path to the same result, and always show its work (question → SQL → reasoning) in the widget's AI tab.
+  </div>
+</section>
+
+<footer>
+  Visually · Canvas BI Gap Analysis · generated from a full code audit of the canvas editor, VisuallReport, public token surfaces, and backend API — July 2026
+</footer>
+
+</div>
+</body>
+</html>

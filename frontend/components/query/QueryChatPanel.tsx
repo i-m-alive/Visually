@@ -4,7 +4,7 @@ import {
   Send, Loader2, AlertCircle, TrendingUp, MessageSquare, X, LayoutDashboard,
   Plus, Trash2, Edit2, Check, ChevronLeft, ChevronRight, Code, Download, RefreshCw,
   Copy, Volume2, VolumeX, FileText, Star, Maximize2, Square, Search, ChevronDown,
-  ExternalLink, StickyNote, Mic, MicOff,
+  ExternalLink, StickyNote, Mic, MicOff, ThumbsUp, ThumbsDown,
 } from 'lucide-react'
 import { agentApi, querySessionApi, type ConversationTurn } from '@/lib/api'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
@@ -216,6 +216,19 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
   const [starredIds, setStarredIds] = useState<Set<string>>(new Set())
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [speakingId, setSpeakingId] = useState<string | null>(null)
+  // Thumbs feedback per assistant message — feeds backend query memory
+  const [feedbackGiven, setFeedbackGiven] = useState<Record<string, 'up' | 'down'>>({})
+
+  const sendFeedback = useCallback((msgKey: string, question: string, cr: ChartResult, helpful: boolean) => {
+    setFeedbackGiven((prev) => ({ ...prev, [msgKey]: helpful ? 'up' : 'down' }))
+    agentApi.submitQueryFeedback(projectId, {
+      question,
+      helpful,
+      sql: cr.sql,
+      table_used: cr.table_used,
+      chart_type: cr.chart_type,
+    }).catch(() => { /* feedback is best-effort */ })
+  }, [projectId])
 
   usePipelineSocket(activeJobId)
 
@@ -779,9 +792,37 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                           const activeChartType = chartTypeOverrides[msgKey] || cr.chart_type
                           const compatTypes = compatibleChartTypes(cr)
 
+                          // Nearest preceding user message = the question this answer belongs to
+                          const _msgIdx = messages.findIndex((m) => m.id === msg.id)
+                          let questionText = ''
+                          for (let i = _msgIdx - 1; i >= 0; i--) {
+                            if (messages[i].type === 'user') { questionText = messages[i].content; break }
+                          }
+                          const fb = feedbackGiven[msgKey]
+
                           const HoverActions = () => (
                             <div className="opacity-0 group-hover:opacity-100 transition-all duration-150 flex items-center gap-1 flex-wrap pt-2 border-t border-gray-100 mt-1">
                               {cr.low_confidence && <span className="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full">Low confidence</span>}
+                              {questionText && cr.sql && (
+                                <>
+                                  <button
+                                    onClick={() => sendFeedback(msgKey, questionText, cr, true)}
+                                    disabled={!!fb}
+                                    className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${fb === 'up' ? 'bg-green-100 text-green-700' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'} ${fb ? 'cursor-default' : ''}`}
+                                    title="Correct answer — remember this pattern"
+                                  >
+                                    <ThumbsUp size={10} fill={fb === 'up' ? 'currentColor' : 'none'} />{fb === 'up' ? 'Saved' : ''}
+                                  </button>
+                                  <button
+                                    onClick={() => sendFeedback(msgKey, questionText, cr, false)}
+                                    disabled={!!fb}
+                                    className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${fb === 'down' ? 'bg-red-100 text-red-700' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'} ${fb ? 'cursor-default' : ''}`}
+                                    title="Wrong answer — don't reuse this pattern"
+                                  >
+                                    <ThumbsDown size={10} fill={fb === 'down' ? 'currentColor' : 'none'} />
+                                  </button>
+                                </>
+                              )}
                               {responseText && <button onClick={() => copyText(responseText, `${msgKey}-text`)} className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-full flex items-center gap-1">{copiedId === `${msgKey}-text` ? <Check size={10} className="text-green-500" /> : <Copy size={10} />} Copy</button>}
                               {responseText && <button onClick={() => isSpeaking ? stopSpeaking() : speakText(responseText, msgKey)} className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${isSpeaking ? 'bg-brand text-white' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'}`}>{isSpeaking ? <VolumeX size={10} /> : <Volume2 size={10} />}{isSpeaking ? 'Stop' : 'Listen'}</button>}
                               <button onClick={() => toggleStar(msgKey)} className={`text-xs px-2 py-0.5 rounded-full flex items-center gap-1 ${isStarred ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-600'}`}><Star size={10} fill={isStarred ? 'currentColor' : 'none'} />{isStarred ? 'Starred' : 'Star'}</button>

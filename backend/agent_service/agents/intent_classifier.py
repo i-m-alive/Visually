@@ -35,6 +35,17 @@ ENTITY TYPES to extract:
 - metrics: numeric measure words (revenue, sales, count, orders, churn, rate, total, average)
 - dimensions: grouping/category words (region, product, category, country, status, month, year, user)
 - time_range: date references ("last quarter", "this year", "2024", "past 30 days") -> normalize to {type: "relative"|"absolute", value: str}
+- time_granularity: the GROUP BY time bucket the user wants, when they ask for a time-bucketed breakdown.
+  "day wise" / "daily" / "per day" / "date wise" -> "day"
+  "week wise" / "weekly" / "per week" -> "week"
+  "month wise" / "monthly" / "per month" / "month over month" -> "month"
+  "quarter wise" / "quarterly" -> "quarter"
+  "year wise" / "yearly" / "annual" / "year over year" -> "year"
+  null when the user did not ask for a time-bucketed breakdown.
+  CRITICAL: time_granularity is how to GROUP the data; time_range is how to FILTER it.
+  "placements per month for the last year" -> time_granularity="month" AND time_range="last year".
+  A request for a chart with DATES on the x axis is ALWAYS a granularity request:
+  "7-day application inflow, in x axis I want dates of last 7 days" -> time_granularity="day" AND time_range="last 7 days".
 - chart_type: explicit chart requests (bar, line, pie, donut, scatter, kpi, multi_row_card, table, area, funnel, gauge, treemap, waterfall, slicer) -> null if not specified
   NOTE: use "multi_row_card" when the user wants a KPI card with MULTIPLE values broken down by a category (e.g. "count by region", "jobs per type"). Use "kpi" only for a single aggregate number.
   NOTE: use "slicer" when the user wants a filter control, dropdown slicer, or checkbox filter that will filter other charts on the page.
@@ -54,6 +65,7 @@ Return ONLY valid JSON:
     "metrics": [],
     "dimensions": [],
     "time_range": null,
+    "time_granularity": null,
     "chart_type": null,
     "filters": []
   },
@@ -63,6 +75,41 @@ Return ONLY valid JSON:
   "output_mode": "chart",
   "reasoning": "one sentence"
 }"""
+
+
+# Deterministic granularity detection — backs up the LLM so "month wise"
+# is NEVER lost even when the classifier misses it.
+_GRANULARITY_PATTERNS: list[tuple[str, str]] = [
+    ("day",     r"\b(day\s*wise|daywise|daily|per\s+day|each\s+day|date\s*wise|datewise|day\s+by\s+day)\b"),
+    ("week",    r"\b(week\s*wise|weekwise|weekly|per\s+week|each\s+week)\b"),
+    ("month",   r"\b(month\s*wise|monthwise|monthly|per\s+month|each\s+month|month\s+over\s+month|mom)\b"),
+    ("quarter", r"\b(quarter\s*wise|quarterly|per\s+quarter|each\s+quarter|qoq)\b"),
+    ("year",    r"\b(year\s*wise|yearwise|yearly|annual|annually|per\s+year|each\s+year|year\s+over\s+year|yoy)\b"),
+]
+
+_VALID_GRANULARITIES = frozenset({"day", "week", "month", "quarter", "year"})
+
+
+def detect_time_granularity(text: str) -> str | None:
+    """Keyword-based granularity detection. Returns day|week|month|quarter|year|None."""
+    lower = (text or "").lower()
+    for gran, pat in _GRANULARITY_PATTERNS:
+        if re.search(pat, lower):
+            return gran
+    # Chart-over-dates heuristics — daily buckets implied even without "day wise":
+    # "dates on the x axis", "x axis I want dates", "dates of last 7 days"
+    if (
+        re.search(r"\bdates?\s+(?:on|in|at|for)\s+(?:the\s+)?x[\s-]*axis\b", lower)
+        or re.search(r"\bx[\s-]*axis\b[^.?!]*\bdates?\b", lower)
+        or re.search(r"\bdates?\s+(?:of|for)\s+(?:the\s+)?last\s+\d+\s+days\b", lower)
+    ):
+        return "day"
+    # "7-day inflow chart/graph/trend" — N-day + a chart word implies daily buckets
+    if re.search(r"\b\d+\s*-\s*day\b", lower) and re.search(
+        r"\b(graph|chart|plot|trend|inflow|breakdown|histogram)\b", lower
+    ):
+        return "day"
+    return None
 
 
 class IntentClassifier:
@@ -107,12 +154,21 @@ class IntentClassifier:
             if isinstance(f, dict):
                 filters.append(FilterCondition(column=f.get("column", ""), op=f.get("op", "="), value=f.get("value")))
 
+        # Granularity: trust the LLM when it returned a valid value; otherwise
+        # fall back to deterministic keyword detection on the raw text so
+        # "month wise" is never silently dropped.
+        gran_raw = entities_raw.get("time_granularity")
+        granularity = gran_raw if gran_raw in _VALID_GRANULARITIES else None
+        if granularity is None:
+            granularity = detect_time_granularity(text)
+
         entities = IntentEntities(
             metrics=entities_raw.get("metrics", []),
             dimensions=entities_raw.get("dimensions", []),
             time_range=time_range,
             chart_type=entities_raw.get("chart_type"),
             filters=filters,
+            time_granularity=granularity,
         )
 
         raw_sub_intents = data.get("sub_intents", [])

@@ -231,3 +231,275 @@ def basic_sql_lint(sql: str, db_type: str = "postgresql") -> Optional[str]:
         pass
 
     return None
+
+
+# ── 4b. Intent-contract check ─────────────────────────────────────────────────
+# Deterministic assertions that the generated SQL actually honours the parsed
+# intent (time filter present, correct GROUP BY granularity, KPI shape).
+# Runs before execution; violations become retry feedback.
+
+_DATE_FILTER_MARKERS = (
+    "current_date", "curdate", "getdate", "now()", "interval", "dateadd",
+    "date_sub", "generator", "date_spine", "generate_series", "between",
+)
+
+_GRAN_MARKERS: dict = {
+    "day": ("date_trunc('day'", 'date_trunc("day"', "::date", "date(", "to_date(",
+            "date_spine", "generate_series", "generator", "%y-%m-%d"),
+    "week": ("date_trunc('week'", 'date_trunc("week"', "week(", "weekofyear",
+             "date_spine", "%x-%v"),
+    "month": ("date_trunc('month'", 'date_trunc("month"', "month(", "monthname",
+              "date_spine", "%y-%m", "'mon yyyy'", "'yyyy-mm'"),
+    "quarter": ("date_trunc('quarter'", 'date_trunc("quarter"', "quarter(",
+                "date_spine"),
+    "year": ("date_trunc('year'", 'date_trunc("year"', "year(", "extract(year",
+             "date_part('year'", "%y"),
+}
+
+# A DATE_TRUNC on a DIFFERENT unit than requested is a hard contract violation
+_ALL_TRUNC_UNITS = ("day", "week", "month", "quarter", "year")
+
+
+def check_sql_contract(
+    sql: str,
+    granularity: Optional[str] = None,
+    time_filter_required: bool = False,
+    chart_type: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Verify the generated SQL honours the parsed intent. Returns an error string
+    describing the violation (used as retry feedback), or None when compliant.
+    Deliberately permissive — only flags unambiguous violations.
+    """
+    if not sql or not sql.strip():
+        return None
+    lower = sql.lower()
+
+    # 1. Time-range filter must exist when the user gave a time range
+    if time_filter_required:
+        has_where = "where" in lower
+        has_date_math = any(m in lower for m in _DATE_FILTER_MARKERS)
+        # literal ISO dates ('2026-06-28') also count as a date filter
+        has_literal_date = bool(re.search(r"'\d{4}-\d{2}-\d{2}'", sql))
+        if not (has_where and (has_date_math or has_literal_date)) and "date_spine" not in lower and "generator" not in lower:
+            return (
+                "The user specified a time range but the SQL has no date filter. "
+                "Add a WHERE clause restricting the date column to the requested window."
+            )
+
+    # 2. Granularity: GROUP BY must bucket time at the requested unit
+    if granularity in _GRAN_MARKERS:
+        # A DATE_TRUNC at a different unit is an explicit violation
+        for unit in _ALL_TRUNC_UNITS:
+            if unit == granularity:
+                continue
+            if f"date_trunc('{unit}'" in lower or f'date_trunc("{unit}"' in lower:
+                return (
+                    f"The user asked for a {granularity}-wise breakdown but the SQL "
+                    f"groups by {unit} (DATE_TRUNC('{unit}', ...)). "
+                    f"Use DATE_TRUNC('{granularity}', date_col) instead."
+                )
+        if not any(m in lower for m in _GRAN_MARKERS[granularity]):
+            return (
+                f"The user asked for a {granularity}-wise breakdown but the SQL does not "
+                f"bucket dates by {granularity}. Group by DATE_TRUNC('{granularity}', date_col) "
+                f"(or the dialect equivalent) and return one row per {granularity}."
+            )
+
+    # 3. KPI shape: exactly one aggregate row — GROUP BY is a violation
+    if (chart_type or "").lower() in ("kpi", "gauge") and re.search(r"\bGROUP\s+BY\b", sql, re.IGNORECASE):
+        return (
+            "Chart type is KPI (single value) but the SQL contains GROUP BY, which "
+            "returns multiple rows. Remove the GROUP BY and return one aggregate value."
+        )
+
+    return None
+
+
+def expected_period_count(start_iso: str, end_iso: str, granularity: str) -> Optional[int]:
+    """Number of time buckets between two ISO dates at the given granularity."""
+    from datetime import date as _date
+    try:
+        s = _date.fromisoformat(start_iso[:10])
+        e = _date.fromisoformat(end_iso[:10])
+    except (ValueError, TypeError):
+        return None
+    if e < s:
+        return None
+    days = (e - s).days + 1
+    if granularity == "day":
+        return days
+    if granularity == "week":
+        return max(1, round(days / 7))
+    if granularity == "month":
+        return (e.year - s.year) * 12 + (e.month - s.month) + 1
+    if granularity == "quarter":
+        sq, eq = (s.month - 1) // 3, (e.month - 1) // 3
+        return (e.year - s.year) * 4 + (eq - sq) + 1
+    if granularity == "year":
+        return e.year - s.year + 1
+    return None
+
+
+# ── 5. Fuzzy column-name correction ──────────────────────────────────────────
+
+def _fuzzy_col_score(needle: str, haystack: str) -> float:
+    """Similarity score between two column name strings (both lowercased)."""
+    if needle == haystack:
+        return 1.0
+    if needle in haystack or haystack in needle:
+        return 0.85
+    n_parts = set(needle.split("_"))
+    h_parts = set(haystack.split("_"))
+    if n_parts and h_parts:
+        overlap = len(n_parts & h_parts) / max(len(n_parts), len(h_parts))
+        if overlap >= 0.5:
+            return 0.65 + overlap * 0.25
+    common = sum(1 for a, b in zip(needle, haystack) if a == b)
+    if needle and common / len(needle) >= 0.6:
+        return 0.60
+    return 0.0
+
+
+def fuzzy_fix_column_names(
+    sql: str,
+    compact_tables: list,
+    candidate_tables: Optional[list[str]] = None,
+) -> tuple[str, list[str]]:
+    """
+    Auto-correct hallucinated column names in generated SQL via fuzzy matching.
+    Returns (fixed_sql, list_of_corrections).
+    Only touches qualified table.column references that fail schema lookup.
+    Silently returns the original SQL unchanged if nothing can be fixed confidently.
+    """
+    col_lookup: dict[str, list[str]] = {}
+    for t in compact_tables:
+        tname = (t.get("name") or "").lower()
+        cols = [c.get("name") for c in (t.get("columns") or []) if c.get("name")]
+        if tname:
+            col_lookup[tname] = cols
+            bare = tname.split(".")[-1]
+            if bare not in col_lookup:
+                col_lookup[bare] = cols
+
+    candidate_lower: set[str] = set()
+    for raw in (candidate_tables or []):
+        candidate_lower.add(raw.lower())
+        candidate_lower.add(raw.lower().split(".")[-1])
+
+    refs = extract_table_column_refs(sql)
+    corrections: list[str] = []
+    fixed = sql
+
+    for table_ref, col_ref in refs:
+        tl = table_ref.lower()
+        cl = col_ref.lower()
+        known = col_lookup.get(tl)
+        if not known:
+            continue
+        if candidate_lower and tl not in candidate_lower:
+            continue
+        known_lower = {c.lower(): c for c in known}
+        if cl in known_lower:
+            continue  # already correct
+        best_col, best_score = None, 0.0
+        for orig_lower, orig in known_lower.items():
+            s = _fuzzy_col_score(cl, orig_lower)
+            if s > best_score:
+                best_score, best_col = s, orig
+        if best_col and best_score >= 0.60:
+            fixed = re.sub(
+                r'\b' + re.escape(table_ref) + r'\.' + re.escape(col_ref) + r'\b',
+                f'{table_ref}.{best_col}',
+                fixed,
+            )
+            corrections.append(f"'{col_ref}' → '{best_col}' (in {table_ref})")
+
+    return fixed, corrections
+
+
+# ── 5b. Filter-value verification ─────────────────────────────────────────────
+
+def fix_filter_values(
+    sql: str,
+    entity_columns: dict,
+) -> tuple[str, list[str]]:
+    """
+    Verify string literals in WHERE equality filters against cached sample
+    values and auto-correct case/whitespace mismatches.
+
+    `status = 'placed'` silently returns 0 rows when the DB stores 'Placed' —
+    this catches it before execution using enriched.entity_columns:
+      {entity_type: [{table, column, sample_values}]}
+
+    Returns (fixed_sql, corrections). Conservative: only replaces when a
+    case-insensitive exact match exists among the samples for a column with
+    the same name.
+    """
+    if not sql or not entity_columns:
+        return sql, []
+
+    # column_name(lower) → set of known sample values
+    samples_by_col: dict[str, set] = {}
+    for col_infos in entity_columns.values():
+        for ci in col_infos or []:
+            cname = (ci.get("column") or "").lower()
+            vals = {str(s) for s in (ci.get("sample_values") or []) if s is not None}
+            if cname and vals:
+                samples_by_col.setdefault(cname, set()).update(vals)
+
+    if not samples_by_col:
+        return sql, []
+
+    corrections: list[str] = []
+    fixed = sql
+
+    # Match  col = 'literal'  and  col.col = 'literal'  (equality only — LIKE
+    # and inequalities are intentional partial matches, leave them alone)
+    for m in re.finditer(r"([\w.]+)\s*=\s*'([^']+)'", sql):
+        col_ref, literal = m.group(1), m.group(2)
+        bare_col = col_ref.split(".")[-1].lower()
+        known = samples_by_col.get(bare_col)
+        if not known or literal in known:
+            continue
+        # case/whitespace-insensitive match against samples
+        lit_norm = literal.strip().lower()
+        exact = next((v for v in known if v.strip().lower() == lit_norm), None)
+        if exact and exact != literal:
+            fixed = fixed.replace(f"'{literal}'", f"'{exact}'", 1)
+            corrections.append(f"filter value '{literal}' → '{exact}' (column {col_ref})")
+
+    return fixed, corrections
+
+
+# ── 6. FK-graph JOIN path finder ──────────────────────────────────────────────
+
+def find_join_path(
+    graph_edges: dict,
+    start: str,
+    end: str,
+    max_hops: int = 2,
+) -> Optional[list[tuple[str, str, str]]]:
+    """
+    BFS over the FK relationship graph to find the shortest JOIN path between
+    two tables. Returns a list of (from_table, to_table, join_condition) tuples,
+    one per hop. Returns None when no path exists within max_hops.
+    """
+    if not graph_edges or start == end:
+        return []
+    from collections import deque
+    queue: deque = deque([(start, [])])
+    visited: set[str] = {start}
+    while queue:
+        current, path = queue.popleft()
+        if len(path) >= max_hops:
+            continue
+        for neighbor, condition in graph_edges.get(current, {}).items():
+            hop = (current, neighbor, condition)
+            new_path = path + [hop]
+            if neighbor == end:
+                return new_path
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, new_path))
+    return None

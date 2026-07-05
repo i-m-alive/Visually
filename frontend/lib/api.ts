@@ -172,6 +172,16 @@ export const agentApi = {
     api.post('/agent/intent', data),
   getJob: (jobId: string) =>
     api.get(`/agent/jobs/${jobId}`),
+  // Thumbs up/down on a query answer — feeds the backend query memory so good
+  // answers become few-shot examples and bad ones are never re-suggested.
+  submitQueryFeedback: (projectId: string, data: {
+    question: string
+    helpful: boolean
+    sql?: string
+    table_used?: string
+    chart_type?: string
+  }) =>
+    api.post(`/projects/${projectId}/query-feedback`, data),
 }
 
 // Persistent Query-feature chat history (sessions + message tree / branching)

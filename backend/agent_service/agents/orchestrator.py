@@ -2,6 +2,7 @@ import asyncio
 import uuid
 import json
 import os
+import re
 from datetime import datetime
 from typing import Optional
 import httpx
@@ -358,6 +359,115 @@ class Orchestrator:
                 ]
                 retrieved_context.primary_tables = filtered_primary or retrieved_context.primary_tables[:1]
 
+            # ── Clarification turn: don't guess when the question is unanswerable ──────
+            # Very low retrieval confidence means no table plausibly matches; a compound
+            # question ("how many X and what were their average Y") needs splitting.
+            # One clarifying question beats a confidently wrong chart.
+            _clarify_reason = None
+            if intent.intent_type == "SINGLE_VIZ" and not conversation_history:
+                _rag_conf = getattr(retrieved_context, "confidence", 0.0) if retrieved_context else 0.0
+                if enriched and retrieved_context is not None and _rag_conf < 0.12:
+                    _clarify_reason = (
+                        "I couldn't confidently match your question to any table in this database. "
+                        "Could you rephrase it using terms closer to your data — for example, "
+                        "mention the specific metric or table you have in mind?"
+                    )
+                elif re.search(r"\?.+\band\b.+\?|\band\s+(what|how\s+many|how\s+much|which)\b",
+                               user_text.lower()) and len(intent.entities.metrics) >= 2:
+                    _clarify_reason = (
+                        "Your question asks for two different things at once, which usually "
+                        "produces a muddled answer. Could you ask them one at a time? "
+                        f"For example, start with just the first part."
+                    )
+            if _clarify_reason:
+                clarify_result = {
+                    "job_id": job_id,
+                    "score": 1.0,
+                    "chart_data": {"rows": [], "columns": [], "labels": [], "values": []},
+                    "low_confidence": True,
+                    "sql": "",
+                    "chart_type": "text",
+                    "title": "Need a quick clarification",
+                    "table_used": "",
+                    "x_axis_label": "",
+                    "y_axis_label": "",
+                    "output_mode": "text",
+                    "narrative": _clarify_reason,
+                    "validation_details": {},
+                    "needs_clarification": True,
+                }
+                await emit({
+                    "type": "chart.confirmed",
+                    "job_id": job_id,
+                    "score": 1.0,
+                    "chart_data": clarify_result,
+                    "low_confidence": True,
+                })
+                if job:
+                    job.status = "completed"
+                    job.result_payload = clarify_result
+                    job.completed_at = datetime.utcnow()
+                    await db.commit()
+                await set_pipeline_state(redis, job_id, "step", "clarification_requested")
+                return clarify_result
+
+            # ── Accuracy context: metric registry + query memory + time contract ──────
+            from agent_service.agents import metric_registry as _metric_registry
+            from agent_service.agents import query_memory as _query_memory
+            from agent_service.agents.query_agent import _compute_date_bounds as _cdb
+            from agent_service.agents.sql_utils import (
+                check_sql_contract, expected_period_count, fix_filter_values,
+            )
+
+            _metric_defs: list = []
+            _few_shots: list = []
+            try:
+                _metric_defs = _metric_registry.match_metrics(user_text, connection_id)
+                if _metric_defs:
+                    print(f"[pipeline:{job_id}] metric registry matched: "
+                          f"{[m['name'] for m in _metric_defs]}", flush=True)
+            except Exception as _me:
+                print(f"[pipeline:{job_id}] metric registry lookup failed (non-fatal): {_me}", flush=True)
+            try:
+                _few_shots = _query_memory.find_similar(connection_id, user_text, k=3)
+                if _few_shots:
+                    print(f"[pipeline:{job_id}] query memory: {len(_few_shots)} similar past queries", flush=True)
+            except Exception as _qe:
+                print(f"[pipeline:{job_id}] query memory lookup failed (non-fatal): {_qe}", flush=True)
+
+            # Intent time contract, used by the SQL contract check and result shape check
+            _gran = getattr(intent.entities, "time_granularity", None)
+            _time_bounds = None
+            if intent.entities.time_range and intent.entities.time_range.type == "relative":
+                _time_bounds = _cdb(intent.entities.time_range.value)
+            _expected_periods = None
+            if _gran and _time_bounds:
+                _expected_periods = expected_period_count(_time_bounds[0], _time_bounds[1], _gran)
+
+            # ── Deterministic SQL template (attempt 1 only) ────────────────────────────
+            # A single registered metric + a simple shape → build SQL in Python,
+            # no LLM, no hallucination. Falls back to the LLM on any execution issue.
+            _template_plan = None
+            try:
+                from agent_service.agents.sql_template_builder import try_build_template_sql
+                _user_filter = None
+                if user_profile:
+                    from agent_service.agents.user_context_builder import get_sql_filter_clause
+                    _user_filter = get_sql_filter_clause(user_profile)
+                _template_plan = try_build_template_sql(
+                    intent, db_type, _metric_defs,
+                    date_bounds=_time_bounds,
+                    n_periods=_expected_periods,
+                    enriched=enriched,
+                    user_filter_clause=_user_filter,
+                )
+                if _template_plan is not None:
+                    print(f"[pipeline:{job_id}] deterministic template SQL built "
+                          f"(metric={_metric_defs[0]['name']!r})", flush=True)
+            except Exception as _tpe:
+                print(f"[pipeline:{job_id}] template builder failed (non-fatal): {_tpe}", flush=True)
+                _template_plan = None
+
             # ── Multi-candidate ambiguity check ───────────────────────────────────────
             # When the top-2 RAG candidates are close in score, run all in parallel
             # so the user sees every plausible answer — not just the first guess.
@@ -438,14 +548,22 @@ class Orchestrator:
                 output_mode = output_mode_override.lower()
 
             for attempt in range(1, _MAX_SINGLE_VIZ_ATTEMPTS + 1) if final_result is None else []:
-                # Step 3: Generate query — pass attempt so temperature scales on retries
+                # Step 3: Generate query — deterministic template on attempt 1 when a
+                # registered metric matched; LLM otherwise (and on all retries).
                 await set_pipeline_state(redis, job_id, "step", f"generating_query_attempt_{attempt}")
-                query_plan = await self._query.generate(
-                    intent, schema, db_type, retry_feedback, attempt, enriched,
-                    retrieved_context=retrieved_context,
-                    conversation_history=conversation_history,
-                    user_profile=user_profile,
-                )
+                _used_template = False
+                if attempt == 1 and _template_plan is not None:
+                    query_plan = _template_plan
+                    _used_template = True
+                else:
+                    query_plan = await self._query.generate(
+                        intent, schema, db_type, retry_feedback, attempt, enriched,
+                        retrieved_context=retrieved_context,
+                        conversation_history=conversation_history,
+                        user_profile=user_profile,
+                        metric_definitions=_metric_defs or None,
+                        few_shot_examples=_few_shots or None,
+                    )
                 await emit({
                     "type": "query.generated",
                     "job_id": job_id,
@@ -455,6 +573,80 @@ class Orchestrator:
                     "title": query_plan.title,
                 })
                 await set_pipeline_state(redis, job_id, "step", "query_generated")
+
+                # ── Intent-contract check: SQL must honour granularity/time/KPI shape ──
+                # (templates are correct by construction — skip)
+                if not _used_template:
+                    contract_err = check_sql_contract(
+                        query_plan.sql,
+                        granularity=_gran,
+                        time_filter_required=bool(_time_bounds),
+                        chart_type=query_plan.chart_type,
+                    )
+                    if contract_err and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                        retry_feedback = f"Intent contract violation: {contract_err}"
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "fix_intent_contract"})
+                        continue
+
+                # ── Pre-execution validation ──────────────────────────────────
+                if enriched and enriched.compact_tables:
+                    from agent_service.agents.sql_utils import (
+                        basic_sql_lint, verify_columns_against_schema, fuzzy_fix_column_names,
+                    )
+                    # 1. Syntax lint
+                    lint_err = basic_sql_lint(query_plan.sql, db_type)
+                    if lint_err and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                        retry_feedback = f"SQL syntax error (caught before execution): {lint_err}. Rewrite the query fixing this issue."
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "fix_lint_error"})
+                        continue
+
+                    # 2. Column existence check
+                    col_err = verify_columns_against_schema(
+                        query_plan.sql, enriched.compact_tables,
+                        candidate_tables=[query_plan.table_used],
+                    )
+                    if col_err:
+                        # 3. Try auto-fix via fuzzy matching before giving up
+                        fixed_sql, corrections = fuzzy_fix_column_names(
+                            query_plan.sql, enriched.compact_tables,
+                            candidate_tables=[query_plan.table_used],
+                        )
+                        if corrections:
+                            print(f"[orchestrator:{job_id}] auto-fixed columns: {corrections}", flush=True)
+                            query_plan = query_plan.__class__(
+                                sql=fixed_sql,
+                                chart_type=query_plan.chart_type,
+                                table_used=query_plan.table_used,
+                                x_axis_label=query_plan.x_axis_label,
+                                y_axis_label=query_plan.y_axis_label,
+                                title=query_plan.title,
+                                reasoning=query_plan.reasoning,
+                                db_dialect=query_plan.db_dialect,
+                            )
+                        elif attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                            # Build schema snippet for the retry message
+                            ct_map = {t["name"]: t for t in enriched.compact_tables}
+                            cand_ct = ct_map.get(query_plan.table_used)
+                            schema_hint = ""
+                            if cand_ct:
+                                col_names = [c.get("name") for c in cand_ct.get("columns", [])[:20]]
+                                schema_hint = f" Actual columns in {query_plan.table_used}: {', '.join(col_names)}."
+                            retry_feedback = f"{col_err}.{schema_hint} Use only columns that exist in the schema."
+                            await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "fix_column_error"})
+                            continue
+
+                # ── Filter-value verification: fix case mismatches in WHERE literals ──
+                # ("status = 'placed'" when the DB stores 'Placed' → silent 0 rows)
+                if enriched and getattr(enriched, "entity_columns", None):
+                    try:
+                        _fv_sql, _fv_corrections = fix_filter_values(
+                            query_plan.sql, enriched.entity_columns,
+                        )
+                        if _fv_corrections:
+                            print(f"[pipeline:{job_id}] filter values corrected: {_fv_corrections}", flush=True)
+                            query_plan.sql = _fv_sql
+                    except Exception as _fe:
+                        print(f"[pipeline:{job_id}] filter-value check failed (non-fatal): {_fe}", flush=True)
 
                 # Step 4: Execute query
                 execute_result = await self._execute_query(connection_id, query_plan.sql)
@@ -466,7 +658,18 @@ class Orchestrator:
                         "duration_ms": execute_result.get("duration_ms", 0),
                     })
                     if attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
-                        retry_feedback = f"Query execution failed: {execute_result['error']}. Fix the SQL syntax or table/column names."
+                        # Include schema hint in retry message
+                        _schema_hint = ""
+                        if enriched and enriched.compact_tables:
+                            _ct_map = {t["name"]: t for t in enriched.compact_tables}
+                            _cand_ct = _ct_map.get(query_plan.table_used if query_plan else "")
+                            if _cand_ct:
+                                _col_names = [c.get("name") for c in _cand_ct.get("columns", [])[:20]]
+                                _schema_hint = f" Valid columns for {query_plan.table_used}: {', '.join(_col_names)}."
+                        retry_feedback = (
+                            f"Query execution failed: {execute_result['error']}."
+                            f"{_schema_hint} Fix the SQL — use only real column names from the schema above."
+                        )
                         await emit({
                             "type": "validation.retry",
                             "job_id": job_id,
@@ -491,6 +694,69 @@ class Orchestrator:
                     "duration_ms": execute_result.get("duration_ms", 0),
                 })
                 await set_pipeline_state(redis, job_id, "step", "query_executed")
+
+                # ── Result quality guard ──────────────────────────────────────
+                _rows = execute_result.get("rows") or []
+                _row_count = execute_result.get("row_count", len(_rows))
+                if _row_count == 0 and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                    _schema_hint2 = ""
+                    if enriched and enriched.compact_tables:
+                        _ct_map2 = {t["name"]: t for t in enriched.compact_tables}
+                        _cand_ct2 = _ct_map2.get(query_plan.table_used if query_plan else "")
+                        if _cand_ct2:
+                            _col_names2 = [c.get("name") for c in _cand_ct2.get("columns", [])[:15]]
+                            _schema_hint2 = f" Table {query_plan.table_used} has columns: {', '.join(_col_names2)}."
+                    retry_feedback = (
+                        f"Query returned 0 rows.{_schema_hint2} "
+                        "Possible causes: wrong table selected, overly strict WHERE filter, "
+                        "or JOIN key mismatch. Try: (1) a different table, "
+                        "(2) remove or loosen WHERE filters, (3) check JOIN keys exist."
+                    )
+                    await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "zero_rows"})
+                    continue
+                # Bad JOIN detection: if row_count > 0 but null ratio > 70% in a JOIN query
+                elif _rows and "JOIN" in (query_plan.sql or "").upper() and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                    _cols = execute_result.get("columns") or []
+                    if _cols:
+                        _total = len(_rows) * len(_cols)
+                        _nulls = sum(1 for r in _rows for v in r.values() if v is None)
+                        if _total > 0 and _nulls / _total > 0.70:
+                            retry_feedback = (
+                                "JOIN produced too many NULL values (possible key mismatch). "
+                                "Verify the JOIN key column names are correct in both tables, "
+                                "or try INNER JOIN instead of LEFT JOIN."
+                            )
+                            await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "bad_join"})
+                            continue
+
+                # ── Result shape check: row count must match the requested time buckets ──
+                # "last 7 days day-wise" must return 7 rows; 4 rows means zero-count days
+                # were dropped (missing date spine); far more means wrong granularity.
+                if (
+                    _expected_periods and _expected_periods >= 2
+                    and _row_count > 0 and attempt < _MAX_SINGLE_VIZ_ATTEMPTS
+                ):
+                    if _row_count < _expected_periods:
+                        retry_feedback = (
+                            f"The user asked for a {_gran}-wise breakdown over "
+                            f"{_expected_periods} {_gran}s but the query returned only "
+                            f"{_row_count} rows — {_gran}s with zero activity were dropped. "
+                            f"Rewrite using a date spine CTE (generate all {_expected_periods} "
+                            f"{_gran}s, LEFT JOIN the data, COUNT a table column so empty "
+                            f"{_gran}s show 0)."
+                        )
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "missing_periods"})
+                        continue
+                    if _row_count > _expected_periods * 3:
+                        retry_feedback = (
+                            f"The user asked for a {_gran}-wise breakdown "
+                            f"(~{_expected_periods} rows expected) but the query returned "
+                            f"{_row_count} rows — the data is bucketed at a finer granularity "
+                            f"than requested. GROUP BY DATE_TRUNC('{_gran}', date_col) so "
+                            f"there is exactly one row per {_gran}."
+                        )
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "wrong_granularity"})
+                        continue
 
                 # Post-execution: correct the chart title's year range to match actual data.
                 # Handles float years (2021.0), non-string columns, and falls back to
@@ -601,6 +867,16 @@ class Orchestrator:
                     "y_axis_label": query_plan.y_axis_label,
                     "validation_details": validation.model_dump(),
                 }
+
+                # ── Query memory: remember this success as a future few-shot ──────────
+                try:
+                    _query_memory.record_success(
+                        connection_id, user_text, query_plan.sql,
+                        query_plan.table_used, query_plan.chart_type,
+                        score=validation.score,
+                    )
+                except Exception as _qme:
+                    print(f"[pipeline:{job_id}] query memory record failed (non-fatal): {_qme}", flush=True)
                 break
 
             if not final_result and query_plan is not None:

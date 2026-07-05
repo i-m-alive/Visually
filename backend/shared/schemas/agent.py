@@ -19,6 +19,10 @@ class IntentEntities(BaseModel):
     time_range: Optional[TimeRange] = None
     chart_type: Optional[str] = None
     filters: List[FilterCondition] = []
+    # GROUP BY granularity when the user asks for a time-bucketed breakdown
+    # ("month wise", "daily", "per quarter"): day|week|month|quarter|year|None.
+    # Distinct from time_range, which FILTERS rows to a window.
+    time_granularity: Optional[str] = None
 
 
 class IntentRequest(BaseModel):

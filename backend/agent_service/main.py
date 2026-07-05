@@ -785,6 +785,110 @@ async def execute_connection_query(
         }
 
 
+# ── Metric Registry: canonical metric definitions per connection ─────────────
+
+class MetricDefinitionRequest(BaseModel):
+    name: str
+    table: str
+    expression: str                       # e.g. "COUNT(*)" or "SUM(amount)"
+    synonyms: list[str] = []
+    date_column: Optional[str] = None
+    filter: Optional[str] = None          # optional WHERE fragment
+    description: Optional[str] = None
+
+
+async def _verify_connection_ownership(project_id: str, conn_id: str, db: AsyncSession):
+    result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.id == uuid.UUID(conn_id),
+        DatabaseConnection.project_id == uuid.UUID(project_id),
+    ))
+    conn = result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    return conn
+
+
+@app.get("/projects/{project_id}/connections/{conn_id}/metrics")
+async def list_metric_definitions(
+    project_id: str, conn_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _verify_connection_ownership(project_id, conn_id, db)
+    from agent_service.agents import metric_registry
+    return {"metrics": list(metric_registry.get_metrics(conn_id).values())}
+
+
+@app.put("/projects/{project_id}/connections/{conn_id}/metrics")
+async def upsert_metric_definition(
+    project_id: str, conn_id: str,
+    req: MetricDefinitionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _verify_connection_ownership(project_id, conn_id, db)
+    from agent_service.agents import metric_registry
+    try:
+        metrics = metric_registry.save_metric(conn_id, req.model_dump())
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    return {"metrics": list(metrics.values())}
+
+
+@app.delete("/projects/{project_id}/connections/{conn_id}/metrics/{metric_name}")
+async def delete_metric_definition(
+    project_id: str, conn_id: str, metric_name: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _verify_connection_ownership(project_id, conn_id, db)
+    from agent_service.agents import metric_registry
+    if not metric_registry.delete_metric(conn_id, metric_name):
+        raise HTTPException(status_code=404, detail="Metric not found")
+    return {"deleted": metric_name}
+
+
+# ── Query feedback: thumbs up/down feeding query memory ──────────────────────
+
+class QueryFeedbackRequest(BaseModel):
+    question: str
+    helpful: bool
+    connection_id: Optional[str] = None   # defaults to the project's active connection
+    sql: Optional[str] = None
+    table_used: Optional[str] = None
+    chart_type: Optional[str] = None
+
+
+@app.post("/projects/{project_id}/query-feedback")
+async def submit_query_feedback(
+    project_id: str,
+    req: QueryFeedbackRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if req.connection_id:
+        await _verify_connection_ownership(project_id, req.connection_id, db)
+        conn_id = req.connection_id
+    else:
+        result = await db.execute(select(DatabaseConnection).where(
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+            DatabaseConnection.is_active == True).limit(1))
+        conn = result.scalar_one_or_none()
+        if not conn:
+            raise HTTPException(status_code=404, detail="No active connection for this project")
+        conn_id = str(conn.id)
+
+    from agent_service.agents import query_memory
+    if req.helpful and req.sql:
+        query_memory.record_success(
+            conn_id, req.question, req.sql,
+            req.table_used or "", req.chart_type or "", score=1.0,
+        )
+        return {"status": "recorded"}
+    removed = query_memory.remove_entry(conn_id, req.question)
+    return {"status": "removed" if removed else "not_found"}
+
+
 @app.post("/projects/{project_id}/schema/crawl")
 async def trigger_schema_crawl(project_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DatabaseConnection).where(
