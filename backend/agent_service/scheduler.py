@@ -87,9 +87,11 @@ async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = 
                         fallback_conn_id = str(pcobj.id)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Scheduler: fallback connection lookup failed: %s", exc)
-            log.info(
-                "Scheduler: refresh dashboard %s  widgets=%d  fallback_conn=%s",
-                dashboard_id, len(widgets), (fallback_conn_id or "none"),
+            print(
+                f"[refresh] ▶ dashboard={dashboard_id[:8]} '{dash.name}' "
+                f"widgets={len(widgets)} only_widget={str(only_widget_id)[:8] if only_widget_id else 'ALL'} "
+                f"fallback_conn={(fallback_conn_id or 'none')[:8]}",
+                flush=True,
             )
 
             # RLS enforcement: scheduled refreshes persist chart_data that public
@@ -106,9 +108,19 @@ async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = 
                 conn_id = str(w.connection_id) if w.connection_id else fallback_conn_id
                 if not sql or not conn_id:
                     summary["skipped"] += 1
+                    print(
+                        f"[refresh]   ⊘ SKIP '{w.title[:40]}' — "
+                        f"{'no SQL stored' if not sql else 'no connection (widget + fallback both empty)'}",
+                        flush=True,
+                    )
                     continue
                 try:
-                    result = await call_query_executor(conn_id, inject_rls(sql, rls_clauses), row_limit=500)
+                    _t0 = datetime.utcnow()
+                    _old_rows = len((w.chart_data or {}).get("rows", [])) if isinstance(w.chart_data, dict) else 0
+                    # 10000 matches the original pipeline's row limit — refreshing with a
+                    # smaller cap silently truncated tables and changed chart shapes.
+                    result = await call_query_executor(conn_id, inject_rls(sql, rls_clauses), row_limit=10000)
+                    _ms = int((datetime.utcnow() - _t0).total_seconds() * 1000)
                     if result and not result.get("error"):
                         rows = result.get("rows", [])
                         columns = result.get("columns", [])
@@ -133,19 +145,27 @@ async def run_dashboard_refresh(dashboard_id: str, only_widget_id: str | None = 
                             **(w.config or {}),
                             "updated_at": int(datetime.utcnow().timestamp() * 1000),
                         }
+                        w.last_refreshed_at = datetime.utcnow()
                         summary["refreshed"] += 1
-                    else:
-                        summary["errors"].append(
-                            {"widget_id": str(w.id), "error": (result or {}).get("error", "unknown")}
+                        print(
+                            f"[refresh]   ✓ '{w.title[:40]}' ({w.chart_type}) "
+                            f"rows {_old_rows}→{len(rows)} in {_ms}ms conn={conn_id[:8]}",
+                            flush=True,
                         )
+                    else:
+                        _err = (result or {}).get("error", "unknown")
+                        summary["errors"].append({"widget_id": str(w.id), "error": _err})
+                        print(f"[refresh]   ✗ '{w.title[:40]}' FAILED in {_ms}ms: {str(_err)[:150]}", flush=True)
                 except Exception as exc:
                     summary["errors"].append({"widget_id": str(w.id), "error": str(exc)})
-                    log.warning("Scheduler: widget %s failed: %s", w.id, exc)
+                    print(f"[refresh]   ✗ '{w.title[:40]}' EXCEPTION: {exc}", flush=True)
 
             await db.commit()
-            log.info(
-                "Scheduler: refreshed %d/%d widgets (skipped %d, errors %d) for dashboard %s",
-                summary["refreshed"], summary["total"], summary["skipped"], len(summary["errors"]), dashboard_id,
+            print(
+                f"[refresh] ■ done dashboard={dashboard_id[:8]}: "
+                f"refreshed={summary['refreshed']}/{summary['total']} "
+                f"skipped={summary['skipped']} errors={len(summary['errors'])}",
+                flush=True,
             )
     except Exception as exc:
         log.exception("Scheduler: refresh failed for dashboard %s: %s", dashboard_id, exc)
@@ -324,6 +344,12 @@ async def process_snapshot_schedules() -> None:
         log.warning("process_snapshot_schedules tick failed: %s", exc)
 
 
+async def _cron_refresh(dashboard_id: str) -> None:
+    """Cron entrypoint — logs the trigger so scheduled runs are visible in the console."""
+    print(f"[refresh] ⏰ CRON fired for dashboard={dashboard_id[:8]} at {datetime.utcnow().isoformat()}Z", flush=True)
+    await run_dashboard_refresh(dashboard_id)
+
+
 def _make_job_id(dashboard_id: str) -> str:
     return f"refresh_{dashboard_id}"
 
@@ -341,17 +367,21 @@ def reload_job_for_dashboard(dashboard_id: str, schedule: dict) -> None:
         return
     try:
         trigger = CronTrigger.from_crontab(schedule["cron"], timezone=schedule.get("timezone", "UTC"))
-        _scheduler.add_job(
-            run_dashboard_refresh,
+        job = _scheduler.add_job(
+            _cron_refresh,
             trigger=trigger,
             args=[dashboard_id],
             id=job_id,
             name=f"Refresh dashboard {dashboard_id[:8]}",
             replace_existing=True,
         )
-        log.info("Scheduler: registered cron '%s' for dashboard %s", schedule["cron"], dashboard_id)
+        print(
+            f"[refresh] ⏱ cron '{schedule['cron']}' registered for dashboard={dashboard_id[:8]} "
+            f"(next run: {getattr(job, 'next_run_time', '?')})",
+            flush=True,
+        )
     except Exception as exc:
-        log.warning("Scheduler: could not register job for %s: %s", dashboard_id, exc)
+        print(f"[refresh] ✗ could not register cron for dashboard={dashboard_id[:8]}: {exc}", flush=True)
 
 
 async def _load_all_schedules() -> None:

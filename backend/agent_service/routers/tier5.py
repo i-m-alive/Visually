@@ -270,6 +270,7 @@ async def refresh_now(
 ):
     """Re-run all widget SQL for this dashboard, save fresh chart_data."""
     from agent_service.scheduler import run_dashboard_refresh
+    print(f"[refresh] 👆 MANUAL refresh-now by {current_user.email} dashboard={dashboard_id[:8]}", flush=True)
     summary = await run_dashboard_refresh(dashboard_id)
     return {"status": "refreshed", "dashboard_id": dashboard_id, **summary}
 
@@ -284,6 +285,7 @@ async def refresh_widget(
     """Re-run a SINGLE widget's SQL and save its fresh chart_data — so refreshing
     one widget only re-queries that widget, not the whole dashboard."""
     from agent_service.scheduler import run_dashboard_refresh
+    print(f"[refresh] 👆 MANUAL widget refresh by {current_user.email} widget={widget_id[:8]}", flush=True)
     summary = await run_dashboard_refresh(dashboard_id, only_widget_id=widget_id)
     return {"status": "refreshed", "dashboard_id": dashboard_id, "widget_id": widget_id, **summary}
 

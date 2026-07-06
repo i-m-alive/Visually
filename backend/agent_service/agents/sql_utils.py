@@ -503,3 +503,71 @@ def find_join_path(
                 visited.add(neighbor)
                 queue.append((neighbor, new_path))
     return None
+
+
+# ── N. Snowflake case-insensitive string comparison normalizer ─────────────────
+
+# Matches: [alias.]col_name = 'literal'
+_STR_EQ_RE = re.compile(
+    r"""((?:[\w"]+\.)?[\w"]+)\s*=\s*'([^']*)'""",
+    re.IGNORECASE,
+)
+# Matches: [alias.]col_name IN ('a', 'b', ...)
+_STR_IN_RE = re.compile(
+    r"""((?:[\w"]+\.)?[\w"]+)\s+IN\s*\(\s*('(?:[^']*)'(?:\s*,\s*'(?:[^']*)')*)\s*\)""",
+    re.IGNORECASE,
+)
+# Literals that should NOT be uppercased (pure hex/UUID and numeric strings)
+_SKIP_UPPER_RE = re.compile(r'^[0-9A-Fa-f]{6,}[-0-9A-Fa-f]*$')
+_NUMERIC_LIT_RE = re.compile(r'^[\d.eE+\-]+$')
+
+
+def _should_upper(lit: str) -> bool:
+    """True when a string literal should be uppercased for case-insensitive comparison."""
+    if _NUMERIC_LIT_RE.match(lit):
+        return False
+    # Long hex strings (UUIDs, hashes) — don't recase, they're already deterministic
+    if len(lit) > 8 and _SKIP_UPPER_RE.match(lit):
+        return False
+    return True
+
+
+def normalize_string_comparisons_snowflake(sql: str) -> str:
+    """Rewrite string equality comparisons in Snowflake SQL to be case-insensitive.
+
+    LLMs often guess lowercase values ('buy', 'sell') when the database stores
+    mixed-case ('Buy', 'Sell'). This rewriter wraps the column with UPPER() and
+    uppercases the literal so the comparison is always case-insensitive:
+
+        col = 'buy'          →  UPPER(col) = 'BUY'
+        t.col = 'Sell'       →  UPPER(t.col) = 'SELL'
+        col IN ('a', 'b')    →  UPPER(col) IN ('A', 'B')
+
+    Skips numeric literals, UUID-like hex strings, and columns already wrapped
+    in UPPER() to avoid double-wrapping.
+
+    Only applies to Snowflake (caller must gate on db_type == 'snowflake').
+    """
+
+    def _eq_sub(m: re.Match) -> str:
+        col, lit = m.group(1), m.group(2)
+        if not _should_upper(lit):
+            return m.group(0)
+        if col.upper().startswith("UPPER("):
+            return m.group(0)
+        return f"UPPER({col}) = '{lit.upper()}'"
+
+    def _in_sub(m: re.Match) -> str:
+        col = m.group(1)
+        lits = re.findall(r"'([^']*)'", m.group(2))
+        if not any(_should_upper(l) for l in lits):
+            return m.group(0)
+        if col.upper().startswith("UPPER("):
+            return m.group(0)
+        inner = ", ".join(f"'{l.upper()}'" for l in lits)
+        return f"UPPER({col}) IN ({inner})"
+
+    # Apply IN first (more specific pattern) then equality
+    sql = _STR_IN_RE.sub(_in_sub, sql)
+    sql = _STR_EQ_RE.sub(_eq_sub, sql)
+    return sql

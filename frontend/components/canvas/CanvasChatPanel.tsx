@@ -143,10 +143,10 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
   const { scope, selectedTables, selectedHops } = useTableScopeStore((s) => s.byCanvas[canvasId]) ?? DEFAULT_SCOPE
   const endRef                  = useRef<HTMLDivElement>(null)
   const textareaRef             = useRef<HTMLTextAreaElement>(null)
-  const [panelWidth, setPanelWidth] = useState(initialWidth ?? 320)
+  const [panelWidth, setPanelWidth] = useState(initialWidth ?? 380)
   const resizingRef  = useRef(false)
   const resizeStartX = useRef(0)
-  const resizeStartW = useRef(initialWidth ?? 320)
+  const resizeStartW = useRef(initialWidth ?? 380)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
   useEffect(() => {
@@ -315,21 +315,24 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       >
         <div className="w-1 h-10 rounded-full bg-gray-300 group-hover:bg-blue-400 transition-colors" />
       </div>
-      <div className="relative bg-white flex flex-col h-full w-full" style={{ borderRadius: 16, overflow: 'hidden', border: '1px solid #e2eaf4' }}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0" style={{ background: 'linear-gradient(135deg, #0a213a, #0d3060)' }}>
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: 'linear-gradient(135deg, #00b4d8, #0077b6)' }}>
-            <Sparkles size={13} className="text-white" />
+      <div className="relative bg-white flex flex-col h-full w-full" style={{ borderRadius: 16, overflow: 'hidden', border: '1px solid #e2eaf4', boxShadow: '0 8px 32px rgba(15,23,42,0.10)' }}>
+      {/* Header — matches the toolbar's Assistant button gradient */}
+      <div className="flex items-center justify-between px-4 py-3 flex-shrink-0" style={{ background: 'linear-gradient(120deg, #2563EB, #4F46E5 60%, #6D28D9)' }}>
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 bg-white/15 border border-white/20 backdrop-blur">
+            <Sparkles size={14} className="text-white" />
           </div>
-          <div>
-            <span className="text-sm font-semibold text-white">{title ?? 'Canvas Assistant'}</span>
-            {subtitle && <p className="text-[10px] leading-tight" style={{ color: 'rgba(255,255,255,0.45)', margin: 0 }}>{subtitle}</p>}
+          <div className="min-w-0">
+            <span className="text-sm font-bold text-white flex items-center gap-1.5">
+              {title ?? 'Canvas Assistant'}
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-300 animate-pulse" title="Connected" />
+            </span>
+            <p className="text-[10px] leading-tight text-white/60 truncate">
+              {subtitle ?? 'Builds charts, explains data, edits this canvas'}
+            </p>
           </div>
         </div>
-        <button onClick={onClose} className="p-1 rounded transition-colors" style={{ color: 'rgba(255,255,255,0.5)' }}
-          onMouseEnter={e => (e.currentTarget.style.color = 'white')}
-          onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.5)')}>
+        <button onClick={onClose} className="p-1.5 rounded-lg text-white/60 hover:text-white hover:bg-white/15 transition-colors flex-shrink-0">
           <X size={16} />
         </button>
       </div>
@@ -352,18 +355,19 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
       )}
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
+      <div className="flex-1 overflow-y-auto p-3 space-y-3.5 min-h-0" style={{ background: 'linear-gradient(180deg, #fafbfd, #f6f8fb)' }}>
         {/* Suggested questions rendered inline after greeting — never push greeting off screen */}
         {showSuggestions && recommended.length > 0 && messages.length === 1 && (
-          <div className="ml-8">
-            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">Suggested</p>
+          <div className="ml-9">
+            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Try asking</p>
             <div className="flex flex-col gap-1.5">
               {recommended.map((q, i) => (
                 <button
                   key={i}
                   onClick={() => send(q)}
-                  className="w-full text-left px-2.5 py-1.5 text-xs text-gray-600 bg-gray-50 hover:bg-blue-50 hover:text-blue-700 border border-gray-100 hover:border-blue-200 rounded-lg transition-colors leading-snug"
+                  className="group w-full text-left px-3 py-2 text-xs text-gray-600 bg-white hover:text-blue-700 border border-gray-200 hover:border-blue-300 rounded-xl transition-all hover:shadow-sm leading-snug flex items-start gap-2"
                 >
+                  <Sparkles size={11} className="text-gray-300 group-hover:text-blue-500 mt-0.5 flex-shrink-0 transition-colors" />
                   {q}
                 </button>
               ))}
@@ -373,19 +377,20 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
         {messages.map((msg, i) => (
           <div key={i} className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
             <div
-              className="w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center text-white text-xs"
+              className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center text-white shadow-sm"
               style={msg.role === 'assistant'
                 ? { background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }
-                : { background: '#9CA3AF' }}
+                : { background: '#64748B' }}
             >
-              {msg.role === 'user' ? <Bot size={11} /> : <Sparkles size={10} />}
+              {msg.role === 'user' ? <Bot size={12} /> : <Sparkles size={11} />}
             </div>
             <div className="flex flex-col gap-2 max-w-[85%] min-w-0">
-              <div className={`px-3 py-2 rounded-2xl text-xs leading-relaxed break-words min-w-0 ${
+              <div className={`px-3.5 py-2.5 rounded-2xl text-[12.5px] leading-relaxed break-words min-w-0 ${
                 msg.role === 'user'
-                  ? 'bg-brand text-white rounded-tr-sm'
-                  : 'bg-gray-100 text-gray-800 rounded-tl-sm'
-              }`}>
+                  ? 'text-white rounded-tr-md shadow-sm'
+                  : 'bg-white text-gray-800 rounded-tl-md border border-gray-200/80 shadow-sm'
+              }`}
+              style={msg.role === 'user' ? { background: 'linear-gradient(120deg, #2563EB, #4F46E5)' } : undefined}>
                 {msg.role === 'assistant'
                   ? (msg.content
                       ? <MarkdownText text={msg.content} />
@@ -397,7 +402,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
               {msg.inlineCharts && msg.inlineCharts.length > 0 && (
                 msg.inlineCharts.length === 1 ? (
                   // Single chart — compact preview
-                  <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
+                  <div className="bg-white border border-gray-200/80 rounded-2xl p-3 shadow-sm">
                     <p className="text-xs font-semibold text-gray-700 mb-2">{msg.inlineCharts[0].title}</p>
                     <ChartRenderer result={msg.inlineCharts[0]} height={172} legend />
                     <div className="mt-2.5">
@@ -422,7 +427,7 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
                   </div>
                 ) : (
                   // Multiple charts — selectable list
-                  <div className="bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
+                  <div className="bg-white border border-gray-200/80 rounded-2xl overflow-hidden shadow-sm">
                     <div className="px-3 py-2 border-b border-gray-100 flex items-center justify-between">
                       <span className="text-xs font-semibold text-gray-600">{msg.inlineCharts.length} charts generated</span>
                       <div className="flex items-center gap-2">
@@ -509,11 +514,12 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
             so it signals that the chart is still being executed/rendered. */}
         {sending && messages[messages.length - 1]?.role === 'assistant' && !!messages[messages.length - 1]?.content && (
           <div className="flex gap-2">
-            <div className="w-6 h-6 rounded-full flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
-              <Sparkles size={10} className="text-white" />
+            <div className="w-7 h-7 rounded-full flex items-center justify-center shadow-sm" style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}>
+              <Sparkles size={11} className="text-white" />
             </div>
-            <div className="px-3 py-2 bg-gray-100 rounded-2xl rounded-tl-sm">
-              <Loader2 size={12} className="animate-spin text-gray-400" />
+            <div className="px-3.5 py-2.5 bg-white border border-gray-200/80 rounded-2xl rounded-tl-md shadow-sm flex items-center gap-2">
+              <Loader2 size={12} className="animate-spin text-blue-500" />
+              <span className="text-[11px] text-gray-400">building chart…</span>
             </div>
           </div>
         )}
@@ -522,37 +528,38 @@ export function CanvasChatPanel({ projectId, canvasId, widgets, pages = [], acti
 
 
       {/* Input */}
-      <div className="px-3 py-3 border-t border-gray-100 flex-shrink-0">
-        <div className="flex items-end gap-2 bg-gray-50 rounded-xl px-3 py-2">
+      <div className="px-3 pt-2.5 pb-2 border-t border-gray-100 bg-white flex-shrink-0">
+        <div className="flex items-end gap-2 bg-white border border-gray-300 rounded-2xl pl-3.5 pr-1.5 py-1.5 focus-within:border-blue-400 focus-within:ring-4 focus-within:ring-blue-100 transition-all">
           <textarea
             ref={textareaRef}
             value={input}
             onChange={e => {
               setInput(e.target.value)
               e.target.style.height = 'auto'
-              e.target.style.height = Math.min(e.target.scrollHeight, 80) + 'px'
+              e.target.style.height = Math.min(e.target.scrollHeight, 96) + 'px'
             }}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
             placeholder="Ask about your data or create a chart…"
             rows={1}
-            className="flex-1 bg-transparent text-xs text-gray-800 placeholder-gray-400 outline-none resize-none leading-relaxed"
-            style={{ maxHeight: 80, overflowY: 'auto' }}
+            className="flex-1 bg-transparent text-[13px] text-gray-800 placeholder-gray-400 outline-none resize-none leading-relaxed py-1"
+            style={{ maxHeight: 96, overflowY: 'auto' }}
           />
           <button
             onClick={() => send()}
             disabled={!input.trim() || sending}
-            className="p-1.5 text-white rounded-lg disabled:opacity-40 transition-colors flex-shrink-0"
+            className="h-8 w-8 inline-flex items-center justify-center text-white rounded-xl disabled:opacity-40 transition-all hover:brightness-110 flex-shrink-0 shadow-sm"
             style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
+            title="Send (Enter)"
           >
-            <Send size={12} />
+            <Send size={13} />
           </button>
         </div>
-        <p className="text-xs text-gray-400 mt-1.5 text-center">
+        <p className="text-[10px] text-gray-400 mt-1.5 text-center">
           {scope === 'selected'
             ? (selectedTables.length
-                ? `${selectedTables.length} table${selectedTables.length !== 1 ? 's' : ''}${selectedHops ? ` +${selectedHops}-hop` : ''} · All pages · Enter to send`
-                : 'Full DB (no tables picked) · All pages · Enter to send')
-            : 'Full DB access · All pages · Enter to send'}
+                ? `${selectedTables.length} table${selectedTables.length !== 1 ? 's' : ''}${selectedHops ? ` +${selectedHops}-hop` : ''} · all pages · Enter to send`
+                : 'Full DB (no tables picked) · all pages · Enter to send')
+            : 'Full DB access · all pages · Enter to send'}
         </p>
       </div>
       </div>{/* end overflow:hidden inner panel */}

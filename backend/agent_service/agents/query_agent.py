@@ -7,7 +7,10 @@ from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL
 from shared.schemas.agent import IntentResult
 from shared.schemas.schema import SemanticSchemaDocument
 from shared.schemas.chart import QueryPlan
-from agent_service.agents.sql_utils import expand_table_aliases, basic_sql_lint, verify_columns_against_schema
+from agent_service.agents.sql_utils import (
+    expand_table_aliases, basic_sql_lint, verify_columns_against_schema,
+    normalize_string_comparisons_snowflake,
+)
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
@@ -241,11 +244,16 @@ SYSTEM_PROMPT = """You are an expert SQL query generator for a data visualizatio
 Given a user's intent, extracted entities, and a database schema document, generate a SQL query that produces correct data for the requested visualization.
 
 RULES:
-1. SELECT only — never write INSERT, UPDATE, DELETE, DROP, or any DDL.
+1. SELECT / WITH only — NEVER write INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, MERGE,
+   TRUNCATE, CALL, VACUUM, LOCK, or any DDL/DML. This is an absolute read-only guardrail.
 2. Always include an ORDER BY clause.
-3. Apply LIMIT — 10000 for chart queries, 100000 for table widgets.
+3. LIMIT CLAUSE — DO NOT AUTO-ADD SMALL LIMITS: Only add LIMIT when the chart type requires it
+   for readability (pie/donut ≤ 20 slices, scatter/bubble ≤ 1000 points, funnel ≤ 10 stages,
+   slicer ≤ 300 values) OR when the user explicitly asks for a specific row count (e.g. "top 10",
+   "limit to 5"). Never add LIMIT to bar, line, area, table, KPI, multi_row_card, or aggregate
+   queries unless the user requests it.
 4. For time-series: use date_trunc('month', date_col) for monthly grouping (PostgreSQL/Redshift).
-5. For bar charts: ORDER BY metric DESC, LIMIT 20 unless user specified otherwise.
+5. For bar charts: ORDER BY metric DESC — no automatic LIMIT unless user specified a count.
 6. For KPI cards: return a single aggregate value (SUM, COUNT, AVG).
 7. Choose column aliases that match what should appear as axis labels.
 8. Prefer the most important table from the schema unless user specified another.
@@ -337,18 +345,18 @@ RULES:
 
 CHART TYPE SQL PATTERNS:
 - line: SELECT date_trunc('month', date_col) AS period, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 1
-- bar_vertical: SELECT dim AS category, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 20
+- bar_vertical: SELECT dim AS category, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC
 - bar_horizontal: same as bar_vertical
-- waterfall: SELECT step_name AS category, delta_value AS value FROM table ORDER BY step_order LIMIT 20
+- waterfall: SELECT step_name AS category, delta_value AS value FROM table ORDER BY step_order
   [Each row is one step: positive value = gain (green bar), negative = loss (red bar), last row labelled "Total"/"Net" becomes the summary bar.
-   For derived waterfalls (no dedicated waterfall table): SELECT period AS category, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 1 LIMIT 20]
-- pie: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+   For derived waterfalls (no dedicated waterfall table): SELECT period AS category, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 1]
+- pie: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 20
 - donut: same as pie
 - kpi: SELECT {agg}(metric) AS value FROM table  [CRITICAL: NO WHERE, NO GROUP BY — must return exactly 1 row]
-- multi_row_card: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC LIMIT 20
+- multi_row_card: SELECT dim AS label, {agg}(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC
   [Use when the user wants a KPI broken down by a category — produces label/value pairs like "TAO: 231 / VCS: 6531"]
 - scatter: SELECT x_col AS x, y_col AS y FROM table LIMIT 1000
-- table: SELECT relevant_cols FROM table ORDER BY sort_col DESC LIMIT 100
+- table: SELECT relevant_cols FROM table ORDER BY sort_col DESC
 - area: SELECT date_trunc('month', date_col) AS period, SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 1
 - stacked_bar: SELECT dim1, dim2, SUM(metric) AS value FROM table GROUP BY 1, 2 ORDER BY 3 DESC
 - grouped_bar: SELECT dim1, dim2, SUM(metric) AS value FROM table GROUP BY 1, 2 ORDER BY 1
@@ -417,6 +425,35 @@ REDSHIFT-SPECIFIC RULES (when db_dialect is "redshift"):
     WRONG:    SELECT staging.bullhorn_client_corporation.name  (3-level = invalid)
   If two tables share a column name, qualify with the alias, not the schema prefix.
 
+SNOWFLAKE-SPECIFIC RULES (when db_dialect is "snowflake"):
+- COLUMN REFERENCE RULE (critical — same as Redshift): NEVER use 3-part "SCHEMA.TABLE.COLUMN"
+  in SELECT/WHERE/JOIN ON. Always assign a short alias to schema-qualified tables:
+    CORRECT:  FROM FAR_TRANS.TRANSACTIONS AS t  →  SELECT t.TOTALVALUE
+    WRONG:    SELECT FAR_TRANS.TRANSACTIONS.TOTALVALUE  (Snowflake error 000904 invalid ident)
+- RESERVED KEYWORDS AS COLUMN NAMES: If a column name is a Snowflake reserved word or type
+  keyword (e.g. TIMESTAMP, VALUE, TYPE, DATE, TIME, YEAR, MONTH, DAY, INTERVAL, COLUMN,
+  CURRENT, POSITION, TABLE, SCHEMA), always double-quote it:
+    CORRECT:  SELECT t."TIMESTAMP" AS "Date"
+    WRONG:    SELECT t.TIMESTAMP  (Snowflake treats TIMESTAMP as a type cast, causing errors)
+- Use DATE_TRUNC('month', col) — same syntax as PostgreSQL/Redshift.
+- Use CURRENT_DATE() (with parentheses) in Snowflake date spine generators (DATEADD, GENERATOR).
+  Use CURRENT_DATE (no parentheses) in plain WHERE date comparisons.
+- Use ILIKE for case-insensitive string matching.
+- Use TO_DATE(col) or TRY_TO_DATE(col) instead of CAST(col AS DATE) for string-to-date.
+
+COLUMN HALLUCINATION PREVENTION (applies to ALL dialects — CRITICAL):
+- You will receive an "exact_column_schema" in the user message listing EVERY column in the
+  target table. You MUST copy column names EXACTLY as spelled there — do NOT invent, shorten,
+  expand, or paraphrase column names.
+- If the metric the user requested (e.g. "total net") does not appear as any column in
+  exact_column_schema.columns, do NOT guess a plausible-sounding name. Instead set sql to a
+  simple COUNT(*) fallback and explain the metric is unavailable in reasoning.
+- A query that references a non-existent column will always fail at runtime. A COUNT(*) or
+  "no data" result is far better than a SQL compilation error.
+- NEVER fabricate table names, column names, or filter values not present in the provided schema.
+- NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, MERGE, TRUNCATE, CALL, or any
+  DDL/DML statement — SELECT and WITH only. This rule has no exceptions.
+
 CONCRETE EXAMPLES — copy the pattern, not the table/column names:
 
 BAR CHART (counts by category):
@@ -424,7 +461,7 @@ BAR CHART (counts by category):
   SQL:   SELECT job_role AS "Job Role", COUNT(*) AS "Count"
          FROM jobs
          WHERE job_role IS NOT NULL
-         GROUP BY job_role ORDER BY 2 DESC LIMIT 20
+         GROUP BY job_role ORDER BY 2 DESC
 
 LINE CHART (trend over time — NO time_range given, return all history):
   Chart: "Monthly Revenue", x="Month", y="Revenue ($)"
@@ -455,7 +492,7 @@ GROUPED KPI / MULTI-ROW CARD (multiple metric values broken down by a category):
   Chart: "Job Count by Source", groups=[TAO, VCS]
   SQL:   SELECT source AS "Source", COUNT(*) AS "Jobs"
          FROM bullhorn_core_job_order
-         GROUP BY source ORDER BY 2 DESC LIMIT 20
+         GROUP BY source ORDER BY 2 DESC
 
 DAY-WISE BAR/LINE CHART with date spine (ALWAYS use this for "last N days" with daily granularity):
   Chart: "Daily Placements – Last 7 Days", x="Date", y="Placements"
@@ -475,12 +512,12 @@ WATERFALL CHART (bridge / variance decomposition — positive=gain, negative=los
   Chart: "Revenue Bridge Q1→Q2", steps=cost categories
   SQL:   SELECT step_name AS "Category", delta AS "Change"
          FROM revenue_bridge
-         ORDER BY step_order LIMIT 20
+         ORDER BY step_order
   If no dedicated bridge table, derive month-over-month deltas:
   SQL:   SELECT TO_CHAR(DATE_TRUNC('month', sale_date), 'Mon YYYY') AS "Month",
                 SUM(revenue) - LAG(SUM(revenue)) OVER (ORDER BY DATE_TRUNC('month', sale_date)) AS "Change"
          FROM sales
-         GROUP BY 1 ORDER BY DATE_TRUNC('month', sale_date) LIMIT 20
+         GROUP BY 1 ORDER BY DATE_TRUNC('month', sale_date)
 
 Return ONLY valid JSON:
 {
@@ -800,6 +837,11 @@ class QueryAgent:
         # Post-process: expand short aliases to prevent alias-reference errors
         if data.get("sql"):
             data["sql"] = expand_table_aliases(data["sql"])
+            # Snowflake string comparisons are case-sensitive; the LLM commonly guesses
+            # lowercase values ('buy', 'sell') when the DB stores mixed-case ('Buy', 'Sell').
+            # Rewrite col = 'val' → UPPER(col) = 'VAL' for case-insensitive matching.
+            if db_type == "snowflake":
+                data["sql"] = normalize_string_comparisons_snowflake(data["sql"])
 
         return QueryPlan(
             sql=data.get("sql", "SELECT 1"),

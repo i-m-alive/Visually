@@ -5,6 +5,8 @@ BLOCKED_KEYWORDS = [
     r'\bINSERT\b', r'\bUPDATE\b', r'\bDELETE\b', r'\bDROP\b',
     r'\bCREATE\b', r'\bALTER\b', r'\bTRUNCATE\b', r'\bEXEC\b',
     r'\bEXECUTE\b', r'\bGRANT\b', r'\bREVOKE\b', r'\bCOPY\b',
+    r'\bMERGE\b', r'\bCALL\b', r'\bVACUUM\b', r'\bLOCK\b',
+    r'\bUNLOCK\b', r'\bREPLACE\b', r'\bUPSERT\b',
 ]
 
 

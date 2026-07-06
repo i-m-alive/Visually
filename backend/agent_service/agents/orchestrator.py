@@ -574,6 +574,24 @@ class Orchestrator:
                 })
                 await set_pipeline_state(redis, job_id, "step", "query_generated")
 
+                # ── Sandbox guardrail: block write SQL before it reaches the DB ────────
+                # Belt-and-suspenders: sandbox also runs inside the query executor, but
+                # catching it here lets us retry with corrective feedback instead of a
+                # hard 400 error from the executor.
+                try:
+                    from query_executor.sandbox import validate_sql as _sandbox_validate
+                    _sql_safe, _sql_reason = _sandbox_validate(query_plan.sql)
+                    if not _sql_safe:
+                        retry_feedback = (
+                            f"Guardrail blocked a write operation in the generated SQL: {_sql_reason}. "
+                            "Rewrite as a read-only SELECT/WITH query."
+                        )
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "write_op_blocked"})
+                        print(f"[orchestrator:{job_id[:8]}] sandbox blocked SQL attempt {attempt}: {_sql_reason}", flush=True)
+                        continue
+                except ImportError:
+                    pass  # sandbox not available in this environment
+
                 # ── Intent-contract check: SQL must honour granularity/time/KPI shape ──
                 # (templates are correct by construction — skip)
                 if not _used_template:
@@ -756,6 +774,63 @@ class Orchestrator:
                             f"there is exactly one row per {_gran}."
                         )
                         await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "wrong_granularity"})
+                        continue
+
+                # ── Deterministic data-sanity checks (before expensive LLM validator) ──
+                # These are zero-cost Python checks that catch common shape failures
+                # without burning a Bedrock call on something obviously wrong.
+                _san_rows  = execute_result.get("rows") or []
+                _san_count = execute_result.get("row_count", len(_san_rows))
+                _san_cols  = execute_result.get("columns") or []
+                _san_ct    = (query_plan.chart_type or "").lower()
+
+                # 1. KPI/gauge must return exactly 1 row with 1 numeric column
+                _KPI_TYPES = frozenset({"kpi", "kpi_card", "gauge", "metric", "scorecard"})
+                if _san_ct in _KPI_TYPES and _san_count > 1 and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                    retry_feedback = (
+                        f"KPI/gauge chart returned {_san_count} rows — must return exactly 1 row. "
+                        "Use a single aggregate (SUM, COUNT, AVG) with no GROUP BY."
+                    )
+                    await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "kpi_shape_mismatch"})
+                    print(f"[orchestrator:{job_id[:8]}] KPI shape fail: {_san_count} rows", flush=True)
+                    continue
+
+                # 2. Cartesian JOIN guard: JOIN + extreme row count = missing JOIN key
+                if "JOIN" in (query_plan.sql or "").upper() and _san_count > 200_000 and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                    retry_feedback = (
+                        f"Query with JOIN returned {_san_count:,} rows — likely a cartesian product "
+                        "(missing or incorrect JOIN condition). "
+                        "Verify that JOIN keys exist in both tables and are correctly matched."
+                    )
+                    await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "cartesian_join"})
+                    print(f"[orchestrator:{job_id[:8]}] cartesian guard triggered: {_san_count:,} rows with JOIN", flush=True)
+                    continue
+
+                # 3. Numeric presence: chart types that require a numeric measure must have one
+                _NUMERIC_CHART_TYPES = frozenset({
+                    "bar_vertical", "bar_horizontal", "line", "area", "stacked_bar",
+                    "stacked_area", "grouped_bar", "scatter", "bubble", "histogram",
+                    "waterfall", "funnel", "combo",
+                })
+                if (
+                    _san_ct in _NUMERIC_CHART_TYPES
+                    and _san_rows and _san_cols
+                    and attempt < _MAX_SINGLE_VIZ_ATTEMPTS
+                ):
+                    _first_row = _san_rows[0]
+                    _has_numeric = any(
+                        isinstance(_first_row.get(c), (int, float))
+                        for c in _san_cols
+                        if _first_row.get(c) is not None
+                    )
+                    if not _has_numeric:
+                        retry_feedback = (
+                            f"Chart type '{_san_ct}' requires at least one numeric column, "
+                            "but all returned columns contain non-numeric data. "
+                            "Apply an aggregate (SUM, COUNT, AVG) to produce a numeric measure."
+                        )
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "no_numeric_column"})
+                        print(f"[orchestrator:{job_id[:8]}] no numeric column for {_san_ct}", flush=True)
                         continue
 
                 # Post-execution: correct the chart title's year range to match actual data.
@@ -961,6 +1036,27 @@ class Orchestrator:
                     narrative = await _narrate_from_result(user_text, final_result, output_mode)
             except Exception as _ne:
                 print(f"[pipeline:{job_id}] narration failed (non-fatal): {_ne}", flush=True)
+
+            # ── Grounding verification: ensure narrator only cited real data ─────────
+            # After the stream completes, run a cheap Haiku check that verifies every
+            # number in the narrative appears in the actual rows. If hallucinated values
+            # are found, the corrected text is emitted as a separate event so the
+            # frontend can replace the streamed tokens with the grounded version.
+            try:
+                from agent_service.agents.result_narrator import verify_narrative_grounding as _verify_grounding
+                if narrative and execute_result.get("rows"):
+                    _grounded, _corrected = await _verify_grounding(narrative, execute_result)
+                    if not _grounded and _corrected and _corrected != narrative:
+                        print(f"[pipeline:{job_id[:8]}] narrator grounding corrected — hallucination detected", flush=True)
+                        narrative = _corrected
+                        await emit({
+                            "type": "narrative.corrected",
+                            "job_id": job_id,
+                            "narrative": narrative,
+                        })
+            except Exception as _gve:
+                print(f"[pipeline:{job_id}] grounding check failed (non-fatal): {_gve}", flush=True)
+
             final_result["output_mode"] = output_mode
             final_result["narrative"] = narrative
             await emit({
@@ -1317,6 +1413,32 @@ class Orchestrator:
         Returns a result dict with confidence and chart_data, or None on failure.
         Used by the multi-candidate parallel execution path."""
         import copy
+
+        # Pre-flight: skip candidate tables that have no numeric/metric columns when the
+        # intent requires aggregation. Pure dimension/profile tables (all TEXT + DATE columns)
+        # will cause the LLM to hallucinate metric column names → SQL compilation errors.
+        if enriched and intent and getattr(intent.entities, "metrics", None):
+            _NUMERIC_TYPE_FRAGMENTS = (
+                "number", "int", "float", "decimal", "numeric", "double",
+                "bigint", "smallint", "real", "money", "currency", "amount",
+            )
+            _ct_map = {t["name"]: t for t in (enriched.compact_tables or [])}
+            _ct = _ct_map.get(candidate_table)
+            if _ct:
+                cols = _ct.get("columns", [])
+                has_numeric = any(
+                    c.get("semantic_type") == "metric"
+                    or any(frag in (c.get("type") or "").lower() for frag in _NUMERIC_TYPE_FRAGMENTS)
+                    for c in cols
+                )
+                if not has_numeric:
+                    print(
+                        f"[pipeline:{job_id}] skipping {candidate_table!r} "
+                        f"— no numeric/metric columns for aggregation query",
+                        flush=True,
+                    )
+                    return None
+
         try:
             # Build a focused RetrievedContext that only mentions this candidate.
             local_ctx = copy.copy(retrieved_context) if retrieved_context else None

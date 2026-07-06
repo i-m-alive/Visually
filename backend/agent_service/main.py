@@ -597,7 +597,9 @@ async def update_connection(project_id: str, conn_id: str, req: ConnectionCreate
     conn.database_name = req.database_name
     conn.username = req.username
     if req.password is not None:
-        # empty string = clear password (switch to IAM auth); non-empty = update it
+        # Non-empty string → encrypt and store new password.
+        # Explicit empty string → intentional "switch to IAM auth" (clear stored password).
+        # None (field absent from payload) → leave existing encrypted_password unchanged.
         conn.encrypted_password = encrypt(req.password) if req.password else None
     conn.ssl_enabled = req.ssl_enabled
     conn.connection_options = req.connection_options

@@ -11,7 +11,7 @@ import {
   Loader2, AlertCircle, CheckCircle2, LayoutGrid, Sparkles, Pencil, Calendar,
   RotateCcw, ZoomIn, ZoomOut, Link2, RefreshCw, Eye, EyeOff, FileJson,
   FunctionSquare, Clock, Shield, FileDown, Zap, Table2, Database, Type,
-  Bell, History as HistoryIcon, Image as ImageIcon,
+  Bell, History as HistoryIcon, Image as ImageIcon, ChevronDown,
 } from 'lucide-react'
 import { canvasApi, widgetApi, vlyApi, scheduleApi, versionsApi } from '@/lib/api'
 import { HistoryDrawer, AlertsModal, ExplainPopover } from '@/components/canvas/AgentPanels'
@@ -22,7 +22,6 @@ import { TableScopePicker } from '@/components/canvas/TableScopePicker'
 import { useTableScopeStore } from '@/stores/tableScopeStore'
 import { VlyExportModal } from '@/components/canvas/VlyExportModal'
 import { ConnectLiveDbModal } from '@/components/canvas/ConnectLiveDbModal'
-import { VisuallReport } from '@/components/canvas/VisuallReport'
 import { CanvasPageTabs, type CanvasPage } from '@/components/canvas/CanvasPageTabs'
 import { MeasuresPanel } from '@/components/canvas/MeasuresPanel'
 import { ScheduleRefreshModal } from '@/components/canvas/ScheduleRefreshModal'
@@ -158,7 +157,6 @@ export default function CanvasEditorPage() {
   const [showConnectDb, setShowConnectDb] = useState(false)
   const [tablesPopPos, setTablesPopPos] = useState<{ top: number; right: number } | null>(null)
   const tablesBtnRef = useRef<HTMLButtonElement>(null)
-  const [showReport, setShowReport]   = useState(false)
   const [zoomTarget, setZoomTarget]   = useState<{ widget: CanvasWidgetData; colors: string[] } | null>(null)
   const [isDirty, setIsDirty]         = useState(false)
   const [editingTitle, setEditingTitle] = useState(false)
@@ -182,6 +180,14 @@ export default function CanvasEditorPage() {
   const hasAutoFitRef   = useRef(false)
   const [isViewOnly, setIsViewOnly]         = useState(false)
   const [showMeasures, setShowMeasures]     = useState(false)
+  const [shareMenu, setShareMenu]           = useState(false)
+  const [configMenu, setConfigMenu]         = useState(false)
+  // Positions for portal-rendered dropdowns (fixed to viewport so they escape
+  // the toolbar's overflow-x:auto clipping context).
+  const [shareMenuPos, setShareMenuPos]     = useState<{ top: number; left: number } | null>(null)
+  const [configMenuPos, setConfigMenuPos]   = useState<{ top: number; left: number } | null>(null)
+  const shareBtnRef  = useRef<HTMLButtonElement>(null)
+  const configBtnRef = useRef<HTMLButtonElement>(null)
   const [showAlerts, setShowAlerts]         = useState(false)
   const [showHistory, setShowHistory]       = useState(false)
   const [explainTarget, setExplainTarget]   = useState<{ widgetId: string; column: string; value: string } | null>(null)
@@ -190,11 +196,16 @@ export default function CanvasEditorPage() {
   const [toastMsg, setToastMsg]             = useState<string | null>(null)
   const [canUndo, setCanUndo]               = useState(false)
   const [canRedo, setCanRedo]               = useState(false)
+  // Ribbon collapsed = only identity + assistant visible (Power-BI/Word style)
+  const [ribbonCollapsed, setRibbonCollapsed] = useState(false)
 
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const undoStackRef   = useRef<GridItem[][]>([])
   const redoStackRef   = useRef<GridItem[][]>([])
   const toastTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Set to true while load() is updating the layout programmatically so that
+  // handleLayoutChange doesn't treat it as a user edit (isDirty / save timer).
+  const programmaticLayoutRef = useRef(false)
 
   function showToast(msg: string) {
     setToastMsg(msg)
@@ -261,6 +272,7 @@ export default function CanvasEditorPage() {
             minH: 3,
             static: locked.has(w.id),
           }))
+      programmaticLayoutRef.current = true
       setLayout(computed)
       if (shouldAutoArrange) {
         void canvasApi.updateLayout(canvasId, computed.map(l => ({
@@ -275,6 +287,18 @@ export default function CanvasEditorPage() {
   }, [canvasId])
 
   useEffect(() => { load() }, [load])
+
+  // Silent background sync: scheduled/cron refreshes update the DB, but an open
+  // canvas never re-read it — users saw stale widgets until a manual page reload.
+  // Poll every 2 min while the tab is visible and there are no unsaved edits.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible' && !isDirty) {
+        load(true)
+      }
+    }, 120_000)
+    return () => clearInterval(id)
+  }, [load, isDirty])
 
   // Zoom-to-fit once on first render: scale the 1280px page to the available
   // width (capped at 100%). Manual zoom controls still override afterwards.
@@ -382,6 +406,12 @@ export default function CanvasEditorPage() {
   }, [layout, persistLayout])
 
   const handleLayoutChange = useCallback((newLayout: Layout, _allLayouts: Partial<Record<string, Layout>>) => {
+    // Suppress dirty-marking when the layout was set programmatically by load()
+    if (programmaticLayoutRef.current) {
+      programmaticLayoutRef.current = false
+      setLayout([...newLayout])
+      return
+    }
     setLayout([...newLayout])
     setIsDirty(true)
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
@@ -510,9 +540,15 @@ export default function CanvasEditorPage() {
     try {
       // Re-run ONLY this widget's query (not the whole dashboard), then re-read
       // its fresh data silently (no full-page spinner).
-      await scheduleApi.refreshWidget(canvasId, widgetId)
+      const resp = await scheduleApi.refreshWidget(canvasId, widgetId)
+      console.log('[refresh] widget', widgetId, resp?.data)
       await load(true)
-      showToast('Data refreshed from database')
+      const r = (resp?.data ?? {}) as { refreshed?: number; errors?: { error: string }[] }
+      if (r.refreshed === 0) {
+        showToast(`Refresh failed: ${r.errors?.[0]?.error?.slice(0, 80) || 'widget skipped (no SQL/connection)'}`)
+      } else {
+        showToast('Data refreshed from database')
+      }
     } catch {
       showToast('Refresh failed')
     } finally {
@@ -524,11 +560,14 @@ export default function CanvasEditorPage() {
     setRefreshingId('all')
     try {
       const resp = await scheduleApi.refreshNow(canvasId)
-      await load()
-      const r = (resp?.data ?? {}) as { refreshed?: number; total?: number }
+      console.log('[refresh] all widgets', resp?.data)
+      // Silent reload: keep widgets mounted and update their data in-place so
+      // the user sees the chart update without a full spinner/unmount cycle.
+      await load(true)
+      const r = (resp?.data ?? {}) as { refreshed?: number; total?: number; skipped?: number; errors?: { error: string }[] }
       showToast(
         typeof r.refreshed === 'number'
-          ? `Refreshed ${r.refreshed}/${r.total ?? r.refreshed} widgets`
+          ? `Refreshed ${r.refreshed}/${r.total ?? r.refreshed} widgets${r.skipped ? ` (${r.skipped} skipped)` : ''}${r.errors?.length ? ` — ${r.errors.length} failed, see console` : ''}`
           : 'All widgets refreshed',
       )
     } catch {
@@ -718,18 +757,23 @@ export default function CanvasEditorPage() {
         </div>
       )}
 
-      {/* Top bar */}
-      {/* ── Ribbon ── Title bar ─────────────────────────────────────────────────── */}
-      <div className="flex items-center gap-2 px-3 py-1.5 bg-white border-b border-gray-200 flex-shrink-0"
-        style={{ background: 'linear-gradient(180deg,#f8fafd 0%,#f1f5f9 100%)' }}>
+      {/* ── Unified toolbar ─────────────────────────────────────────────────────
+          Dropdowns use createPortal + position:fixed so they are never clipped
+          by the toolbar's overflow-x:auto scroll container.
+          ribbonCollapsed hides the tool sections (Word-style). */}
+      <div className="flex items-center gap-1 h-[52px] px-3 bg-white/90 backdrop-blur border-b border-gray-200 flex-shrink-0 overflow-x-auto whitespace-nowrap">
+
+        {/* Identity — always visible */}
         <button
           onClick={() => router.push(`/projects/${projectId}/canvas`)}
-          className="p-1 text-gray-400 hover:text-gray-700 rounded hover:bg-white/80 transition-colors flex-shrink-0"
+          className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-800 hover:bg-gray-100 transition-colors flex-shrink-0"
           title="Back to canvases"
         >
-          <ChevronLeft size={16} />
+          <ChevronLeft size={17} />
         </button>
-        <Layers size={14} className="text-blue-600 flex-shrink-0" />
+        <div className="h-8 w-8 inline-flex items-center justify-center rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex-shrink-0 shadow-sm">
+          <Layers size={15} className="text-white" />
+        </div>
         {editingTitle ? (
           <input
             autoFocus
@@ -740,242 +784,262 @@ export default function CanvasEditorPage() {
               if (e.key === 'Enter') handleTitleSave()
               if (e.key === 'Escape') { setTitleValue(canvas?.name ?? ''); setEditingTitle(false) }
             }}
-            className="text-sm font-semibold text-gray-900 bg-white border border-blue-400 rounded px-1.5 outline-none min-w-0 w-44"
+            className="text-[15px] font-bold text-gray-900 bg-white border border-blue-400 rounded-lg px-2 py-1 outline-none ring-2 ring-blue-100 min-w-0 w-52 flex-shrink-0"
           />
         ) : (
           <button
             onClick={() => { setTitleValue(canvas?.name ?? ''); setEditingTitle(true) }}
-            className="group/title flex items-center gap-1 text-sm font-semibold text-gray-800 hover:text-blue-600 transition-colors min-w-0"
+            className="group/title flex items-center gap-1.5 px-1.5 text-[15px] font-bold text-gray-900 hover:text-blue-700 transition-colors min-w-0 flex-shrink-0"
             title="Click to rename"
           >
-            <span className="truncate max-w-[200px]">{canvas?.name}</span>
-            <Pencil size={11} className="text-gray-300 group-hover/title:text-blue-500 shrink-0 transition-colors" />
+            <span className="truncate max-w-[220px]">{canvas?.name}</span>
+            <Pencil size={12} className="text-transparent group-hover/title:text-blue-400 shrink-0 transition-colors" />
           </button>
         )}
-        <div className="flex items-center gap-1 ml-1 flex-shrink-0 text-xs">
-          {saving && <span className="flex items-center gap-1 text-gray-400"><Loader2 size={11} className="animate-spin" /> Saving…</span>}
-          {savedOk && <span className="flex items-center gap-1 text-green-600"><CheckCircle2 size={11} /> Saved</span>}
+        <div className="flex items-center flex-shrink-0 text-xs mr-1">
+          {saving && <span className="flex items-center gap-1 px-2 py-1 text-gray-400"><Loader2 size={11} className="animate-spin" /> Saving</span>}
+          {savedOk && <span className="flex items-center gap-1 px-2 py-1 text-green-600 bg-green-50 rounded-full"><CheckCircle2 size={11} /> Saved</span>}
           {isDirty && !saving && !savedOk && (
-            <button onClick={handleManualSave} className="flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors">
+            <button onClick={handleManualSave} className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white bg-blue-600 rounded-full hover:bg-blue-700 transition-colors shadow-sm">
               <Save size={11} /> Save
             </button>
           )}
         </div>
-      </div>
 
-      {/* ── Ribbon ── Command bar ───────────────────────────────────────────────── */}
-      <div className="flex items-end gap-0 px-0 bg-white border-b border-gray-200 flex-shrink-0 overflow-x-auto"
-        style={{ background: 'white' }}>
+        {/* Tool sections — hidden when ribbon is collapsed */}
+        {!ribbonCollapsed && (
+          <>
+            <div className="w-px h-5 bg-gray-200 mx-1 flex-shrink-0" />
 
-        {/* Helper for ribbon groups */}
-        {/* Group: Edit */}
-        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
-          <div className="flex items-center gap-0.5">
-            <button onClick={handleUndo} disabled={!canUndo} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-30 transition-colors group" title="Undo (Ctrl+Z)">
-              <RotateCcw size={16} className="text-gray-600" />
-              <span className="text-[9px] text-gray-500">Undo</span>
+            {/* Undo / Redo */}
+            <button onClick={handleUndo} disabled={!canUndo} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 disabled:opacity-25 disabled:hover:bg-transparent transition-colors flex-shrink-0" title="Undo (Ctrl+Z)">
+              <RotateCcw size={15} />
             </button>
-            <button onClick={handleRedo} disabled={!canRedo} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-30 transition-colors scale-x-[-1]" title="Redo (Ctrl+Y)">
-              <RotateCcw size={16} className="text-gray-600" />
+            <button onClick={handleRedo} disabled={!canRedo} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 disabled:opacity-25 disabled:hover:bg-transparent transition-colors scale-x-[-1] flex-shrink-0" title="Redo (Ctrl+Y)">
+              <RotateCcw size={15} />
             </button>
-          </div>
-          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Edit</span>
-        </div>
 
-        {/* Group: View */}
-        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
-          <div className="flex items-center gap-0.5">
-            <button onClick={() => setGridZoom(z => Math.max(0.5, z - 0.1))} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors" title="Zoom out">
-              <ZoomOut size={16} className="text-gray-600" />
-              <span className="text-[9px] text-gray-500">Out</span>
-            </button>
-            <span className="text-xs font-semibold text-gray-600 min-w-[36px] text-center px-1 py-1 bg-gray-50 rounded border border-gray-200 select-none" style={{ fontSize: 11 }}>
-              {Math.round(gridZoom * 100)}%
-            </span>
-            <button onClick={() => setGridZoom(z => Math.min(1.5, z + 0.1))} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors" title="Zoom in">
-              <ZoomIn size={16} className="text-gray-600" />
-              <span className="text-[9px] text-gray-500">In</span>
-            </button>
+            <div className="w-px h-5 bg-gray-200 mx-1 flex-shrink-0" />
+
+            {/* Zoom cluster */}
+            <div className="flex items-center bg-gray-50 border border-gray-200 rounded-lg overflow-hidden flex-shrink-0">
+              <button onClick={() => setGridZoom(z => Math.max(0.5, Math.round((z - 0.1) * 10) / 10))} className="h-7 w-7 inline-flex items-center justify-center text-gray-500 hover:text-gray-900 hover:bg-gray-100 transition-colors" title="Zoom out (Ctrl −)">
+                <ZoomOut size={13} />
+              </button>
+              <span className="text-[11px] font-semibold text-gray-600 min-w-[38px] text-center select-none tabular-nums">
+                {Math.round(gridZoom * 100)}%
+              </span>
+              <button onClick={() => setGridZoom(z => Math.min(1.5, Math.round((z + 0.1) * 10) / 10))} className="h-7 w-7 inline-flex items-center justify-center text-gray-500 hover:text-gray-900 hover:bg-gray-100 transition-colors" title="Zoom in (Ctrl +)">
+                <ZoomIn size={13} />
+              </button>
+            </div>
             <button
               onClick={() => { setIsViewOnly(v => !v); showToast(!isViewOnly ? 'View-only mode on' : 'Edit mode') }}
-              className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${isViewOnly ? 'bg-amber-50 text-amber-600' : 'hover:bg-gray-100 text-gray-600'}`}
-              title={isViewOnly ? 'Exit view-only mode' : 'Enter view-only mode'}
+              className={`h-8 w-8 inline-flex items-center justify-center rounded-lg transition-colors flex-shrink-0 ${isViewOnly ? 'bg-amber-100 text-amber-600' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'}`}
+              title={isViewOnly ? 'Exit view-only mode' : 'View-only mode'}
             >
-              {isViewOnly ? <EyeOff size={16} /> : <Eye size={16} />}
-              <span className="text-[9px]">View</span>
+              {isViewOnly ? <EyeOff size={15} /> : <Eye size={15} />}
             </button>
-            <button onClick={handleRefreshAll} disabled={refreshingId === 'all'} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-50 transition-colors text-gray-600" title="Refresh all">
-              <RefreshCw size={16} className={refreshingId === 'all' ? 'animate-spin' : ''} />
-              <span className="text-[9px] text-gray-500">Refresh</span>
+            <button onClick={handleRefreshAll} disabled={refreshingId === 'all'} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 disabled:opacity-50 transition-colors flex-shrink-0" title="Refresh all widgets">
+              <RefreshCw size={15} className={refreshingId === 'all' ? 'animate-spin text-blue-600' : ''} />
             </button>
-          </div>
-          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">View</span>
-        </div>
 
-        {/* Group: Insert */}
-        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
-          <div className="flex items-center gap-0.5">
+            <div className="w-px h-5 bg-gray-200 mx-1 flex-shrink-0" />
+
+            {/* Insert */}
             {!isViewOnly && (
-              <button onClick={() => setShowChat(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-blue-50 hover:text-blue-700 transition-colors text-gray-600" title="Add chart">
-                <Plus size={16} />
-                <span className="text-[9px]">Add Chart</span>
-              </button>
-            )}
-            {!isViewOnly && (
-              <button onClick={handleInsertText} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Insert text box">
-                <Type size={16} />
-                <span className="text-[9px]">Text</span>
-              </button>
-            )}
-            {!isViewOnly && (
-              <button onClick={handleInsertImage} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Insert image">
-                <ImageIcon size={16} />
-                <span className="text-[9px]">Image</span>
-              </button>
+              <>
+                <button onClick={() => setShowChat(true)} className="h-8 inline-flex items-center gap-1.5 px-3 rounded-lg text-sm font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-100 transition-colors flex-shrink-0" title="Ask the AI to build a chart">
+                  <Plus size={15} /> Chart
+                </button>
+                <button onClick={handleInsertText} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 transition-colors flex-shrink-0" title="Insert text box">
+                  <Type size={15} />
+                </button>
+                <button onClick={handleInsertImage} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 transition-colors flex-shrink-0" title="Insert image">
+                  <ImageIcon size={15} />
+                </button>
+              </>
             )}
             {widgets.length > 0 && (
-              <button onClick={handleAutoArrange} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Auto-arrange">
-                <LayoutGrid size={16} />
-                <span className="text-[9px]">Auto</span>
+              <button onClick={handleAutoArrange} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-900 hover:bg-gray-100 transition-colors flex-shrink-0" title="Auto-arrange widgets">
+                <LayoutGrid size={15} />
               </button>
             )}
-          </div>
-          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Insert</span>
-        </div>
 
-        {/* Group: Share */}
-        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
-          <div className="flex items-center gap-0.5">
-            <button onClick={handleCopyLink} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Copy link">
-              <Link2 size={16} />
-              <span className="text-[9px]">Copy Link</span>
-            </button>
-            <button onClick={handleExportJSON} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-gray-100 transition-colors text-gray-600" title="Export JSON">
-              <FileJson size={16} />
-              <span className="text-[9px]">JSON</span>
-            </button>
-            <button onClick={() => setShowExport(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-teal-50 hover:text-teal-700 transition-colors text-gray-600" title="Export .vly">
-              <FileDown size={16} />
-              <span className="text-[9px]">Export .vly</span>
-            </button>
-            {(canvas?.is_offline || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline') && (
-              <button onClick={() => setShowConnectDb(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-indigo-50 hover:text-indigo-700 transition-colors text-indigo-600" title="Connect a live database — switch from bundled offline data to real-time data">
-                <Database size={16} />
-                <span className="text-[9px]">Connect DB</span>
-              </button>
-            )}
-          </div>
-          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Share</span>
-        </div>
+            <div className="w-px h-5 bg-gray-200 mx-1 flex-shrink-0" />
 
-        {/* Group: Configure */}
-        <div className="flex flex-col items-center px-3 py-1 border-r border-gray-100">
-          <div className="flex items-center gap-0.5">
-            <button onClick={() => setShowMeasures(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-purple-50 hover:text-purple-700 transition-colors text-gray-600" title="Calculated Measures">
-              <FunctionSquare size={16} />
-              <span className="text-[9px]">Measures</span>
-            </button>
-            <button onClick={() => setShowSchedule(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-green-50 hover:text-green-700 transition-colors text-gray-600" title="Schedule Refresh">
-              <Clock size={16} />
-              <span className="text-[9px]">Schedule</span>
-            </button>
-            <button onClick={() => setShowRLS(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-orange-50 hover:text-orange-700 transition-colors text-gray-600" title="Row-Level Security">
-              <Shield size={16} />
-              <span className="text-[9px]">RLS</span>
-            </button>
-            <button onClick={() => setShowAlerts(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-amber-50 hover:text-amber-600 transition-colors text-gray-600" title="Data alerts — the agent watches your charts">
-              <Bell size={16} />
-              <span className="text-[9px]">Alerts</span>
-            </button>
-            <button onClick={() => setShowHistory(true)} className="flex flex-col items-center gap-0.5 px-2 py-1 rounded hover:bg-blue-50 hover:text-blue-700 transition-colors text-gray-600" title="Version history">
-              <HistoryIcon size={16} />
-              <span className="text-[9px]">History</span>
-            </button>
-          </div>
-          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">Configure</span>
-        </div>
-
-        {/* Group: AI — primary actions, visually prominent */}
-        <div className="flex flex-col items-center px-3 py-1">
-          <div className="flex items-center gap-1">
+            {/* Share — button only; dropdown rendered in portal below toolbar */}
             <button
-              onClick={() => setShowChat(v => !v)}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md border transition-colors ${showChat ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-gray-600 border-gray-200 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-300'}`}
-            >
-              <MessageSquare size={17} />
-              <span className="text-[9px] font-semibold">AI Chat</span>
-            </button>
-            {/* Table scope — same control as in the chat, shared via the store.
-                Rendered in a portal (below) so it can't be hidden behind the canvas grid. */}
-            <button
-              ref={tablesBtnRef}
+              ref={shareBtnRef}
               onClick={() => {
-                const r = tablesBtnRef.current?.getBoundingClientRect()
-                if (r) setTablesPopPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) })
-                setShowTablePicker(v => !v)
+                const r = shareBtnRef.current?.getBoundingClientRect()
+                if (r) setShareMenuPos({ top: r.bottom + 4, left: r.left })
+                setShareMenu(v => !v)
+                setConfigMenu(false)
               }}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md border transition-colors ${showTablePicker ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-gray-600 border-gray-200 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-300'}`}
-              title="Choose which tables the AI assistant focuses on"
+              className={`h-8 inline-flex items-center gap-1 px-2.5 rounded-lg text-sm transition-colors flex-shrink-0 ${shareMenu ? 'bg-gray-100 text-gray-900' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'}`}
+              title="Share & export"
             >
-              <Table2 size={17} />
-              <span className="text-[9px] font-semibold">Tables</span>
+              <Link2 size={15} /> <ChevronDown size={12} className="opacity-60" />
             </button>
-            {showTablePicker && typeof document !== 'undefined' && createPortal(
-              <>
-                <div style={{ position: 'fixed', inset: 0, zIndex: 9998 }} onClick={() => setShowTablePicker(false)} />
-                <div style={{
-                  position: 'fixed',
-                  top: tablesPopPos?.top ?? 64,
-                  right: tablesPopPos?.right ?? 12,
-                  width: 320,
-                  zIndex: 9999,
-                  borderRadius: 12,
-                  background: '#fff',
-                  border: '1px solid #e2e8f0',
-                  boxShadow: '0 16px 40px rgba(10,33,58,0.18)',
-                }}>
-                  <TableScopePicker canvasId={canvasId} />
-                </div>
-              </>,
-              document.body,
-            )}
-            {showExport && (
-              <VlyExportModal
-                canvasId={canvasId}
-                onClose={() => setShowExport(false)}
-              />
-            )}
-            {showConnectDb && (
-              <ConnectLiveDbModal
-                projectId={projectId}
-                dashboardId={canvasId}
-                hint={canvas?.connection_hint}
-                onClose={() => setShowConnectDb(false)}
-                onConnected={() => window.location.reload()}
-              />
-            )}
+
+            {/* Configure — button only; dropdown rendered in portal below toolbar */}
             <button
-              onClick={() => setShowReport(true)}
-              className="flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md text-white border border-transparent transition-all hover:opacity-90"
-              style={{ background: 'linear-gradient(135deg, #2563EB, #7C3AED)' }}
-              title="View as rich report"
+              ref={configBtnRef}
+              onClick={() => {
+                const r = configBtnRef.current?.getBoundingClientRect()
+                if (r) setConfigMenuPos({ top: r.bottom + 4, left: r.left })
+                setConfigMenu(v => !v)
+                setShareMenu(false)
+              }}
+              className={`h-8 inline-flex items-center gap-1 px-2.5 rounded-lg text-sm transition-colors flex-shrink-0 ${configMenu ? 'bg-gray-100 text-gray-900' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'}`}
+              title="Measures, schedule & security"
             >
-              <Sparkles size={17} />
-              <span className="text-[9px] font-semibold">Visually</span>
+              <FunctionSquare size={15} /> <ChevronDown size={12} className="opacity-60" />
             </button>
-            <button
-              onClick={() => router.push(`/intelligence/${canvasId}`)}
-              className="flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-md text-white border border-transparent transition-all hover:opacity-90"
-              style={{ background: 'linear-gradient(135deg, #00a9d4, #16c0e8)' }}
-              title="Open Executive Intelligence"
-            >
-              <Zap size={17} />
-              <span className="text-[9px] font-semibold">Intelligence</span>
+
+            {/* Agentic quick actions */}
+            <button onClick={() => setShowAlerts(true)} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-amber-600 hover:bg-amber-50 transition-colors flex-shrink-0" title="Data alerts">
+              <Bell size={15} />
             </button>
-          </div>
-          <span className="text-[9px] text-gray-400 uppercase tracking-wider mt-0.5">AI</span>
+            <button onClick={() => setShowHistory(true)} className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-gray-500 hover:text-blue-700 hover:bg-blue-50 transition-colors flex-shrink-0" title="Version history">
+              <HistoryIcon size={15} />
+            </button>
+          </>
+        )}
+
+        {/* Right cluster — always visible */}
+        <div className="flex items-center gap-1.5 ml-auto pl-2 flex-shrink-0">
+          {!ribbonCollapsed && (
+            <>
+              <button
+                ref={tablesBtnRef}
+                onClick={() => {
+                  const r = tablesBtnRef.current?.getBoundingClientRect()
+                  if (r) setTablesPopPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) })
+                  setShowTablePicker(v => !v)
+                }}
+                className={`h-8 inline-flex items-center gap-1.5 px-2.5 rounded-lg text-sm transition-colors ${showTablePicker ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'}`}
+                title="Choose which tables the AI focuses on"
+              >
+                <Table2 size={15} /> Tables
+              </button>
+              <button
+                onClick={() => router.push(`/intelligence/${canvasId}`)}
+                className="h-8 inline-flex items-center gap-1.5 px-3 rounded-lg text-sm font-semibold text-cyan-700 bg-cyan-50 hover:bg-cyan-100 border border-cyan-100 transition-colors"
+                title="Open Executive Intelligence"
+              >
+                <Zap size={15} /> Intelligence
+              </button>
+            </>
+          )}
+          <button
+            onClick={() => setShowChat(v => !v)}
+            className={`h-8 inline-flex items-center gap-1.5 px-3.5 rounded-lg text-sm font-semibold transition-all shadow-sm ${
+              showChat
+                ? 'bg-gray-900 text-white'
+                : 'text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700'
+            }`}
+            title="Canvas Assistant (N)"
+          >
+            <Sparkles size={15} /> Assistant
+          </button>
+
+          {/* Ribbon collapse toggle — mimics Word's ∧ ribbon pin */}
+          <div className="w-px h-5 bg-gray-200 mx-1 flex-shrink-0" />
+          <button
+            onClick={() => setRibbonCollapsed(v => !v)}
+            className="h-7 w-7 inline-flex items-center justify-center rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors flex-shrink-0"
+            title={ribbonCollapsed ? 'Expand toolbar' : 'Collapse toolbar'}
+          >
+            <ChevronDown size={14} className={`transition-transform duration-200 ${ribbonCollapsed ? 'rotate-180' : ''}`} />
+          </button>
         </div>
       </div>
+
+      {/* Portal-rendered dropdowns — rendered at document.body so the toolbar's
+          overflow-x:auto container never clips them. z-index 9980 sits above
+          every canvas surface but below critical overlays (modals, etc.). */}
+      {shareMenu && shareMenuPos && typeof document !== 'undefined' && createPortal(
+        <>
+          <div className="fixed inset-0 z-[9980]" onClick={() => setShareMenu(false)} />
+          <div className="fixed z-[9981] w-52 bg-white border border-gray-200 rounded-xl shadow-2xl py-1.5"
+            style={{ top: shareMenuPos.top, left: shareMenuPos.left }}>
+            {[
+              { icon: <Link2 size={14} />, label: 'Copy link', fn: handleCopyLink },
+              { icon: <FileJson size={14} />, label: 'Export JSON', fn: handleExportJSON },
+              { icon: <FileDown size={14} />, label: 'Export .vly bundle', fn: () => setShowExport(true) },
+            ].map(item => (
+              <button key={item.label} onClick={() => { setShareMenu(false); item.fn() }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2 text-sm text-gray-700 hover:bg-gray-50 hover:text-gray-900 transition-colors">
+                <span className="text-gray-400">{item.icon}</span>{item.label}
+              </button>
+            ))}
+            {(canvas?.is_offline || (canvas?.layout_config as { data_mode?: string } | undefined)?.data_mode === 'offline') && (
+              <button onClick={() => { setShareMenu(false); setShowConnectDb(true) }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2 text-sm text-indigo-600 hover:bg-indigo-50 transition-colors border-t border-gray-100 mt-1 pt-2">
+                <Database size={14} /> Connect live database
+              </button>
+            )}
+          </div>
+        </>,
+        document.body,
+      )}
+      {configMenu && configMenuPos && typeof document !== 'undefined' && createPortal(
+        <>
+          <div className="fixed inset-0 z-[9980]" onClick={() => setConfigMenu(false)} />
+          <div className="fixed z-[9981] w-56 bg-white border border-gray-200 rounded-xl shadow-2xl py-1.5"
+            style={{ top: configMenuPos.top, left: configMenuPos.left }}>
+            {[
+              { icon: <FunctionSquare size={14} />, label: 'Calculated measures', fn: () => setShowMeasures(true) },
+              { icon: <Clock size={14} />, label: 'Scheduled refresh', fn: () => setShowSchedule(true) },
+              { icon: <Shield size={14} />, label: 'Row-level security', fn: () => setShowRLS(true) },
+            ].map(item => (
+              <button key={item.label} onClick={() => { setConfigMenu(false); item.fn() }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2 text-sm text-gray-700 hover:bg-gray-50 hover:text-gray-900 transition-colors">
+                <span className="text-gray-400">{item.icon}</span>{item.label}
+              </button>
+            ))}
+          </div>
+        </>,
+        document.body,
+      )}
+
+      {/* Floating surfaces owned by the toolbar */}
+      {showTablePicker && typeof document !== 'undefined' && createPortal(
+        <>
+          <div style={{ position: 'fixed', inset: 0, zIndex: 9998 }} onClick={() => setShowTablePicker(false)} />
+          <div style={{
+            position: 'fixed',
+            top: tablesPopPos?.top ?? 64,
+            right: tablesPopPos?.right ?? 12,
+            width: 320,
+            zIndex: 9999,
+            borderRadius: 12,
+            background: '#fff',
+            border: '1px solid #e2e8f0',
+            boxShadow: '0 16px 40px rgba(10,33,58,0.18)',
+          }}>
+            <TableScopePicker canvasId={canvasId} />
+          </div>
+        </>,
+        document.body,
+      )}
+      {showExport && (
+        <VlyExportModal
+          canvasId={canvasId}
+          onClose={() => setShowExport(false)}
+        />
+      )}
+      {showConnectDb && (
+        <ConnectLiveDbModal
+          projectId={projectId}
+          dashboardId={canvasId}
+          hint={canvas?.connection_hint}
+          onClose={() => setShowConnectDb(false)}
+          onConnected={() => window.location.reload()}
+        />
+      )}
 
       {/* Date filter bar */}
       {(canvas?.filter_config?.filter(f => f.filter_type === 'date_range') ?? []).length > 0 && (
@@ -1171,13 +1235,14 @@ export default function CanvasEditorPage() {
         )}
         </div>
 
-        {/* Chat panel — absolute overlay so grid width is never affected */}
+        {/* Chat panel — floating overlay so grid width is never affected */}
         {showChat && (
           <div style={{
-            position: 'absolute', right: 0, top: 0, bottom: 0, zIndex: 40,
+            position: 'absolute', right: 10, top: 10, bottom: 10, zIndex: 40,
             display: 'flex', flexDirection: 'column',
-            boxShadow: '-4px 0 24px rgba(0,0,0,0.10)',
+            animation: 'canvasChatIn 0.22s cubic-bezier(0.16, 1, 0.3, 1)',
           }}>
+            <style>{`@keyframes canvasChatIn { from { opacity: 0; transform: translateX(16px) } to { opacity: 1; transform: translateX(0) } }`}</style>
             <CanvasChatPanel
               projectId={projectId}
               canvasId={canvasId}
@@ -1227,25 +1292,6 @@ export default function CanvasEditorPage() {
         />
       )}
 
-      {/* Visually report overlay */}
-      {showReport && canvas && (
-        <VisuallReport
-          canvas={{ id: canvas.id, name: canvas.name, project_id: canvas.project_id, filter_config: canvas.filter_config }}
-          widgets={widgets}
-          pages={pages}
-          initialPageId={activePageId}
-          projectId={projectId}
-          onClose={() => setShowReport(false)}
-          onWidgetAdded={load}
-          onPageRename={handleRenamePage}
-          onPageDelete={handleDeletePage}
-          onPageDuplicate={handleDuplicatePage}
-          onPageReorder={async (newPages) => {
-            setPages(newPages)
-            await canvasApi.updateLayoutConfig(canvasId, { pages: newPages })
-          }}
-        />
-      )}
 
       {/* Tier 5: Calculated Measures */}
       {showMeasures && (

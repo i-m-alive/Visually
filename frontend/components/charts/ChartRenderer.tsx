@@ -66,7 +66,16 @@ export function formatValue(v: unknown, fmt?: ValueFormat): string {
   if (v === null || v === undefined) return ''
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   if (isNaN(n) || !isFinite(n)) return String(v)
-  if (!fmt || Object.keys(fmt).length === 0) return String(v)
+  if (!fmt || Object.keys(fmt).length === 0) {
+    // Catch scientific-notation strings from Python (e.g. "0E-10" from Decimal arithmetic)
+    // and numbers that JavaScript serialises as "1e-10". Display near-zero as "0".
+    const str = String(v)
+    if (/e/i.test(str)) {
+      if (Math.abs(n) < 1e-9) return '0'
+      return n.toLocaleString(undefined, { maximumFractionDigits: 6 })
+    }
+    return str
+  }
   const decimals = fmt.decimals ?? (fmt.kind === 'percent' ? 1 : 2)
   let out: string
   if (fmt.compact && Math.abs(n) >= 1000) {
@@ -175,8 +184,24 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   // Display-only column renames: explicit prop wins, else carried on the result.
   const effColumnLabels = columnLabels ?? result.column_labels
 
-  const height = heightProp ?? (compact ? 180 : 300)
   const ct = (chart_type || 'bar_vertical').toLowerCase()
+  const rowCount = rows?.length ?? 0
+  // Auto-scale height when no explicit height is provided
+  const height = heightProp !== undefined ? heightProp : (() => {
+    if (compact) return 180
+    if (ct === 'bar_horizontal' || ct === 'bar_horizontal_stacked') {
+      // Each horizontal bar needs vertical space — scale with row count
+      return Math.max(220, Math.min(rowCount * 30 + 40, 700))
+    }
+    if (ct === 'bar_vertical' || ct === 'bar') {
+      // Vertical bars: taller for more categories so axis labels and bars have room
+      return Math.max(300, Math.min(rowCount * 16 + 80, 520))
+    }
+    if (ct === 'line' || ct === 'area' || ct === 'stacked_area') {
+      return Math.max(280, Math.min(rowCount * 4 + 240, 400))
+    }
+    return 300
+  })()
 
   // Extended fields stored by orchestrator for complex chart types
   const series   = (chart_data as Record<string, unknown>).series   as { name: string; values: (number | null)[] }[] | undefined
@@ -200,16 +225,23 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   const orgNodes     = (chart_data as Record<string, unknown>).org_nodes     as Array<{ id: string; name: string; parent: string }> | undefined
 
   // Smart column detection: when rows contain typed data, prefer string→X, number→Y
+  // Python Decimal values serialize as numeric strings (e.g. "169708393.7797"), so we
+  // treat a column as numeric if its sample value is a number OR a parseable numeric string.
+  const isNumericVal = (v: unknown): boolean =>
+    typeof v === 'number' || (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v)))
+  const isStringCol = (v: unknown): boolean =>
+    typeof v === 'string' && isNaN(Number(v))
+
   let xKey = columns[0] || x_axis_label || 'x'
   let yKey = columns[1] || y_axis_label || 'value'
   if (rows.length > 0 && columns.length >= 2) {
     const sample = rows[0]
-    const strCols = columns.filter(c => typeof sample[c] === 'string')
-    const numCols = columns.filter(c => typeof sample[c] === 'number')
+    const strCols = columns.filter(c => isStringCol(sample[c]))
+    const numCols = columns.filter(c => isNumericVal(sample[c]))
     if (strCols.length > 0 && numCols.length > 0) {
       xKey = strCols[0]
       yKey = numCols[0]
-    } else if (numCols.length >= 2 && typeof sample[xKey] === 'number' && typeof sample[yKey] === 'number') {
+    } else if (numCols.length >= 2 && isNumericVal(sample[xKey]) && isNumericVal(sample[yKey])) {
       // Both numeric: keep default order (x=first, y=second)
     } else if (strCols.length >= 2) {
       // Both strings: use first as category, count rows as value (fallback)
@@ -255,10 +287,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
     return s
   }
 
-  const rechartData = trimmedData.map(row => ({
-    ...row,
-    [xKey]: formatXLabel(row[xKey]),
-  }))
+  const rechartData = trimmedData.map(row => {
+    const yRaw = row[yKey]
+    const yNum = typeof yRaw === 'number' ? yRaw
+      : typeof yRaw === 'string' && yRaw.trim() !== '' && !isNaN(Number(yRaw)) ? Number(yRaw)
+      : yRaw
+    return { ...row, [xKey]: formatXLabel(row[xKey]), [yKey]: yNum }
+  })
 
   // ── Shared computed values (used by ref-line, labels, comparison) ──────────
   const numYVals = rechartData.map(r => Number(r[yKey] ?? 0)).filter(n => !isNaN(n) && isFinite(n))
@@ -2069,6 +2104,13 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   // ── Bar (vertical, default — also handles bar_vertical) ──────────────────────
   const anomalySet = new Set(anomalyIndices)
   const gradId = `barG-${yKey}`.replace(/[^a-z0-9-]/gi, '_')
+  // Compact axis/label formatter shared by both vertical and horizontal bar paths.
+  const fmtYTick = (v: number) => {
+    if (Math.abs(v) >= 1e9) return `${(v / 1e9).toFixed(1)}B`
+    if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`
+    if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}K`
+    return String(v)
+  }
   // If many categories and labels are long, auto-switch to horizontal bar
   const shouldAutoHBar = rechartData.length > 15 && rechartData.some(r => String(r[xKey] ?? '').length > 6)
   if (shouldAutoHBar) {
@@ -2088,7 +2130,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
               </linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-            <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+            <XAxis type="number" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} tickFormatter={fmtYTick} />
             <YAxis dataKey={xKey} type="category" width={yAxisW} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
             <Tooltip formatter={(v: number) => v.toLocaleString()} />
             {avgY !== null && (
@@ -2101,7 +2143,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
                 ? capped.map((_, i) => <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />)
                 : (showAnomalies && capped.map((_, i) => anomalySet.has(i) ? <Cell key={i} fill="#EF4444" /> : null))}
               <LabelList dataKey={yKey} position="right" style={{ fontSize: 9, fill: 'var(--dash-text-muted, #6B7280)' }}
-                formatter={(v: number) => isNaN(v) ? '' : Math.abs(v) >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v)} />
+                formatter={(v: number) => isNaN(v) ? '' : fmtYTick(v)} />
             </Bar>
           </BarChart>
         </ResponsiveContainer>
@@ -2116,7 +2158,7 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
   const barLegH = legend ? 24 : 0
   const barChart = (
     <ResponsiveContainer width="100%" height={legend ? height - barLegH : height}>
-      <BarChart data={rechartData} style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
+      <BarChart data={rechartData} margin={{ top: 30, right: 20, left: 5, bottom: 5 }} style={onDataPointClick ? { cursor: 'pointer' } : undefined}>
         <defs>
           <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={COLORS[0]} stopOpacity={0.95} />
@@ -2125,13 +2167,14 @@ export function ChartRenderer({ result, compact = false, colors, height: heightP
         </defs>
         <CartesianGrid strokeDasharray="3 3" />
         <XAxis dataKey={xKey} tick={{ fontSize: 11 }} interval="preserveStartEnd" />
-        <YAxis tick={{ fontSize: 11 }} />
+        <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtYTick} domain={[0, (dataMax: number) => Math.ceil(dataMax * 1.18)]} />
         <Tooltip />
         {avgY !== null && (
           <ReferenceLine y={avgY} stroke="#F59E0B" strokeDasharray="4 2"
             label={{ value: fmtAvg, position: 'insideTopRight', fill: '#F59E0B', fontSize: 9, fontWeight: 600 }} />
         )}
         <Bar dataKey={yKey} name={metricName} fill={barMultiColor ? undefined : `url(#${gradId})`} radius={[3, 3, 0, 0]}
+          isAnimationActive={false}
           onClick={onDataPointClick ? (data) => onDataPointClick(xKey, data[xKey]) : undefined}>
           {barMultiColor
             ? rechartData.map((_, i) => <Cell key={i} fill={showAnomalies && anomalySet.has(i) ? '#EF4444' : COLORS[i % COLORS.length]} />)

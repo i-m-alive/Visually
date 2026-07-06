@@ -414,14 +414,17 @@ export function CanvasWidget({
 
       {/* Drag handle + controls — chrome is quiet until the card is hovered */}
       <div
-        className="drag-handle flex items-center gap-1 pl-2.5 pr-1.5 py-1.5 bg-transparent cursor-grab active:cursor-grabbing flex-shrink-0"
+        className="flex items-center gap-1 pl-2.5 pr-1.5 py-1.5 bg-transparent flex-shrink-0"
         style={{ height: HANDLE_H }}
       >
-        {isLocked ? (
-          <Lock size={12} className="text-amber-400 flex-shrink-0" />
-        ) : (
-          <GripVertical size={14} className="text-gray-200 group-hover/card:text-gray-400 transition-colors flex-shrink-0" />
-        )}
+        {/* Only the grip icon is the drag handle; the rest of the header is clickable */}
+        <div className="drag-handle flex-shrink-0 flex items-center cursor-grab active:cursor-grabbing">
+          {isLocked ? (
+            <Lock size={12} className="text-amber-400" />
+          ) : (
+            <GripVertical size={14} className="text-gray-200 group-hover/card:text-gray-400 transition-colors" />
+          )}
+        </div>
 
         {/* Staleness dot */}
         {isStale && (

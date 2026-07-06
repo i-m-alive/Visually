@@ -42,6 +42,9 @@ export default function ConnectionPage() {
     sf_warehouse: '', sf_role: '', sf_schema: '',
   })
   const [showPw, setShowPw] = useState(false)
+  // True only when the user has explicitly typed in the password field during this edit
+  // session. Keeps us from wiping the stored password when the user only edits username/host.
+  const [passwordDirty, setPasswordDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveResult, setSaveResult] = useState<{ ok: boolean; msg: string } | null>(null)
 
@@ -100,6 +103,7 @@ export default function ConnectionPage() {
       iam_role_arn: '',
       sf_warehouse: '', sf_role: '', sf_schema: '',
     })
+    setPasswordDirty(false)
     setSaveResult(null)
     setTestResult(null)
   }
@@ -128,12 +132,20 @@ export default function ConnectionPage() {
         username: form.username.trim(),
         ssl_enabled: form.ssl_enabled,
         connection_options: buildConnectionOptions(),
-        password: form.password, // empty string = clear stored password (use IAM auth)
+        // Only send password when the user actually typed in the field.
+        // Omitting it (→ null in Pydantic) leaves the stored encrypted password untouched,
+        // so changing just the username/host never silently wipes the stored credentials.
+        // Sending an empty string when passwordDirty=true is the intentional "switch to IAM" path.
+        ...(passwordDirty ? { password: form.password } : {}),
       }
       const resp = await projectApi.updateConnection(projectId, editing, payload)
       setConnections(prev => prev.map(c => c.id === editing ? resp.data : c))
       setSaveResult({ ok: true, msg: 'Connection saved!' })
+      setTestResult(null)
+      setPasswordDirty(false)
       setForm(f => ({ ...f, password: '' }))
+      // Re-probe with new credentials so the status badge and test banner refresh.
+      void handleTest(editing as string)
     } catch (err: any) {
       setSaveResult({ ok: false, msg: err?.response?.data?.detail ?? 'Save failed' })
     } finally {
@@ -355,17 +367,24 @@ export default function ConnectionPage() {
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">
                       Password{' '}
-                      <span className="text-gray-400 font-normal">
-                        {form.db_type === 'snowflake' ? '(re-enter to update)' : '(clear to use IAM auth)'}
-                      </span>
+                      {!passwordDirty
+                        ? <span className="text-gray-400 font-normal">(leave blank to keep existing)</span>
+                        : form.password
+                          ? <span className="text-green-600 font-normal">✓ new password will be saved</span>
+                          : <span className="text-amber-600 font-normal">⚠ will clear stored password → switch to IAM auth</span>
+                      }
                     </label>
                     <div className="relative">
                       <input
                         type={showPw ? 'text' : 'password'}
                         value={form.password}
-                        onChange={e => set('password', e.target.value)}
-                        className="input-field text-sm pr-9"
-                        placeholder={form.db_type === 'snowflake' ? 'Enter password to save' : 'Leave blank for IAM / AWS credential auth'}
+                        onChange={e => { set('password', e.target.value); setPasswordDirty(true) }}
+                        className={`input-field text-sm pr-9 ${passwordDirty && !form.password ? 'border-amber-400 focus:ring-amber-300' : ''}`}
+                        placeholder={
+                          passwordDirty
+                            ? (form.db_type === 'snowflake' ? 'Enter new password' : 'Leave blank to clear (switch to IAM)')
+                            : '●●●●●●● (unchanged — type to update)'
+                        }
                       />
                       <button type="button" onClick={() => setShowPw(v => !v)}
                         className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">

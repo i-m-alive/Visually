@@ -124,7 +124,7 @@ export function CanvasPageTabs({
   const sortedPages = [...pages].sort((a, b) => a.order - b.order)
 
   return (
-    <div className="flex items-center h-9 bg-white border-t border-gray-200 flex-shrink-0 select-none">
+    <div className="flex items-center h-10 px-1.5 gap-1 bg-white/95 backdrop-blur border-t border-gray-200 flex-shrink-0 select-none">
       {/* Scroll left */}
       {pages.length > 6 && (
         <button onClick={scrollLeft} className="p-1.5 text-gray-400 hover:text-gray-700 flex-shrink-0 hover:bg-gray-100 transition-colors">
@@ -135,7 +135,7 @@ export function CanvasPageTabs({
       {/* Tab strip */}
       <div
         ref={scrollRef}
-        className="flex items-end h-full overflow-x-auto flex-1 min-w-0"
+        className="flex items-center gap-1 h-full overflow-x-auto flex-1 min-w-0 py-1.5"
         style={{ scrollbarWidth: 'none' }}
       >
         {sortedPages.map(page => {
@@ -153,11 +153,13 @@ export function CanvasPageTabs({
               onDrop={e => handleDrop(e, page.id)}
               onDragEnd={handleDragEnd}
               className={`
-                relative group flex items-center flex-shrink-0 h-full px-2 gap-1
-                border-r border-gray-100 cursor-pointer transition-colors
-                ${isActive   ? 'bg-white border-b-2 border-b-blue-600 text-gray-900' : 'bg-gray-50 text-gray-500 hover:bg-gray-100 hover:text-gray-700'}
+                relative group flex items-center flex-shrink-0 h-7 px-2.5 gap-1.5
+                rounded-lg cursor-pointer transition-all
+                ${isActive
+                  ? 'bg-blue-50 text-blue-700 border border-blue-200 shadow-sm font-semibold'
+                  : 'text-gray-500 border border-transparent hover:bg-gray-100 hover:text-gray-800'}
                 ${isDragging ? 'opacity-40' : ''}
-                ${isOver     ? 'bg-blue-50 border-l-2 border-l-blue-400' : ''}
+                ${isOver     ? 'ring-2 ring-blue-300' : ''}
               `}
               onClick={() => !isEditing && onSwitch(page.id)}
               onDoubleClick={() => startRename(page)}
@@ -211,10 +213,10 @@ export function CanvasPageTabs({
       {/* Add page */}
       <button
         onClick={onAdd}
-        className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 flex-shrink-0 transition-colors border-l border-gray-100"
+        className="h-7 inline-flex items-center gap-1 px-2.5 rounded-lg text-xs font-medium text-gray-400 hover:text-blue-600 hover:bg-blue-50 flex-shrink-0 transition-colors"
         title="Add page"
       >
-        <Plus size={14} />
+        <Plus size={13} /> Page
       </button>
 
       {/* Context menu — clamped to viewport, opens above tabs */}

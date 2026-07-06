@@ -859,7 +859,9 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                                 <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium flex-shrink-0 ${cr.score >= 0.65 ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>{(cr.score * 100).toFixed(0)}%</span>
                                 <button onClick={() => setExpandedChart({ ...cr, chart_type: activeChartType })} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 text-gray-400 hover:text-gray-600 rounded flex-shrink-0" title="Expand"><Maximize2 size={14} /></button>
                               </div>
-                              <ChartRenderer result={{ ...cr, chart_type: activeChartType }} />
+                              <div style={{ minWidth: 0, width: '100%', overflow: 'hidden' }}>
+                                <ChartRenderer result={{ ...cr, chart_type: activeChartType }} />
+                              </div>
                               {compatTypes.length > 1 && (
                                 <div className="flex gap-1.5 flex-wrap">
                                   {compatTypes.map((t) => (

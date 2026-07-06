@@ -1017,7 +1017,9 @@ export function VisuallReport({ canvas, widgets, pages = [], initialPageId = '',
       .catch(() => { if (!cancelled) showToast('Filter query failed') })
       .finally(() => { if (!cancelled) setFilterLoading(false) })
     return () => { cancelled = true }
-  }, [activeFilters, appliedDateRange]) // eslint-disable-line react-hooks/exhaustive-deps
+    // `widgets` is a dep so a dashboard refresh (parent reloads widgets) re-runs the
+    // filtered requery instead of leaving a stale pre-refresh snapshot on screen.
+  }, [activeFilters, appliedDateRange, widgets]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleFilter = useCallback((column: string, value: string) => {
     setActiveFilters(prev => {

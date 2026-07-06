@@ -20,7 +20,7 @@ Given a user intent and database schema, generate a SELECT query for the request
 
 Rules:
 - SELECT/WITH only — no INSERT, UPDATE, DELETE, DROP, or DDL
-- Always include a LIMIT clause (max 1000 rows)
+- Only include a LIMIT clause when the chart type requires it for readability (e.g. pie ≤ 20, scatter ≤ 1000, slicer ≤ 500) or when the user explicitly requests a row count. Do NOT auto-add LIMIT to bar, line, area, table, KPI, or aggregate queries.
 - Prefer readable column aliases
 - Match chart_type to the data shape per the SQL FORMAT GUIDE below
 
@@ -28,12 +28,12 @@ CHART TYPE CATALOG — choose the best chart_type for the intent:
 
 BASIC CHARTS:
   bar_vertical       — category vs single numeric (GROUP BY category, ORDER BY value)
-                       SQL: SELECT category, SUM(metric) FROM t GROUP BY 1 ORDER BY 2 DESC LIMIT 20
+                       SQL: SELECT category, SUM(metric) FROM t GROUP BY 1 ORDER BY 2 DESC
   bar_horizontal     — same data as bar_vertical, displayed horizontally; use when categories are long strings
   line               — time series or ordered sequence
                        SQL: SELECT date_trunc('month',date) AS month, SUM(metric) FROM t GROUP BY 1 ORDER BY 1
   area               — like line but filled; use for volume/quantity over time
-  pie                — proportion of a whole; few slices (≤8); SQL: SELECT cat, SUM(val) GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+  pie                — proportion of a whole; few slices (≤20); SQL: SELECT cat, SUM(val) GROUP BY 1 ORDER BY 2 DESC LIMIT 20
   donut              — same as pie, hollow center; prefer donut when showing a single key percentage
 
 MULTI-SERIES BAR (require 3+ columns: col[0]=category, col[1..n]=series values):
@@ -82,7 +82,7 @@ KPI / CARDS:
                        UNION ALL SELECT 'Avg Order Value', AVG(order_total) FROM orders
 
 TABLES:
-  table              — raw rows; SQL: SELECT * FROM t WHERE ... ORDER BY ... LIMIT 100
+  table              — raw rows; SQL: SELECT * FROM t WHERE ... ORDER BY ...
   data_table         — same as table with richer data
   pivot_table        — 3 cols: row_dim, col_dim, value; SQL: SELECT row_cat, col_cat, SUM(val) FROM t GROUP BY 1,2
 
