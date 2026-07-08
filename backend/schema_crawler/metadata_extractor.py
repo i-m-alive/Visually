@@ -295,8 +295,9 @@ All tables in this database (use these exact names for fk_target_table):
 For each table, analyze the column schema and sample rows. Infer:
 - Business purpose, data grain, fact vs dimension table
 - semantic_type per column: pk | fk | metric | dimension | date | identifier | text | flag
-- FK target tables (only when the column name clearly implies another table in the list)
+- FK target tables (ONLY when the column name clearly implies another table in the list above — do NOT invent FK targets not present in the list)
 - Filter-eligible columns: low-cardinality categoricals (status, type, category) NOT IDs or free-text
+- example_values: for filter-eligible dimension/category columns only, list up to 10 representative distinct values seen in sample_rows. Omit entirely (empty list []) for PII columns (email, phone, password, ssn, token, auth, credit, card, secret, dob) and for high-cardinality or numeric columns.
 
 Tables to analyze:
 {json.dumps(tables_payload, default=str)}
@@ -318,10 +319,12 @@ Return ONLY valid JSON with this exact structure (no prose, no markdown):
       "columns": [
         {{
           "name": "column_name",
+          "business_name": "Human Readable Column Name",
           "description": "5-12 words: what this column measures or identifies",
           "semantic_type": "pk",
           "fk_target_table": null,
           "fk_target_column": null,
+          "example_values": [],
           "is_kpi_metric": false,
           "is_dimension": false,
           "is_filter_eligible": false
@@ -421,11 +424,16 @@ async def _do_extraction(
         qualified = f"{schema_part}.{name_part}" if schema_part else name_part
         all_qualified.append(qualified)
         bare_to_qualified[name_part] = qualified
+        row_count = t.get("row_count", 0)
+        # Empty tables (0 rows) have no sample data for Phase A — include them so
+        # they get basic semantic typing, but flag them so the LLM knows there's
+        # no data to examine. Don't skip them entirely or they lose all enrichment.
+        sample_rows = sample_rows_map.get(qualified, []) or sample_rows_map.get(name_part, [])
         table_payloads.append({
             "qualified_name": qualified,
-            "row_count": t.get("row_count", 0),
+            "row_count": row_count,
             "columns": t.get("columns", []),
-            "sample_rows": sample_rows_map.get(qualified, []),
+            "sample_rows": sample_rows,
         })
 
     # ── Phase A: LLM extraction (3 tables per batch, max 5 concurrent) ─────────
@@ -489,22 +497,61 @@ async def _do_extraction(
                 resolved = bare_to_qualified.get(raw_tgt)
                 col["fk_target_table"] = resolved if resolved else None
 
-    # Collect FK candidates
-    fk_candidates = [
-        {
-            "src_table": tbl["table_name"],
-            "fk_col": col["name"],
-            "tgt_table": col["fk_target_table"],
-            "pk_col": col["fk_target_column"],
-        }
-        for tbl in llm_results
-        for col in tbl.get("columns", [])
-        if col.get("semantic_type") == "fk"
-        and col.get("fk_target_table")
-        and col.get("fk_target_column")
-    ]
+    # Build a fast lookup: bare column name → set of qualified table names that have it
+    # Used to validate FK targets actually have the referenced primary key column.
+    _tbl_col_lookup: dict[str, set] = {}
+    for tbl in llm_results:
+        tname = tbl["table_name"]
+        for col in tbl.get("columns", []):
+            _tbl_col_lookup.setdefault(tname, set()).add(col["name"].lower())
+    # Also index bare table names for unqualified lookups
+    _bare_col_lookup: dict[str, set] = {
+        tname.split(".")[-1]: cols for tname, cols in _tbl_col_lookup.items()
+    }
 
-    # Collect filter candidates (columns with no example_values yet)
+    # Collect FK candidates — filter out those whose target table OR target column
+    # doesn't exist in the schema (prevents hallucinated FKs from being DB-validated)
+    fk_candidates = []
+    for tbl in llm_results:
+        for col in tbl.get("columns", []):
+            if col.get("semantic_type") != "fk":
+                continue
+            tgt_table = col.get("fk_target_table")
+            tgt_col = col.get("fk_target_column")
+            if not tgt_table or not tgt_col:
+                continue
+            # Verify FK target table is in the known schema
+            tgt_cols = _tbl_col_lookup.get(tgt_table) or _bare_col_lookup.get(tgt_table.split(".")[-1])
+            if tgt_cols is None:
+                print(
+                    f"[metadata_extractor] Dropping FK {tbl['table_name']}.{col['name']}"
+                    f" → {tgt_table} (target table not in schema)",
+                    flush=True,
+                )
+                col["fk_target_table"] = None
+                col["fk_target_column"] = None
+                col["semantic_type"] = "identifier"
+                continue
+            # Verify FK target column exists in the target table
+            if tgt_col.lower() not in tgt_cols:
+                print(
+                    f"[metadata_extractor] Dropping FK {tbl['table_name']}.{col['name']}"
+                    f" → {tgt_table}.{tgt_col} (column not found in target)",
+                    flush=True,
+                )
+                col["fk_target_table"] = None
+                col["fk_target_column"] = None
+                col["semantic_type"] = "identifier"
+                continue
+            fk_candidates.append({
+                "src_table": tbl["table_name"],
+                "fk_col": col["name"],
+                "tgt_table": tgt_table,
+                "pk_col": tgt_col,
+            })
+
+    # Collect filter candidates — columns marked filter-eligible with no example values yet.
+    # Also collect columns that have example_values = [] (empty list, not missing) from prior runs.
     filter_candidates = [
         (tbl["table_name"], col["name"])
         for tbl in llm_results
@@ -608,6 +655,42 @@ async def _do_extraction(
             except Exception:
                 pass
 
+    # ── Semantic type verification (post-process LLM output) ──────────────────
+    # The LLM can misclassify columns — apply deterministic corrections before
+    # persisting to catch obvious errors without an extra LLM call.
+    _NUMERIC_TYPE_FRAGMENTS = frozenset({
+        "int", "float", "decimal", "numeric", "double",
+        "bigint", "smallint", "real", "money", "number",
+    })
+    _DATE_TYPE_FRAGMENTS = frozenset({"date", "time", "timestamp"})
+    _BOOL_TYPE_FRAGMENTS = frozenset({"bool", "bit", "tinyint(1)"})
+
+    for tbl in llm_results:
+        for col in tbl.get("columns", []):
+            cname_l = col.get("name", "").lower()
+            ctype_l = (col.get("type") or "").lower()
+            stype = (col.get("semantic_type") or "").lower()
+
+            # Primary key columns: if column_key indicates PK, override to "pk"
+            if col.get("is_primary_key") and stype not in ("pk",):
+                col["semantic_type"] = "pk"
+
+            # Date/time columns should be "date", not "dimension" or "text"
+            elif stype not in ("date", "pk") and any(f in ctype_l for f in _DATE_TYPE_FRAGMENTS):
+                col["semantic_type"] = "date"
+
+            # Boolean / flag columns should be "flag"
+            elif stype not in ("pk", "flag") and any(f in ctype_l for f in _BOOL_TYPE_FRAGMENTS):
+                col["semantic_type"] = "flag"
+                col["is_kpi_metric"] = False
+                col["is_dimension"] = False
+
+            # Numeric columns misclassified as "identifier" or "text" → "metric"
+            elif stype in ("identifier", "text") and any(f in ctype_l for f in _NUMERIC_TYPE_FRAGMENTS):
+                if not cname_l.endswith("_id") and cname_l != "id":
+                    col["semantic_type"] = "metric"
+                    col["is_kpi_metric"] = True
+
     # ── Persist all results to app DB ─────────────────────────────────────────
     conn_uuid = uuid.UUID(connection_id)
     now = datetime.utcnow()
@@ -649,21 +732,43 @@ async def _do_extraction(
                 if not cname:
                     continue
 
+                # PII detection: columns whose name signals personally-identifiable data
+                # should never have example values stored and should not be filter candidates.
+                is_pii = any(sig in cname.lower() for sig in _PII_SIGNALS)
+
                 # Determine FK confirmation
                 is_fk = col.get("semantic_type") == "fk"
                 fk_key = (tname, cname, col.get("fk_target_table") or "", col.get("fk_target_column") or "")
                 fk_confirmed = is_fk and fk_key in confirmed_fks
 
-                # Merge LLM example_values with Phase C distinct values
-                example_vals: list[str] = list(col.get("example_values") or [])
-                phase_c_vals = filter_values.get((tname, cname), [])
-                if phase_c_vals:
-                    seen = set(example_vals)
-                    for v in phase_c_vals:
-                        if v not in seen:
-                            example_vals.append(v)
-                            seen.add(v)
-                example_vals = example_vals[:200]
+                # Merge LLM example_values with Phase C distinct values.
+                # Clear any examples for PII columns (crawlers mask sample rows, but the
+                # LLM may still suggest inferred examples).
+                if is_pii:
+                    example_vals = []
+                else:
+                    example_vals = list(col.get("example_values") or [])
+                    phase_c_vals = filter_values.get((tname, cname), [])
+                    if phase_c_vals:
+                        seen = set(example_vals)
+                        for v in phase_c_vals:
+                            if v not in seen:
+                                example_vals.append(v)
+                                seen.add(v)
+                    example_vals = example_vals[:200]
+
+                # Compute cardinality from collected distinct values — used downstream
+                # to distinguish low-cardinality dimension columns from high-cardinality
+                # free-text or ID columns.  Only populated when Phase C ran.
+                cardinality = len(filter_values.get((tname, cname), [])) if not is_pii else None
+
+                # Override is_filter_eligible for PII columns and high-cardinality columns
+                is_filter_eligible = col.get("is_filter_eligible")
+                if is_pii:
+                    is_filter_eligible = False
+                elif cardinality is not None and cardinality > 150:
+                    # High cardinality → not useful as a filter dropdown
+                    is_filter_eligible = False
 
                 db.add(SchemaColumnMetadata(
                     id=uuid.uuid4(),
@@ -681,12 +786,24 @@ async def _do_extraction(
                     example_values=example_vals or None,
                     is_kpi_metric=col.get("is_kpi_metric"),
                     is_dimension=col.get("is_dimension"),
-                    is_filter_eligible=col.get("is_filter_eligible"),
+                    is_filter_eligible=is_filter_eligible,
                     generation_method="llm_sample_rows",
                     generated_at=now,
                 ))
 
         await db.commit()
+
+    # Invalidate the in-process schema cache so that the next query against this
+    # connection rebuilds EnrichedSchema from the freshly stored metadata (with
+    # correct semantic types, FK edges, example_values, and a fresh TF-IDF index).
+    # Without this, the stale cache persists until its TTL expires (up to 72h).
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from agent_service.agents import schema_cache as _sc
+        _sc.invalidate(connection_id)
+        print(f"[metadata_extractor] schema cache invalidated for {connection_id[:8]}", flush=True)
+    except Exception as _inv_exc:
+        print(f"[metadata_extractor] cache invalidation skipped: {_inv_exc}", flush=True)
 
     print(
         f"[metadata_extractor] ✓ done  tables={len(llm_results)}"

@@ -130,8 +130,7 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     connection_id=connection_id,
                 )
             elif db_type == "mysql":
-                # MySQL crawler does not collect sample rows yet
-                schema_doc = await crawl_mysql(
+                schema_doc, sample_rows_map = await crawl_mysql(
                     host=conn.host or "localhost",
                     port=conn.port or 3306,
                     database=conn.database_name or "",
@@ -140,7 +139,6 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     ssl=conn.ssl_enabled,
                     connection_id=connection_id,
                 )
-                sample_rows_map = {}
             elif db_type == "snowflake":
                 opts = conn.connection_options or {}
                 warehouse = opts.get("warehouse") if isinstance(opts, dict) else None
@@ -244,6 +242,28 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                         pass
 
             await db.commit()
+
+            # Auto-detect the project's domain (recruitment/finance/generic) from the
+            # tables/columns just crawled — free, synchronous, no LLM. Never overwrites
+            # a user's explicit choice (Project.domain_is_manual). Non-fatal on failure.
+            try:
+                from shared.domain_detection import detect_domain_from_schema
+                from shared.models.projects import Project
+                detected = detect_domain_from_schema(schema_doc.get("tables", []))
+                proj_result = await db.execute(
+                    select(Project).where(Project.id == uuid.UUID(project_id))
+                )
+                proj_row = proj_result.scalar_one_or_none()
+                if proj_row and not proj_row.domain_is_manual and proj_row.domain != detected:
+                    print(
+                        f"[schema_crawler] JOB {job_id[:8]} domain auto-detected: "
+                        f"{proj_row.domain!r} -> {detected!r} (project={project_id[:8]})",
+                        flush=True,
+                    )
+                    proj_row.domain = detected
+                    await db.commit()
+            except Exception as _de:
+                print(f"[schema_crawler] JOB {job_id[:8]} domain detection failed (non-fatal): {_de}", flush=True)
 
             # Fire-and-forget: enrich schema metadata in the background.
             # Non-fatal — crawl result is already persisted above.

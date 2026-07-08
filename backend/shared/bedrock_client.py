@@ -74,6 +74,52 @@ def get_token_summary() -> dict:
     return agg
 
 
+def format_token_log(label: str, session_id: str = "") -> str:
+    """Build a one-line token-usage log entry from the current tracking bucket.
+
+    Meant to be printed at the end of every chat/query turn so token consumption
+    is easy to compare across the three chat systems (Canvas/DB, Intel/DB, QueryChat).
+
+    Effective-input formula (Bedrock cache pricing):
+      eff_in = (raw_in - cache_read) * 1.0
+             + cache_read           * 0.10   # 10% of full price
+             + cache_write          * 1.25   # 25% premium for cache creation
+    Returns empty string when no tracking data is available.
+    """
+    summary = get_token_summary()
+    if not summary:
+        return ""
+
+    total_in = total_out = total_cr = total_cw = total_calls = 0
+    model_short = "unknown"
+    for m, s in summary.items():
+        total_in    += s["input_tokens"]
+        total_out   += s["output_tokens"]
+        total_cr    += s["cache_read_input_tokens"]
+        total_cw    += s["cache_creation_input_tokens"]
+        total_calls += s["calls"]
+        # us.anthropic.claude-sonnet-4-5-20250929-v1:0 → claude-sonnet-4-5
+        _m = m.split("/")[-1]                          # drop any path prefix
+        _m = _m.rsplit(":", 1)[0]                      # drop :0 version suffix
+        _m = __import__("re").sub(r"[-\.]\d{8}.*$", "", _m)  # drop -20250929-v1
+        model_short = _m.split(".")[-1]                # drop us.anthropic. prefix
+
+    eff_in = int(
+        (total_in - total_cr) * 1.0
+        + total_cr * 0.10
+        + total_cw * 1.25
+    )
+    total_billed = eff_in + total_out
+    sess = (session_id[:8] + "…") if len(session_id) > 8 else session_id
+
+    return (
+        f"[TOKENS:{label}]  sess={sess}  model={model_short}  calls={total_calls}  "
+        f"in={total_in:,}  out={total_out:,}  "
+        f"cache_read={total_cr:,}  cache_write={total_cw:,}  "
+        f"eff_in={eff_in:,}  total_billed={total_billed:,}"
+    )
+
+
 def _track_usage(model_id: str, result: dict) -> None:
     bucket = _token_bucket.get()
     if bucket is None:
@@ -156,8 +202,9 @@ async def bedrock_invoke(
         _track_usage(model_id, result)
         return result["content"][0]["text"]
 
+    ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))
 
 
 async def bedrock_invoke_with_history(
@@ -199,8 +246,9 @@ async def bedrock_invoke_with_history(
         _track_usage(model_id, result)
         return result["content"][0]["text"]
 
+    ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))
 
 
 async def bedrock_invoke_with_tools(
@@ -267,8 +315,9 @@ async def bedrock_invoke_with_tools(
             "content":     result.get("content", []),
         }
 
+    ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))
 
 
 async def bedrock_invoke_stream(
@@ -341,7 +390,12 @@ async def bedrock_invoke_stream(
         item = await q.get()
         if item is _DONE:
             break
-        yield item
+        kind, payload = item
+        # Track streaming token usage in the same context-var bucket as non-streaming
+        # calls so get_token_summary() captures the full turn across both code paths.
+        if kind == "usage":
+            _track_usage(model_id, {"usage": payload})
+        yield kind, payload
 
 
 async def bedrock_invoke_with_image(
@@ -398,8 +452,9 @@ async def bedrock_invoke_with_image(
             print(f"[bedrock-vision] ✗ FAILED after {time.time()-t0:.1f}s: {type(exc).__name__}: {exc}", flush=True)
             raise
 
+    ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))
 
 
 async def bedrock_invoke_with_multiple_images(
@@ -442,5 +497,6 @@ async def bedrock_invoke_with_multiple_images(
         _track_usage(model_id, result)
         return result["content"][0]["text"]
 
+    ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_BEDROCK_EXECUTOR, _invoke)
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))

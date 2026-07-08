@@ -425,8 +425,9 @@ from shared.models.database_connections import DbType
 from shared.models.schema_snapshots import SchemaSnapshot
 from shared.encryption import encrypt, decrypt
 from shared.schemas.projects import (
-    ProjectCreate, ProjectResponse, ConnectionCreate, ConnectionResponse, ConnectionTestResult,
+    ProjectCreate, ProjectUpdate, ProjectResponse, ConnectionCreate, ConnectionResponse, ConnectionTestResult,
 )
+from agent_service.agents.domain_config import VALID_DOMAINS, BRAINWAVE_GATED_DOMAINS, normalize_domain, is_brainwave_host
 import httpx
 
 SCHEMA_CRAWLER_URL = os.getenv("SCHEMA_CRAWLER_URL", "http://localhost:8003")
@@ -436,6 +437,7 @@ QUERY_EXECUTOR_URL  = os.getenv("QUERY_EXECUTOR_URL",  "http://localhost:8002")
 @app.post("/projects", response_model=ProjectResponse, status_code=201)
 async def create_project(req: ProjectCreate, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     project = Project(id=uuid.uuid4(), name=req.name, description=req.description,
+                     domain=normalize_domain(req.domain),
                      owner_id=current_user.id, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
     db.add(project)
     db.add(ProjectMember(id=uuid.uuid4(), project_id=project.id, user_id=current_user.id,
@@ -443,6 +445,7 @@ async def create_project(req: ProjectCreate, current_user: User = Depends(get_cu
     await db.commit()
     await db.refresh(project)
     return ProjectResponse(id=str(project.id), name=project.name, description=project.description,
+                          domain=project.domain,
                           owner_id=str(project.owner_id), created_at=project.created_at.isoformat())
 
 
@@ -462,6 +465,7 @@ async def list_projects(current_user: User = Depends(get_current_user), db: Asyn
         .order_by(Project.created_at.desc())
     )
     return [ProjectResponse(id=str(p.id), name=p.name, description=p.description,
+                           domain=p.domain,
                            owner_id=str(p.owner_id), created_at=p.created_at.isoformat())
             for p in result.scalars().all()]
 
@@ -485,6 +489,44 @@ async def get_project(project_id: str, current_user: User = Depends(get_current_
     if not access.scalar_one_or_none():
         raise HTTPException(status_code=403, detail="Access denied")
     return ProjectResponse(id=str(project.id), name=project.name, description=project.description,
+                          domain=project.domain,
+                          owner_id=str(project.owner_id), created_at=project.created_at.isoformat())
+
+
+@app.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project(project_id: str, req: ProjectUpdate, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    from sqlalchemy import or_
+    access = await db.execute(
+        select(Project)
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(Project.id == project.id)
+        .where(or_(Project.owner_id == current_user.id,
+                   ProjectMember.user_id == current_user.id))
+    )
+    if not access.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
+    if req.name is not None:
+        project.name = req.name
+    if req.description is not None:
+        project.description = req.description
+    if req.domain is not None:
+        if req.domain not in VALID_DOMAINS:
+            raise HTTPException(status_code=400, detail=f"Invalid domain. Must be one of: {', '.join(sorted(VALID_DOMAINS))}")
+        project.domain = req.domain
+        # A user explicitly chose a domain via this endpoint — the post-crawl
+        # auto-detection heuristic (schema_crawler) must never overwrite it again.
+        project.domain_is_manual = True
+    project.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(project)
+    return ProjectResponse(id=str(project.id), name=project.name, description=project.description,
+                          domain=project.domain,
                           owner_id=str(project.owner_id), created_at=project.created_at.isoformat())
 
 
@@ -1141,8 +1183,15 @@ class IntentSubmitRequest(BaseModel):
     text: str
     project_id: str
     connection_id: Optional[str] = None
+    # Query Chat session (see routers/query_sessions.py) — when present, prior
+    # turns are loaded server-side from the persisted message tree instead of
+    # relying solely on the client to resend them (see _load_session_history).
+    session_id: Optional[str] = None
     # Last N turns from the frontend — used to resolve follow-up queries in the pipeline.
-    # Each turn: {role: "user"|"assistant", content: str, chart_title?: str, sql?: str}
+    # Each turn: {role: "user"|"assistant", content: str, chart_title?: str, sql?: str,
+    # error?: str, low_confidence?: bool}. The last two let a "why did that fail?"
+    # follow-up be diagnosed against what actually went wrong (see orchestrator.py).
+    # Ignored when session_id resolves to a persisted history — that's authoritative.
     conversation_history: Optional[list] = None
     # Schema scope — when "selected", only selected_tables (+ their FK neighbours) are used
     scope: Optional[str] = None           # "selected" | "database" | None (= "database")
@@ -1154,6 +1203,59 @@ class IntentSubmitRequest(BaseModel):
 
 _orchestrator = Orchestrator()
 _quick_classifier = QuickClassifier()
+
+
+async def _load_session_history(session_id: str, user_id: uuid.UUID, db: AsyncSession) -> Optional[list]:
+    """
+    Reconstruct conversation_history server-side from the persisted message tree
+    (routers/query_sessions.py), following the ACTIVE branch only (active_leaf_id
+    back to root via parent_id) — abandoned edit branches must not leak into
+    context. Returns None if the session is missing/not owned/empty, so callers
+    can fall back to whatever the client sent.
+    """
+    from shared.models.query_chat import QuerySession, QueryMessage
+    try:
+        sess_uuid = uuid.UUID(session_id)
+    except ValueError:
+        return None
+    sess = (await db.execute(
+        select(QuerySession).where(QuerySession.id == sess_uuid)
+    )).scalar_one_or_none()
+    if not sess or sess.user_id != user_id or not sess.active_leaf_id:
+        return None
+    msgs = (await db.execute(
+        select(QueryMessage).where(QueryMessage.session_id == sess.id)
+    )).scalars().all()
+    by_id = {m.id: m for m in msgs}
+    branch = []
+    cur_id = sess.active_leaf_id
+    seen = set()
+    while cur_id and cur_id in by_id and cur_id not in seen:
+        seen.add(cur_id)
+        m = by_id[cur_id]
+        branch.append(m)
+        cur_id = m.parent_id
+    branch.reverse()
+    if not branch:
+        return None
+    history = []
+    for m in branch:
+        turn = {"role": m.role, "content": m.content or ""}
+        if m.result:
+            if m.result.get("sql"):
+                turn["sql"] = m.result["sql"]
+            if m.result.get("title"):
+                turn["chart_title"] = m.result["title"]
+            # Carried through so a later "why did that fail?" follow-up can be
+            # diagnosed against what actually went wrong (see orchestrator.py's
+            # root-cause follow-up handling) instead of silently regenerating a
+            # brand new, unrelated chart.
+            if m.result.get("error"):
+                turn["error"] = m.result["error"]
+            if m.result.get("low_confidence"):
+                turn["low_confidence"] = True
+        history.append(turn)
+    return history
 
 
 async def _run_pipeline(
@@ -1194,54 +1296,98 @@ async def _run_pipeline(
     )
 
     async with AsyncSessionLocal() as db:
-        # ── Load Brainwave user profile (platform-level, no project_id) ────────
-        user_profile = None
+        # ── Resolve project domain — drives which persona/skill-agents/access-gate
+        # apply below. Defaults to "recruitment" (today's behavior) if lookup fails.
+        project_domain = "recruitment"
         try:
-            from shared.models.brainwave_user_profile import BrainwaveUserProfile
-            lookup_email = user_email
-            if impersonate_email and impersonate_email != user_email:
-                # Verify the requesting user is allowed to impersonate
-                _req = (await db.execute(
-                    select(BrainwaveUserProfile)
-                    .where(BrainwaveUserProfile.user_email == user_email)
-                )).scalar_one_or_none()
-                if _req and _req.can_impersonate:
-                    lookup_email = impersonate_email
-                    print(
-                        f"[pipeline:{job_id}] impersonating {impersonate_email} "
-                        f"(requested by {user_email})",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[pipeline:{job_id}] impersonation denied "
-                        f"(user {user_email} lacks can_impersonate)",
-                        flush=True,
-                    )
-            if lookup_email:
-                _p = (await db.execute(
-                    select(BrainwaveUserProfile)
-                    .where(BrainwaveUserProfile.user_email == lookup_email)
-                )).scalar_one_or_none()
-                if _p:
-                    # Also pull full_name from the users table for identity queries
-                    _user_rec = (await db.execute(
-                        select(User).where(User.email == lookup_email)
+            _proj = (await db.execute(
+                select(Project).where(Project.id == uuid.UUID(project_id))
+            )).scalar_one_or_none()
+            if _proj:
+                project_domain = normalize_domain(_proj.domain)
+        except Exception as _pde:
+            print(f"[pipeline:{job_id}] project domain lookup failed (non-fatal): {_pde}", flush=True)
+
+        # ── Explicit override: Snowflake connections are always "finance" domain ──
+        # No need to toggle the project setting per connection — whenever the active
+        # connection is Snowflake, role-based (Brainwave) access control is skipped
+        # outright and the finance skill-agent persona is used, regardless of what
+        # the project's stored domain setting says.
+        _conn_for_domain = None
+        _is_brainwave_db = True  # safe default if the connection lookup itself fails
+        try:
+            _conn_for_domain = (await db.execute(
+                select(DatabaseConnection).where(DatabaseConnection.id == uuid.UUID(connection_id))
+            )).scalar_one_or_none()
+            if _conn_for_domain and _conn_for_domain.db_type.value == "snowflake" and project_domain != "finance":
+                print(
+                    f"[pipeline:{job_id}] connection is Snowflake — forcing domain='finance' "
+                    f"(was {project_domain!r}); role-based access disabled",
+                    flush=True,
+                )
+                project_domain = "finance"
+            # ── Explicit host check: the Brainwave gate must key off the ACTUAL
+            # connected database's host, not just the domain toggle — so a random
+            # Postgres/Snowflake connection on a "recruitment" project is never
+            # wrongly profile-gated. Configure via BRAINWAVE_DB_HOSTS (see
+            # domain_config.py); unset = no additional restriction (current behavior).
+            _is_brainwave_db = is_brainwave_host(_conn_for_domain.host if _conn_for_domain else None)
+        except Exception as _cde:
+            print(f"[pipeline:{job_id}] connection domain-override lookup failed (non-fatal): {_cde}", flush=True)
+
+        # ── Load Brainwave user profile (platform-level, no project_id) ────────
+        # Only the "recruitment" domain, on a connection whose host actually
+        # matches Brainwave's, is tied to this identity model — everything else
+        # skips it entirely, no profile/gate required.
+        user_profile = None
+        lookup_email = user_email
+        if project_domain in BRAINWAVE_GATED_DOMAINS and _is_brainwave_db:
+            try:
+                from shared.models.brainwave_user_profile import BrainwaveUserProfile
+                if impersonate_email and impersonate_email != user_email:
+                    # Verify the requesting user is allowed to impersonate
+                    _req = (await db.execute(
+                        select(BrainwaveUserProfile)
+                        .where(BrainwaveUserProfile.user_email == user_email)
                     )).scalar_one_or_none()
-                    user_profile = {
-                        "user_email":      _p.user_email,
-                        "full_name":       (_user_rec.full_name if _user_rec else None) or _p.db_name,
-                        "brainwave_role":  _p.brainwave_role,
-                        "db_name":         _p.db_name,
-                        "qualifier_id":    _p.qualifier_id,
-                        "can_impersonate": _p.can_impersonate,
-                    }
-        except Exception as _pe:
-            print(f"[pipeline:{job_id}] profile lookup failed (non-fatal): {_pe}", flush=True)
+                    if _req and _req.can_impersonate:
+                        lookup_email = impersonate_email
+                        print(
+                            f"[pipeline:{job_id}] impersonating {impersonate_email} "
+                            f"(requested by {user_email})",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[pipeline:{job_id}] impersonation denied "
+                            f"(user {user_email} lacks can_impersonate)",
+                            flush=True,
+                        )
+                if lookup_email:
+                    _p = (await db.execute(
+                        select(BrainwaveUserProfile)
+                        .where(BrainwaveUserProfile.user_email == lookup_email)
+                    )).scalar_one_or_none()
+                    if _p:
+                        # Also pull full_name from the users table for identity queries
+                        _user_rec = (await db.execute(
+                            select(User).where(User.email == lookup_email)
+                        )).scalar_one_or_none()
+                        user_profile = {
+                            "user_email":      _p.user_email,
+                            "full_name":       (_user_rec.full_name if _user_rec else None) or _p.db_name,
+                            "brainwave_role":  _p.brainwave_role,
+                            "db_name":         _p.db_name,
+                            "qualifier_id":    _p.qualifier_id,
+                            "can_impersonate": _p.can_impersonate,
+                        }
+            except Exception as _pe:
+                print(f"[pipeline:{job_id}] profile lookup failed (non-fatal): {_pe}", flush=True)
 
         # ── DIAGNOSTIC LOG ────────────────────────────────────────────────────
         print(
             f"[DIAG pipeline:{job_id[:8]}] "
+            f"domain={project_domain!r} "
             f"profile_found={user_profile is not None} "
             f"lookup_email={lookup_email!r} "
             f"DEV_MODE={DEV_MODE}",
@@ -1257,10 +1403,11 @@ async def _run_pipeline(
             )
 
         # ── Access guard — Step 8 ────────────────────────────────────────────
-        # Only Brainwave team members (who have a profile row) may use the agents.
-        # In DEV_MODE the check is skipped so the developer can test before
-        # their own profile row exists.
-        if user_profile is None and not DEV_MODE:
+        # Only Brainwave team members (who have a profile row) may use the agents,
+        # and only for domains gated on that identity model AND connections that
+        # are actually the Brainwave database. In DEV_MODE the check is skipped so
+        # the developer can test before their own profile row exists.
+        if project_domain in BRAINWAVE_GATED_DOMAINS and _is_brainwave_db and user_profile is None and not DEV_MODE:
             from agent_service.services.ws_manager import manager as _wsmgr
             await _wsmgr.broadcast(job_id, {
                 "type":    "agent.complete",
@@ -1271,6 +1418,9 @@ async def _run_pipeline(
                 ),
             })
             return
+
+        from shared.bedrock_client import start_token_tracking, format_token_log
+        start_token_tracking()
 
         if resolved_type == "DASHBOARD":
             await _orchestrator.run_dashboard_pipeline(
@@ -1287,7 +1437,12 @@ async def _run_pipeline(
                 selected_hops=selected_hops,
                 output_mode_override=output_mode,
                 user_profile=user_profile,
+                domain=project_domain,
             )
+
+        _tok_log = format_token_log(f"query_chat/{scope or 'db'}", job_id)
+        if _tok_log:
+            print(_tok_log, flush=True)
     # Do NOT call redis.aclose() here — get_redis() returns a shared singleton pool.
     # Closing it here kills any active pubsub connections (e.g. WebSocket listeners).
 
@@ -1326,9 +1481,15 @@ async def submit_intent(
 
     impersonate_email = request.headers.get("X-Impersonate-Role")
 
+    conversation_history = req.conversation_history
+    if req.session_id:
+        session_history = await _load_session_history(req.session_id, current_user.id, db)
+        if session_history:
+            conversation_history = session_history
+
     background_tasks.add_task(
         _run_pipeline, job_id, req.text, req.project_id, str(current_user.id),
-        connection_id, job_type, req.conversation_history,
+        connection_id, job_type, conversation_history,
         req.scope, req.selected_tables, req.selected_hops, req.output_mode,
         current_user.email,
         impersonate_email,

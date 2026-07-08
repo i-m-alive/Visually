@@ -44,7 +44,12 @@ from agent_service.agents.intelligence_chat_agent import (
     _is_chart_creation_request,
 )
 import agent_service.agents.schema_cache as _schema_cache
-from shared.bedrock_client import bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL
+from shared.bedrock_client import (
+    bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL,
+    start_token_tracking, format_token_log,
+)
+from agent_service.agents.intent_parser import parse_intent
+from agent_service.agents.nl_schema_router import route_query
 
 router = APIRouter(tags=["intelligence-chat"])
 _agent = IntelligenceChatAgent()
@@ -230,6 +235,22 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
             flush=True,
         )
 
+    # ── NL2SQL two-stage pipeline (same as chat.py — feeds GraphRAG scoping) ───
+    resolved_context = None
+    if enriched and req.message.strip():
+        try:
+            intent = await parse_intent(req.message)
+            if intent.needs_sql:
+                resolved_context = route_query(intent, enriched, req.message)
+                print(
+                    f"[intel_chat] NL2SQL resolved  tables={resolved_context.relevant_tables[:4]}"
+                    f"  entities={len(resolved_context.entity_resolutions)}"
+                    f"  scores={len(resolved_context.table_scores)}",
+                    flush=True,
+                )
+        except Exception as _nl2sql_err:
+            print(f"[intel_chat] ⚠ NL2SQL pipeline failed (non-fatal): {_nl2sql_err}", flush=True)
+
     return {
         "session_id": session_id,
         "history": history,
@@ -242,6 +263,7 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         "connection_id": effective_connection_id,
         "model_pref": effective_model_pref,
         "verified_tables_doc": verified_tables_doc,
+        "resolved_context": resolved_context,
     }
 
 
@@ -312,6 +334,7 @@ async def intel_chat(
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
+    start_token_tracking()
     ctx = await _collect_chat_context(req, db, redis)
 
     result = await _agent.respond(
@@ -328,6 +351,7 @@ async def intel_chat(
         scope=req.scope or "report",
         conversation_memory=ctx["memory"],
         verified_tables_doc=ctx.get("verified_tables_doc"),
+        resolved_context=ctx.get("resolved_context"),
     )
 
     sql_spec = result.get("sql_to_execute")
@@ -353,6 +377,11 @@ async def intel_chat(
     ]
     new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
     await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
+
+    _scope_label = f"intel/{req.scope or 'report'}"
+    _tok_log = format_token_log(_scope_label, ctx["session_id"])
+    if _tok_log:
+        print(_tok_log, flush=True)
     print(f"[intel_chat] ✔ turn complete  session={ctx['session_id'][:8]}  turns={len(updated_history) // 2}", flush=True)
 
     return IntelChatResponse(
@@ -373,6 +402,7 @@ async def intel_chat_stream(
     """Streaming variant of /intelligence/chat (Server-Sent Events).
     Event types: text, chart, action, error, done. All DB access happens up
     front in _collect_chat_context, so the generator only touches Redis + httpx."""
+    start_token_tracking()
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
 
@@ -396,6 +426,7 @@ async def intel_chat_stream(
             scope=req.scope or "report",
             conversation_memory=ctx["memory"],
             verified_tables_doc=ctx.get("verified_tables_doc"),
+            resolved_context=ctx.get("resolved_context"),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[intel_chat] ✗ stream setup failed: {exc!r}", flush=True)
@@ -486,6 +517,10 @@ async def intel_chat_stream(
         ]
         new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
         await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
+
+        _tok_log = format_token_log(f"intel/{req.scope or 'report'}(stream)", ctx["session_id"])
+        if _tok_log:
+            print(_tok_log, flush=True)
         print(f"[intel_chat] ✔ stream complete  session={ctx['session_id'][:8]}  turns={len(updated_history) // 2}", flush=True)
 
         yield _sse({"type": "done", "session_id": ctx["session_id"],

@@ -810,11 +810,19 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
             if db_col and db_col.example_values and not stats.get("top_values"):
                 stats["top_values"] = [{cname: v} for v in db_col.example_values]
 
+            # Cardinality index: estimate distinct value count from example_values length.
+            # Phase C collects up to 200 distinct values; if we got <200 it's exact,
+            # otherwise it's a lower bound. Stored as stats["cardinality_estimate"].
+            if db_col and db_col.example_values and "cardinality_estimate" not in stats:
+                stats["cardinality_estimate"] = len(db_col.example_values)
+
             enriched_cols.append({
                 "name": cname,
                 "type": c.get("type"),
                 "description": col_desc[:250],
                 "semantic_type": db_col.semantic_type if db_col else None,
+                "is_filter_eligible": db_col.is_filter_eligible if db_col else None,
+                "business_name": db_col.business_name if db_col else None,
                 "stats": stats or None,
             })
 
@@ -1277,6 +1285,22 @@ def _build_concept_index_heuristic(
         key_dims: list[str] = sem.get("key_dimension_cols", [])
         key_dates: list[str] = sem.get("key_date_cols", [])
 
+        # Domain context: extract tokens from the table's own description and business_name.
+        # These tokens get added as concept aliases for all key columns in the table,
+        # giving the retriever domain vocabulary to anchor lookups.
+        tbl_desc: str = tbl.get("description", "") or ""
+        tbl_biz: str = tbl.get("business_name", "") or ""
+        tbl_domain_tokens: list[str] = []
+        for raw in (tbl_desc, tbl_biz, sem.get("description", "") or ""):
+            for token in re.findall(r"[a-zA-Z_]{3,}", raw):
+                tok = token.replace("_", " ").lower()
+                if tok not in STOPWORDS:
+                    tbl_domain_tokens.append(tok)
+
+        # Schema-prefix terms: "far_trans transactions" → map to table concepts
+        bare_tname = tname.split(".")[-1]
+        schema_prefix = tname.split(".")[0] if "." in tname else ""
+
         for col in tbl.get("columns", []):
             cname: str = col.get("name", "")
             ctype: str = col.get("type", "").lower()
@@ -1287,14 +1311,24 @@ def _build_concept_index_heuristic(
             if cname in key_metrics:
                 # Add both the bare name and a human-readable "table metric" alias
                 _add(cname.replace("_", " "), tname, cname, 0.95, "key_metric")
-                pretty = f"{tname.replace('_', ' ')} {cname.replace('_', ' ')}"
+                pretty = f"{bare_tname.replace('_', ' ')} {cname.replace('_', ' ')}"
                 _add(pretty, tname, cname, 0.90, "key_metric")
+                # Domain tokens from table description also map to key metrics
+                for dt in tbl_domain_tokens[:8]:
+                    _add(dt, tname, cname, 0.72, "table_domain_metric")
             elif cname in key_dims:
                 _add(cname.replace("_", " "), tname, cname, 0.85, "key_dimension")
+                for dt in tbl_domain_tokens[:4]:
+                    _add(dt, tname, cname, 0.65, "table_domain_dimension")
             elif cname in key_dates:
                 _add(cname.replace("_", " "), tname, cname, 0.80, "key_date")
             else:
                 _add(cname.replace("_", " "), tname, cname, 0.60, "column_name")
+
+            # Business name of the column as a concept alias
+            biz_name: str = col.get("business_name", "") or ""
+            if biz_name and biz_name.lower() != cname.lower():
+                _add(biz_name.lower(), tname, cname, 0.82, "business_name")
 
             # Semantic-type tags → concept aliases
             if stype:
@@ -1309,14 +1343,21 @@ def _build_concept_index_heuristic(
                     if term not in STOPWORDS:
                         _add(term, tname, cname, 0.55, "description")
 
-            # Table-level concept: "table_name column_name" combined phrase
-            combined = f"{tname.replace('_', ' ')} {cname.replace('_', ' ')}"
+            # Table-level concept: "bare_table_name column_name" combined phrase
+            combined = f"{bare_tname.replace('_', ' ')} {cname.replace('_', ' ')}"
             _add(combined, tname, cname, 0.70, "combined")
 
-        # Table-name itself → all key columns
-        tname_term = tname.replace("_", " ")
+        # Table-name itself (bare, qualified, and business) → all key columns
+        tname_term = bare_tname.replace("_", " ")
         for cname in key_metrics[:3]:
             _add(tname_term, tname, cname, 0.65, "table_key_metric")
+        if schema_prefix:
+            schema_term = schema_prefix.replace("_", " ")
+            for cname in key_metrics[:2]:
+                _add(schema_term, tname, cname, 0.55, "schema_domain")
+        if tbl_biz:
+            for cname in key_metrics[:3]:
+                _add(tbl_biz.lower(), tname, cname, 0.75, "table_business_name")
 
     # Sort each term's list by score descending
     for term in index:

@@ -22,9 +22,11 @@ import os
 import re
 from typing import Optional, TYPE_CHECKING
 from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL, BEDROCK_OPUS_MODEL
+from agent_service.agents import schema_scope as _iscope
 
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
+    from agent_service.agents.nl_schema_router import ResolvedContext
 
 INTEL_CHAT_MODEL = BEDROCK_SONNET_MODEL
 INTEL_CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
@@ -321,6 +323,10 @@ _INSTRUCTIONS = _SYSTEM_PROMPT_TEMPLATE.format()
 _SAMPLE_VALUE_LIMIT = int(os.getenv("INTEL_CHAT_SAMPLE_VALUE_LIMIT", "5"))
 _COL_DESC_MAX = int(os.getenv("INTEL_CHAT_COL_DESC_MAX", "80"))
 _TABLE_DESC_MAX = int(os.getenv("INTEL_CHAT_TABLE_DESC_MAX", "160"))
+
+# GraphRAG-scoped schema thresholds (mirrors chat_agent settings).
+_INTEL_GRAPHRAG_MIN_TABLES = int(os.getenv("INTEL_GRAPHRAG_MIN_TABLES", "10"))
+_INTEL_GRAPHRAG_SCOPE_HOPS = int(os.getenv("INTEL_GRAPHRAG_HOPS", "2"))
 
 # ── Widget-table extraction helpers ───────────────────────────────────────────
 _WIDGET_TABLE_RE = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', re.IGNORECASE)
@@ -788,6 +794,63 @@ class IntelligenceChatAgent:
             _intel_schema_map_cache[key] = schema
         return schema
 
+    def _build_graphrag_scoped_schema(
+        self,
+        enriched: "EnrichedSchema",
+        resolved_context: "ResolvedContext",
+        connection_id: Optional[str],
+        total: int,
+    ) -> str:
+        """GraphRAG-ranked scope for scope=database on the Intelligence Copilot.
+        Uses NL router's top-ranked tables as seed + FK-graph expansion — driven by
+        query relevance, not widget SQL.  Falls back to full schema if nothing resolves."""
+        seed_names = set((resolved_context.relevant_tables or [])[:8])
+        try:
+            seed, neighbors = self.resolve_scope_tables(enriched, seed_names, _INTEL_GRAPHRAG_SCOPE_HOPS)
+        except Exception as exc:
+            print(f"[intel_chat_agent] ⚠ graphrag scope resolve failed ({exc!r}) — full schema", flush=True)
+            return self._get_cached_schema(enriched, connection_id)
+
+        if not seed:
+            print(
+                f"[intel_chat_agent] graphrag scope: 0 seed tables matched from "
+                f"candidates {list(seed_names)[:4]} — full schema ({total} tables)",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        try:
+            schema = _iscope.render_scoped_schema(
+                enriched, seed, neighbors, _INTEL_GRAPHRAG_SCOPE_HOPS,
+                col_desc_max=_COL_DESC_MAX, table_desc_max=_TABLE_DESC_MAX,
+                sample_limit=_SAMPLE_VALUE_LIMIT,
+                scope_intro=(
+                    "SCOPE: DATABASE (query-ranked) — tables selected by relevance to "
+                    "this specific query. FOCUSED TABLES (below) are the highest-ranked "
+                    "matches. RELATED TABLES are their FK-graph neighbours available for "
+                    "JOINs. If you need a table not listed here, say so in your reply."
+                ),
+                seed_header=f"FOCUSED TABLES — {len(seed)} table(s) ranked most relevant to this query:",
+                related_header_fmt=(
+                    "RELATED TABLES — {n} table(s) within {hops} FK-hop(s) of the focused "
+                    "tables (name + description + join path; full detail available on request):"
+                ),
+            )
+            full_len = len(self._get_cached_schema(enriched, connection_id))
+            scoped_len = len(schema)
+            saved_pct = round((1 - scoped_len / max(full_len, 1)) * 100, 1)
+            print(
+                f"[intel_chat_agent] scope=database(graphrag)  seed={len(seed)}  "
+                f"related={len(neighbors)}  total_tables={total}  "
+                f"chars={scoped_len:,}/{full_len:,}  saved={saved_pct}%  "
+                f"≈{(full_len - scoped_len) // 4:,} input tokens saved",
+                flush=True,
+            )
+            return schema
+        except Exception as exc:
+            print(f"[intel_chat_agent] ⚠ graphrag scoped render failed ({exc!r}) — full schema", flush=True)
+            return self._get_cached_schema(enriched, connection_id)
+
     def _build_dynamic_context(
         self,
         dashboard_widgets: list,
@@ -811,10 +874,21 @@ class IntelligenceChatAgent:
         connection_id: Optional[str] = None,
         scope: str = "database",
         verified_tables_doc: Optional[dict] = None,
+        resolved_context: Optional["ResolvedContext"] = None,
+        conversation_history: Optional[list] = None,
     ) -> list[dict]:
         dynamic = self._build_dynamic_context(
             dashboard_widgets, dashboard_pages, active_page_id, priority_tables,
         )
+
+        # route_query() resolves tables from the CURRENT message alone, so an
+        # elliptical follow-up ("what about last month") with no table-name signal
+        # of its own can score every table near-zero — pruning the schema down to
+        # whichever table wins that noise and silently dropping the table the
+        # conversation was actually about. When history is present and the
+        # router's own confidence is weak, skip GraphRAG scoping for this turn.
+        _top_score = max(resolved_context.table_scores.values(), default=0.0) if resolved_context else 0.0
+        _ambiguous_followup = bool(conversation_history) and _top_score < 0.15
 
         if enriched and enriched.compact_tables:
             total = len(enriched.compact_tables)
@@ -836,20 +910,45 @@ class IntelligenceChatAgent:
                         schema = self._get_cached_schema(enriched, connection_id)
                         print(f"[intel_chat_agent] ⚠ scoped build failed ({exc!r}) — full schema", flush=True)
                 else:
-                    # No report tables matched (e.g. widgets have no parseable SQL) →
-                    # fall back to the full schema so the copilot is never blind.
+                    # No report tables matched (e.g. widgets have no parseable SQL) —
+                    # fall back to GraphRAG if available, else full schema.
+                    if (
+                        resolved_context
+                        and not resolved_context.fallback
+                        and resolved_context.focused_tables
+                        and total >= _INTEL_GRAPHRAG_MIN_TABLES
+                        and not _ambiguous_followup
+                    ):
+                        schema = self._build_graphrag_scoped_schema(
+                            enriched, resolved_context, connection_id, total
+                        )
+                    else:
+                        schema = self._get_cached_schema(enriched, connection_id)
+                        print(
+                            f"[intel_chat_agent] scope=report  seed_tables=0 — no report tables "
+                            f"matched, falling back to FULL schema ({total} tables)",
+                            flush=True,
+                        )
+            else:
+                # scope="database" — use GraphRAG-ranked scoping when the NL router
+                # resolved relevant tables and the schema is large enough to benefit.
+                if (
+                    resolved_context
+                    and not resolved_context.fallback
+                    and resolved_context.focused_tables
+                    and total >= _INTEL_GRAPHRAG_MIN_TABLES
+                    and not _ambiguous_followup
+                ):
+                    schema = self._build_graphrag_scoped_schema(
+                        enriched, resolved_context, connection_id, total
+                    )
+                else:
                     schema = self._get_cached_schema(enriched, connection_id)
                     print(
-                        f"[intel_chat_agent] scope=report  seed_tables=0 — no report tables "
-                        f"matched, falling back to FULL schema ({total} tables)",
+                        f"[intel_chat_agent] scope=database — full schema "
+                        f"({'ambiguous follow-up, ' if _ambiguous_followup else ''}{total} tables)",
                         flush=True,
                     )
-            else:
-                schema = self._get_cached_schema(enriched, connection_id)
-                print(
-                    f"[intel_chat_agent] scope=database — full schema ({total} tables)",
-                    flush=True,
-                )
             verified_block = _format_verified_tables(verified_tables_doc or {})
             extra = [{"type": "text", "text": verified_block}] if verified_block else []
             return [
@@ -884,6 +983,7 @@ class IntelligenceChatAgent:
         scope: str = "database",
         conversation_memory: Optional[list[str]] = None,
         verified_tables_doc: Optional[dict] = None,
+        resolved_context: Optional["ResolvedContext"] = None,
     ) -> tuple[list[dict], list[dict], str, int]:
         """Build (system_blocks, messages, model_id, max_tokens)."""
         system_blocks = self._build_system_blocks(
@@ -896,6 +996,8 @@ class IntelligenceChatAgent:
             connection_id=connection_id,
             scope=scope,
             verified_tables_doc=verified_tables_doc,
+            resolved_context=resolved_context,
+            conversation_history=conversation_history,
         )
         # Distilled memory: the gist of earlier questions, injected as a small dynamic
         # block so the copilot remembers what was asked WITHOUT replaying the full
@@ -1011,6 +1113,7 @@ class IntelligenceChatAgent:
         scope: str = "database",
         conversation_memory: Optional[list[str]] = None,
         verified_tables_doc: Optional[dict] = None,
+        resolved_context: Optional["ResolvedContext"] = None,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
@@ -1018,6 +1121,7 @@ class IntelligenceChatAgent:
             model_override, connection_id, scope=scope,
             conversation_memory=conversation_memory,
             verified_tables_doc=verified_tables_doc,
+            resolved_context=resolved_context,
         )
 
         raw = await bedrock_invoke_with_history(

@@ -9,7 +9,7 @@ from shared.schemas.schema import SemanticSchemaDocument
 from shared.schemas.chart import QueryPlan
 from agent_service.agents.sql_utils import (
     expand_table_aliases, basic_sql_lint, verify_columns_against_schema,
-    normalize_string_comparisons_snowflake,
+    normalize_string_comparisons_snowflake, extract_recent_tables,
 )
 
 if TYPE_CHECKING:
@@ -699,19 +699,7 @@ class QueryAgent:
 
         # Recently-used table memory: tables used in recent turns get priority
         if conversation_history:
-            import re as _re
-            recent_tables: list[str] = []
-            for turn in conversation_history[-4:]:
-                sql_text = turn.get("sql") or ""
-                if sql_text:
-                    for m in _re.finditer(r'\bFROM\s+([\w.]+)\b', sql_text, _re.IGNORECASE):
-                        tname = m.group(1).strip('"').strip("'")
-                        if tname and tname not in recent_tables:
-                            recent_tables.append(tname)
-                    for m in _re.finditer(r'\bJOIN\s+([\w.]+)\b', sql_text, _re.IGNORECASE):
-                        tname = m.group(1).strip('"').strip("'")
-                        if tname and tname not in recent_tables:
-                            recent_tables.append(tname)
+            recent_tables = extract_recent_tables(conversation_history)
             if recent_tables:
                 user_content["recently_used_tables"] = {
                     "tables": recent_tables[:4],
@@ -834,14 +822,17 @@ class QueryAgent:
                 "tables_joined": [],
             }
 
-        # Post-process: expand short aliases to prevent alias-reference errors
-        if data.get("sql"):
+        # Post-process: expand short aliases to prevent alias-reference errors.
+        # Snowflake is SKIPPED — aliases (t.col, t."TIMESTAMP") are fully valid in Snowflake
+        # and expand_table_aliases corrupts SQL with quoted identifiers like t."TIMESTAMP"
+        # because its regex only matches unquoted word characters ([\w]+).
+        if data.get("sql") and db_type != "snowflake":
             data["sql"] = expand_table_aliases(data["sql"])
-            # Snowflake string comparisons are case-sensitive; the LLM commonly guesses
-            # lowercase values ('buy', 'sell') when the DB stores mixed-case ('Buy', 'Sell').
-            # Rewrite col = 'val' → UPPER(col) = 'VAL' for case-insensitive matching.
-            if db_type == "snowflake":
-                data["sql"] = normalize_string_comparisons_snowflake(data["sql"])
+        # Snowflake string comparisons are case-sensitive; the LLM commonly guesses
+        # lowercase values ('buy', 'sell') when the DB stores mixed-case ('Buy', 'Sell').
+        # Rewrite col = 'val' → UPPER(col) = 'VAL' for case-insensitive matching.
+        if data.get("sql") and db_type == "snowflake":
+            data["sql"] = normalize_string_comparisons_snowflake(data["sql"])
 
         return QueryPlan(
             sql=data.get("sql", "SELECT 1"),

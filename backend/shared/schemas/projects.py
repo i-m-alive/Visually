@@ -5,12 +5,20 @@ from typing import Optional
 class ProjectCreate(BaseModel):
     name: str
     description: Optional[str] = None
+    domain: Optional[str] = None  # "recruitment" | "finance" | "generic" — defaults server-side
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    domain: Optional[str] = None
 
 
 class ProjectResponse(BaseModel):
     id: str
     name: str
     description: Optional[str]
+    domain: str
     owner_id: str
     created_at: str
 

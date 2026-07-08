@@ -1,11 +1,13 @@
 import json
 import re
+from typing import Optional
 from shared.bedrock_client import bedrock_invoke, BEDROCK_HAIKU_MODEL
 from shared.schemas.agent import IntentResult, IntentEntities, TimeRange, FilterCondition
+from agent_service.agents.domain_config import SKILL_DOMAINS, normalize_domain
 
 INTENT_CLASSIFIER_MODEL = BEDROCK_HAIKU_MODEL
 
-SYSTEM_PROMPT = """You are an intent classification system for a data visualization platform.
+_CORE_PROMPT = """You are an intent classification system for a data visualization platform.
 Analyze the user's message and extract structured information.
 
 INTENT TYPES (choose exactly one):
@@ -13,7 +15,14 @@ INTENT TYPES (choose exactly one):
 - DASHBOARD: User wants multiple charts, a full dashboard, or an overview. Signals: "dashboard", "overview", "summary", "report", multiple different metric words in one request.
 - FOLLOWUP: User is referring to a prior result with pronouns. Signals: "it", "that", "this chart", "the graph", "filter", "drill", "refine", "update", "change it", "why did it".
 - SCHEMA_EXPLORE: User wants to explore what data/tables are available, understand the database structure, or get example questions they can ask. Signals: "what tables do I have", "what data do I have", "explain my schema", "what can I ask", "what's in my database", "what data is available", "explore data", "list my tables", "what kind of questions", "what do I have access to", "show me what you know".
+"""
 
+# Per-domain "AGENT SKILL INTENTS" vocabulary. A domain not listed here (e.g.
+# "generic") gets NO skill-intent block at all — those questions always stay on
+# the SINGLE_VIZ/DASHBOARD/FOLLOWUP/SCHEMA_EXPLORE chart/SQL path instead of
+# being routed to a vertical-specific persona that may refuse out-of-scope data.
+_SKILL_INTENT_BLOCKS: dict[str, str] = {
+    "recruitment": """
 AGENT SKILL INTENTS — route to the tool-use agent layer, NOT the SQL pipeline.
 Use these when the user's request maps to a recruitment workflow action, not a data visualisation:
 - MATCH: Find, rank, or score candidates for a job using ML scores. Signals: "best candidates", "top candidates", "rank candidates", "who should I interview", "shortlist for", "score candidates", "find candidates for [role]", "strongest applicants", "recommend candidates".
@@ -25,7 +34,23 @@ Use these when the user's request maps to a recruitment workflow action, not a d
 - AUDIT: Audit the recruitment pipeline for data quality issues, missing scores, stale records, or financial/billing integrity. Signals: "audit pipeline", "data quality", "missing scores", "unscored candidates", "stale applications", "incomplete profiles", "compliance check", "what's missing", "billing issues", "billing rate", "bill rate", "pay rate", "rate mismatch", "inverted margin", "placement errors", "financial audit", "missing bill rate", "zero bill rate".
 - PROSPECT: Find pipeline gaps, jobs at risk, or business development opportunities. Signals: "pipeline gaps", "jobs with no candidates", "at-risk roles", "opportunities", "business development", "which jobs need attention", "roles without recommendations".
 - ACTION: Create a note, update a candidate or application status, or tag a record. Signals: "add note", "update status", "mark as", "move to [stage]", "create note for", "tag [candidate]", "change status of".
+""",
+    "finance": """
+AGENT SKILL INTENTS — route to the tool-use agent layer, NOT the SQL pipeline.
+Use these when the user's request maps to a finance/operations workflow action, not a data visualisation:
+- MATCH: Find, rank, or flag accounts, transactions, or customers by risk, fraud, or priority score. Signals: "highest risk accounts", "flag suspicious transactions", "top risk customers", "rank accounts by exposure", "score transactions", "find high-risk transactions", "riskiest accounts".
+- BRIEFING: Give a daily overview of what needs attention in finance operations, OR answer personal/role-specific queries when the user says "my". Signals: "briefing", "daily summary", "what should I focus on", "what needs attention today", "operations overview", "morning priorities", "what's urgent", "catch me up", "my accounts", "my transactions", "my portfolio", "my clients", "show me my", "what am I working on", "my activity", "my performance", "my exceptions", "my open items".
+- SCREEN: Screen a specific account, transaction, or customer, or generate a review checklist. Signals: "screen [account]", "review checklist for", "evaluate this transaction", "assess [customer]".
+- ENRICH: Enrich or complete an account, customer, or transaction record using available data. Signals: "enrich profile", "fill in missing info", "complete [customer]'s profile", "summarize [account]", "update record".
+- VERIFY: Verify a transaction or account for inconsistencies, gaps, or compliance mismatches. Signals: "verify [transaction]", "check compliance", "validate account", "inconsistencies", "does this match", "anomalies", "red flags".
+- PRESENT: Generate a client-facing statement, report, or presentation. Signals: "present accounts", "statement", "client report", "prepare presentation for client", "send report to".
+- AUDIT: Audit finance data for quality issues, missing values, stale records, or reconciliation/integrity problems. Signals: "audit transactions", "data quality", "missing values", "stale records", "incomplete records", "compliance check", "what's missing", "reconciliation issues", "balance mismatch", "duplicate transactions", "orphaned records", "negative balance".
+- PROSPECT: Find operational gaps, at-risk accounts, or business opportunities. Signals: "gaps", "accounts with no activity", "at-risk accounts", "opportunities", "which accounts need attention", "unresolved exceptions".
+- ACTION: Create a note, update a record's status, or tag a record. Signals: "add note", "update status", "mark as", "move to [stage]", "create note for", "tag [account]", "change status of".
+""",
+}
 
+_TAIL_PROMPT = """
 OUTPUT MODE (choose exactly one) — how the answer is best presented:
 - "chart": the answer is best SHOWN as a visualization. Signals: "trend", "over time", "by <category>", "compare", "distribution", "breakdown", "top N", "show me a chart/graph", any explicit chart_type, or any request whose result is a series of values across a dimension/time.
 - "text": the answer is best stated in WORDS, with no chart. Signals: a single fact or aggregate ("how many", "what is the total", "what's the average", "which is highest/lowest"), yes/no questions, or "explain", "summarize", "describe", "tell me about". A single number or short fact -> "text".
@@ -56,25 +81,44 @@ VAGUENESS SCORE (0.0 to 1.0):
 - 0.3-0.6: partially specified ("show revenue by region")
 - 0.6-0.9: mostly specified ("bar chart of monthly revenue")
 - 0.9-1.0: fully specified (exact SQL intent)
+"""
 
+_BASE_INTENT_TYPES = ["SINGLE_VIZ", "DASHBOARD", "FOLLOWUP", "SCHEMA_EXPLORE"]
+_SKILL_INTENT_TYPES = ["MATCH", "BRIEFING", "SCREEN", "ENRICH", "VERIFY", "PRESENT", "AUDIT", "PROSPECT", "ACTION"]
+
+
+def build_system_prompt(domain: str) -> str:
+    """Assemble the classifier's system prompt for this project's domain.
+
+    Domains in SKILL_DOMAINS get their own AGENT SKILL INTENTS vocabulary (and
+    those intent types in the JSON schema enum); other domains (e.g. "generic")
+    get neither — those questions can only ever land on SINGLE_VIZ/DASHBOARD/
+    FOLLOWUP/SCHEMA_EXPLORE, so a specialist persona can never misfire on them.
+    """
+    skill_block = _SKILL_INTENT_BLOCKS.get(domain, "") if domain in SKILL_DOMAINS else ""
+    intent_types = _BASE_INTENT_TYPES + (_SKILL_INTENT_TYPES if skill_block else [])
+    intent_enum = " | ".join(intent_types)
+
+    json_schema = f"""
 Return ONLY valid JSON:
-{
-  "intent_type": "SINGLE_VIZ | DASHBOARD | FOLLOWUP | SCHEMA_EXPLORE | MATCH | BRIEFING | SCREEN | ENRICH | VERIFY | PRESENT | AUDIT | PROSPECT | ACTION",
+{{
+  "intent_type": "{intent_enum}",
   "confidence": 0.0,
-  "entities": {
+  "entities": {{
     "metrics": [],
     "dimensions": [],
     "time_range": null,
     "time_granularity": null,
     "chart_type": null,
     "filters": []
-  },
+  }},
   "vagueness_score": 0.0,
   "followup_ref": null,
   "sub_intents": [],
   "output_mode": "chart",
   "reasoning": "one sentence"
-}"""
+}}"""
+    return _CORE_PROMPT + skill_block + _TAIL_PROMPT + json_schema
 
 
 # Deterministic granularity detection — backs up the LLM so "month wise"
@@ -113,11 +157,33 @@ def detect_time_granularity(text: str) -> str | None:
 
 
 class IntentClassifier:
-    async def classify(self, text: str) -> IntentResult:
+    async def classify(
+        self, text: str, conversation_history: Optional[list] = None, domain: str = "recruitment",
+    ) -> IntentResult:
+        # A follow-up ("what about last month", "now by region") carries almost no
+        # signal on its own — without the prior turn, metrics/dimensions extract
+        # empty and the message reads as fully vague. Give the classifier the
+        # last turn so it can resolve pronouns/ellipsis against it.
+        user_message = text
+        if conversation_history:
+            context_lines = []
+            for turn in conversation_history[-2:]:
+                role = turn.get("role", "user")
+                content = (turn.get("content") or "").strip()
+                if content:
+                    context_lines.append(f"{role}: {content}")
+            if context_lines:
+                user_message = (
+                    "Recent conversation (use it to resolve references like 'that', "
+                    "'it', 'now by X', 'last month' in the current message):\n"
+                    + "\n".join(context_lines)
+                    + "\n\nCurrent message: " + text
+                )
+
         raw = await bedrock_invoke(
             model_id=INTENT_CLASSIFIER_MODEL,
-            system_prompt=SYSTEM_PROMPT,
-            user_message=text,
+            system_prompt=build_system_prompt(normalize_domain(domain)),
+            user_message=user_message,
             max_tokens=1024,
             temperature=0.1,
         )

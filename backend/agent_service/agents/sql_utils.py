@@ -62,8 +62,11 @@ def expand_table_aliases(sql: str) -> str:
         #    3-level reference that Redshift rejects; "sales.col" resolves fine
         #    against "FROM public.sales".
         bare_table = table_name.split(".")[-1]
+        # Pattern handles both unquoted (col) and double-quoted ("col") identifiers.
+        # \b inside the group applies only to unquoted names; quoted names end with "
+        # which is its own natural boundary, so no trailing \b is needed for them.
         result = re.sub(
-            r'\b' + re.escape(alias) + r'\.([\w]+)\b',
+            r'\b' + re.escape(alias) + r'\.((?:"[^"]+"|[\w]+\b))',
             bare_table.replace('\\', '\\\\') + r'.\1',
             result,
         )
@@ -83,6 +86,32 @@ def expand_table_aliases(sql: str) -> str:
 
 
 # ── 2. Table.column reference extraction ─────────────────────────────────────
+
+def extract_recent_tables(
+    conversation_history: Optional[list], max_turns: int = 4, max_tables: int = 4
+) -> list[str]:
+    """
+    Tables referenced via FROM/JOIN in the SQL of recent conversation turns.
+    Used to bias table retrieval/schema selection for follow-up questions whose
+    own wording gives little or no signal (e.g. "what about last month").
+    """
+    if not conversation_history:
+        return []
+    recent_tables: list[str] = []
+    for turn in conversation_history[-max_turns:]:
+        sql_text = turn.get("sql") or ""
+        if not sql_text:
+            continue
+        for m in re.finditer(r'\bFROM\s+([\w.]+)\b', sql_text, re.IGNORECASE):
+            tname = m.group(1).strip('"').strip("'")
+            if tname and tname not in recent_tables:
+                recent_tables.append(tname)
+        for m in re.finditer(r'\bJOIN\s+([\w.]+)\b', sql_text, re.IGNORECASE):
+            tname = m.group(1).strip('"').strip("'")
+            if tname and tname not in recent_tables:
+                recent_tables.append(tname)
+    return recent_tables[:max_tables]
+
 
 def extract_table_column_refs(sql: str) -> list[tuple[str, str]]:
     """

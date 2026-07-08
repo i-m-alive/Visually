@@ -25,7 +25,10 @@ from agent_service.agents.chat_agent import (
     _is_chart_creation_request,
 )
 import agent_service.agents.schema_cache as _schema_cache
-from shared.bedrock_client import bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL
+from shared.bedrock_client import (
+    bedrock_invoke_stream, bedrock_invoke, BEDROCK_SONNET_MODEL,
+    start_token_tracking, format_token_log,
+)
 from agent_service.agents.intent_parser import parse_intent
 from agent_service.agents.nl_schema_router import route_query
 
@@ -385,6 +388,7 @@ async def chat(
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
+    start_token_tracking()
     ctx = await _collect_chat_context(req, db, redis)
 
     result = await _agent.respond(
@@ -436,6 +440,11 @@ async def chat(
     ]
     await ChatAgent.save_history(ctx["session_id"], updated_history, redis)
 
+    _scope_label = f"canvas/{req.scope or 'db'}"
+    _tok_log = format_token_log(_scope_label, ctx["session_id"])
+    if _tok_log:
+        print(_tok_log, flush=True)
+
     return ChatResponse(
         session_id=ctx["session_id"],
         text=result["text"],
@@ -459,6 +468,7 @@ async def chat_stream(
     (incremental prose delta), `chart` (rendered inline chart), `action`
     (dashboard action), `error`, and `done`. All DB access happens up front in
     _collect_chat_context, so the generator only touches Redis + httpx."""
+    start_token_tracking()
     ctx = await _collect_chat_context(req, db, redis)
     system_blocks, messages, model_id, max_tokens = _agent.prepare(
         message=req.message,
@@ -579,6 +589,10 @@ async def chat_stream(
             {"role": "assistant", "content": final_text},
         ]
         await ChatAgent.save_history(ctx["session_id"], updated_history, redis)
+
+        _tok_log = format_token_log(f"canvas/{req.scope or 'db'}(stream)", ctx["session_id"])
+        if _tok_log:
+            print(_tok_log, flush=True)
 
         yield _sse({"type": "done", "session_id": ctx["session_id"],
                     "turn_count": len(updated_history) // 2})

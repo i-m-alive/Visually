@@ -11,6 +11,11 @@ from bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL  # noqa: E402
 
 SCHEMA_MODEL = BEDROCK_SONNET_MODEL
 
+_PII_SIGNALS = frozenset({
+    "email", "phone", "ssn", "dob", "password", "secret",
+    "token", "auth", "credit", "card",
+})
+
 SEMANTIC_TABLE_KEYWORDS = {
     "order", "sale", "customer", "event", "transaction", "revenue",
     "metric", "product", "user", "account", "payment",
@@ -27,7 +32,7 @@ async def _run_with_timeout(coro, timeout: float):
 async def crawl_mysql(
     host: str, port: int, database: str, user: str, password: str, ssl: bool,
     connection_id: str,
-) -> dict:
+) -> tuple[dict, dict]:
     start = datetime.now(timezone.utc)
 
     conn = await aiomysql.connect(
@@ -91,6 +96,7 @@ async def crawl_mysql(
             col_map.setdefault(col["table_name"], []).append(dict(col))
 
         table_data = {}
+        sample_rows_map: dict[str, list] = {}
         all_table_names = {t["table_name"] for t in tables_raw}
 
         for t in tables_raw:
@@ -136,15 +142,52 @@ async def crawl_mysql(
                 except Exception:
                     pass
 
+            # ── Sample rows (up to 25 rows, PII masked) ──────────────────────
+            col_names = [c["column_name"] for c in (col_map.get(tname) or [])]
+            sample_rows: list[dict] = []
+            if row_count > 0:
+                try:
+                    if row_count <= 100:
+                        raw_rows = await _run_with_timeout(
+                            fetch(f"SELECT * FROM `{tname}` LIMIT 25"),
+                            timeout=8.0,
+                        )
+                    else:
+                        # ORDER BY RAND() is expensive on large tables; use mod-based sampling
+                        raw_rows = await _run_with_timeout(
+                            fetch(f"SELECT * FROM `{tname}` WHERE (RAND() * 100) < 5 LIMIT 25"),
+                            timeout=8.0,
+                        )
+                    if raw_rows:
+                        pii_cols = {c for c in col_names if any(sig in c.lower() for sig in _PII_SIGNALS)}
+                        for row in raw_rows:
+                            for pii_col in pii_cols:
+                                if pii_col in row:
+                                    row[pii_col] = "[REDACTED]"
+                        sample_rows = [
+                            {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                             for k, v in row.items()}
+                            for row in raw_rows
+                        ]
+                except Exception:
+                    pass
+            sample_rows_map[tname] = sample_rows
+
             inferred_rels = []
             for col in (col_map.get(tname) or []):
                 cname = col["column_name"]
+                # Infer FK only when: column ends in _id, the base name is meaningful
+                # (≥4 chars to avoid false positives like 'a_id'), and a matching
+                # table actually exists. Explicit FKs from information_schema are
+                # always preferred; these inferred ones are a fallback for DBs
+                # without declared FK constraints.
                 if cname.endswith("_id") and cname != "id":
                     base = cname[:-3]
-                    if base + "s" in all_table_names:
-                        inferred_rels.append({"column": cname, "ref_table": base + "s", "ref_column": "id", "inferred": True})
-                    elif base in all_table_names:
-                        inferred_rels.append({"column": cname, "ref_table": base, "ref_column": "id", "inferred": True})
+                    if len(base) >= 4:
+                        if base + "s" in all_table_names:
+                            inferred_rels.append({"column": cname, "ref_table": base + "s", "ref_column": "id", "inferred": True})
+                        elif base in all_table_names:
+                            inferred_rels.append({"column": cname, "ref_table": base, "ref_column": "id", "inferred": True})
 
             explicit = [{**fk, "inferred": False} for fk in fks.get(tname, [])]
 
@@ -175,6 +218,9 @@ async def crawl_mysql(
                     "is_primary_key": cname in tdata["primary_keys"],
                     "description": desc.get("columns", {}).get(cname, f"Column {cname}"),
                     "stats": tdata["col_stats"].get(cname),
+                    # Constraints and defaults — useful for LLM prompt context
+                    "default_value": col.get("column_default"),
+                    "max_length": col.get("character_maximum_length"),
                 }
                 columns_out.append(col_out)
 
@@ -200,7 +246,7 @@ async def crawl_mysql(
 
         crawl_duration = (datetime.now(timezone.utc) - start).total_seconds()
 
-        return {
+        schema_doc = {
             "connection_id": connection_id,
             "crawled_at": start.isoformat(),
             "tables": tables_out,
@@ -209,6 +255,8 @@ async def crawl_mysql(
             "version": 1,
             "crawl_duration_seconds": crawl_duration,
         }
+        # Return the same (schema_doc, sample_rows_map) tuple that other crawlers return
+        return schema_doc, sample_rows_map
     finally:
         conn.close()
 

@@ -204,4 +204,4 @@ async def run(user_text: str, ctx: AgentContext) -> str:
 
 # ── Self-register ─────────────────────────────────────────────────────────────
 from agent_service.agents.skill_agents import register  # noqa: E402
-register("AUDIT", run)
+register("recruitment", "AUDIT", run)

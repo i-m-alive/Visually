@@ -116,10 +116,12 @@ export const authApi = {
 }
 
 export const projectApi = {
-  create: (data: { name: string; description?: string }) =>
+  create: (data: { name: string; description?: string; domain?: string }) =>
     api.post('/projects', data),
   list: () => api.get('/projects'),
   get: (id: string) => api.get(`/projects/${id}`),
+  update: (id: string, data: { name?: string; description?: string; domain?: string }) =>
+    api.patch(`/projects/${id}`, data),
   delete: (id: string) => api.delete(`/projects/${id}`),
   listConnections: (projectId: string) =>
     api.get(`/projects/${projectId}/connections`),

@@ -27,12 +27,22 @@ const DB_DEFAULTS: Record<string, number> = {
   snowflake: 443,
 }
 
+const DOMAIN_OPTIONS: { value: string; label: string; description: string }[] = [
+  { value: 'recruitment', label: 'Recruitment', description: 'Candidate matching, placement briefings, pipeline audits.' },
+  { value: 'finance', label: 'Finance', description: 'Risk/transaction ranking, ops briefings, data-quality audits.' },
+  { value: 'generic', label: 'Generic', description: 'No specialist skills — just chart and data questions.' },
+]
+
 export default function ConnectionPage() {
   const { id: projectId } = useParams<{ id: string }>()
 
   const [connections, setConnections] = useState<Connection[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
+
+  const [domain, setDomain] = useState('recruitment')
+  const [domainSaving, setDomainSaving] = useState(false)
+  const [domainSaveResult, setDomainSaveResult] = useState<{ ok: boolean; msg: string } | null>(null)
 
   const [editing, setEditing] = useState<string | null>(null)
   const [form, setForm] = useState({
@@ -78,14 +88,33 @@ export default function ConnectionPage() {
   const load = async () => {
     setLoading(true); setLoadError('')
     try {
-      const resp = await projectApi.listConnections(projectId)
-      setConnections(resp.data)
+      const [connResp, projResp] = await Promise.all([
+        projectApi.listConnections(projectId),
+        projectApi.get(projectId),
+      ])
+      setConnections(connResp.data)
+      setDomain(projResp.data?.domain ?? 'recruitment')
       // Auto-check each connection so the card shows its live status without a click.
-      ;(resp.data as Connection[]).forEach(c => { void probeStatus(c.id) })
+      ;(connResp.data as Connection[]).forEach(c => { void probeStatus(c.id) })
     } catch {
       setLoadError('Failed to load connections.')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleDomainChange = async (next: string) => {
+    const prev = domain
+    setDomain(next)
+    setDomainSaving(true); setDomainSaveResult(null)
+    try {
+      await projectApi.update(projectId, { domain: next })
+      setDomainSaveResult({ ok: true, msg: 'Domain updated' })
+    } catch (err: any) {
+      setDomain(prev)
+      setDomainSaveResult({ ok: false, msg: err?.response?.data?.detail ?? 'Failed to update domain' })
+    } finally {
+      setDomainSaving(false)
     }
   }
 
@@ -197,6 +226,45 @@ export default function ConnectionPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
+        {!loading && (
+          <div className="bg-white border border-gray-100 rounded-2xl p-5 mb-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-gray-900">Project Domain</h3>
+            <p className="text-sm text-gray-500 mt-0.5 mb-3">
+              Which vertical this project's agent is tuned for — controls its persona and which
+              specialist skills (candidate matching, risk ranking, audits, etc.) are available.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {DOMAIN_OPTIONS.map(opt => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  disabled={domainSaving}
+                  onClick={() => handleDomainChange(opt.value)}
+                  className={`text-left px-3 py-2.5 rounded-xl border transition-colors ${
+                    domain === opt.value
+                      ? 'border-blue-500 bg-blue-50/60'
+                      : 'border-gray-100 hover:border-gray-200'
+                  } ${domainSaving ? 'opacity-60 cursor-wait' : ''}`}
+                >
+                  <div className="text-sm font-medium text-gray-900">{opt.label}</div>
+                  <div className="text-xs text-gray-500 mt-0.5">{opt.description}</div>
+                </button>
+              ))}
+            </div>
+            {domainSaveResult && (
+              <p className={`text-xs mt-2 ${domainSaveResult.ok ? 'text-green-600' : 'text-red-600'}`}>
+                {domainSaveResult.msg}
+              </p>
+            )}
+            {connections.some(c => c.db_type === 'snowflake') && (
+              <p className="text-xs text-amber-600 mt-2">
+                A Snowflake connection is configured on this project — Snowflake connections always
+                run as Finance domain (role-based access is skipped), regardless of the selection above.
+              </p>
+            )}
+          </div>
+        )}
+
         {loading && (
           <div className="flex items-center justify-center h-48">
             <Loader2 className="w-7 h-7 text-blue-500 animate-spin" />

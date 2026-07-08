@@ -6,7 +6,7 @@ import {
   Copy, Volume2, VolumeX, FileText, Star, Maximize2, Square, Search, ChevronDown,
   ExternalLink, StickyNote, Mic, MicOff, ThumbsUp, ThumbsDown,
 } from 'lucide-react'
-import { agentApi, querySessionApi, type ConversationTurn } from '@/lib/api'
+import { agentApi, querySessionApi, projectApi, type ConversationTurn } from '@/lib/api'
 import { usePipelineSocket } from '@/hooks/usePipelineSocket'
 import { MarkdownRenderer } from './MarkdownRenderer'
 import { usePipelineStore } from '@/stores/pipelineStore'
@@ -229,6 +229,32 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
       chart_type: cr.chart_type,
     }).catch(() => { /* feedback is best-effort */ })
   }, [projectId])
+
+  // Domain toggle — defaults to whatever schema_crawler auto-detected for this
+  // project (or the last manual choice); user can override any time.
+  const [domain, setDomain] = useState<string | null>(null)
+  const [domainSaving, setDomainSaving] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    projectApi.get(projectId).then((resp) => {
+      if (!cancelled) setDomain(resp.data?.domain ?? 'recruitment')
+    }).catch(() => { /* non-fatal — toggle just stays hidden until loaded */ })
+    return () => { cancelled = true }
+  }, [projectId])
+
+  const handleDomainChange = async (next: string) => {
+    const prev = domain
+    setDomain(next)
+    setDomainSaving(true)
+    try {
+      await projectApi.update(projectId, { domain: next })
+    } catch {
+      setDomain(prev)
+    } finally {
+      setDomainSaving(false)
+    }
+  }
 
   usePipelineSocket(activeJobId)
 
@@ -675,6 +701,29 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
             {onSwitchConnection && (
               <button onClick={onSwitchConnection} className="text-[11px] text-brand hover:underline flex-shrink-0">Switch</button>
             )}
+          </div>
+        )}
+        {/* Domain toggle — defaults to the auto-detected domain, user can override */}
+        {domain && (
+          <div className="border-t border-gray-100 px-2.5 py-2">
+            <p className="text-[10px] uppercase tracking-wide text-gray-400 mb-1">Domain</p>
+            <div className="flex gap-1">
+              {(['recruitment', 'finance', 'generic'] as const).map((d) => (
+                <button
+                  key={d}
+                  type="button"
+                  disabled={domainSaving}
+                  onClick={() => handleDomainChange(d)}
+                  className={`flex-1 text-[11px] px-1.5 py-1 rounded-md border capitalize transition-colors ${
+                    domain === d
+                      ? 'bg-brand text-white border-brand'
+                      : 'bg-white text-gray-500 border-gray-200 hover:border-gray-300'
+                  } ${domainSaving ? 'opacity-60 cursor-wait' : ''}`}
+                >
+                  {d}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </aside>

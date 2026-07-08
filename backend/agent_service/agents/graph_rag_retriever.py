@@ -241,13 +241,20 @@ def retrieve(
     intent,               # ParsedIntent (from intent_parser.py) — duck-typed
     enriched: "EnrichedSchema",
     top_k: int = 5,
+    history_tables: Optional[list] = None,
 ) -> RetrievedContext:
     """
     Multi-signal Graph RAG retrieval. Never raises — returns empty context on error.
     The orchestrator falls back to word-overlap scoring when context is empty.
+
+    history_tables: tables used in recent conversation turns (see
+    sql_utils.extract_recent_tables). When the current message's own
+    retrieval signal is weak — typical of elliptical follow-ups like
+    "what about last month" — these are kept in the candidate set so their
+    schema still reaches the LLM instead of being silently dropped.
     """
     try:
-        return _retrieve(user_text, intent, enriched, top_k)
+        return _retrieve(user_text, intent, enriched, top_k, history_tables)
     except Exception as exc:
         print(f"[graph_rag] ⚠ retrieval failed (non-fatal): {exc}", flush=True)
         return RetrievedContext()
@@ -258,6 +265,7 @@ def _retrieve(
     intent,
     enriched: "EnrichedSchema",
     top_k: int,
+    history_tables: Optional[list] = None,
 ) -> RetrievedContext:
     if not enriched or not enriched.compact_tables:
         return RetrievedContext()
@@ -466,6 +474,27 @@ def _retrieve(
         for score, tn, sigs in ranked:
             extra = 0.18 if tn in view_names and score >= 0.25 else 0.0
             boosted.append((min(score + extra, 1.0), tn, sigs))
+        boosted.sort(key=lambda x: x[0], reverse=True)
+        ranked = boosted
+
+    # ── Conversation-history fallback ──────────────────────────────────────────
+    # Only kicks in when the query's OWN signal is weak (top score < 0.20) —
+    # a decently-matched query is left alone. When it does kick in, tables used
+    # in recent turns are pulled back into contention so their columns still
+    # reach the LLM for the follow-up, instead of the retrieval silently
+    # wandering off to an unrelated table with equally weak signal.
+    if history_tables and ranked and ranked[0][0] < 0.20:
+        hist_norm = {h.lower() for h in history_tables}
+        boosted = []
+        for score, tn, sigs in ranked:
+            tn_bare = tn.lower()
+            is_hist = tn_bare in hist_norm or any(
+                tn_bare.endswith(f".{h}") or h.endswith(f".{tn_bare}") for h in hist_norm
+            )
+            if is_hist and score < 0.30:
+                boosted.append((0.30, tn, list(dict.fromkeys(sigs + ["history"]))))
+            else:
+                boosted.append((score, tn, sigs))
         boosted.sort(key=lambda x: x[0], reverse=True)
         ranked = boosted
 

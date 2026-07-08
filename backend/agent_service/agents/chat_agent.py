@@ -345,6 +345,12 @@ _SAMPLE_VALUE_LIMIT = int(os.getenv("CHAT_SAMPLE_VALUE_LIMIT", "5"))
 _COL_DESC_MAX = int(os.getenv("CHAT_COL_DESC_MAX", "80"))
 _TABLE_DESC_MAX = int(os.getenv("CHAT_TABLE_DESC_MAX", "160"))
 
+# GraphRAG-scoped schema: only kick in when the DB is large enough to matter.
+# For small DBs (<10 tables) the full schema is cheap anyway — don't bother.
+_GRAPHRAG_MIN_TABLES = int(os.getenv("CHAT_GRAPHRAG_MIN_TABLES", "10"))
+# FK hops to walk outward from the GraphRAG seed when building the scoped schema.
+_GRAPHRAG_SCOPE_HOPS = int(os.getenv("CHAT_GRAPHRAG_HOPS", "2"))
+
 
 def _clip(text: str, limit: int) -> str:
     """Trim text to `limit` chars (limit<=0 disables trimming)."""
@@ -704,6 +710,63 @@ class ChatAgent:
             print(f"[chat] ⚠ scoped build failed ({exc!r}) — full schema", flush=True)
             return self._get_cached_schema(enriched, connection_id)
 
+    def _build_graphrag_scoped_schema(
+        self,
+        enriched: "EnrichedSchema",
+        resolved_context: "ResolvedContext",
+        connection_id: Optional[str],
+        total: int,
+    ) -> str:
+        """GraphRAG-ranked scope for scope=database: uses the NL router's top-ranked
+        tables as seed, then expands to their FK-graph neighbours (_GRAPHRAG_SCOPE_HOPS
+        hops).  Compared to sending the full schema this can save 90%+ of input tokens
+        on databases with 50+ tables.  Falls back to full schema if nothing resolves."""
+        seed_names = set((resolved_context.relevant_tables or [])[:8])
+        try:
+            seed, neighbors = _scope.resolve_scope_tables(enriched, seed_names, _GRAPHRAG_SCOPE_HOPS)
+        except Exception as exc:
+            print(f"[chat] ⚠ graphrag scope resolve failed ({exc!r}) — full schema", flush=True)
+            return self._get_cached_schema(enriched, connection_id)
+
+        if not seed:
+            print(
+                f"[chat] graphrag scope: 0 seed tables matched from "
+                f"candidates {list(seed_names)[:4]} — full schema ({total} tables)",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        try:
+            schema = _scope.render_scoped_schema(
+                enriched, seed, neighbors, _GRAPHRAG_SCOPE_HOPS,
+                col_desc_max=_COL_DESC_MAX, table_desc_max=_TABLE_DESC_MAX,
+                sample_limit=_SAMPLE_VALUE_LIMIT,
+                scope_intro=(
+                    "SCOPE: DATABASE (query-ranked) — tables selected by relevance to "
+                    "this specific query. FOCUSED TABLES (below) are the highest-ranked "
+                    "matches. RELATED TABLES are their FK-graph neighbours available for "
+                    "JOINs. If you genuinely need a table not listed, say so in your reply."
+                ),
+                seed_header=f"FOCUSED TABLES — {len(seed)} table(s) ranked most relevant to this query:",
+                related_header_fmt=(
+                    "RELATED TABLES — {n} table(s) within {hops} FK-hop(s) of the focused "
+                    "tables (name + description + join path; full detail available on request):"
+                ),
+            )
+            full_len = len(self._get_cached_schema(enriched, connection_id))
+            scoped_len = len(schema)
+            saved_pct = round((1 - scoped_len / max(full_len, 1)) * 100, 1)
+            print(
+                f"[chat] scope=database(graphrag)  seed={len(seed)}  related={len(neighbors)}  "
+                f"total_tables={total}  chars={scoped_len:,}/{full_len:,}  "
+                f"saved={saved_pct}%  ≈{(full_len - scoped_len) // 4:,} input tokens saved",
+                flush=True,
+            )
+            return schema
+        except Exception as exc:
+            print(f"[chat] ⚠ graphrag scoped render failed ({exc!r}) — full schema", flush=True)
+            return self._get_cached_schema(enriched, connection_id)
+
     def _build_system_blocks(
         self,
         schema_doc: dict,
@@ -717,6 +780,7 @@ class ChatAgent:
         selected_tables: Optional[list[str]] = None,
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
         resolved_context: Optional["ResolvedContext"] = None,
+        conversation_history: Optional[list] = None,
     ) -> list[dict]:
         """Assemble the system prompt as Bedrock content blocks with a cache
         breakpoint at the end of the schema. Zones 1+2 (instructions + schema)
@@ -742,8 +806,37 @@ class ChatAgent:
                     enriched, selected_tables or [], selected_hops, connection_id, total
                 )
             else:
-                schema = self._get_cached_schema(enriched, connection_id)
-                print(f"[chat] scope=database — full schema ({total} tables)", flush=True)
+                # scope="database" — use GraphRAG-ranked scoping when the NL router
+                # resolved relevant tables and the schema is large enough to benefit.
+                # route_query() resolves tables from the CURRENT message alone, so an
+                # elliptical follow-up ("what about last month") with no table-name
+                # signal of its own can score every table near-zero and get routed to
+                # whichever table wins that noise — pruning the schema down to it and
+                # silently dropping the table the conversation was actually about.
+                # When history is present and the router's own confidence is weak,
+                # skip scoping and send the full schema instead of guessing.
+                _top_score = max(resolved_context.table_scores.values(), default=0.0) if resolved_context else 0.0
+                _ambiguous_followup = bool(conversation_history) and _top_score < 0.15
+                if (
+                    resolved_context
+                    and not resolved_context.fallback
+                    and resolved_context.focused_tables
+                    and total >= _GRAPHRAG_MIN_TABLES
+                    and not _ambiguous_followup
+                ):
+                    schema = self._build_graphrag_scoped_schema(
+                        enriched, resolved_context, connection_id, total
+                    )
+                elif _ambiguous_followup:
+                    schema = self._get_cached_schema(enriched, connection_id)
+                    print(
+                        f"[chat] scope=database — full schema (ambiguous follow-up, "
+                        f"top_score={_top_score:.3f}, {total} tables)",
+                        flush=True,
+                    )
+                else:
+                    schema = self._get_cached_schema(enriched, connection_id)
+                    print(f"[chat] scope=database — full schema ({total} tables)", flush=True)
 
             blocks: list[dict] = [
                 {"type": "text", "text": _INSTRUCTIONS},
@@ -798,6 +891,7 @@ class ChatAgent:
             selected_tables=selected_tables,
             selected_hops=selected_hops,
             resolved_context=resolved_context,
+            conversation_history=conversation_history,
         )
         # Prepend pre-computed date bounds so the LLM can't miss or misinterpret them
         time_hint = _extract_time_filter_hint(message)

@@ -29,6 +29,17 @@ from agent_service.services.ws_manager import manager as _ws_manager
 # 0.65 lets well-formed results pass on the first attempt.
 _VALIDATION_PASS_THRESHOLD = 0.65
 
+# Matches an explicit "why did that fail / why is this wrong" follow-up — domain
+# agnostic, gates the root-cause diagnosis path (see run_single_viz_pipeline).
+_ROOT_CAUSE_FOLLOWUP_PATTERN = re.compile(
+    r"\bwhy\s+(is|was|did|does|are)\b.{0,40}\b(wrong|fail(ed)?|off|so\s+(high|low)|error|empty|zero|broken)\b"
+    r"|\bwhat('s| is)\s+wrong\b"
+    r"|\bwhat\s+happened\b"
+    r"|\bdebug\s+(this|that)\b"
+    r"|\bexplain\s+(this|that)\s+(error|result|failure|number)\b",
+    re.IGNORECASE,
+)
+
 DASHBOARD_DECOMPOSE_MODEL = BEDROCK_HAIKU_MODEL
 DASHBOARD_MAX_CHARTS = 5        # max charts per dashboard (count cap)
 CHART_CONCURRENCY = 10          # parallel Bedrock chart slots (can exceed DASHBOARD_MAX_CHARTS)
@@ -49,6 +60,25 @@ class Orchestrator:
         self._intent = IntentClassifier()
         self._query = QueryAgent()
         self._validator = ValidatorAgent()
+        from agent_service.agents.root_cause_agent import RootCauseAgent
+        self._root_cause = RootCauseAgent()
+
+    @staticmethod
+    def _root_cause_schema_context(enriched, table_names: list) -> list:
+        """Small {name, columns} list for the tables most likely relevant to a
+        diagnosis — reused by both the automatic and on-demand root-cause paths."""
+        if not enriched or not getattr(enriched, "compact_tables", None) or not table_names:
+            return []
+        ct_map = {t["name"]: t for t in enriched.compact_tables}
+        out = []
+        for tn in table_names[:5]:
+            ct = ct_map.get(tn)
+            if ct:
+                out.append({
+                    "name": tn,
+                    "columns": [c.get("name") for c in ct.get("columns", [])[:20]],
+                })
+        return out
 
     async def run_single_viz_pipeline(
         self,
@@ -65,6 +95,7 @@ class Orchestrator:
         selected_hops: Optional[int] = 2,
         output_mode_override: Optional[str] = None,
         user_profile: Optional[dict] = None,
+        domain: str = "recruitment",
     ) -> dict:
         async def emit(event: dict):
             # Direct in-process broadcast (works with or without Redis)
@@ -85,7 +116,9 @@ class Orchestrator:
         try:
             # STEP 1: Classify intent
             await set_pipeline_state(redis, job_id, "step", "classifying")
-            intent = await self._intent.classify(user_text)
+            intent = await self._intent.classify(
+                user_text, conversation_history=conversation_history, domain=domain,
+            )
             await emit({
                 "type": "intent.classified",
                 "job_id": job_id,
@@ -103,15 +136,22 @@ class Orchestrator:
                 "MATCH", "BRIEFING", "SCREEN", "ENRICH",
                 "VERIFY", "PRESENT", "AUDIT", "PROSPECT", "ACTION",
             })
+            # Skill agents are per-domain personas (see domain_config.SKILL_DOMAINS).
+            # A domain with no skill agents (e.g. "generic") never routes here even
+            # if the classifier somehow returns one of these intent types — the
+            # intent-classifier prompt already omits this vocabulary for such
+            # domains, this is defense in depth.
+            from agent_service.agents.domain_config import SKILL_DOMAINS
+            _route_to_agent = intent.intent_type in _AGENT_INTENTS and domain in SKILL_DOMAINS
             # ── DIAGNOSTIC LOG ──────────────────────────────────────────────
             print(
                 f"[DIAG orchestrator:{job_id[:8]}] "
-                f"intent={intent.intent_type!r} confidence={intent.confidence:.2f} "
-                f"route={'AGENT_SKILL' if intent.intent_type in _AGENT_INTENTS else 'SQL_PIPELINE'} "
+                f"intent={intent.intent_type!r} confidence={intent.confidence:.2f} domain={domain!r} "
+                f"route={'AGENT_SKILL' if _route_to_agent else 'SQL_PIPELINE'} "
                 f"user_profile={'set(role=' + str(user_profile.get('brainwave_role')) + ')' if user_profile else 'None'}",
                 flush=True,
             )
-            if intent.intent_type in _AGENT_INTENTS:
+            if _route_to_agent:
                 from agent_service.agents.tool_agent import AgentContext
                 from agent_service.agents import skill_agents
 
@@ -200,6 +240,7 @@ class Orchestrator:
                     emit=emit,
                     schema_tables=_schema_tables,
                     user_profile=user_profile,
+                    domain=domain,
                 )
                 await emit({
                     "type":       "agent.started",
@@ -209,7 +250,7 @@ class Orchestrator:
                 await set_pipeline_state(redis, job_id, "step", "agent_running")
 
                 try:
-                    agent_fn = skill_agents.get_agent(intent.intent_type)
+                    agent_fn = skill_agents.get_agent(domain, intent.intent_type)
                     answer   = await agent_fn(agent_user_text, ctx)
                 except Exception as _ae:
                     print(
@@ -294,11 +335,14 @@ class Orchestrator:
             # Returns ranked TableCandidates with column/JOIN hints for QueryAgent.
             retrieved_context = None
             if enriched:
+                from agent_service.agents.sql_utils import extract_recent_tables
+                _history_tables = extract_recent_tables(conversation_history)
                 retrieved_context = _graph_rag.retrieve(
                     user_text=user_text,
                     intent=intent,
                     enriched=enriched,
                     top_k=6,
+                    history_tables=_history_tables,
                 )
                 if retrieved_context and retrieved_context.primary_tables:
                     await emit({
@@ -307,6 +351,97 @@ class Orchestrator:
                         "tables": retrieved_context.primary_tables[:4],
                         "confidence": round(retrieved_context.confidence, 3),
                     })
+
+            # ── Explicit "why did that fail?" follow-up ──────────────────────────
+            # Domain-agnostic: works identically for recruitment/finance/generic.
+            # Only fires when the immediately prior turn actually recorded a
+            # failure/low-confidence flag — otherwise this falls through to the
+            # normal pipeline exactly as before (a plain follow-up chart request).
+            _last_turn = conversation_history[-1] if conversation_history else None
+            _wants_root_cause = bool(
+                _last_turn
+                and (_last_turn.get("error") or _last_turn.get("low_confidence"))
+                and _ROOT_CAUSE_FOLLOWUP_PATTERN.search(user_text)
+            )
+            if _wants_root_cause:
+                from agent_service.agents.sql_utils import extract_recent_tables as _ert
+                await set_pipeline_state(redis, job_id, "step", "root_cause_diagnosis")
+                _failed_sql = _last_turn.get("sql") or ""
+                _rc_tables = _ert([_last_turn]) if _failed_sql else []
+                _rc_ctx = self._root_cause_schema_context(enriched, _rc_tables)
+                _diag = await self._root_cause.diagnose(
+                    user_text=user_text,
+                    failed_sql=_failed_sql,
+                    problem=_last_turn.get("error") or (
+                        "The previous result was flagged low-confidence — it may not "
+                        "have accurately answered the question."
+                    ),
+                    db_type=db_type,
+                    tables_context=_rc_ctx,
+                )
+                _om = (getattr(intent, "output_mode", "chart") or "chart").lower()
+                _fixed_result = None
+                if _diag.fixed_sql:
+                    _fixed_result = await self._execute_query(connection_id, _diag.fixed_sql)
+                    if _fixed_result.get("error"):
+                        _fixed_result = None
+
+                if _fixed_result is not None:
+                    from shared.schemas.chart import QueryPlan as _QueryPlan
+                    _plan = _QueryPlan(
+                        sql=_diag.fixed_sql,
+                        chart_type=("table" if _om != "chart" else "bar_vertical"),
+                        table_used=(_rc_tables[0] if _rc_tables else ""),
+                        title="Corrected result", reasoning="", db_dialect=db_type,
+                    )
+                    _render = await self._render_chart(_plan, _fixed_result) if _om == "chart" else {}
+                    root_cause_result = {
+                        "job_id": job_id,
+                        "score": 0.6,
+                        "chart_data": self._build_chart_data(_plan, _fixed_result, _render),
+                        "low_confidence": True,
+                        "sql": _diag.fixed_sql,
+                        "chart_type": _plan.chart_type,
+                        "title": _plan.title,
+                        "table_used": _plan.table_used,
+                        "x_axis_label": "",
+                        "y_axis_label": "",
+                        "output_mode": _om,
+                        "narrative": f"{_diag.explanation} I corrected the query — here's the result.",
+                        "validation_details": {},
+                        "root_cause": _diag.model_dump(),
+                    }
+                else:
+                    root_cause_result = {
+                        "job_id": job_id,
+                        "score": 0.0,
+                        "chart_data": {"rows": [], "columns": [], "labels": [], "values": []},
+                        "low_confidence": True,
+                        "sql": _failed_sql,
+                        "chart_type": "text",
+                        "title": "Why that didn't work",
+                        "table_used": "",
+                        "x_axis_label": "",
+                        "y_axis_label": "",
+                        "output_mode": "text",
+                        "narrative": _diag.explanation,
+                        "validation_details": {},
+                        "root_cause": _diag.model_dump(),
+                    }
+                await emit({
+                    "type": "chart.confirmed",
+                    "job_id": job_id,
+                    "score": root_cause_result["score"],
+                    "chart_data": root_cause_result,
+                    "low_confidence": True,
+                })
+                if job:
+                    job.status = "completed"
+                    job.result_payload = root_cause_result
+                    job.completed_at = datetime.utcnow()
+                    await db.commit()
+                await set_pipeline_state(redis, job_id, "step", "root_cause_done")
+                return root_cause_result
 
             # SCHEMA_EXPLORE: skip SQL pipeline, return a plain-English schema overview
             if intent.intent_type == "SCHEMA_EXPLORE":
@@ -696,14 +831,104 @@ class Orchestrator:
                         })
                         continue
                     else:
+                        # Final attempt still hard-failed — diagnose the root cause and
+                        # attempt one corrected query before giving up entirely, instead
+                        # of returning a bare, chartless error.
+                        _rc_ctx = self._root_cause_schema_context(
+                            enriched, [query_plan.table_used] if query_plan else [],
+                        )
+                        _diag = await self._root_cause.diagnose(
+                            user_text=user_text,
+                            failed_sql=query_plan.sql if query_plan else "",
+                            problem=f"SQL execution error: {execute_result['error']}",
+                            db_type=db_type,
+                            tables_context=_rc_ctx,
+                        )
+                        _fixed_result = None
+                        if _diag.fixed_sql:
+                            _fixed_result = await self._execute_query(connection_id, _diag.fixed_sql)
+                            if _fixed_result.get("error"):
+                                _fixed_result = None
+
+                        if _fixed_result is not None:
+                            # Auto-fix worked — feed the RECOVERED result through the
+                            # normal success path below so it's narrated/rendered
+                            # exactly like any other successful attempt.
+                            print(f"[orchestrator:{job_id[:8]}] root-cause auto-fix succeeded ({_diag.root_cause})", flush=True)
+                            query_plan.sql = _diag.fixed_sql
+                            execute_result = _fixed_result
+                            await emit({
+                                "type": "query.executed",
+                                "job_id": job_id,
+                                "row_count": execute_result.get("row_count", 0),
+                                "duration_ms": execute_result.get("duration_ms", 0),
+                            })
+                            render_result = (
+                                await self._render_chart(query_plan, execute_result)
+                                if output_mode == "chart" else {}
+                            )
+                            validation = await self._validator.validate(
+                                query_plan, execute_result, attempt,
+                                expected_chart_type=expected_chart_type,
+                            )
+                            chart_data = self._build_chart_data(query_plan, execute_result, render_result)
+                            final_result = {
+                                "job_id": job_id,
+                                "score": validation.score,
+                                "chart_data": chart_data,
+                                "low_confidence": True,
+                                "sql": query_plan.sql,
+                                "chart_type": query_plan.chart_type,
+                                "title": query_plan.title,
+                                "table_used": query_plan.table_used,
+                                "x_axis_label": query_plan.x_axis_label,
+                                "y_axis_label": query_plan.y_axis_label,
+                                "validation_details": validation.model_dump(),
+                                "root_cause": _diag.model_dump(),
+                            }
+                            break
+
+                        # Couldn't fix it — explain why instead of a bare error, so the
+                        # user gets a real answer instead of a dead end. Built and
+                        # returned directly (not via the post-loop narrator) so this
+                        # explanation can't be silently overwritten by narration.
+                        print(f"[orchestrator:{job_id[:8]}] root-cause diagnosis, no fix available ({_diag.root_cause})", flush=True)
                         await emit({
                             "type": "pipeline.error",
                             "job_id": job_id,
                             "message": f"Query failed after {_MAX_SINGLE_VIZ_ATTEMPTS} attempts: {execute_result['error']}",
                             "recoverable": False,
                         })
-                        await self._fail_job(job_id, execute_result["error"], db)
-                        return {"error": execute_result["error"]}
+                        _explain_result = {
+                            "job_id": job_id,
+                            "score": 0.0,
+                            "chart_data": {"rows": [], "columns": [], "labels": [], "values": []},
+                            "low_confidence": True,
+                            "sql": query_plan.sql if query_plan else "",
+                            "chart_type": "text",
+                            "title": "I couldn't complete this query",
+                            "table_used": query_plan.table_used if query_plan else "",
+                            "x_axis_label": "",
+                            "y_axis_label": "",
+                            "output_mode": "text",
+                            "narrative": _diag.explanation,
+                            "validation_details": {},
+                            "error": execute_result["error"],
+                            "root_cause": _diag.model_dump(),
+                        }
+                        await emit({
+                            "type": "chart.confirmed",
+                            "job_id": job_id,
+                            "score": 0.0,
+                            "chart_data": _explain_result,
+                            "low_confidence": True,
+                        })
+                        if job:
+                            job.status = "completed"
+                            job.result_payload = _explain_result
+                            job.completed_at = datetime.utcnow()
+                            await db.commit()
+                        return _explain_result
 
                 await emit({
                     "type": "query.executed",

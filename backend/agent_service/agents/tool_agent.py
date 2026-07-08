@@ -46,6 +46,9 @@ class AgentContext:
     # None when the user has no profile (DEV_MODE passthrough) or is a VP/admin
     # who needs no per-user filter.
     user_profile: dict | None = None
+    # Project domain ("recruitment" | "finance" | "generic") — selects which
+    # skill-agent persona/tools this request should use. See domain_config.py.
+    domain: str = "recruitment"
 
 
 # ── Write-tool gate ──────────────────────────────────────────────────────────
