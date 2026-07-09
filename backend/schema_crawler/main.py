@@ -275,6 +275,12 @@ async def _run_crawl(job_id: str, connection_id: str, project_id: str):
                     sample_rows_map=sample_rows_map,
                     db_conn_kwargs=db_conn_kwargs,
                     db_type=db_type,
+                    # None on the first-ever crawl for this connection (no prior
+                    # snapshot to diff against) — metadata_extractor treats that
+                    # as "extract everything". Otherwise scopes re-extraction to
+                    # only added/changed tables instead of redoing the whole
+                    # connection's LLM extraction on every crawl.
+                    diff_summary=diff_summary,
                 )
             )
 

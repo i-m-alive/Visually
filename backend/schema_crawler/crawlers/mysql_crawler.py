@@ -1,15 +1,6 @@
 import asyncio
-import json
-import os
-import re
-import sys
 from datetime import datetime, timezone
 import aiomysql
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "shared"))
-from bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL  # noqa: E402
-
-SCHEMA_MODEL = BEDROCK_SONNET_MODEL
 
 _PII_SIGNALS = frozenset({
     "email", "phone", "ssn", "dob", "password", "secret",
@@ -202,7 +193,7 @@ async def crawl_mysql(
                 "all_relationships": explicit + inferred_rels,
             }
 
-        descriptions = await _generate_descriptions(table_data)
+        descriptions = _heuristic_descriptions(table_data)
         ranked_tables = _rank_tables(table_data)
 
         tables_out = []
@@ -261,39 +252,35 @@ async def crawl_mysql(
         conn.close()
 
 
-async def _generate_descriptions(table_data: dict) -> dict:
-    schema_summary = {
-        tname: {
-            "columns": [{"name": c["column_name"], "type": c["data_type"]} for c in tdata["columns"][:30]],
-            "row_count": tdata["row_count"],
+def _heuristic_descriptions(table_data: dict) -> dict:
+    """
+    Zero-cost placeholder descriptions — no LLM call.
+
+    This pass used to make its own Bedrock call (same model as
+    metadata_extractor.py's Phase A), but its output was always fully
+    superseded moments later in the same crawl once schema_cache.py loads
+    metadata_extractor's richer, sample-row-informed descriptions — that LLM
+    spend was pure waste (see the metadata-pipeline gap analysis, Phase 3).
+    This heuristic exists only to keep compact_tables/TF-IDF text non-empty
+    during the brief async window before that richer pass finishes.
+
+    Note: unlike the other crawlers, mysql's table_data is keyed directly by
+    table name (no (tkey, tdata) pair), and no separate batching was needed
+    here since there's no LLM call to batch anymore.
+    """
+    results: dict = {}
+    for tname, tdata in table_data.items():
+        col_names = [c["column_name"] for c in tdata["columns"][:8]]
+        results[tname] = {
+            "description": (
+                f"Table with columns: {', '.join(col_names)}" if col_names else f"Table {tname}"
+            ),
+            "columns": {
+                c["column_name"]: c["column_name"].replace("_", " ")
+                for c in tdata["columns"]
+            },
         }
-        for tname, tdata in table_data.items()
-    }
-    prompt = json.dumps(schema_summary, default=str)
-    for attempt in range(2):
-        try:
-            text = await bedrock_invoke(
-                model_id=SCHEMA_MODEL,
-                system_prompt=(
-                    "You are a database analyst. Given raw database schema metadata, generate semantic descriptions.\n"
-                    "For each table: 1-2 sentences about the business entity.\n"
-                    "For each column: 5-15 words describing what it measures.\n"
-                    "Return ONLY valid JSON. No prose, no markdown."
-                ),
-                user_message=f"Generate descriptions:\n{prompt}",
-                max_tokens=4096,
-                temperature=0.1,
-            )
-            text = text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```[a-z]*\n?", "", text)
-                text = re.sub(r"```$", "", text).strip()
-            parsed = json.loads(text)
-            return parsed.get("tables", parsed)
-        except Exception:
-            if attempt == 1:
-                return {}
-    return {}
+    return results
 
 
 def _rank_tables(table_data: dict) -> list:

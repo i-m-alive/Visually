@@ -47,8 +47,16 @@ Use these when the user's request maps to a finance/operations workflow action, 
 - AUDIT: Audit finance data for quality issues, missing values, stale records, or reconciliation/integrity problems. Signals: "audit transactions", "data quality", "missing values", "stale records", "incomplete records", "compliance check", "what's missing", "reconciliation issues", "balance mismatch", "duplicate transactions", "orphaned records", "negative balance".
 - PROSPECT: Find operational gaps, at-risk accounts, or business opportunities. Signals: "gaps", "accounts with no activity", "at-risk accounts", "opportunities", "which accounts need attention", "unresolved exceptions".
 - ACTION: Create a note, update a record's status, or tag a record. Signals: "add note", "update status", "mark as", "move to [stage]", "create note for", "tag [account]", "change status of".
+- RECONCILE: Match totals/transactions between two related tables or sources and find what doesn't tie out. Signals: "reconcile", "does this tie out", "match the ledger to", "unmatched transactions", "balance discrepancy", "why doesn't this add up", "compare statement to ledger".
+- ANOMALY: Find unusual/suspicious transactions or accounts via statistical patterns (not a pre-existing risk score column). Signals: "unusual activity", "suspicious pattern", "structuring", "anomalies in", "outlier transactions", "does this look normal", "sudden spike", "unusual for this account".
+- FORECAST: Project a trend, balance, or cash flow forward from historical data. Signals: "forecast", "projected", "trend for next month", "expected balance", "run rate", "predict", "on pace for".
+- NETWORK: Find relationships/connections between accounts, customers, or transactions (shared attributes, fund flows, related parties) — not about one entity alone. Signals: "related accounts", "connected to", "shared with", "fund flow between", "who else is linked to", "related party", "circular transfers".
 """,
 }
+
+# Intent types that only make sense for the "finance" domain (see the finance
+# skill block above) — never offered to recruitment or any other domain.
+_FINANCE_ONLY_INTENT_TYPES = ["RECONCILE", "ANOMALY", "FORECAST", "NETWORK"]
 
 _TAIL_PROMPT = """
 OUTPUT MODE (choose exactly one) — how the answer is best presented:
@@ -97,6 +105,8 @@ def build_system_prompt(domain: str) -> str:
     """
     skill_block = _SKILL_INTENT_BLOCKS.get(domain, "") if domain in SKILL_DOMAINS else ""
     intent_types = _BASE_INTENT_TYPES + (_SKILL_INTENT_TYPES if skill_block else [])
+    if domain == "finance" and skill_block:
+        intent_types = intent_types + _FINANCE_ONLY_INTENT_TYPES
     intent_enum = " | ".join(intent_types)
 
     json_schema = f"""

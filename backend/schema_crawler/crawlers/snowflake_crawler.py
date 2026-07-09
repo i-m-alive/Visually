@@ -1,15 +1,6 @@
 import asyncio
-import json
-import re
-import os
-import sys
 from datetime import datetime, timezone
 from typing import Optional
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "shared"))
-from bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL  # noqa: E402
-
-SCHEMA_MODEL = BEDROCK_SONNET_MODEL
 
 _PII_SIGNALS = frozenset({"email", "phone", "ssn", "dob", "password", "secret", "token", "auth", "credit", "card"})
 _SYSTEM_DATABASES = frozenset({"SNOWFLAKE", "SNOWFLAKE_SAMPLE_DATA"})
@@ -392,7 +383,7 @@ async def crawl_snowflake(
         explicit = [{**fk, "inferred": False} for fk in tdata.get("foreign_keys", [])]
         tdata["all_relationships"] = explicit + inferred_rels
 
-    descriptions = await _generate_descriptions(table_data)
+    descriptions = _heuristic_descriptions(table_data)
     ranked_tables = _rank_tables(table_data)
 
     tables_out = []
@@ -452,53 +443,32 @@ async def crawl_snowflake(
     return schema_doc, sample_rows_map
 
 
-async def _describe_batch(batch: list, batch_idx: int) -> dict:
-    schema_summary = {}
-    for _tkey, tdata in batch:
-        tname = tdata["table_name"]
-        schema_summary[tname] = {
-            "columns": [
-                {"name": col.get("COLUMN_NAME", ""), "type": col.get("DATA_TYPE", "")}
-                for col in tdata["columns"][:15]
-            ],
-            "row_count": tdata["row_count"],
-        }
-    prompt = json.dumps(schema_summary, default=str)
-    for attempt in range(2):
-        try:
-            text = await bedrock_invoke(
-                model_id=SCHEMA_MODEL,
-                system_prompt=(
-                    "You are a database analyst. Generate semantic descriptions for the given schema.\n"
-                    "For each table: 1-2 sentences about the business entity it represents.\n"
-                    "For each column: a short phrase (5-12 words) describing what it measures or identifies.\n"
-                    "Return ONLY valid JSON in this exact shape: "
-                    '{\"table_name\": {\"description\": \"...\", \"columns\": {\"col_name\": \"...\"}}}. '
-                    "No prose, no markdown, no explanation."
-                ),
-                user_message=f"Generate descriptions:\n{prompt}",
-                max_tokens=4096,
-                temperature=0.1,
-            )
-            text = text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```[a-z]*\n?", "", text)
-                text = re.sub(r"```$", "", text).strip()
-            parsed = json.loads(text)
-            return parsed.get("tables", parsed)
-        except Exception as exc:
-            print(f"[snowflake_crawler] descriptions batch {batch_idx} attempt {attempt+1} failed: {exc}")
-    return {}
+def _heuristic_descriptions(table_data: dict) -> dict:
+    """
+    Zero-cost placeholder descriptions — no LLM call.
 
-
-async def _generate_descriptions(table_data: dict) -> dict:
-    _BATCH = 10
-    items = list(table_data.items())
-    batches = [items[i: i + _BATCH] for i in range(0, len(items), _BATCH)]
-    batch_results = await asyncio.gather(*[_describe_batch(b, idx) for idx, b in enumerate(batches)])
+    This pass used to make its own Bedrock call (same model as
+    metadata_extractor.py's Phase A), but its output was always fully
+    superseded moments later in the same crawl once schema_cache.py loads
+    metadata_extractor's richer, sample-row-informed descriptions — that LLM
+    spend was pure waste (see the metadata-pipeline gap analysis, Phase 3).
+    This heuristic exists only to keep compact_tables/TF-IDF text non-empty
+    during the brief async window before that richer pass finishes.
+    """
     results: dict = {}
-    for r in batch_results:
-        results.update(r)
+    for _tkey, tdata in table_data.items():
+        tname = tdata["table_name"]
+        col_names = [col.get("COLUMN_NAME", "") for col in tdata["columns"][:8]]
+        col_names = [c for c in col_names if c]
+        results[tname] = {
+            "description": (
+                f"Table with columns: {', '.join(col_names)}" if col_names else f"Table {tname}"
+            ),
+            "columns": {
+                col.get("COLUMN_NAME", ""): col.get("COLUMN_NAME", "").replace("_", " ")
+                for col in tdata["columns"] if col.get("COLUMN_NAME")
+            },
+        }
     return results
 
 

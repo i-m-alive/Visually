@@ -83,6 +83,10 @@ _SKILL_MODULES: list[str] = [
     "agent_service.agents.skill_agents.finance_audit_agent",
     "agent_service.agents.skill_agents.finance_prospect_agent",
     "agent_service.agents.skill_agents.finance_enrich_agent",
+    "agent_service.agents.skill_agents.finance_reconcile_agent",
+    "agent_service.agents.skill_agents.finance_anomaly_agent",
+    "agent_service.agents.skill_agents.finance_forecast_agent",
+    "agent_service.agents.skill_agents.finance_network_agent",
 ]
 
 

@@ -28,6 +28,7 @@ import re
 import sys
 import uuid
 from datetime import datetime
+from typing import Optional
 
 # Add backend/ (parent of both schema_crawler/ and shared/) to sys.path so that
 # "shared.*" imports resolve the same package instance already used by main.py.
@@ -36,10 +37,10 @@ from datetime import datetime
 # table twice on the same MetaData and raising InvalidRequestError on startup.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.bedrock_client import bedrock_invoke, BEDROCK_SONNET_MODEL  # noqa: E402
+from shared.bedrock_client import bedrock_invoke_with_history, BEDROCK_SONNET_MODEL  # noqa: E402
 from shared.database import AsyncSessionLocal                            # noqa: E402
 from shared.models.schema_metadata import SchemaTableMetadata, SchemaColumnMetadata  # noqa: E402
-from sqlalchemy import delete                                            # noqa: E402
+from sqlalchemy import delete, select                                    # noqa: E402
 
 _EXTRACTION_MODEL = BEDROCK_SONNET_MODEL
 _FK_CONFIRM_THRESHOLD = 0.6   # 60% value overlap confirms a FK
@@ -262,6 +263,68 @@ async def _collect_distinct_values(conn, table: str, column: str) -> list[str]:
 
 # ── Phase A: LLM extraction ───────────────────────────────────────────────────
 
+# Cell values inside sample_rows are serialized verbatim into the prompt with
+# no per-value cap — a single wide text/JSON column could otherwise dominate a
+# batch's token cost with no bound. Truncate defensively before sending.
+_MAX_CELL_VALUE_LEN = 200
+
+
+def _truncate_sample_rows(rows: list[dict], max_len: int = _MAX_CELL_VALUE_LEN) -> list[dict]:
+    out = []
+    for row in rows:
+        out.append({
+            k: (v[:max_len] + "…" if isinstance(v, str) and len(v) > max_len else v)
+            for k, v in row.items()
+        })
+    return out
+
+
+# Static instructions — identical for every batch/mop-up call within a run, and
+# identical across every run forever. Kept separate from the per-batch table
+# name list and payload so both can sit behind one Anthropic prompt-cache
+# breakpoint (see _call_llm_batch) instead of being re-billed on every call.
+_SYSTEM_INSTRUCTIONS = """You are analyzing database tables for a BI/analytics platform.
+
+For each table, analyze the column schema and sample rows. Infer:
+- Business purpose, data grain, fact vs dimension table
+- semantic_type per column: pk | fk | metric | dimension | date | identifier | text | flag
+- FK target tables (ONLY when the column name clearly implies another table in the list above — do NOT invent FK targets not present in the list)
+- Filter-eligible columns: low-cardinality categoricals (status, type, category) NOT IDs or free-text
+- example_values: for filter-eligible dimension/category columns only, list up to 10 representative distinct values seen in sample_rows. Omit entirely (empty list []) for PII columns (email, phone, password, ssn, token, auth, credit, card, secret, dob) and for high-cardinality or numeric columns.
+
+Return ONLY valid JSON with this exact structure (no prose, no markdown):
+{
+  "tables": [
+    {
+      "table_name": "schema.table_name",
+      "business_name": "Human Friendly Name",
+      "description": "One sentence: what this table stores and what one row represents.",
+      "grain": "one row per <entity>",
+      "is_fact_table": true,
+      "use_for": ["analytics use case 1"],
+      "never_use_for": ["wrong use case"],
+      "key_metric_cols": ["col_used_for_sum_count"],
+      "key_dimension_cols": ["col_used_for_group_by"],
+      "key_date_cols": ["col_that_is_a_date"],
+      "columns": [
+        {
+          "name": "column_name",
+          "business_name": "Human Readable Column Name",
+          "description": "5-12 words: what this column measures or identifies",
+          "semantic_type": "pk",
+          "fk_target_table": null,
+          "fk_target_column": null,
+          "example_values": [],
+          "is_kpi_metric": false,
+          "is_dimension": false,
+          "is_filter_eligible": false
+        }
+      ]
+    }
+  ]
+}"""
+
+
 async def _call_llm_batch(batch: list[dict], all_table_names: list[str]) -> list[dict]:
     """
     Send one batch (≤3 tables) to Claude.
@@ -284,65 +347,34 @@ async def _call_llm_batch(batch: list[dict], all_table_names: list[str]) -> list
             "table_name": t["qualified_name"],
             "row_count": t.get("row_count", 0),
             "columns": cols,
-            "sample_rows": t.get("sample_rows", [])[:5],  # cap at 5 sample rows
+            "sample_rows": _truncate_sample_rows(t.get("sample_rows", [])[:5]),  # cap at 5 rows
         })
 
-    prompt = f"""You are analyzing database tables for a BI/analytics platform.
-
-All tables in this database (use these exact names for fk_target_table):
-{json.dumps(all_table_names)}
-
-For each table, analyze the column schema and sample rows. Infer:
-- Business purpose, data grain, fact vs dimension table
-- semantic_type per column: pk | fk | metric | dimension | date | identifier | text | flag
-- FK target tables (ONLY when the column name clearly implies another table in the list above — do NOT invent FK targets not present in the list)
-- Filter-eligible columns: low-cardinality categoricals (status, type, category) NOT IDs or free-text
-- example_values: for filter-eligible dimension/category columns only, list up to 10 representative distinct values seen in sample_rows. Omit entirely (empty list []) for PII columns (email, phone, password, ssn, token, auth, credit, card, secret, dob) and for high-cardinality or numeric columns.
-
-Tables to analyze:
-{json.dumps(tables_payload, default=str)}
-
-Return ONLY valid JSON with this exact structure (no prose, no markdown):
-{{
-  "tables": [
-    {{
-      "table_name": "schema.table_name",
-      "business_name": "Human Friendly Name",
-      "description": "One sentence: what this table stores and what one row represents.",
-      "grain": "one row per <entity>",
-      "is_fact_table": true,
-      "use_for": ["analytics use case 1"],
-      "never_use_for": ["wrong use case"],
-      "key_metric_cols": ["col_used_for_sum_count"],
-      "key_dimension_cols": ["col_used_for_group_by"],
-      "key_date_cols": ["col_that_is_a_date"],
-      "columns": [
-        {{
-          "name": "column_name",
-          "business_name": "Human Readable Column Name",
-          "description": "5-12 words: what this column measures or identifies",
-          "semantic_type": "pk",
-          "fk_target_table": null,
-          "fk_target_column": null,
-          "example_values": [],
-          "is_kpi_metric": false,
-          "is_dimension": false,
-          "is_filter_eligible": false
-        }}
-      ]
-    }}
-  ]
-}}"""
+    # Cache breakpoint: instructions + the full table-name list are identical
+    # across every batch/mop-up call within one extraction run — an unqualified
+    # schema resends this ~10+ times otherwise. Anthropic prompt caching means
+    # only the first call in a run pays full price for this block; subsequent
+    # calls within the ~5 min cache window read it at a steep discount.
+    system_blocks = [{
+        "type": "text",
+        "text": (
+            _SYSTEM_INSTRUCTIONS
+            + "\n\nAll tables in this database (use these exact names for fk_target_table):\n"
+            + json.dumps(all_table_names)
+        ),
+        "cache_control": {"type": "ephemeral"},
+    }]
+    user_message = f"Tables to analyze:\n{json.dumps(tables_payload, default=str)}"
 
     for attempt in range(3):
         try:
             if attempt > 0:
                 await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
             raw = await asyncio.wait_for(
-                bedrock_invoke(
+                bedrock_invoke_with_history(
                     model_id=_EXTRACTION_MODEL,
-                    system_prompt="You are a database schema analyst. Return only valid JSON.",
-                    user_message=prompt,
+                    system_prompt=system_blocks,
+                    messages=[{"role": "user", "content": user_message}],
                     temperature=0.0,
                     max_tokens=12000,
                 ),
@@ -371,6 +403,141 @@ Return ONLY valid JSON with this exact structure (no prose, no markdown):
     return []
 
 
+async def _persist_metadata(
+    connection_id: str,
+    snapshot_version: int,
+    llm_results: list[dict],
+    confirmed_fks: set,
+    filter_values: dict,
+) -> None:
+    """
+    Write llm_results (+ any Phase B/C enrichment already available) to the DB.
+
+    Called twice by _do_extraction: once as a safety checkpoint right after
+    Phase A (with confirmed_fks/filter_values empty, before the Phase B/C DB
+    round-trips that could fail/timeout), and once more at the end with the
+    fully enriched/corrected data. Both calls are idempotent — each deletes
+    then reinserts only the rows for tables present in `llm_results` — so a
+    crash during Phase B/C loses at most the FK-confirmation/filter-value
+    enrichment, never the (expensive, already-paid-for) Phase A extraction
+    itself.
+    """
+    conn_uuid = uuid.UUID(connection_id)
+    now = datetime.utcnow()
+
+    # Scoped delete: only the tables we're actually about to reinsert below —
+    # NOT a blanket wipe of the whole connection. A table that isn't in
+    # llm_results this run (unchanged and skipped, or failed extraction even
+    # after mop-up) must keep its existing metadata untouched rather than
+    # losing it with nothing to replace it.
+    reinsert_names = {tbl.get("table_name", "") for tbl in llm_results if tbl.get("table_name")}
+    if not reinsert_names:
+        return
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            delete(SchemaTableMetadata).where(
+                SchemaTableMetadata.connection_id == conn_uuid,
+                SchemaTableMetadata.table_name.in_(reinsert_names),
+            )
+        )
+        await db.execute(
+            delete(SchemaColumnMetadata).where(
+                SchemaColumnMetadata.connection_id == conn_uuid,
+                SchemaColumnMetadata.table_name.in_(reinsert_names),
+            )
+        )
+
+        for tbl in llm_results:
+            tname = tbl.get("table_name", "")
+            if not tname:
+                continue
+
+            db.add(SchemaTableMetadata(
+                id=uuid.uuid4(),
+                connection_id=conn_uuid,
+                schema_snapshot_version=snapshot_version,
+                table_name=tname,
+                business_name=tbl.get("business_name"),
+                description=tbl.get("description"),
+                grain=tbl.get("grain"),
+                is_fact_table=tbl.get("is_fact_table"),
+                use_for=tbl.get("use_for") or [],
+                never_use_for=tbl.get("never_use_for") or [],
+                key_metric_cols=tbl.get("key_metric_cols") or [],
+                key_dimension_cols=tbl.get("key_dimension_cols") or [],
+                key_date_cols=tbl.get("key_date_cols") or [],
+                generation_method="llm_sample_rows",
+                generated_at=now,
+            ))
+
+            for col in tbl.get("columns", []):
+                cname = col.get("name", "")
+                if not cname:
+                    continue
+
+                # PII detection: columns whose name signals personally-identifiable data
+                # should never have example values stored and should not be filter candidates.
+                is_pii = any(sig in cname.lower() for sig in _PII_SIGNALS)
+
+                # Determine FK confirmation
+                is_fk = col.get("semantic_type") == "fk"
+                fk_key = (tname, cname, col.get("fk_target_table") or "", col.get("fk_target_column") or "")
+                fk_confirmed = is_fk and fk_key in confirmed_fks
+
+                # Merge LLM example_values with Phase C distinct values.
+                # Clear any examples for PII columns (crawlers mask sample rows, but the
+                # LLM may still suggest inferred examples).
+                if is_pii:
+                    example_vals = []
+                else:
+                    example_vals = list(col.get("example_values") or [])
+                    phase_c_vals = filter_values.get((tname, cname), [])
+                    if phase_c_vals:
+                        seen = set(example_vals)
+                        for v in phase_c_vals:
+                            if v not in seen:
+                                example_vals.append(v)
+                                seen.add(v)
+                    example_vals = example_vals[:200]
+
+                # Compute cardinality from collected distinct values — used downstream
+                # to distinguish low-cardinality dimension columns from high-cardinality
+                # free-text or ID columns.  Only populated when Phase C ran.
+                cardinality = len(filter_values.get((tname, cname), [])) if not is_pii else None
+
+                # Override is_filter_eligible for PII columns and high-cardinality columns
+                is_filter_eligible = col.get("is_filter_eligible")
+                if is_pii:
+                    is_filter_eligible = False
+                elif cardinality is not None and cardinality > 150:
+                    # High cardinality → not useful as a filter dropdown
+                    is_filter_eligible = False
+
+                db.add(SchemaColumnMetadata(
+                    id=uuid.uuid4(),
+                    connection_id=conn_uuid,
+                    schema_snapshot_version=snapshot_version,
+                    table_name=tname,
+                    column_name=cname,
+                    business_name=col.get("business_name"),
+                    description=col.get("description"),
+                    semantic_type=col.get("semantic_type"),
+                    fk_target_table=col.get("fk_target_table"),
+                    fk_target_column=col.get("fk_target_column"),
+                    fk_confirmed=fk_confirmed,
+                    fk_confirmation_score=None,
+                    example_values=example_vals or None,
+                    is_kpi_metric=col.get("is_kpi_metric"),
+                    is_dimension=col.get("is_dimension"),
+                    is_filter_eligible=is_filter_eligible,
+                    generation_method="llm_sample_rows",
+                    generated_at=now,
+                ))
+
+        await db.commit()
+
+
 # ── Main orchestrator ─────────────────────────────────────────────────────────
 
 async def run_metadata_extraction(
@@ -380,10 +547,17 @@ async def run_metadata_extraction(
     sample_rows_map: dict,     # {qualified_table_name: [row_dict, ...]}
     db_conn_kwargs: dict,      # {host, port, database, user, password, ssl}
     db_type: str,
+    diff_summary: Optional[dict] = None,
 ) -> None:
     """
     Entry point called as a background task after every crawl.
     Errors are logged but never propagated — this is always non-fatal.
+
+    diff_summary: the dict from schema_crawler.diff.compute_schema_diff, or None
+    on the first-ever crawl for this connection (no prior snapshot to diff
+    against). When present, extraction is scoped to added/changed tables plus
+    any table with no existing metadata row yet — see _do_extraction — instead
+    of redoing the whole connection's LLM extraction on every single crawl.
     """
     print(
         f"[metadata_extractor] starting  connection={connection_id}"
@@ -393,7 +567,7 @@ async def run_metadata_extraction(
     try:
         await _do_extraction(
             connection_id, snapshot_version, schema_doc,
-            sample_rows_map, db_conn_kwargs, db_type,
+            sample_rows_map, db_conn_kwargs, db_type, diff_summary,
         )
     except Exception:
         import traceback
@@ -410,6 +584,7 @@ async def _do_extraction(
     sample_rows_map: dict,
     db_conn_kwargs: dict,
     db_type: str,
+    diff_summary: Optional[dict] = None,
 ) -> None:
     tables = schema_doc.get("tables", [])
 
@@ -435,6 +610,69 @@ async def _do_extraction(
             "columns": t.get("columns", []),
             "sample_rows": sample_rows,
         })
+
+    # ── Diff-aware scoping: skip tables that didn't change AND already have
+    # metadata, instead of re-extracting everything on every single crawl ──────
+    conn_uuid = uuid.UUID(connection_id)
+    dropped_qualified: set[str] = set()
+    tables_to_extract: Optional[set[str]] = None  # None = extract everything
+
+    async with AsyncSessionLocal() as _db:
+        existing_names = {
+            row[0] for row in (await _db.execute(
+                select(SchemaTableMetadata.table_name)
+                .where(SchemaTableMetadata.connection_id == conn_uuid)
+            )).all()
+        }
+
+    if diff_summary is not None:
+        changed_bare = set(diff_summary.get("added_tables", [])) | {
+            c["table"] for c in (diff_summary.get("column_changes") or [])
+        }
+        changed_qualified = {bare_to_qualified.get(b, b) for b in changed_bare}
+        dropped_qualified = {
+            bare_to_qualified.get(b, b) for b in (diff_summary.get("dropped_tables") or [])
+        }
+        # Always (re)extract: changed tables + any table with no metadata row
+        # yet (covers first-time-seen tables and tables a prior run failed on).
+        never_extracted = set(all_qualified) - existing_names
+        tables_to_extract = changed_qualified | never_extracted
+        skipped = len(all_qualified) - len(tables_to_extract)
+        print(
+            f"[metadata_extractor] diff-aware scoping: {len(tables_to_extract)} table(s)"
+            f" to extract ({len(changed_qualified)} changed, {len(never_extracted)} never-extracted),"
+            f" {skipped} unchanged table(s) skipped, {len(dropped_qualified)} dropped",
+            flush=True,
+        )
+        table_payloads = [p for p in table_payloads if p["qualified_name"] in tables_to_extract]
+
+        # Dropped-table cleanup happens here, unconditionally — NOT folded into
+        # the abort-if-nothing-to-extract check below, so a crawl that only
+        # dropped tables (nothing added/changed) still removes their stale
+        # metadata instead of silently leaving orphaned rows behind forever.
+        if dropped_qualified:
+            async with AsyncSessionLocal() as _db:
+                await _db.execute(
+                    delete(SchemaTableMetadata).where(
+                        SchemaTableMetadata.connection_id == conn_uuid,
+                        SchemaTableMetadata.table_name.in_(dropped_qualified),
+                    )
+                )
+                await _db.execute(
+                    delete(SchemaColumnMetadata).where(
+                        SchemaColumnMetadata.connection_id == conn_uuid,
+                        SchemaColumnMetadata.table_name.in_(dropped_qualified),
+                    )
+                )
+                await _db.commit()
+            print(
+                f"[metadata_extractor] removed metadata for {len(dropped_qualified)} dropped table(s)",
+                flush=True,
+            )
+
+        if not table_payloads:
+            print("[metadata_extractor] no added/changed tables to extract", flush=True)
+            return
 
     # ── Phase A: LLM extraction (3 tables per batch, max 5 concurrent) ─────────
     _BATCH = 3
@@ -484,9 +722,32 @@ async def _do_extraction(
         )
         llm_results.extend(recovered)
 
+        # Failure visibility: tables still missing after batch + mop-up retries
+        # get no metadata row and previously vanished into a bare count with no
+        # indication of WHICH tables failed. Log each one with a consistent,
+        # greppable tag — Phase 4's never_extracted check already retries these
+        # automatically on the next crawl since they have no existing row.
+        recovered_names = {t.get("table_name", "").lower() for t in recovered}
+        still_missing = [
+            p["qualified_name"] for p in missing_payloads
+            if p["qualified_name"].lower() not in recovered_names
+        ]
+        for tname in still_missing:
+            print(f"[metadata_extractor] EXTRACTION_FAILED table={tname}", flush=True)
+
     if not llm_results:
         print("[metadata_extractor] Phase A returned 0 tables — aborting", flush=True)
         return
+
+    # Safety checkpoint: persist Phase A's output now, BEFORE the Phase B/C
+    # DB round-trips below (which open a connection to the USER's database and
+    # could fail/timeout) — so a crash there doesn't discard this (expensive,
+    # already-paid-for) LLM extraction with nothing to show for it.
+    try:
+        await _persist_metadata(connection_id, snapshot_version, llm_results, set(), {})
+        print(f"[metadata_extractor] checkpoint: persisted {len(llm_results)} table(s) from Phase A", flush=True)
+    except Exception as _cp_exc:
+        print(f"[metadata_extractor] checkpoint persist failed (non-fatal, retried at final persist): {_cp_exc}", flush=True)
 
     # Normalise FK target names — Claude might return bare table names; resolve to qualified
     qualified_set = set(all_qualified)
@@ -692,106 +953,7 @@ async def _do_extraction(
                     col["is_kpi_metric"] = True
 
     # ── Persist all results to app DB ─────────────────────────────────────────
-    conn_uuid = uuid.UUID(connection_id)
-    now = datetime.utcnow()
-
-    async with AsyncSessionLocal() as db:
-        # Replace old metadata for this connection
-        await db.execute(
-            delete(SchemaTableMetadata).where(SchemaTableMetadata.connection_id == conn_uuid)
-        )
-        await db.execute(
-            delete(SchemaColumnMetadata).where(SchemaColumnMetadata.connection_id == conn_uuid)
-        )
-
-        for tbl in llm_results:
-            tname = tbl.get("table_name", "")
-            if not tname:
-                continue
-
-            db.add(SchemaTableMetadata(
-                id=uuid.uuid4(),
-                connection_id=conn_uuid,
-                schema_snapshot_version=snapshot_version,
-                table_name=tname,
-                business_name=tbl.get("business_name"),
-                description=tbl.get("description"),
-                grain=tbl.get("grain"),
-                is_fact_table=tbl.get("is_fact_table"),
-                use_for=tbl.get("use_for") or [],
-                never_use_for=tbl.get("never_use_for") or [],
-                key_metric_cols=tbl.get("key_metric_cols") or [],
-                key_dimension_cols=tbl.get("key_dimension_cols") or [],
-                key_date_cols=tbl.get("key_date_cols") or [],
-                generation_method="llm_sample_rows",
-                generated_at=now,
-            ))
-
-            for col in tbl.get("columns", []):
-                cname = col.get("name", "")
-                if not cname:
-                    continue
-
-                # PII detection: columns whose name signals personally-identifiable data
-                # should never have example values stored and should not be filter candidates.
-                is_pii = any(sig in cname.lower() for sig in _PII_SIGNALS)
-
-                # Determine FK confirmation
-                is_fk = col.get("semantic_type") == "fk"
-                fk_key = (tname, cname, col.get("fk_target_table") or "", col.get("fk_target_column") or "")
-                fk_confirmed = is_fk and fk_key in confirmed_fks
-
-                # Merge LLM example_values with Phase C distinct values.
-                # Clear any examples for PII columns (crawlers mask sample rows, but the
-                # LLM may still suggest inferred examples).
-                if is_pii:
-                    example_vals = []
-                else:
-                    example_vals = list(col.get("example_values") or [])
-                    phase_c_vals = filter_values.get((tname, cname), [])
-                    if phase_c_vals:
-                        seen = set(example_vals)
-                        for v in phase_c_vals:
-                            if v not in seen:
-                                example_vals.append(v)
-                                seen.add(v)
-                    example_vals = example_vals[:200]
-
-                # Compute cardinality from collected distinct values — used downstream
-                # to distinguish low-cardinality dimension columns from high-cardinality
-                # free-text or ID columns.  Only populated when Phase C ran.
-                cardinality = len(filter_values.get((tname, cname), [])) if not is_pii else None
-
-                # Override is_filter_eligible for PII columns and high-cardinality columns
-                is_filter_eligible = col.get("is_filter_eligible")
-                if is_pii:
-                    is_filter_eligible = False
-                elif cardinality is not None and cardinality > 150:
-                    # High cardinality → not useful as a filter dropdown
-                    is_filter_eligible = False
-
-                db.add(SchemaColumnMetadata(
-                    id=uuid.uuid4(),
-                    connection_id=conn_uuid,
-                    schema_snapshot_version=snapshot_version,
-                    table_name=tname,
-                    column_name=cname,
-                    business_name=col.get("business_name"),
-                    description=col.get("description"),
-                    semantic_type=col.get("semantic_type"),
-                    fk_target_table=col.get("fk_target_table"),
-                    fk_target_column=col.get("fk_target_column"),
-                    fk_confirmed=fk_confirmed,
-                    fk_confirmation_score=None,
-                    example_values=example_vals or None,
-                    is_kpi_metric=col.get("is_kpi_metric"),
-                    is_dimension=col.get("is_dimension"),
-                    is_filter_eligible=is_filter_eligible,
-                    generation_method="llm_sample_rows",
-                    generated_at=now,
-                ))
-
-        await db.commit()
+    await _persist_metadata(connection_id, snapshot_version, llm_results, confirmed_fks, filter_values)
 
     # Invalidate the in-process schema cache so that the next query against this
     # connection rebuilds EnrichedSchema from the freshly stored metadata (with
