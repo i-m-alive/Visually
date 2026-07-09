@@ -235,13 +235,14 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
             flush=True,
         )
 
-    # ── NL2SQL two-stage pipeline (same as chat.py — feeds GraphRAG scoping) ───
+    # ── NL2SQL two-stage pipeline (feeds GraphRAG scoping in report mode) ───────
     resolved_context = None
+    _parsed_intent = None
     if enriched and req.message.strip():
         try:
-            intent = await parse_intent(req.message)
-            if intent.needs_sql:
-                resolved_context = route_query(intent, enriched, req.message)
+            _parsed_intent = await parse_intent(req.message)
+            if _parsed_intent.needs_sql:
+                resolved_context = route_query(_parsed_intent, enriched, req.message)
                 print(
                     f"[intel_chat] NL2SQL resolved  tables={resolved_context.relevant_tables[:4]}"
                     f"  entities={len(resolved_context.entity_resolutions)}"
@@ -251,7 +252,32 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         except Exception as _nl2sql_err:
             print(f"[intel_chat] ⚠ NL2SQL pipeline failed (non-fatal): {_nl2sql_err}", flush=True)
 
-    # Detect offline mode once here so callers don't need extra DB queries.
+    # ── Full graph-RAG retrieval (database scope only) ───────────────────────
+    # graph_rag_retriever.retrieve() produces richer TableCandidate objects with
+    # column-level hints (metric/dimension/date), entity filter hints, and verified
+    # FK join paths — far more useful for SQL generation than nl_schema_router alone.
+    retrieved_graphrag = None
+    if (req.scope or "report") == "database" and enriched and _parsed_intent:
+        try:
+            from agent_service.agents.graph_rag_retriever import retrieve as _graphrag_retrieve
+            retrieved_graphrag = _graphrag_retrieve(
+                req.message, _parsed_intent, enriched, top_k=8,
+                history_tables=list(priority_tables) if priority_tables else None,
+            )
+            print(
+                f"[intel_chat] graph-RAG (fulldb)  "
+                f"tables={retrieved_graphrag.primary_tables[:4]}  "
+                f"confidence={retrieved_graphrag.confidence:.2f}  "
+                f"candidates={len(retrieved_graphrag.candidates)}  "
+                f"needs_join={retrieved_graphrag.needs_join}",
+                flush=True,
+            )
+        except Exception as _rag_err:
+            print(f"[intel_chat] ⚠ graph-RAG retrieval failed (non-fatal): {_rag_err}", flush=True)
+
+    # ── Connection check for full-DB mode ────────────────────────────────────
+    # For scope=database, a live connection is required.  Offline connections
+    # (vly_offline) cannot serve arbitrary DB queries — only their embedded tables.
     is_offline = bool(effective_connection_id) and await _is_offline_connection(effective_connection_id, db)
     if is_offline:
         print(f"[intel_chat] offline canvas detected  connection={effective_connection_id[:8] if effective_connection_id else 'none'}", flush=True)
@@ -269,6 +295,7 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         "model_pref": effective_model_pref,
         "verified_tables_doc": verified_tables_doc,
         "resolved_context": resolved_context,
+        "retrieved_graphrag": retrieved_graphrag,
         "is_offline": is_offline,
     }
 
@@ -291,35 +318,21 @@ async def _is_offline_connection(connection_id: Optional[str], db: AsyncSession)
 
 
 def _validate_sql_safety(sql: str) -> Optional[str]:
-    """Return an error message if sql contains writes/DDL; None means safe."""
-    stripped = sql.strip().lstrip("(")
-    first = stripped[:10].upper()
-    for keyword in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "GRANT", "REVOKE"):
-        if first.startswith(keyword):
-            return f"SQL must be read-only SELECT/WITH — {keyword} statements are not allowed."
-    # Block access to system catalog tables.
-    lower = sql.lower()
-    for sys_tbl in ("information_schema.", "pg_catalog.", "pg_class", "pg_namespace"):
-        if sys_tbl in lower:
-            return f"Access to system tables ({sys_tbl.rstrip('.')}) is not allowed in report mode."
-    return None
+    """Thin wrapper kept for any callers outside this module.
+    Delegates to intel_guardrails for the full layer stack."""
+    from agent_service.agents.intel_guardrails import apply_fulldb_guardrails
+    gr = apply_fulldb_guardrails(sql, allowed_tables=None, mode="database")
+    return gr.error if not gr.safe else None
 
 
 def _check_table_scope(sql: str, allowed_tables: set[str]) -> Optional[str]:
-    """Warn (non-blocking) if SQL references tables outside the report's scope.
-    Returns a warning string or None. Does NOT block execution — only logs."""
+    """Thin wrapper kept for any callers outside this module.
+    Returns a warning string or None; does NOT block execution."""
     if not allowed_tables:
         return None
-    from_join = re.findall(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE)
-    ctes = {m.lower() for m in re.findall(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', sql, re.IGNORECASE)}
-    out_of_scope = []
-    for tbl in from_join:
-        bare = tbl.split(".")[-1].lower()
-        if bare in ctes:
-            continue
-        if tbl.lower() not in allowed_tables and bare not in allowed_tables:
-            out_of_scope.append(tbl)
-    return f"[scope] SQL references table(s) outside report: {out_of_scope}" if out_of_scope else None
+    from agent_service.agents.intel_guardrails import apply_fulldb_guardrails
+    gr = apply_fulldb_guardrails(sql, allowed_tables=allowed_tables, mode="database")
+    return gr.warning if gr.safe else None
 
 
 async def _execute_and_build_chart(
@@ -335,16 +348,20 @@ async def _execute_and_build_chart(
     if sql_spec.get("sql"):
         print(f"[intel_chat] generated SQL: {sql_spec['sql'][:400]}", flush=True)
 
-    # Guardrail: reject non-SELECT statements before execution.
-    safety_err = _validate_sql_safety(sql_spec.get("sql") or "")
-    if safety_err:
-        print(f"[intel_chat] ⚠ SQL safety check failed: {safety_err}", flush=True)
-        return None, f"\n\n⚠️ {safety_err}"
-
-    # Scope check: log out-of-scope table access (non-blocking — warns but runs).
-    scope_warn = _check_table_scope(sql_spec.get("sql") or "", priority_tables or set())
-    if scope_warn:
-        print(f"[intel_chat] ⚠ {scope_warn}", flush=True)
+    # ── Guardrails: full layer stack (safety + scope + row-limit) ─────────────
+    from agent_service.agents.intel_guardrails import apply_fulldb_guardrails
+    _gr = apply_fulldb_guardrails(
+        sql_spec.get("sql") or "",
+        allowed_tables=priority_tables if priority_tables else None,
+        mode="report" if priority_tables else "database",
+    )
+    if not _gr.safe:
+        print(f"[intel_chat] ⚠ SQL guardrail blocked: {_gr.error}", flush=True)
+        return None, f"\n\n⚠️ {_gr.error}"
+    if _gr.warning:
+        print(f"[intel_chat] ⚠ SQL guardrail warning: {_gr.warning}", flush=True)
+    # Use the cleaned + row-limited SQL from guardrails.
+    sql_spec = {**sql_spec, "sql": _gr.sql}
 
     if not connection_id:
         print("[intel_chat] ⚠ no connection available to execute SQL", flush=True)
@@ -444,6 +461,7 @@ async def intel_chat(
         conversation_memory=ctx["memory"],
         verified_tables_doc=ctx.get("verified_tables_doc"),
         resolved_context=ctx.get("resolved_context"),
+        retrieved_graphrag=ctx.get("retrieved_graphrag"),
     )
 
     sql_spec = result.get("sql_to_execute")
@@ -523,6 +541,7 @@ async def intel_chat_stream(
             conversation_memory=ctx["memory"],
             verified_tables_doc=ctx.get("verified_tables_doc"),
             resolved_context=ctx.get("resolved_context"),
+            retrieved_graphrag=ctx.get("retrieved_graphrag"),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[intel_chat] ✗ stream setup failed: {exc!r}", flush=True)
@@ -642,6 +661,74 @@ async def clear_intel_chat(
     await IntelligenceChatAgent.clear_history(session_id, redis)
     print(f"[intel_chat] cleared history  session={session_id[:8]}", flush=True)
     return {"status": "cleared", "session_id": session_id}
+
+
+@router.get("/intelligence/chat/connection-status")
+async def intel_connection_status(
+    project_id: Optional[str] = None,
+    dashboard_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return whether a live database connection is available for the intelligence copilot.
+
+    The frontend uses this to decide whether to show the Full DB mode toggle:
+      - has_live_connection=True  → show the toggle (user can switch to database scope)
+      - is_offline=True           → hide the toggle (offline canvas, no live DB)
+      - has_live_connection=False → show a "connect your database" prompt instead
+
+    Rules:
+      • An active, non-offline DatabaseConnection on the project → full DB mode available.
+      • A vly_offline synthetic connection → full DB mode NOT available.
+      • No connection at all → full DB mode NOT available.
+    """
+    has_live = False
+    conn_id: Optional[str] = None
+    is_offline_flag = False
+
+    if project_id:
+        try:
+            project_uuid = uuid.UUID(project_id)
+            conn_r = await db.execute(
+                select(DatabaseConnection)
+                .where(DatabaseConnection.project_id == project_uuid)
+                .where(DatabaseConnection.is_active == True)
+                .limit(1)
+            )
+            conn = conn_r.scalar_one_or_none()
+            if conn:
+                db_type_val = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+                if db_type_val == "vly_offline":
+                    is_offline_flag = True
+                else:
+                    has_live = True
+                    conn_id = str(conn.id)
+        except Exception as exc:
+            print(f"[intel_chat] ⚠ connection-status project lookup failed: {exc}", flush=True)
+
+    if not has_live and dashboard_id:
+        try:
+            fallback = await _get_dashboard_connection_id(dashboard_id, db)
+            if fallback:
+                offline = await _is_offline_connection(fallback, db)
+                if offline:
+                    is_offline_flag = True
+                else:
+                    has_live = True
+                    conn_id = fallback
+        except Exception as exc:
+            print(f"[intel_chat] ⚠ connection-status dashboard fallback failed: {exc}", flush=True)
+
+    print(
+        f"[intel_chat] connection-status  project={project_id or 'none'}  "
+        f"has_live={has_live}  is_offline={is_offline_flag}",
+        flush=True,
+    )
+    return {
+        "has_live_connection": has_live,
+        "connection_id": conn_id,
+        "is_offline": is_offline_flag,
+        "full_db_mode_available": has_live,
+    }
 
 
 # ── helpers (forked copy from chat.py — kept local so this path is standalone) ──

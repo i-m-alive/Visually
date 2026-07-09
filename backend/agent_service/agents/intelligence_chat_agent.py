@@ -27,6 +27,7 @@ from agent_service.agents import schema_scope as _iscope
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
     from agent_service.agents.nl_schema_router import ResolvedContext
+    from agent_service.agents.graph_rag_retriever import RetrievedContext
 
 INTEL_CHAT_MODEL = BEDROCK_SONNET_MODEL
 INTEL_CONVERSATION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
@@ -376,6 +377,43 @@ TONE: Clear, helpful, and data-focused. For charts/tables/KPIs, always explain t
 # prefix. `.format()` with no args unescapes the doubled `{{ }}` in the JSON
 # examples without substituting anything (there are no placeholders left).
 _INSTRUCTIONS = _SYSTEM_PROMPT_TEMPLATE.format()
+
+# DATABASE MODE override block — injected between ZONE 1 and the cached schema
+# (ZONE 2) when scope="database".  It is a static constant so it does NOT
+# invalidate the schema cache across turns.  The LLM reads this first and lets
+# it override the "REPORT MODE" references in _INSTRUCTIONS above.
+_DATABASE_MODE_HEADER = """\
+══════════════════════════════════════════════════════════════════════
+DATABASE MODE — FULL-DB ACCESS (this overrides REPORT MODE above)
+══════════════════════════════════════════════════════════════════════
+You are operating in DATABASE MODE, not report mode.
+
+WHAT CHANGES IN DATABASE MODE:
+• You have access to the FULL database schema — query any table, not just the ones
+  used by the current report's widgets.
+• The schema below was selected by graph-RAG relevance ranking (TF-IDF + concept +
+  entity + FK-graph signals) — FOCUSED TABLES are the highest-ranked matches for
+  this specific query; RELATED TABLES are their FK-graph neighbours.
+• GRAPH-RAG RETRIEVAL HINTS (column-level signals) are injected immediately after the
+  schema — use them to pick the right columns and write accurate JOINs.
+• Results are capped at 10,000 rows per query.
+
+SECURITY BOUNDARIES (full-DB mode — enforced server-side):
+• SELECT / WITH (CTE) only — no INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE,
+  COPY, GRANT, REVOKE, SET, SHOW, EXPLAIN, ANALYZE, or any DDL/DML/admin statement.
+• Do NOT access system catalog tables (information_schema, pg_catalog, pg_stat,
+  pg_locks, Redshift STL/STV/SVL views, Snowflake account_usage, etc.).
+• Do NOT chain multiple statements with semicolons.
+
+CAPABILITIES IN DATABASE MODE:
+1. Answer questions about any data in this database — not limited to what the current
+   report shows.
+2. Query ANY table in the database schema; JOIN freely across tables.
+3. Generate new chart visualizations inline in this conversation.
+4. Explain cross-domain trends, anomalies, and patterns in plain English.
+5. Add charts to the current canvas page or suggest placements across pages.
+══════════════════════════════════════════════════════════════════════\
+"""
 
 _SAMPLE_VALUE_LIMIT = int(os.getenv("INTEL_CHAT_SAMPLE_VALUE_LIMIT", "5"))
 _COL_DESC_MAX = int(os.getenv("INTEL_CHAT_COL_DESC_MAX", "80"))
@@ -921,6 +959,90 @@ class IntelligenceChatAgent:
             print(f"[intel_chat_agent] ⚠ graphrag scoped render failed ({exc!r}) — full schema", flush=True)
             return self._get_cached_schema(enriched, connection_id)
 
+    def _build_true_graphrag_schema(
+        self,
+        enriched: "EnrichedSchema",
+        retrieved: "RetrievedContext",
+        connection_id: Optional[str],
+        total: int,
+    ) -> str:
+        """Full-DB schema block driven by graph_rag_retriever.retrieve() results.
+
+        Uses the true graph-RAG primary tables (scored by TF-IDF + concept +
+        entity + FK-graph signals) as the seed for FK-hop expansion — richer
+        than nl_schema_router which only does NL token matching.
+
+        Falls back to the full cached schema when nothing resolves.
+        """
+        seed_names = set((retrieved.primary_tables or [])[:8])
+        if not seed_names:
+            print(
+                f"[intel_chat_agent] true-graphrag: no primary tables returned "
+                f"(confidence={retrieved.confidence:.2f}) — full schema ({total} tables)",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        try:
+            seed, neighbors = self.resolve_scope_tables(
+                enriched, seed_names, _INTEL_GRAPHRAG_SCOPE_HOPS
+            )
+        except Exception as exc:
+            print(
+                f"[intel_chat_agent] ⚠ true-graphrag scope resolve failed ({exc!r}) "
+                "— full schema",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        if not seed:
+            print(
+                f"[intel_chat_agent] true-graphrag: 0 seed tables matched from "
+                f"candidates {list(seed_names)[:4]} — full schema ({total} tables)",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        try:
+            schema = _iscope.render_scoped_schema(
+                enriched, seed, neighbors, _INTEL_GRAPHRAG_SCOPE_HOPS,
+                col_desc_max=_COL_DESC_MAX, table_desc_max=_TABLE_DESC_MAX,
+                sample_limit=_SAMPLE_VALUE_LIMIT,
+                scope_intro=(
+                    "SCOPE: DATABASE (true graph-RAG ranked) — tables selected by "
+                    "TF-IDF, concept matching, entity signals, and FK-graph expansion "
+                    "for this specific query. FOCUSED TABLES have the highest relevance "
+                    "scores. RELATED TABLES are FK-graph neighbours available for JOINs. "
+                    "Graph-RAG column hints follow immediately after this schema block."
+                ),
+                seed_header=(
+                    f"FOCUSED TABLES — {len(seed)} table(s) ranked most relevant "
+                    f"(confidence={retrieved.confidence:.0%}):"
+                ),
+                related_header_fmt=(
+                    "RELATED TABLES — {n} table(s) within {hops} FK-hop(s) of the "
+                    "focused tables (name + purpose + join path):"
+                ),
+            )
+            full_len = len(self._get_cached_schema(enriched, connection_id))
+            scoped_len = len(schema)
+            saved_pct = round((1 - scoped_len / max(full_len, 1)) * 100, 1)
+            print(
+                f"[intel_chat_agent] scope=database(true-graphrag)  "
+                f"seed={len(seed)}  related={len(neighbors)}  total={total}  "
+                f"chars={scoped_len:,}/{full_len:,}  saved={saved_pct}%  "
+                f"≈{(full_len - scoped_len) // 4:,} input tokens saved",
+                flush=True,
+            )
+            return schema
+        except Exception as exc:
+            print(
+                f"[intel_chat_agent] ⚠ true-graphrag schema render failed ({exc!r}) "
+                "— full schema",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
     def _build_dynamic_context(
         self,
         dashboard_widgets: list,
@@ -946,42 +1068,41 @@ class IntelligenceChatAgent:
         verified_tables_doc: Optional[dict] = None,
         resolved_context: Optional["ResolvedContext"] = None,
         conversation_history: Optional[list] = None,
+        retrieved_graphrag: Optional["RetrievedContext"] = None,
     ) -> list[dict]:
         dynamic = self._build_dynamic_context(
             dashboard_widgets, dashboard_pages, active_page_id, priority_tables,
         )
 
-        # route_query() resolves tables from the CURRENT message alone, so an
-        # elliptical follow-up ("what about last month") with no table-name signal
-        # of its own can score every table near-zero — pruning the schema down to
-        # whichever table wins that noise and silently dropping the table the
-        # conversation was actually about. When history is present and the
-        # router's own confidence is weak, skip GraphRAG scoping for this turn.
+        # Ambiguous follow-up guard: route_query() scores tables from the CURRENT
+        # message only — a context-free elliptical follow-up ("what about last month?")
+        # can score every table near-zero. Skip graphRAG scoping on those turns.
         _top_score = max(resolved_context.table_scores.values(), default=0.0) if resolved_context else 0.0
         _ambiguous_followup = bool(conversation_history) and _top_score < 0.15
 
         if enriched and enriched.compact_tables:
             total = len(enriched.compact_tables)
+
             if scope == "report":
+                # ── Report scope: seed = widget SQL tables + FK hops ───────────
                 try:
                     seed, neighbors = self.resolve_scope_tables(enriched, priority_tables)
-                except Exception as exc:  # noqa: BLE001 — never let scoping break a turn
+                except Exception as exc:
                     seed, neighbors = set(), set()
                     print(f"[intel_chat_agent] ⚠ resolve_scope_tables failed ({exc!r}) — full schema", flush=True)
                 if seed:
                     try:
                         schema = self._build_scoped_schema(enriched, seed, neighbors)
                         print(
-                            f"[intel_chat_agent] scope=report  seed_tables={len(seed)}  "
-                            f"related_tables={len(neighbors)}  (of {total} total) — scoped schema built",
+                            f"[intel_chat_agent] scope=report  seed={len(seed)}  "
+                            f"related={len(neighbors)}  of {total} total",
                             flush=True,
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         schema = self._get_cached_schema(enriched, connection_id)
                         print(f"[intel_chat_agent] ⚠ scoped build failed ({exc!r}) — full schema", flush=True)
                 else:
-                    # No report tables matched (e.g. widgets have no parseable SQL) —
-                    # fall back to GraphRAG if available, else full schema.
+                    # No report tables matched → fall back to nl_schema_router scoping or full schema.
                     if (
                         resolved_context
                         and not resolved_context.fallback
@@ -995,14 +1116,44 @@ class IntelligenceChatAgent:
                     else:
                         schema = self._get_cached_schema(enriched, connection_id)
                         print(
-                            f"[intel_chat_agent] scope=report  seed_tables=0 — no report tables "
+                            f"[intel_chat_agent] scope=report  seed=0 — no report tables "
                             f"matched, falling back to FULL schema ({total} tables)",
                             flush=True,
                         )
+
+                verified_block = _format_verified_tables(verified_tables_doc or {})
+                extra = [{"type": "text", "text": verified_block}] if verified_block else []
+                return [
+                    {"type": "text", "text": _INSTRUCTIONS},
+                    {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
+                    *extra,
+                    {"type": "text", "text": dynamic},
+                ]
+
             else:
-                # scope="database" — use GraphRAG-ranked scoping when the NL router
-                # resolved relevant tables and the schema is large enough to benefit.
+                # ── Database scope: true graph-RAG retrieval is preferred ──────
+                # Priority 1: RetrievedContext from graph_rag_retriever.retrieve()
+                #   → rich TableCandidate objects (column hints, entity hints, join paths)
+                # Priority 2: ResolvedContext from nl_schema_router.route_query()
+                #   → lightweight table name list (score-based)
+                # Priority 3: full schema (fallback)
+                graphrag_hints_text = ""
                 if (
+                    retrieved_graphrag
+                    and retrieved_graphrag.candidates
+                    and not _ambiguous_followup
+                ):
+                    schema = self._build_true_graphrag_schema(
+                        enriched, retrieved_graphrag, connection_id, total
+                    )
+                    # Inject column-level hints as a dynamic block (changes per query —
+                    # placed AFTER the cached schema so it doesn't bust the cache key).
+                    try:
+                        from agent_service.agents.graph_rag_retriever import format_retrieval_hints
+                        graphrag_hints_text = format_retrieval_hints(retrieved_graphrag)
+                    except Exception as exc:
+                        print(f"[intel_chat_agent] ⚠ format_retrieval_hints failed ({exc!r})", flush=True)
+                elif (
                     resolved_context
                     and not resolved_context.fallback
                     and resolved_context.focused_tables
@@ -1019,14 +1170,22 @@ class IntelligenceChatAgent:
                         f"({'ambiguous follow-up, ' if _ambiguous_followup else ''}{total} tables)",
                         flush=True,
                     )
-            verified_block = _format_verified_tables(verified_tables_doc or {})
-            extra = [{"type": "text", "text": verified_block}] if verified_block else []
-            return [
-                {"type": "text", "text": _INSTRUCTIONS},
-                {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
-                *extra,
-                {"type": "text", "text": dynamic},
-            ]
+
+                verified_block = _format_verified_tables(verified_tables_doc or {})
+                extra = [{"type": "text", "text": verified_block}] if verified_block else []
+
+                # DATABASE MODE uses the mode-override header BEFORE the cached schema.
+                # The header is a static constant so it doesn't invalidate the schema cache.
+                blocks: list[dict] = [
+                    {"type": "text", "text": _INSTRUCTIONS},
+                    {"type": "text", "text": _DATABASE_MODE_HEADER},
+                    {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
+                ]
+                if graphrag_hints_text:
+                    blocks.append({"type": "text", "text": graphrag_hints_text})
+                blocks.extend(extra)
+                blocks.append({"type": "text", "text": dynamic})
+                return blocks
 
         raw_schema = self._build_schema_section_raw(schema_doc)
         verified_block = _format_verified_tables(verified_tables_doc or {})
@@ -1054,6 +1213,7 @@ class IntelligenceChatAgent:
         conversation_memory: Optional[list[str]] = None,
         verified_tables_doc: Optional[dict] = None,
         resolved_context: Optional["ResolvedContext"] = None,
+        retrieved_graphrag: Optional["RetrievedContext"] = None,
     ) -> tuple[list[dict], list[dict], str, int]:
         """Build (system_blocks, messages, model_id, max_tokens)."""
         system_blocks = self._build_system_blocks(
@@ -1068,6 +1228,7 @@ class IntelligenceChatAgent:
             verified_tables_doc=verified_tables_doc,
             resolved_context=resolved_context,
             conversation_history=conversation_history,
+            retrieved_graphrag=retrieved_graphrag,
         )
         # Distilled memory: the gist of earlier questions, injected as a small dynamic
         # block so the copilot remembers what was asked WITHOUT replaying the full
@@ -1184,6 +1345,7 @@ class IntelligenceChatAgent:
         conversation_memory: Optional[list[str]] = None,
         verified_tables_doc: Optional[dict] = None,
         resolved_context: Optional["ResolvedContext"] = None,
+        retrieved_graphrag: Optional["RetrievedContext"] = None,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
@@ -1192,6 +1354,7 @@ class IntelligenceChatAgent:
             conversation_memory=conversation_memory,
             verified_tables_doc=verified_tables_doc,
             resolved_context=resolved_context,
+            retrieved_graphrag=retrieved_graphrag,
         )
 
         raw = await bedrock_invoke_with_history(
