@@ -341,6 +341,7 @@ async def _execute_and_build_chart(
     db: Optional[AsyncSession] = None,
     dashboard_id: Optional[str] = None,
     priority_tables: Optional[set] = None,
+    enriched=None,
 ) -> tuple[Optional[dict], Optional[str]]:
     """Run a sql_execute spec and build the inline_chart payload.
     Routes to offline DuckDB when the connection is a vly_offline synthetic one.
@@ -362,6 +363,29 @@ async def _execute_and_build_chart(
         print(f"[intel_chat] ⚠ SQL guardrail warning: {_gr.warning}", flush=True)
     # Use the cleaned + row-limited SQL from guardrails.
     sql_spec = {**sql_spec, "sql": _gr.sql}
+
+    # ── Pre-execution: column existence check against schema cache ────────────
+    # Catches hallucinated column names before a DB round-trip.
+    # Qualified refs (table.col) are auto-corrected via fuzzy matching when possible.
+    # Unqualified refs (bare col) that can't be resolved are logged for diagnosis.
+    if enriched and getattr(enriched, "compact_tables", None) and sql_spec.get("sql"):
+        from agent_service.agents.sql_utils import (
+            verify_all_column_refs, fuzzy_fix_column_names,
+        )
+        _col_errs = verify_all_column_refs(
+            sql_spec["sql"], enriched.compact_tables,
+            candidate_tables=list(priority_tables) if priority_tables else None,
+        )
+        if _col_errs:
+            _fixed_sql, _corrections = fuzzy_fix_column_names(
+                sql_spec["sql"], enriched.compact_tables,
+                candidate_tables=list(priority_tables) if priority_tables else None,
+            )
+            if _corrections:
+                print(f"[intel_chat] pre-exec col fix: {_corrections}", flush=True)
+                sql_spec = {**sql_spec, "sql": _fixed_sql}
+            else:
+                print(f"[intel_chat] ⚠ pre-exec col issues (unfixable): {_col_errs[:3]}", flush=True)
 
     if not connection_id:
         print("[intel_chat] ⚠ no connection available to execute SQL", flush=True)
@@ -387,10 +411,16 @@ async def _execute_and_build_chart(
     if exec_result.get("error"):
         print(f"[intel_chat] ⚠ sql exec error: {str(exec_result['error'])[:200]} — attempting self-correct", flush=True)
         # For offline mode, skip live-column-lookup self-correct (no live DB); retry without it.
+        # Pass enriched cache so self-correct can look up columns without a live DB call.
+        # Also works for offline mode: column hints come from the cache, not information_schema.
         if not is_offline:
-            fixed_sql = await _self_correct_sql(connection_id, sql_spec["sql"], str(exec_result["error"]))
+            fixed_sql = await _self_correct_sql(
+                connection_id, sql_spec["sql"], str(exec_result["error"]), enriched=enriched,
+            )
         else:
-            fixed_sql = None
+            fixed_sql = await _self_correct_sql(
+                connection_id, sql_spec["sql"], str(exec_result["error"]), enriched=enriched,
+            ) if enriched else None
         if fixed_sql and fixed_sql.strip() != (sql_spec["sql"] or "").strip():
             retry = (
                 await _exec_offline(db, dashboard_id, fixed_sql)
@@ -408,6 +438,33 @@ async def _execute_and_build_chart(
         print(f"[intel_chat] ⚠ sql returned 0 rows  sql={sql_spec['sql'][:160]}", flush=True)
         return None, ("\n\n⚠️ The query ran but returned no rows — there may be no matching "
                       "data, or a name/date filter didn't match. Try rephrasing or broadening it.")
+
+    # ── Post-execution sanity: NULL aggregate + all-zero values ─────────────
+    # These pass SQL execution but silently produce a meaningless chart.
+    _post_columns = exec_result.get("columns", [])
+    _post_rows = exec_result.get("rows", [])
+    if _post_rows and _post_columns:
+        from agent_service.agents.sql_utils import check_result_sanity
+        _san_ok, _san_msg = check_result_sanity(
+            _post_rows, _post_columns, sql_spec.get("chart_type", ""), sql_spec["sql"]
+        )
+        if not _san_ok and _san_msg:
+            print(f"[intel_chat] ⚠ post-exec sanity: {_san_msg[:200]}", flush=True)
+            # Attempt self-correct with the sanity failure as the error message.
+            _san_fixed = await _self_correct_sql(
+                connection_id, sql_spec["sql"], _san_msg, enriched=enriched,
+            ) if connection_id else None
+            if _san_fixed and _san_fixed.strip() != sql_spec["sql"].strip():
+                _san_retry = (
+                    await _exec_offline(db, dashboard_id, _san_fixed)
+                    if is_offline else await _execute_sql(connection_id, _san_fixed)
+                )
+                if not _san_retry.get("error") and _san_retry.get("rows"):
+                    print(f"[intel_chat] ✓ sanity self-correct succeeded", flush=True)
+                    sql_spec = {**sql_spec, "sql": _san_fixed}
+                    exec_result = _san_retry
+                    _post_columns = exec_result.get("columns", [])
+                    _post_rows = exec_result.get("rows", [])
 
     render_result = await _render_chart(sql_spec, exec_result["rows"])
     columns = exec_result.get("columns", [])
@@ -478,6 +535,7 @@ async def intel_chat(
             sql_spec, ctx["connection_id"],
             db=db, dashboard_id=req.dashboard_id,
             priority_tables=ctx.get("priority_tables"),
+            enriched=ctx.get("enriched"),
         )
         if warning:
             result["text"] = (result.get("text") or "").rstrip() + warning
@@ -616,6 +674,7 @@ async def intel_chat_stream(
                 db=db if ctx.get("is_offline") else None,
                 dashboard_id=req.dashboard_id,
                 priority_tables=ctx.get("priority_tables"),
+                enriched=ctx.get("enriched"),
             )
             if warning:
                 final_text = (final_text or "").rstrip() + warning
@@ -866,20 +925,48 @@ async def _fetch_table_columns(connection_id: str, schema: str, table: str) -> l
     return [str(r.get("column_name")) for r in (res.get("rows") or []) if r.get("column_name")]
 
 
-async def _self_correct_sql(connection_id: str, failed_sql: str, error_msg: str) -> Optional[str]:
-    """When a generated query references columns that don't exist, fetch the REAL
-    columns of the tables it used and ask the model to rewrite using only those."""
+async def _self_correct_sql(
+    connection_id: str,
+    failed_sql: str,
+    error_msg: str,
+    enriched=None,
+) -> Optional[str]:
+    """When a generated query references columns that don't exist, look up the REAL
+    columns (from the enriched schema cache first, live DB as fallback) and ask the
+    model to rewrite using only those columns."""
     tables: list[str] = []
     for name in _FROM_JOIN_RE.findall(failed_sql or ""):
         n = name.strip()
-        if "." in n and n not in tables:
+        # Previously filtered to "." in n only, silently dropping unqualified table names.
+        # Now collect all FROM/JOIN targets regardless of schema qualification.
+        if n and n not in tables:
             tables.append(n)
     col_lines: list[str] = []
-    for t in tables[:6]:
-        schema, _, table = t.partition(".")
-        cols = await _fetch_table_columns(connection_id, schema, table)
-        if cols:
-            col_lines.append(f'{t} has ONLY these columns: {", ".join(cols)}')
+
+    # Primary: use the enriched schema cache — instant, no DB round-trip needed.
+    if enriched and getattr(enriched, "compact_tables", None):
+        _ct_idx: dict[str, dict] = {}
+        for t in enriched.compact_tables:
+            tn = (t.get("name") or "").lower()
+            if tn:
+                _ct_idx[tn] = t
+                _ct_idx[tn.split(".")[-1]] = t
+        for tname in tables[:8]:
+            ct = _ct_idx.get(tname.lower()) or _ct_idx.get(tname.split(".")[-1].lower())
+            if ct:
+                cols = [c.get("name") for c in (ct.get("columns") or []) if c.get("name")]
+                if cols:
+                    col_lines.append(f'{ct.get("name")} has ONLY these columns: {", ".join(cols[:40])}')
+
+    # Fallback: live information_schema lookup for schema-qualified tables not in cache.
+    if not col_lines:
+        for t in tables[:6]:
+            if "." in t:
+                schema, _, table = t.partition(".")
+                cols = await _fetch_table_columns(connection_id, schema, table)
+                if cols:
+                    col_lines.append(f'{t} has ONLY these columns: {", ".join(cols)}')
+
     if not col_lines:
         return None
 

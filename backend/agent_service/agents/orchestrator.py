@@ -135,6 +135,9 @@ class Orchestrator:
             _AGENT_INTENTS = frozenset({
                 "MATCH", "BRIEFING", "SCREEN", "ENRICH",
                 "VERIFY", "PRESENT", "AUDIT", "PROSPECT", "ACTION",
+                # Finance-only intents (see intent_classifier.py's finance skill
+                # block — these are never offered to non-finance domains).
+                "RECONCILE", "ANOMALY", "FORECAST", "NETWORK",
             })
             # Skill agents are per-domain personas (see domain_config.SKILL_DOMAINS).
             # A domain with no skill agents (e.g. "generic") never routes here even
@@ -218,6 +221,21 @@ class Orchestrator:
                             for _t in _schema_tables[:20]:
                                 _cols = ", ".join(_t.get("columns", [])[:15])
                                 _lines.append(f"  - {_t['name']}  columns: [{_cols}]")
+
+                            # Token optimization: pre-resolve likely table roles for
+                            # finance agents so they can skip a discovery turn instead
+                            # of spending a run_sql call figuring out "which table is
+                            # the transaction table" on every single invocation.
+                            if domain == "finance":
+                                from agent_service.agents.table_role_classifier import (
+                                    classify_table_roles, format_table_roles,
+                                )
+                                _role_block = format_table_roles(
+                                    classify_table_roles(_enriched.compact_tables)
+                                )
+                                if _role_block:
+                                    _lines += ["", _role_block]
+
                             _lines += ["", f"User request: {user_text}"]
                             agent_user_text = "\n".join(_lines)
                             print(
@@ -788,6 +806,32 @@ class Orchestrator:
                             await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "fix_column_error"})
                             continue
 
+                # ── 2b. Unqualified column ref check ─────────────────────────────
+                # Catches bare column names like SELECT revenue FROM tbl that the
+                # qualified check above misses (it only handles tbl.revenue).
+                if enriched and enriched.compact_tables and query_plan.sql:
+                    from agent_service.agents.sql_utils import verify_all_column_refs
+                    _all_col_errs = verify_all_column_refs(
+                        query_plan.sql, enriched.compact_tables,
+                        candidate_tables=[query_plan.table_used] if query_plan.table_used else None,
+                    )
+                    # Isolate unqualified errors only (qualified errors were already handled above)
+                    _unqual_errs = [e for e in _all_col_errs if "not found in any referenced table" in e]
+                    if _unqual_errs and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                        _ct_map_uq = {t["name"]: t for t in enriched.compact_tables}
+                        _cand_uq = _ct_map_uq.get(query_plan.table_used or "")
+                        _hint_uq = ""
+                        if _cand_uq:
+                            _cols_uq = [c.get("name") for c in _cand_uq.get("columns", [])[:20]]
+                            _hint_uq = f" Real columns in {query_plan.table_used}: {', '.join(_cols_uq)}."
+                        retry_feedback = (
+                            f"Unrecognised column(s) detected: {'; '.join(_unqual_errs[:3])}.{_hint_uq} "
+                            "Use only column names that exist in the schema above."
+                        )
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "fix_unqual_column"})
+                        print(f"[orchestrator:{job_id[:8]}] unqual col check: {_unqual_errs[:3]}", flush=True)
+                        continue
+
                 # ── Filter-value verification: fix case mismatches in WHERE literals ──
                 # ("status = 'placed'" when the DB stores 'Placed' → silent 0 rows)
                 if enriched and getattr(enriched, "entity_columns", None):
@@ -1056,6 +1100,24 @@ class Orchestrator:
                         )
                         await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": "no_numeric_column"})
                         print(f"[orchestrator:{job_id[:8]}] no numeric column for {_san_ct}", flush=True)
+                        continue
+
+                # 4. NULL aggregate + all-zero value checks (gaps in the checks above)
+                if _san_rows and _san_cols and attempt < _MAX_SINGLE_VIZ_ATTEMPTS:
+                    from agent_service.agents.sql_utils import check_result_sanity
+                    _san_ok, _san_msg = check_result_sanity(
+                        _san_rows, _san_cols, _san_ct, query_plan.sql
+                    )
+                    if not _san_ok and _san_msg:
+                        retry_feedback = _san_msg + (
+                            " Rewrite the query to return a non-null, non-zero value."
+                        )
+                        _strategy = (
+                            "null_aggregate" if "NULL" in _san_msg
+                            else "all_zero_values"
+                        )
+                        await emit({"type": "validation.retry", "job_id": job_id, "attempt": attempt + 1, "strategy": _strategy})
+                        print(f"[orchestrator:{job_id[:8]}] result sanity: {_san_msg[:120]}", flush=True)
                         continue
 
                 # Post-execution: correct the chart title's year range to match actual data.
