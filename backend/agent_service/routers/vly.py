@@ -428,6 +428,9 @@ async def _generate_vly(
     # ── schema_enriched.json ──────────────────────────────────────────────────
     schema_enriched_doc: dict = {}
     used_tables_lower: set[str] = set()
+    # scope_lower tracks the report's own tables + 2-hop FK neighbours; populated
+    # inside the enriched-schema block below and reused to filter schema_metadata.
+    scope_lower: set[str] = set()
     for hint in schema_hints:
         t = hint.get("table", "")
         if t:
@@ -497,7 +500,7 @@ async def _generate_vly(
                 except Exception as exc:
                     print(f"[vly-export] neighbour expansion failed (non-fatal): {exc}", flush=True)
 
-            scope_lower = used_tables_lower | related_lower
+            scope_lower = used_tables_lower | related_lower  # hoisted — reused in schema_metadata filter
             filtered_tables = {
                 tbl: info for tbl, info in table_items
                 if tbl.lower() in scope_lower or tbl.split(".")[-1].lower() in scope_lower
@@ -560,15 +563,36 @@ async def _generate_vly(
                         "enriched":              json.loads(enriched_json),
                     }
 
-                # Approach C — durable LLM metadata rows (warms future re-builds too)
-                tbl_meta_rows = (await db.execute(
+                # Approach C — durable LLM metadata rows (report-scoped: only tables
+                # used by this report + 2-hop FK neighbours, not the whole database).
+                # This keeps schema_metadata.json small and prevents the AI copilot
+                # from seeing unrelated tables, which wastes tokens.
+                _all_tbl_meta = (await db.execute(
                     select(SchemaTableMetadata)
                     .where(SchemaTableMetadata.connection_id == sample_conn_id)
                 )).scalars().all()
-                col_meta_rows = (await db.execute(
+                _all_col_meta = (await db.execute(
                     select(SchemaColumnMetadata)
                     .where(SchemaColumnMetadata.connection_id == sample_conn_id)
                 )).scalars().all()
+
+                # Filter to report scope (used tables + FK neighbours).
+                # scope_lower is empty only when enriched schema was unavailable;
+                # in that case fall back to all metadata so we don't export nothing.
+                if scope_lower:
+                    tbl_meta_rows = [
+                        r for r in _all_tbl_meta
+                        if r.table_name.lower() in scope_lower
+                        or r.table_name.split(".")[-1].lower() in scope_lower
+                    ]
+                    col_meta_rows = [
+                        r for r in _all_col_meta
+                        if r.table_name.lower() in scope_lower
+                        or r.table_name.split(".")[-1].lower() in scope_lower
+                    ]
+                else:
+                    tbl_meta_rows = _all_tbl_meta
+                    col_meta_rows = _all_col_meta
 
                 if tbl_meta_rows or col_meta_rows:
                     schema_metadata_doc = {
@@ -576,6 +600,8 @@ async def _generate_vly(
                         "cache_format_version": 1,
                         "snapshot_version":     cache_snap.version,
                         "exported_at":          now_iso,
+                        "scoped_to_report":     bool(scope_lower),
+                        "report_tables":        sorted(used_tables_lower),
                         "tables": [
                             {
                                 "schema_snapshot_version": r.schema_snapshot_version,
@@ -617,7 +643,9 @@ async def _generate_vly(
                 print(
                     f"[vly-export] embedded schema cache "
                     f"(cache={'yes' if schema_cache_doc else 'no'}, "
-                    f"tbl_meta={len(tbl_meta_rows)}, col_meta={len(col_meta_rows)})",
+                    f"tbl_meta={len(tbl_meta_rows)}/{len(_all_tbl_meta)} "
+                    f"col_meta={len(col_meta_rows)}/{len(_all_col_meta)} "
+                    f"scope={'report-scoped' if scope_lower else 'full-db'})",
                     flush=True,
                 )
         except Exception as exc:

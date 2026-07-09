@@ -35,7 +35,7 @@ from sqlalchemy import select
 from shared.database import get_db
 from shared.redis_client import get_redis
 from shared.models.schema_snapshots import SchemaSnapshot
-from shared.models.database_connections import DatabaseConnection
+from shared.models.database_connections import DatabaseConnection, DbType
 from shared.models.dashboards import Dashboard
 from shared.models.widgets import Widget
 from agent_service.agents.intelligence_chat_agent import (
@@ -251,6 +251,11 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         except Exception as _nl2sql_err:
             print(f"[intel_chat] ⚠ NL2SQL pipeline failed (non-fatal): {_nl2sql_err}", flush=True)
 
+    # Detect offline mode once here so callers don't need extra DB queries.
+    is_offline = bool(effective_connection_id) and await _is_offline_connection(effective_connection_id, db)
+    if is_offline:
+        print(f"[intel_chat] offline canvas detected  connection={effective_connection_id[:8] if effective_connection_id else 'none'}", flush=True)
+
     return {
         "session_id": session_id,
         "history": history,
@@ -264,16 +269,83 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         "model_pref": effective_model_pref,
         "verified_tables_doc": verified_tables_doc,
         "resolved_context": resolved_context,
+        "is_offline": is_offline,
     }
 
 
+async def _is_offline_connection(connection_id: Optional[str], db: AsyncSession) -> bool:
+    """Return True when connection_id belongs to a synthetic vly_offline connection."""
+    if not connection_id:
+        return False
+    try:
+        conn_r = await db.execute(
+            select(DatabaseConnection).where(DatabaseConnection.id == uuid.UUID(connection_id))
+        )
+        conn = conn_r.scalar_one_or_none()
+        if not conn:
+            return False
+        db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+        return db_type == "vly_offline"
+    except Exception:
+        return False
+
+
+def _validate_sql_safety(sql: str) -> Optional[str]:
+    """Return an error message if sql contains writes/DDL; None means safe."""
+    stripped = sql.strip().lstrip("(")
+    first = stripped[:10].upper()
+    for keyword in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "GRANT", "REVOKE"):
+        if first.startswith(keyword):
+            return f"SQL must be read-only SELECT/WITH — {keyword} statements are not allowed."
+    # Block access to system catalog tables.
+    lower = sql.lower()
+    for sys_tbl in ("information_schema.", "pg_catalog.", "pg_class", "pg_namespace"):
+        if sys_tbl in lower:
+            return f"Access to system tables ({sys_tbl.rstrip('.')}) is not allowed in report mode."
+    return None
+
+
+def _check_table_scope(sql: str, allowed_tables: set[str]) -> Optional[str]:
+    """Warn (non-blocking) if SQL references tables outside the report's scope.
+    Returns a warning string or None. Does NOT block execution — only logs."""
+    if not allowed_tables:
+        return None
+    from_join = re.findall(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE)
+    ctes = {m.lower() for m in re.findall(r'\b([a-zA-Z_]\w*)\s+AS\s*\(', sql, re.IGNORECASE)}
+    out_of_scope = []
+    for tbl in from_join:
+        bare = tbl.split(".")[-1].lower()
+        if bare in ctes:
+            continue
+        if tbl.lower() not in allowed_tables and bare not in allowed_tables:
+            out_of_scope.append(tbl)
+    return f"[scope] SQL references table(s) outside report: {out_of_scope}" if out_of_scope else None
+
+
 async def _execute_and_build_chart(
-    sql_spec: dict, connection_id: Optional[str]
+    sql_spec: dict,
+    connection_id: Optional[str],
+    db: Optional[AsyncSession] = None,
+    dashboard_id: Optional[str] = None,
+    priority_tables: Optional[set] = None,
 ) -> tuple[Optional[dict], Optional[str]]:
     """Run a sql_execute spec and build the inline_chart payload.
+    Routes to offline DuckDB when the connection is a vly_offline synthetic one.
     Returns (inline_chart | None, warning_text | None)."""
     if sql_spec.get("sql"):
         print(f"[intel_chat] generated SQL: {sql_spec['sql'][:400]}", flush=True)
+
+    # Guardrail: reject non-SELECT statements before execution.
+    safety_err = _validate_sql_safety(sql_spec.get("sql") or "")
+    if safety_err:
+        print(f"[intel_chat] ⚠ SQL safety check failed: {safety_err}", flush=True)
+        return None, f"\n\n⚠️ {safety_err}"
+
+    # Scope check: log out-of-scope table access (non-blocking — warns but runs).
+    scope_warn = _check_table_scope(sql_spec.get("sql") or "", priority_tables or set())
+    if scope_warn:
+        print(f"[intel_chat] ⚠ {scope_warn}", flush=True)
+
     if not connection_id:
         print("[intel_chat] ⚠ no connection available to execute SQL", flush=True)
         return None, ("\n\n⚠️ I couldn't run the query: no active database connection "
@@ -281,12 +353,32 @@ async def _execute_and_build_chart(
     if not sql_spec.get("sql"):
         return None, None
 
-    exec_result = await _execute_sql(connection_id, sql_spec["sql"])
+    # Offline routing: vly_offline connections use DuckDB + Parquet instead of the live DB.
+    from shared.offline_store import execute_offline_sql as _exec_offline
+    is_offline = db is not None and await _is_offline_connection(connection_id, db)
+    if is_offline:
+        if not dashboard_id:
+            return None, "\n\n⚠️ Offline query failed: dashboard context unavailable."
+        exec_result = await _exec_offline(db, dashboard_id, sql_spec["sql"])
+        print(
+            f"[intel_chat] offline SQL  dashboard={dashboard_id[:8]}  "
+            f"rows={exec_result.get('row_count', 0)}  err={exec_result.get('error', 'none')[:80] if exec_result.get('error') else 'none'}",
+            flush=True,
+        )
+    else:
+        exec_result = await _execute_sql(connection_id, sql_spec["sql"])
     if exec_result.get("error"):
         print(f"[intel_chat] ⚠ sql exec error: {str(exec_result['error'])[:200]} — attempting self-correct", flush=True)
-        fixed_sql = await _self_correct_sql(connection_id, sql_spec["sql"], str(exec_result["error"]))
+        # For offline mode, skip live-column-lookup self-correct (no live DB); retry without it.
+        if not is_offline:
+            fixed_sql = await _self_correct_sql(connection_id, sql_spec["sql"], str(exec_result["error"]))
+        else:
+            fixed_sql = None
         if fixed_sql and fixed_sql.strip() != (sql_spec["sql"] or "").strip():
-            retry = await _execute_sql(connection_id, fixed_sql)
+            retry = (
+                await _exec_offline(db, dashboard_id, fixed_sql)
+                if is_offline else await _execute_sql(connection_id, fixed_sql)
+            )
             if not retry.get("error"):
                 print(f"[intel_chat] ✓ self-corrected SQL ran: {fixed_sql[:160]}", flush=True)
                 sql_spec = {**sql_spec, "sql": fixed_sql}
@@ -364,7 +456,11 @@ async def intel_chat(
 
     inline_chart = None
     if sql_spec:
-        inline_chart, warning = await _execute_and_build_chart(sql_spec, ctx["connection_id"])
+        inline_chart, warning = await _execute_and_build_chart(
+            sql_spec, ctx["connection_id"],
+            db=db, dashboard_id=req.dashboard_id,
+            priority_tables=ctx.get("priority_tables"),
+        )
         if warning:
             result["text"] = (result.get("text") or "").rstrip() + warning
     elif _is_data_query_request(req.message) or _is_chart_creation_request(req.message):
@@ -496,7 +592,12 @@ async def intel_chat_stream(
         final_text = parsed["text"]
 
         if sql_spec:
-            inline_chart, warning = await _execute_and_build_chart(sql_spec, ctx["connection_id"])
+            inline_chart, warning = await _execute_and_build_chart(
+                sql_spec, ctx["connection_id"],
+                db=db if ctx.get("is_offline") else None,
+                dashboard_id=req.dashboard_id,
+                priority_tables=ctx.get("priority_tables"),
+            )
             if warning:
                 final_text = (final_text or "").rstrip() + warning
                 yield _sse({"type": "text", "delta": warning})

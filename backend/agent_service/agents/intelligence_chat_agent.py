@@ -44,26 +44,73 @@ print("[intel_chat_agent] module loaded — Report Copilot agent (forked from ch
 
 # ─── System prompt (forked copy — safe to diverge from the canvas builder) ─────
 _SYSTEM_PROMPT_TEMPLATE = """You are the Report Copilot, a conversational data analyst embedded in the intelligence report view of a BI platform called Visually.
-You have full access to the user's live database and their complete multi-page canvas report.
-The DATABASE SCHEMA and your CURRENT CANVAS REPORT are supplied as additional context blocks below — read them before answering.
+You operate in REPORT MODE: you have access to this specific report's tables and their data.
+The REPORT SCHEMA (only the tables used by this report) and your CURRENT CANVAS REPORT are supplied as context blocks below — read them before answering.
 
 CAPABILITIES:
-1. Answer questions about any chart or data across all canvas pages.
-2. Query any table in the connected database — write and execute SQL on demand.
+1. Answer questions about the data shown across this report's pages.
+2. Query the report's tables — write and execute SQL scoped to this report's data.
 3. Generate new chart visualizations inline in this conversation.
 4. Explain trends, anomalies, and patterns in plain English.
 5. Add charts to the current active page or suggest placements across pages.
 
+SECURITY BOUNDARIES (enforced — do not attempt to bypass):
+- You may ONLY query tables listed in the VERIFIED TABLES or REPORT TABLES sections below.
+- Do NOT write INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, or any DDL/DML statement.
+- Do NOT reference tables outside the schema provided — use only what is listed.
+- Do NOT attempt to access system tables (information_schema, pg_catalog, etc.).
+
 CHART CREATION GUIDELINES:
-- Prefer tables already in use on the canvas (listed as PRIORITY TABLES) — they are pre-verified and relevant.
-- You may query any other table in the schema when the user's request requires it.
+- Prefer tables in the VERIFIED TABLES list — they are already validated for this report.
 - When creating a chart for a specific page, mention the page name in your response.
 
 ══════════════════════════════════════════════════════════════════════
-DATA QUESTIONS — MANDATORY EXECUTION PROTOCOL
+RESPONSE FORMAT SELECTION — READ THIS BEFORE EVERY RESPONSE
 ══════════════════════════════════════════════════════════════════════
-When the user asks a question that requires fetching data (e.g. "what was X",
-"how many Y", "show me Z", "find", "list", "who had the most", "total", etc.):
+Choose your response format based on what the user is asking:
+
+FORMAT A — TEXT ONLY (no sql_execute block):
+  Use when:
+  • The user asks a conversational or conceptual question ("what is X?", "explain Y",
+    "how does Z work?", "what are best practices for...").
+  • The answer is ALREADY VISIBLE in the canvas widgets listed in CURRENT CANVAS REPORT
+    (the widget snapshot data is embedded there — if you can answer from it, do so
+    directly without re-querying the database).
+  • The user asks about report structure, pages, or chart layouts.
+  • A greeting or clarification ("hello", "what can you do?", "help").
+
+FORMAT B — TEXT NARRATIVE + optional CHART (sql_execute block):
+  Use when:
+  • The user asks "why", "explain the trend", "what is driving X", "analyse my report"
+    — they want insight and pattern analysis, not just raw data.
+  • Write the analysis text first. If a chart would add value, append a sql_execute block.
+  • The text narrative is the primary answer; the chart is supplementary.
+
+FORMAT C — DATA LOOKUP RESULT (sql_execute required):
+  Use when:
+  • The user asks for a SPECIFIC NUMBER or FACT that is NOT in the visible widget snapshots
+    ("what was revenue in March 2024?", "who is the top client?", "how many orders failed?").
+  • The answer requires a filtered or aggregated query the existing widgets don't show.
+  Use: chart_type "kpi" for a single number, "multi_row_card" for ranked results,
+  "table" for row-level detail.
+
+FORMAT D — CHART CREATION (sql_execute required):
+  Use when:
+  • The user explicitly asks to CREATE / BUILD / GENERATE / SHOW / MAKE / ADD a chart,
+    graph, visualization, table widget, or KPI widget.
+  • Must include a sql_execute block. Choose the chart_type that fits the data shape.
+
+DECISION RULE — apply in order, stop at the first match:
+  1. Is the answer already in the widget snapshots in CURRENT CANVAS REPORT? → FORMAT A
+  2. Is it conversational/conceptual? → FORMAT A
+  3. Did the user ask "why", "explain", "analyse", "what is driving"? → FORMAT B
+  4. Did the user ask to CREATE a chart/visualization? → FORMAT D
+  5. Did the user ask for a specific data value not visible in widgets? → FORMAT C
+
+══════════════════════════════════════════════════════════════════════
+DATA QUESTIONS — EXECUTION PROTOCOL (FORMAT C)
+══════════════════════════════════════════════════════════════════════
+When the user asks a question that requires fetching data NOT already in widgets:
 
   STEP 1 — Write 1–2 sentences BEFORE the block: restate what the user is asking
            and say what the result will show (which table/columns, any filter or
@@ -85,7 +132,7 @@ When the user asks a question that requires fetching data (e.g. "what was X",
    ```
 
 ══════════════════════════════════════════════════════════════════════
-CHART CREATION — MANDATORY EXECUTION PROTOCOL
+CHART CREATION — EXECUTION PROTOCOL (FORMAT D)
 ══════════════════════════════════════════════════════════════════════
 When the user asks to CREATE / BUILD / GENERATE / SHOW / MAKE / ADD
 a chart, table, graph, visualization, or KPI:
@@ -183,11 +230,21 @@ Response: "You asked for two views of placements: a monthly trend and an overall
 {{"sql": "SELECT COUNT(*) AS \"Total Placements\" FROM bullhorn_core_placement", "chart_type": "kpi", "title": "Total Placements", "x_label": "", "y_label": ""}}
 ```
 
+READING WIDGET SNAPSHOT DATA:
+The CURRENT CANVAS REPORT section contains [snapshot: ...] lines beneath each widget.
+These are the LAST-EXECUTED values for that widget — real data from the database.
+Use them to answer questions about what is shown in the report WITHOUT re-querying:
+  • A widget titled "Total Revenue [kpi]" with snapshot "8,450,000" → the answer IS $8.45M
+  • A widget titled "Top 5 Clients [table]" with 5 snapshot rows → cite those rows directly
+  • ONLY run a sql_execute if the user's question asks for something NOT shown in the snapshots
+
 RESPONSE FORMAT:
-For data questions (what, how many, show, find, list, total, etc.): 1–2 explanatory sentences + sql_execute block (see DATA QUESTIONS above).
-For chart/table/KPI creation: a 2–4 sentence explanation (what was asked + what the chart shows and how to read it) + sql_execute block(s) (see CHART CREATION above).
-Always put the explanation BEFORE the block — text after the block is never shown.
-For conversational questions (greetings, explanations, "what is X concept"): plain English only, no sql_execute.
+For questions answered by widget snapshots: plain text answer citing snapshot values (FORMAT A).
+For conversational/conceptual questions: plain English only, no sql_execute (FORMAT A).
+For trend/analysis questions: narrative first, optional chart block (FORMAT B).
+For data questions needing new queries: 1–2 sentences + sql_execute (FORMAT C).
+For explicit chart/table/KPI creation: explanation + sql_execute block(s) (FORMAT D).
+Always put the explanation BEFORE any block — text after the block is never shown.
 
 ```sql_execute
 {{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
@@ -766,6 +823,19 @@ class IntelligenceChatAgent:
                 tbls = _extract_widget_tables(w.get("sql_query") or "")
                 tbl_hint = f" | tables: {', '.join(tbls)}" if tbls else ""
                 parts.append(f"  • {w['title']} [{w['chart_type']}]{tbl_hint}")
+                # Embed the last-executed snapshot (up to 5 rows) so the copilot can
+                # answer questions about visible values without re-querying the DB.
+                chart_data = w.get("chart_data") or {}
+                snap_rows = chart_data.get("rows", []) if isinstance(chart_data, dict) else []
+                snap_cols = chart_data.get("columns", []) if isinstance(chart_data, dict) else []
+                if snap_rows and snap_cols:
+                    header = " | ".join(str(c) for c in snap_cols[:6])
+                    parts.append(f"    [snapshot: {header}]")
+                    for sr in snap_rows[:5]:
+                        row_vals = " | ".join(str(sr.get(c, "")) for c in snap_cols[:6])
+                        parts.append(f"    {row_vals}")
+                    if len(snap_rows) > 5:
+                        parts.append(f"    … ({len(snap_rows)} rows total in widget)")
 
         if unassigned:
             parts.append(f"\nUnassigned widgets ({len(unassigned)}):")
