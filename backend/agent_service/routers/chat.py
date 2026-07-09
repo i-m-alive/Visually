@@ -4,6 +4,8 @@ import uuid
 import json
 import re
 import os
+import types
+from dataclasses import dataclass
 from typing import Optional
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -34,6 +36,9 @@ from agent_service.agents.nl_schema_router import route_query
 
 router = APIRouter(tags=["chat"])
 _agent = ChatAgent()
+
+from agent_service.agents.root_cause_agent import RootCauseAgent  # noqa: E402
+_root_cause = RootCauseAgent()
 
 QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://localhost:3001")
@@ -79,6 +84,7 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
     )
 
     history = await ChatAgent.load_history(session_id, redis)
+    memory = await ChatAgent.load_memory(session_id, redis)
     schema_doc, connection_id_for_schema, db_type = await _get_schema_context(req.project_id, db)
     effective_connection_id = req.connection_id or connection_id_for_schema
 
@@ -118,11 +124,12 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
 
     # ── NL2SQL two-stage pipeline (non-blocking; failures produce None) ──────
     resolved_context = None
+    _parsed_intent = None
     if enriched and req.message.strip():
         try:
-            intent = await parse_intent(req.message)
-            if intent.needs_sql:
-                resolved_context = route_query(intent, enriched, req.message)
+            _parsed_intent = await parse_intent(req.message)
+            if _parsed_intent.needs_sql:
+                resolved_context = route_query(_parsed_intent, enriched, req.message)
                 print(
                     f"[chat] NL2SQL resolved  tables={resolved_context.relevant_tables[:4]}"
                     f"  entities={len(resolved_context.entity_resolutions)}"
@@ -131,6 +138,35 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
                 )
         except Exception as _nl2sql_err:
             print(f"[chat] ⚠ NL2SQL pipeline failed (non-fatal): {_nl2sql_err}", flush=True)
+
+    # ── Full graph-RAG retrieval (scope=database only) ────────────────────────
+    # graph_rag_retriever.retrieve() produces richer TableCandidate objects with
+    # column-level hints (metric/dimension/date), entity filter hints, and verified
+    # FK join paths — far more useful for SQL generation than nl_schema_router alone.
+    retrieved_graphrag = None
+    if (req.scope or "database") == "database" and enriched and _parsed_intent:
+        try:
+            from agent_service.agents.graph_rag_retriever import retrieve as _graphrag_retrieve
+            retrieved_graphrag = _graphrag_retrieve(
+                req.message, _parsed_intent, enriched, top_k=8,
+                history_tables=list(priority_tables) if priority_tables else None,
+            )
+            print(
+                f"[chat] graph-RAG  tables={retrieved_graphrag.primary_tables[:4]}  "
+                f"confidence={retrieved_graphrag.confidence:.2f}  "
+                f"candidates={len(retrieved_graphrag.candidates)}  "
+                f"needs_join={retrieved_graphrag.needs_join}",
+                flush=True,
+            )
+        except Exception as _rag_err:
+            print(f"[chat] ⚠ graph-RAG retrieval failed (non-fatal): {_rag_err}", flush=True)
+
+    # ── Offline connection detection ──────────────────────────────────────────
+    # vly_offline (imported canvas, no live DB) connections can only serve their
+    # embedded tables. The query executor already routes these to DuckDB
+    # transparently, but the guardrail/self-correct paths need to know so they
+    # skip live information_schema lookups that would otherwise fail.
+    is_offline = bool(effective_connection_id) and await _is_offline_connection(effective_connection_id, db)
 
     # Fetch project dashboards for navigation actions
     dashboards_list: list[dict] = []
@@ -150,32 +186,110 @@ async def _collect_chat_context(req: "ChatRequest", db: AsyncSession, redis) -> 
     return {
         "session_id": session_id,
         "history": history,
+        "memory": memory,
         "schema_doc": schema_doc,
         "enriched": enriched,
         "dashboard_widgets": dashboard_widgets,
         "dashboard_pages": dashboard_pages,
         "priority_tables": priority_tables,
         "connection_id": effective_connection_id,
+        "db_type": db_type,
         "model_pref": effective_model_pref,
         "resolved_context": resolved_context,
+        "retrieved_graphrag": retrieved_graphrag,
         "dashboards_list": dashboards_list,
+        "is_offline": is_offline,
     }
 
 
+async def _is_offline_connection(connection_id: Optional[str], db: AsyncSession) -> bool:
+    """Return True when connection_id belongs to a synthetic vly_offline connection."""
+    if not connection_id:
+        return False
+    try:
+        conn_r = await db.execute(
+            select(DatabaseConnection).where(DatabaseConnection.id == uuid.UUID(connection_id))
+        )
+        conn = conn_r.scalar_one_or_none()
+        if not conn:
+            return False
+        db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+        return db_type == "vly_offline"
+    except Exception:
+        return False
+
+
+@dataclass
+class ChartExecResult:
+    """Result of executing a sql_execute spec — richer than a plain (chart, warning)
+    tuple so callers can persist sql/error/low_confidence into conversation history
+    for later root-cause follow-ups (see _try_root_cause_followup)."""
+    inline_chart: Optional[dict] = None
+    warning: Optional[str] = None
+    sql: Optional[str] = None            # final SQL actually run/attempted, or None
+    error: Optional[str] = None          # execution error text, or None
+    low_confidence: bool = False
+
+
 async def _execute_and_build_chart(
-    sql_spec: dict, connection_id: Optional[str]
-) -> tuple[Optional[dict], Optional[str]]:
+    sql_spec: dict,
+    connection_id: Optional[str],
+    priority_tables: Optional[set] = None,
+    enriched=None,
+) -> ChartExecResult:
     """Run a sql_execute spec and build the inline_chart payload.
-    Returns (inline_chart | None, warning_text | None). The warning is appended to
-    the assistant text so a failed/empty query never produces a silent blank."""
+    The warning is appended to the assistant text so a failed/empty query never
+    produces a silent blank. Narration (result_narrator) is NOT called here —
+    callers do that after this returns, so streaming callers can yield the chart
+    immediately without waiting on an extra narration round-trip."""
     if sql_spec.get("sql"):
         print(f"[chat] generated SQL: {sql_spec['sql'][:400]}", flush=True)
+
+    # ── Guardrails: full layer stack (safety + scope + row-limit) ─────────────
+    # mode="database" — the Canvas Assistant can query any table; out-of-scope
+    # tables (relative to what's already on the canvas) only WARN, never block.
+    from agent_service.agents.intel_guardrails import apply_fulldb_guardrails
+    _gr = apply_fulldb_guardrails(
+        sql_spec.get("sql") or "", allowed_tables=priority_tables or None, mode="database",
+    )
+    if not _gr.safe:
+        print(f"[chat] ⚠ SQL guardrail blocked: {_gr.error}", flush=True)
+        return ChartExecResult(warning=f"\n\n⚠️ {_gr.error}", sql=sql_spec.get("sql"), error=_gr.error)
+    if _gr.warning:
+        print(f"[chat] ⚠ SQL guardrail warning: {_gr.warning}", flush=True)
+    # Row-limit-capped is benign (not a correctness signal); out-of-scope-table is.
+    _low_confidence = "outside the allowed scope" in (_gr.warning or "")
+    sql_spec = {**sql_spec, "sql": _gr.sql}
+
     if not connection_id:
         print("[chat] ⚠ no connection available to execute SQL", flush=True)
-        return None, ("\n\n⚠️ I couldn't run the query: no active database connection "
-                      "is available for this report.")
+        _msg = "no active database connection is available for this report."
+        return ChartExecResult(
+            warning=f"\n\n⚠️ I couldn't run the query: {_msg}",
+            sql=sql_spec.get("sql"), error=_msg,
+        )
     if not sql_spec.get("sql"):
-        return None, None
+        return ChartExecResult()
+
+    # ── Pre-execution: column existence check against schema cache ────────────
+    # Catches hallucinated column names before a DB round-trip. Qualified refs
+    # (table.col) are auto-corrected via fuzzy matching when possible.
+    if enriched and getattr(enriched, "compact_tables", None):
+        from agent_service.agents.sql_utils import verify_all_column_refs, fuzzy_fix_column_names
+        _col_errs = verify_all_column_refs(
+            sql_spec["sql"], enriched.compact_tables,
+            candidate_tables=list(priority_tables) if priority_tables else None,
+        )
+        if _col_errs:
+            _fixed_sql, _corrections = fuzzy_fix_column_names(
+                sql_spec["sql"], enriched.compact_tables,
+                candidate_tables=list(priority_tables) if priority_tables else None,
+            )
+            if _corrections:
+                print(f"[chat] pre-exec col fix: {_corrections}", flush=True)
+                sql_spec = {**sql_spec, "sql": _fixed_sql}
+            else:
+                print(f"[chat] ⚠ pre-exec col issues (unfixable): {_col_errs[:3]}", flush=True)
 
     exec_result = await _execute_sql(connection_id, sql_spec["sql"])
     if exec_result.get("error"):
@@ -183,21 +297,52 @@ async def _execute_and_build_chart(
         # the model borrowed a column from the wrong table. Fetch the real columns and
         # rewrite once before giving up — so a single SQL slip auto-heals.
         print(f"[chat] ⚠ sql exec error: {str(exec_result['error'])[:200]} — attempting self-correct", flush=True)
-        fixed_sql = await _self_correct_sql(connection_id, sql_spec["sql"], str(exec_result["error"]))
+        fixed_sql = await _self_correct_sql(
+            connection_id, sql_spec["sql"], str(exec_result["error"]), enriched=enriched,
+        )
         if fixed_sql and fixed_sql.strip() != (sql_spec["sql"] or "").strip():
             retry = await _execute_sql(connection_id, fixed_sql)
             if not retry.get("error"):
                 print(f"[chat] ✓ self-corrected SQL ran: {fixed_sql[:160]}", flush=True)
                 sql_spec = {**sql_spec, "sql": fixed_sql}
                 exec_result = retry
+                _low_confidence = True
             else:
                 print(f"[chat] ✗ self-correct retry still failed: {str(retry.get('error'))[:160]}", flush=True)
         if exec_result.get("error"):
-            return None, f"\n\n⚠️ The query failed to run: {exec_result['error']}"
+            return ChartExecResult(
+                warning=f"\n\n⚠️ The query failed to run: {exec_result['error']}",
+                sql=sql_spec.get("sql"), error=str(exec_result["error"]), low_confidence=True,
+            )
     if not exec_result.get("rows"):
         print(f"[chat] ⚠ sql returned 0 rows  sql={sql_spec['sql'][:160]}", flush=True)
-        return None, ("\n\n⚠️ The query ran but returned no rows — there may be no matching "
-                      "data, or a name/date filter didn't match. Try rephrasing or broadening it.")
+        return ChartExecResult(
+            warning=("\n\n⚠️ The query ran but returned no rows — there may be no matching "
+                     "data, or a name/date filter didn't match. Try rephrasing or broadening it."),
+            sql=sql_spec.get("sql"), error="Query returned 0 rows", low_confidence=True,
+        )
+
+    # ── Post-execution sanity: NULL aggregate + all-zero values ─────────────
+    # These pass SQL execution but silently produce a meaningless chart.
+    _post_columns = exec_result.get("columns", [])
+    _post_rows = exec_result.get("rows", [])
+    if _post_rows and _post_columns:
+        from agent_service.agents.sql_utils import check_result_sanity
+        _san_ok, _san_msg = check_result_sanity(
+            _post_rows, _post_columns, sql_spec.get("chart_type", ""), sql_spec["sql"]
+        )
+        if not _san_ok and _san_msg:
+            print(f"[chat] ⚠ post-exec sanity: {_san_msg[:200]}", flush=True)
+            _san_fixed = await _self_correct_sql(
+                connection_id, sql_spec["sql"], _san_msg, enriched=enriched,
+            )
+            if _san_fixed and _san_fixed.strip() != sql_spec["sql"].strip():
+                _san_retry = await _execute_sql(connection_id, _san_fixed)
+                if not _san_retry.get("error") and _san_retry.get("rows"):
+                    print("[chat] ✓ sanity self-correct succeeded", flush=True)
+                    sql_spec = {**sql_spec, "sql": _san_fixed}
+                    exec_result = _san_retry
+                    _low_confidence = True
 
     render_result = await _render_chart(sql_spec, exec_result["rows"])
     columns = exec_result.get("columns", [])
@@ -220,12 +365,109 @@ async def _execute_and_build_chart(
         "sql": sql_spec["sql"],
         "image_base64": render_result.get("image_base64"),
     }
-    return inline_chart, None
+    return ChartExecResult(inline_chart=inline_chart, sql=sql_spec["sql"], low_confidence=_low_confidence)
+
+
+async def _narrate_chart_result(user_text: str, sql_spec: dict, inline_chart: dict) -> Optional[str]:
+    """Post-execution, data-grounded narration of a successfully built chart.
+    Returns None (non-fatal) if narration fails or produces nothing — callers
+    must treat this as optional, matching result_narrator.py's own fail-open design."""
+    try:
+        from agent_service.agents.result_narrator import narrate, verify_narrative_grounding
+        qp = types.SimpleNamespace(
+            chart_type=sql_spec.get("chart_type"), title=sql_spec.get("title"),
+        )
+        narrative = await narrate(user_text, qp, inline_chart["chart_data"], output_mode="chart")
+        if not narrative:
+            return None
+        grounded, corrected = await verify_narrative_grounding(narrative, inline_chart["chart_data"])
+        if not grounded and corrected:
+            narrative = corrected
+        return narrative
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chat] narration failed (non-fatal): {exc}", flush=True)
+        return None
 
 
 def _no_sql_note() -> str:
     return ("\n\n⚠️ I wasn't able to generate the query for that. Try rephrasing, or name "
             "the table/columns you'd like me to use.")
+
+
+def _wants_root_cause_followup(user_text: str, history: list) -> Optional[dict]:
+    """Gate for the root-cause short-circuit: only fires when the user's phrasing
+    matches ROOT_CAUSE_FOLLOWUP_PATTERN AND the immediately-prior turn actually
+    recorded a failure/low-confidence flag. Returns that prior turn, or None."""
+    if not history:
+        return None
+    last_turn = history[-1]
+    if not (last_turn.get("role") == "assistant" and (last_turn.get("error") or last_turn.get("low_confidence"))):
+        return None
+    from agent_service.agents.sql_utils import ROOT_CAUSE_FOLLOWUP_PATTERN
+    if not ROOT_CAUSE_FOLLOWUP_PATTERN.search(user_text or ""):
+        return None
+    return last_turn
+
+
+async def _try_root_cause_followup(
+    user_text: str,
+    last_turn: dict,
+    connection_id: Optional[str],
+    db_type: str,
+    enriched,
+    priority_tables: Optional[set] = None,
+) -> Optional[dict]:
+    """Diagnose "why did that fail?" against the actual prior failure, instead of
+    blindly re-guessing. Returns a full response dict (inline_chart/text + narrative
+    + exec metadata) or None if diagnosis produces nothing usable."""
+    from agent_service.agents.sql_utils import root_cause_schema_context
+    failed_sql = last_turn.get("sql") or ""
+    tables: list[str] = []
+    if failed_sql:
+        for m in _FROM_JOIN_RE.findall(failed_sql):
+            n = m.strip()
+            if n and n not in tables:
+                tables.append(n)
+    rc_ctx = root_cause_schema_context(enriched, tables)
+    try:
+        diagnosis = await _root_cause.diagnose(
+            user_text=user_text,
+            failed_sql=failed_sql,
+            problem=last_turn.get("error") or (
+                "The previous result was flagged low-confidence — it may not "
+                "have accurately answered the question."
+            ),
+            db_type=db_type or "postgresql",
+            tables_context=rc_ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chat] root-cause diagnose failed (non-fatal): {exc}", flush=True)
+        return None
+
+    print(f"[chat] root_cause_diagnosis fired  root_cause={diagnosis.root_cause}  has_fix={bool(diagnosis.fixed_sql)}", flush=True)
+
+    if diagnosis.fixed_sql:
+        # Re-run through the normal execution path so the corrected SQL inherits
+        # guardrails, pre-exec column checks, and post-exec sanity checks instead
+        # of running agent-generated SQL unchecked.
+        exec_result = await _execute_and_build_chart(
+            {"sql": diagnosis.fixed_sql, "chart_type": "table", "title": "Corrected result"},
+            connection_id, priority_tables=priority_tables, enriched=enriched,
+        )
+        if exec_result.inline_chart:
+            narrative = await _narrate_chart_result(user_text, {"sql": diagnosis.fixed_sql}, exec_result.inline_chart)
+            text = f"{diagnosis.explanation} I corrected the query — here's the result."
+            return {
+                "text": text, "inline_chart": exec_result.inline_chart,
+                "narrative": narrative, "sql": exec_result.sql,
+                "error": None, "low_confidence": True,
+            }
+
+    return {
+        "text": diagnosis.explanation, "inline_chart": None,
+        "narrative": None, "sql": failed_sql or None,
+        "error": None, "low_confidence": True,
+    }
 
 
 async def _run_candidate_sql(
@@ -382,6 +624,28 @@ async def _try_multi_candidate_chat(
     return results
 
 
+def _build_history_turn(user_text: str, final_text: str, narrative: Optional[str],
+                         exec_result: Optional["ChartExecResult"]) -> tuple[dict, dict]:
+    """Build the (user, assistant) turn pair to persist. Concatenates the model's
+    pre-execution prose with the post-execution grounded narrative (when both exist
+    and differ) rather than replacing one with the other — the prose can carry
+    acknowledgment/drill-down framing the narrator never sees, while the narrative
+    is what makes a later "why is this happening" follow-up data-grounded."""
+    if final_text and narrative and narrative not in final_text:
+        content = final_text.rstrip() + "\n\n" + narrative
+    else:
+        content = narrative or final_text
+    assistant_turn = {"role": "assistant", "content": content}
+    if exec_result:
+        if exec_result.sql:
+            assistant_turn["sql"] = exec_result.sql
+        if exec_result.error:
+            assistant_turn["error"] = exec_result.error
+        if exec_result.low_confidence:
+            assistant_turn["low_confidence"] = True
+    return {"role": "user", "content": user_text}, assistant_turn
+
+
 @router.post("/agent/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
@@ -390,6 +654,29 @@ async def chat(
 ):
     start_token_tracking()
     ctx = await _collect_chat_context(req, db, redis)
+
+    # ── Root-cause follow-up short-circuit ────────────────────────────────────
+    # "why did that fail?" against an actually-failed prior turn skips the normal
+    # LLM-generation flow entirely and diagnoses against what really went wrong.
+    _rc_last_turn = _wants_root_cause_followup(req.message, ctx["history"])
+    if _rc_last_turn is not None:
+        rc = await _try_root_cause_followup(
+            req.message, _rc_last_turn, ctx["connection_id"], ctx.get("db_type", "postgresql"),
+            ctx.get("enriched"), priority_tables=ctx.get("priority_tables"),
+        )
+        if rc is not None:
+            user_turn, assistant_turn = _build_history_turn(
+                req.message, rc["text"], rc.get("narrative"),
+                ChartExecResult(sql=rc.get("sql"), error=rc.get("error"), low_confidence=rc.get("low_confidence", False)),
+            )
+            updated_history = ctx["history"] + [user_turn, assistant_turn]
+            new_memory = ChatAgent.distill_memory(ctx["memory"], req.message)
+            await ChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
+            return ChatResponse(
+                session_id=ctx["session_id"], text=assistant_turn["content"],
+                inline_chart=rc.get("inline_chart"), dashboard_action=None,
+                turn_count=len(updated_history) // 2, candidates=None,
+            )
 
     result = await _agent.respond(
         message=req.message,
@@ -406,6 +693,8 @@ async def chat(
         selected_tables=req.selected_tables,
         selected_hops=req.selected_hops if req.selected_hops is not None else 2,
         resolved_context=ctx.get("resolved_context"),
+        retrieved_graphrag=ctx.get("retrieved_graphrag"),
+        conversation_memory=ctx.get("memory"),
     )
 
     sql_spec = result.get("sql_to_execute")
@@ -418,12 +707,20 @@ async def chat(
 
     inline_chart = None
     candidates = None
+    narrative = None
+    exec_result: Optional[ChartExecResult] = None
     if sql_spec:
-        inline_chart, warning = await _execute_and_build_chart(sql_spec, ctx["connection_id"])
-        if warning:
-            result["text"] = (result.get("text") or "").rstrip() + warning
-        # Multi-candidate check: run alternative tables in parallel when routing is ambiguous.
+        exec_result = await _execute_and_build_chart(
+            sql_spec, ctx["connection_id"],
+            priority_tables=ctx.get("priority_tables"),
+            enriched=ctx.get("enriched"),
+        )
+        inline_chart = exec_result.inline_chart
+        if exec_result.warning:
+            result["text"] = (result.get("text") or "").rstrip() + exec_result.warning
         if inline_chart:
+            narrative = await _narrate_chart_result(req.message, sql_spec, inline_chart)
+            # Multi-candidate check: run alternative tables in parallel when routing is ambiguous.
             try:
                 candidates = await _try_multi_candidate_chat(req.message, ctx, inline_chart)
                 if candidates:
@@ -434,11 +731,10 @@ async def chat(
         result["text"] = (result.get("text") or "").rstrip() + _no_sql_note()
         print("[chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
 
-    updated_history = ctx["history"] + [
-        {"role": "user", "content": req.message},
-        {"role": "assistant", "content": result["text"]},
-    ]
-    await ChatAgent.save_history(ctx["session_id"], updated_history, redis)
+    user_turn, assistant_turn = _build_history_turn(req.message, result["text"], narrative, exec_result)
+    updated_history = ctx["history"] + [user_turn, assistant_turn]
+    new_memory = ChatAgent.distill_memory(ctx["memory"], req.message)
+    await ChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
 
     _scope_label = f"canvas/{req.scope or 'db'}"
     _tok_log = format_token_log(_scope_label, ctx["session_id"])
@@ -447,7 +743,7 @@ async def chat(
 
     return ChatResponse(
         session_id=ctx["session_id"],
-        text=result["text"],
+        text=assistant_turn["content"],
         inline_chart=inline_chart,
         dashboard_action=result.get("dashboard_action"),
         turn_count=len(updated_history) // 2,
@@ -470,6 +766,42 @@ async def chat_stream(
     _collect_chat_context, so the generator only touches Redis + httpx."""
     start_token_tracking()
     ctx = await _collect_chat_context(req, db, redis)
+
+    def _sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    # ── Root-cause follow-up short-circuit ────────────────────────────────────
+    # Skips the normal LLM-generation flow entirely — diagnoses against the
+    # actually-recorded failure instead of blindly re-guessing.
+    _rc_last_turn = _wants_root_cause_followup(req.message, ctx["history"])
+    if _rc_last_turn is not None:
+        async def _rc_event_gen():
+            rc = await _try_root_cause_followup(
+                req.message, _rc_last_turn, ctx["connection_id"], ctx.get("db_type", "postgresql"),
+                ctx.get("enriched"), priority_tables=ctx.get("priority_tables"),
+            )
+            if rc is None:
+                yield _sse({"type": "error", "message": "I couldn't diagnose the previous failure."})
+                yield _sse({"type": "done", "session_id": ctx["session_id"], "turn_count": len(ctx["history"]) // 2})
+                return
+            user_turn, assistant_turn = _build_history_turn(
+                req.message, rc["text"], rc.get("narrative"),
+                ChartExecResult(sql=rc.get("sql"), error=rc.get("error"), low_confidence=rc.get("low_confidence", False)),
+            )
+            yield _sse({"type": "text", "delta": assistant_turn["content"]})
+            if rc.get("inline_chart"):
+                yield _sse({"type": "chart", "chart": rc["inline_chart"]})
+            updated_history = ctx["history"] + [user_turn, assistant_turn]
+            new_memory = ChatAgent.distill_memory(ctx["memory"], req.message)
+            await ChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
+            yield _sse({"type": "done", "session_id": ctx["session_id"], "turn_count": len(updated_history) // 2})
+
+        return StreamingResponse(
+            _rc_event_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     system_blocks, messages, model_id, max_tokens = _agent.prepare(
         message=req.message,
         conversation_history=ctx["history"],
@@ -485,6 +817,8 @@ async def chat_stream(
         selected_tables=req.selected_tables,
         selected_hops=req.selected_hops if req.selected_hops is not None else 2,
         resolved_context=ctx.get("resolved_context"),
+        retrieved_graphrag=ctx.get("retrieved_graphrag"),
+        conversation_memory=ctx.get("memory"),
     )
 
     # Inject navigation context when the project has dashboards
@@ -500,9 +834,6 @@ async def chat_stream(
             "Use fuzzy/partial name matching to resolve the correct dashboard."
         )
         system_blocks = list(system_blocks) + [{"type": "text", "text": _nav_block}]
-
-    def _sse(obj: dict) -> str:
-        return f"data: {json.dumps(obj)}\n\n"
 
     async def event_gen():
         raw = ""
@@ -558,14 +889,26 @@ async def chat_stream(
                 sql_spec = retry_sqls[0]
 
         final_text = parsed["text"]
+        narrative = None
+        exec_result: Optional[ChartExecResult] = None
 
         if sql_spec:
-            inline_chart, warning = await _execute_and_build_chart(sql_spec, ctx["connection_id"])
-            if warning:
-                final_text = (final_text or "").rstrip() + warning
-                yield _sse({"type": "text", "delta": warning})
+            exec_result = await _execute_and_build_chart(
+                sql_spec, ctx["connection_id"],
+                priority_tables=ctx.get("priority_tables"),
+                enriched=ctx.get("enriched"),
+            )
+            inline_chart = exec_result.inline_chart
+            if exec_result.warning:
+                final_text = (final_text or "").rstrip() + exec_result.warning
+                yield _sse({"type": "text", "delta": exec_result.warning})
             if inline_chart:
+                # Yield the chart FIRST — narration below adds a Sonnet + Haiku
+                # round-trip and must never delay the chart the user is waiting on.
                 yield _sse({"type": "chart", "chart": inline_chart})
+                narrative = await _narrate_chart_result(req.message, sql_spec, inline_chart)
+                if narrative:
+                    yield _sse({"type": "text", "delta": "\n\n" + narrative})
                 # Multi-candidate: run alternatives when routing is ambiguous.
                 try:
                     candidates = await _try_multi_candidate_chat(req.message, ctx, inline_chart)
@@ -584,11 +927,10 @@ async def chat_stream(
         if parsed.get("dashboard_action"):
             yield _sse({"type": "action", "action": parsed["dashboard_action"]})
 
-        updated_history = ctx["history"] + [
-            {"role": "user", "content": req.message},
-            {"role": "assistant", "content": final_text},
-        ]
-        await ChatAgent.save_history(ctx["session_id"], updated_history, redis)
+        user_turn, assistant_turn = _build_history_turn(req.message, final_text, narrative, exec_result)
+        updated_history = ctx["history"] + [user_turn, assistant_turn]
+        new_memory = ChatAgent.distill_memory(ctx["memory"], req.message)
+        await ChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
 
         _tok_log = format_token_log(f"canvas/{req.scope or 'db'}(stream)", ctx["session_id"])
         if _tok_log:
@@ -602,6 +944,72 @@ async def chat_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/agent/chat/connection-status")
+async def chat_connection_status(
+    project_id: Optional[str] = None,
+    dashboard_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return whether a live database connection is available for the Canvas Assistant.
+
+    The frontend uses this to decide whether to show the "Selected tables" scope
+    picker and whether to warn the user that a query will run against bundled
+    (offline) data rather than a live database:
+      - has_live_connection=True  → full schema browsing + arbitrary queries available
+      - is_offline=True           → vly_offline canvas; queries only see bundled tables
+      - has_live_connection=False → no connection at all; show a "connect your database" prompt
+    """
+    has_live = False
+    conn_id: Optional[str] = None
+    is_offline_flag = False
+
+    if project_id:
+        try:
+            project_uuid = uuid.UUID(project_id)
+            conn_r = await db.execute(
+                select(DatabaseConnection)
+                .where(DatabaseConnection.project_id == project_uuid)
+                .where(DatabaseConnection.is_active == True)
+                .limit(1)
+            )
+            conn = conn_r.scalar_one_or_none()
+            if conn:
+                db_type_val = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+                if db_type_val == "vly_offline":
+                    is_offline_flag = True
+                    conn_id = str(conn.id)
+                else:
+                    has_live = True
+                    conn_id = str(conn.id)
+        except Exception as exc:
+            print(f"[chat] ⚠ connection-status project lookup failed: {exc}", flush=True)
+
+    if not has_live and not is_offline_flag and dashboard_id:
+        try:
+            fallback = await _get_dashboard_connection_id(dashboard_id, db)
+            if fallback:
+                offline = await _is_offline_connection(fallback, db)
+                if offline:
+                    is_offline_flag = True
+                    conn_id = fallback
+                else:
+                    has_live = True
+                    conn_id = fallback
+        except Exception as exc:
+            print(f"[chat] ⚠ connection-status dashboard fallback failed: {exc}", flush=True)
+
+    print(
+        f"[chat] connection-status  project={project_id or 'none'}  "
+        f"has_live={has_live}  is_offline={is_offline_flag}",
+        flush=True,
+    )
+    return {
+        "has_live_connection": has_live,
+        "connection_id": conn_id,
+        "is_offline": is_offline_flag,
+    }
 
 
 # ─── Export Chat endpoint ─────────────────────────────────────────────────────
@@ -826,23 +1234,50 @@ async def _fetch_table_columns(connection_id: str, schema: str, table: str) -> l
     return [str(r.get("column_name")) for r in (res.get("rows") or []) if r.get("column_name")]
 
 
-async def _self_correct_sql(connection_id: str, failed_sql: str, error_msg: str) -> Optional[str]:
-    """When a generated query references columns that don't exist, fetch the REAL
-    columns of the tables it used and ask the model to rewrite using only those.
+async def _self_correct_sql(
+    connection_id: str,
+    failed_sql: str,
+    error_msg: str,
+    enriched=None,
+) -> Optional[str]:
+    """When a generated query references columns that don't exist, look up the REAL
+    columns (from the enriched schema cache first, live DB as fallback) and ask the
+    model to rewrite using only those columns.
     Returns corrected SQL (or None if we couldn't help). This fixes the common
     case where the LLM borrows a column from the wrong table in a large schema."""
-    # Collect schema-qualified tables from the failed SQL (skip CTE/alias names).
     tables: list[str] = []
     for name in _FROM_JOIN_RE.findall(failed_sql or ""):
         n = name.strip()
-        if "." in n and n not in tables:
+        # Collect ALL FROM/JOIN targets, not just schema-qualified ones — a filter
+        # of "." in n here would silently drop unqualified table names.
+        if n and n not in tables:
             tables.append(n)
     col_lines: list[str] = []
-    for t in tables[:6]:
-        schema, _, table = t.partition(".")
-        cols = await _fetch_table_columns(connection_id, schema, table)
-        if cols:
-            col_lines.append(f'{t} has ONLY these columns: {", ".join(cols)}')
+
+    # Primary: use the enriched schema cache — instant, no DB round-trip needed.
+    if enriched and getattr(enriched, "compact_tables", None):
+        _ct_idx: dict[str, dict] = {}
+        for t in enriched.compact_tables:
+            tn = (t.get("name") or "").lower()
+            if tn:
+                _ct_idx[tn] = t
+                _ct_idx[tn.split(".")[-1]] = t
+        for tname in tables[:8]:
+            ct = _ct_idx.get(tname.lower()) or _ct_idx.get(tname.split(".")[-1].lower())
+            if ct:
+                cols = [c.get("name") for c in (ct.get("columns") or []) if c.get("name")]
+                if cols:
+                    col_lines.append(f'{ct.get("name")} has ONLY these columns: {", ".join(cols[:40])}')
+
+    # Fallback: live information_schema lookup for schema-qualified tables not in cache.
+    if not col_lines:
+        for t in tables[:6]:
+            if "." in t:
+                schema, _, table = t.partition(".")
+                cols = await _fetch_table_columns(connection_id, schema, table)
+                if cols:
+                    col_lines.append(f'{t} has ONLY these columns: {", ".join(cols)}')
+
     if not col_lines:
         return None
 

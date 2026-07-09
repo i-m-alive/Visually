@@ -25,6 +25,8 @@ import json
 import re
 import os
 import traceback
+import types
+from dataclasses import dataclass
 from typing import Optional
 import httpx
 from fastapi import APIRouter, Depends
@@ -53,6 +55,9 @@ from agent_service.agents.nl_schema_router import route_query
 
 router = APIRouter(tags=["intelligence-chat"])
 _agent = IntelligenceChatAgent()
+
+from agent_service.agents.root_cause_agent import RootCauseAgent  # noqa: E402
+_root_cause = RootCauseAgent()
 
 QUERY_EXECUTOR_URL = os.getenv("QUERY_EXECUTOR_URL", "http://localhost:8002")
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://localhost:3001")
@@ -292,6 +297,7 @@ async def _collect_chat_context(req: "IntelChatRequest", db: AsyncSession, redis
         "dashboard_pages": dashboard_pages,
         "priority_tables": priority_tables,
         "connection_id": effective_connection_id,
+        "db_type": db_type,
         "model_pref": effective_model_pref,
         "verified_tables_doc": verified_tables_doc,
         "resolved_context": resolved_context,
@@ -335,6 +341,18 @@ def _check_table_scope(sql: str, allowed_tables: set[str]) -> Optional[str]:
     return gr.warning if gr.safe else None
 
 
+@dataclass
+class ChartExecResult:
+    """Result of executing a sql_execute spec — richer than a plain (chart, warning)
+    tuple so callers can persist sql/error/low_confidence into conversation history
+    for later root-cause follow-ups (see _try_root_cause_followup)."""
+    inline_chart: Optional[dict] = None
+    warning: Optional[str] = None
+    sql: Optional[str] = None            # final SQL actually run/attempted, or None
+    error: Optional[str] = None          # execution error text, or None
+    low_confidence: bool = False
+
+
 async def _execute_and_build_chart(
     sql_spec: dict,
     connection_id: Optional[str],
@@ -342,10 +360,12 @@ async def _execute_and_build_chart(
     dashboard_id: Optional[str] = None,
     priority_tables: Optional[set] = None,
     enriched=None,
-) -> tuple[Optional[dict], Optional[str]]:
+) -> ChartExecResult:
     """Run a sql_execute spec and build the inline_chart payload.
     Routes to offline DuckDB when the connection is a vly_offline synthetic one.
-    Returns (inline_chart | None, warning_text | None)."""
+    Narration (result_narrator) is NOT called here — callers do that after this
+    returns, so streaming callers can yield the chart immediately without waiting
+    on an extra narration round-trip."""
     if sql_spec.get("sql"):
         print(f"[intel_chat] generated SQL: {sql_spec['sql'][:400]}", flush=True)
 
@@ -358,9 +378,11 @@ async def _execute_and_build_chart(
     )
     if not _gr.safe:
         print(f"[intel_chat] ⚠ SQL guardrail blocked: {_gr.error}", flush=True)
-        return None, f"\n\n⚠️ {_gr.error}"
+        return ChartExecResult(warning=f"\n\n⚠️ {_gr.error}", sql=sql_spec.get("sql"), error=_gr.error)
     if _gr.warning:
         print(f"[intel_chat] ⚠ SQL guardrail warning: {_gr.warning}", flush=True)
+    # Row-limit-capped is benign (not a correctness signal); out-of-scope-table is.
+    _low_confidence = "outside the allowed scope" in (_gr.warning or "")
     # Use the cleaned + row-limited SQL from guardrails.
     sql_spec = {**sql_spec, "sql": _gr.sql}
 
@@ -389,17 +411,22 @@ async def _execute_and_build_chart(
 
     if not connection_id:
         print("[intel_chat] ⚠ no connection available to execute SQL", flush=True)
-        return None, ("\n\n⚠️ I couldn't run the query: no active database connection "
-                      "is available for this report.")
+        _msg = "no active database connection is available for this report."
+        return ChartExecResult(
+            warning=f"\n\n⚠️ I couldn't run the query: {_msg}", sql=sql_spec.get("sql"), error=_msg,
+        )
     if not sql_spec.get("sql"):
-        return None, None
+        return ChartExecResult()
 
     # Offline routing: vly_offline connections use DuckDB + Parquet instead of the live DB.
     from shared.offline_store import execute_offline_sql as _exec_offline
     is_offline = db is not None and await _is_offline_connection(connection_id, db)
     if is_offline:
         if not dashboard_id:
-            return None, "\n\n⚠️ Offline query failed: dashboard context unavailable."
+            return ChartExecResult(
+                warning="\n\n⚠️ Offline query failed: dashboard context unavailable.",
+                sql=sql_spec.get("sql"), error="dashboard context unavailable",
+            )
         exec_result = await _exec_offline(db, dashboard_id, sql_spec["sql"])
         print(
             f"[intel_chat] offline SQL  dashboard={dashboard_id[:8]}  "
@@ -430,14 +457,21 @@ async def _execute_and_build_chart(
                 print(f"[intel_chat] ✓ self-corrected SQL ran: {fixed_sql[:160]}", flush=True)
                 sql_spec = {**sql_spec, "sql": fixed_sql}
                 exec_result = retry
+                _low_confidence = True
             else:
                 print(f"[intel_chat] ✗ self-correct retry still failed: {str(retry.get('error'))[:160]}", flush=True)
         if exec_result.get("error"):
-            return None, f"\n\n⚠️ The query failed to run: {exec_result['error']}"
+            return ChartExecResult(
+                warning=f"\n\n⚠️ The query failed to run: {exec_result['error']}",
+                sql=sql_spec.get("sql"), error=str(exec_result["error"]), low_confidence=True,
+            )
     if not exec_result.get("rows"):
         print(f"[intel_chat] ⚠ sql returned 0 rows  sql={sql_spec['sql'][:160]}", flush=True)
-        return None, ("\n\n⚠️ The query ran but returned no rows — there may be no matching "
-                      "data, or a name/date filter didn't match. Try rephrasing or broadening it.")
+        return ChartExecResult(
+            warning=("\n\n⚠️ The query ran but returned no rows — there may be no matching "
+                     "data, or a name/date filter didn't match. Try rephrasing or broadening it."),
+            sql=sql_spec.get("sql"), error="Query returned 0 rows", low_confidence=True,
+        )
 
     # ── Post-execution sanity: NULL aggregate + all-zero values ─────────────
     # These pass SQL execution but silently produce a meaningless chart.
@@ -465,6 +499,7 @@ async def _execute_and_build_chart(
                     exec_result = _san_retry
                     _post_columns = exec_result.get("columns", [])
                     _post_rows = exec_result.get("rows", [])
+                    _low_confidence = True
 
     render_result = await _render_chart(sql_spec, exec_result["rows"])
     columns = exec_result.get("columns", [])
@@ -486,12 +521,137 @@ async def _execute_and_build_chart(
         "image_base64": render_result.get("image_base64"),
     }
     print(f"[intel_chat] ✓ chart built  type={inline_chart['chart_type']}  rows={len(rows)}  cols={len(columns)}", flush=True)
-    return inline_chart, None
+    return ChartExecResult(inline_chart=inline_chart, sql=sql_spec["sql"], low_confidence=_low_confidence)
+
+
+async def _narrate_chart_result(user_text: str, sql_spec: dict, inline_chart: dict) -> Optional[str]:
+    """Post-execution, data-grounded narration of a successfully built chart.
+    Returns None (non-fatal) if narration fails or produces nothing — callers
+    must treat this as optional, matching result_narrator.py's own fail-open design."""
+    try:
+        from agent_service.agents.result_narrator import narrate, verify_narrative_grounding
+        qp = types.SimpleNamespace(
+            chart_type=sql_spec.get("chart_type"), title=sql_spec.get("title"),
+        )
+        narrative = await narrate(user_text, qp, inline_chart["chart_data"], output_mode="chart")
+        if not narrative:
+            return None
+        grounded, corrected = await verify_narrative_grounding(narrative, inline_chart["chart_data"])
+        if not grounded and corrected:
+            narrative = corrected
+        return narrative
+    except Exception as exc:  # noqa: BLE001
+        print(f"[intel_chat] narration failed (non-fatal): {exc}", flush=True)
+        return None
 
 
 def _no_sql_note() -> str:
     return ("\n\n⚠️ I wasn't able to generate the query for that. Try rephrasing, or name "
             "the table/columns you'd like me to use.")
+
+
+def _wants_root_cause_followup(user_text: str, history: list) -> Optional[dict]:
+    """Gate for the root-cause short-circuit: only fires when the user's phrasing
+    matches ROOT_CAUSE_FOLLOWUP_PATTERN AND the immediately-prior turn actually
+    recorded a failure/low-confidence flag. Returns that prior turn, or None."""
+    if not history:
+        return None
+    last_turn = history[-1]
+    if not (last_turn.get("role") == "assistant" and (last_turn.get("error") or last_turn.get("low_confidence"))):
+        return None
+    from agent_service.agents.sql_utils import ROOT_CAUSE_FOLLOWUP_PATTERN
+    if not ROOT_CAUSE_FOLLOWUP_PATTERN.search(user_text or ""):
+        return None
+    return last_turn
+
+
+async def _try_root_cause_followup(
+    user_text: str,
+    last_turn: dict,
+    connection_id: Optional[str],
+    db_type: str,
+    enriched,
+    priority_tables: Optional[set] = None,
+    db: Optional[AsyncSession] = None,
+    dashboard_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Diagnose "why did that fail?" against the actual prior failure, instead of
+    blindly re-guessing. Returns a full response dict (inline_chart/text + narrative
+    + exec metadata) or None if diagnosis produces nothing usable.
+
+    db/dashboard_id are threaded through so a corrected offline (vly_offline) query
+    still routes to DuckDB via _execute_and_build_chart's existing offline branch."""
+    from agent_service.agents.sql_utils import root_cause_schema_context
+    failed_sql = last_turn.get("sql") or ""
+    tables: list[str] = []
+    if failed_sql:
+        for m in _FROM_JOIN_RE.findall(failed_sql):
+            n = m.strip()
+            if n and n not in tables:
+                tables.append(n)
+    rc_ctx = root_cause_schema_context(enriched, tables)
+    try:
+        diagnosis = await _root_cause.diagnose(
+            user_text=user_text,
+            failed_sql=failed_sql,
+            problem=last_turn.get("error") or (
+                "The previous result was flagged low-confidence — it may not "
+                "have accurately answered the question."
+            ),
+            db_type=db_type or "postgresql",
+            tables_context=rc_ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[intel_chat] root-cause diagnose failed (non-fatal): {exc}", flush=True)
+        return None
+
+    print(f"[intel_chat] root_cause_diagnosis fired  root_cause={diagnosis.root_cause}  has_fix={bool(diagnosis.fixed_sql)}", flush=True)
+
+    if diagnosis.fixed_sql:
+        # Re-run through the normal execution path so the corrected SQL inherits
+        # offline routing, guardrails, and sanity checks instead of running
+        # agent-generated SQL unchecked.
+        exec_result = await _execute_and_build_chart(
+            {"sql": diagnosis.fixed_sql, "chart_type": "table", "title": "Corrected result"},
+            connection_id, db=db, dashboard_id=dashboard_id,
+            priority_tables=priority_tables, enriched=enriched,
+        )
+        if exec_result.inline_chart:
+            narrative = await _narrate_chart_result(user_text, {"sql": diagnosis.fixed_sql}, exec_result.inline_chart)
+            text = f"{diagnosis.explanation} I corrected the query — here's the result."
+            return {
+                "text": text, "inline_chart": exec_result.inline_chart,
+                "narrative": narrative, "sql": exec_result.sql,
+                "error": None, "low_confidence": True,
+            }
+
+    return {
+        "text": diagnosis.explanation, "inline_chart": None,
+        "narrative": None, "sql": failed_sql or None,
+        "error": None, "low_confidence": True,
+    }
+
+
+def _build_history_turn(user_text: str, final_text: str, narrative: Optional[str],
+                         exec_result: Optional["ChartExecResult"]) -> tuple[dict, dict]:
+    """Build the (user, assistant) turn pair to persist. Concatenates the model's
+    pre-execution prose with the post-execution grounded narrative (when both exist
+    and differ) rather than replacing one with the other — the prose can carry
+    acknowledgment/drill-down framing the narrator never sees, while the narrative
+    is what makes a later "why is this happening" follow-up data-grounded."""
+    if final_text and narrative and narrative not in final_text:
+        content = final_text.rstrip() + "\n\n" + narrative
+    else:
+        content = narrative or final_text
+    assistant_turn = {"role": "assistant", "content": content}
+    if exec_result:
+        if exec_result.sql:
+            assistant_turn["sql"] = exec_result.sql
+        if exec_result.error:
+            assistant_turn["error"] = exec_result.error
+        if exec_result.low_confidence:
+            assistant_turn["low_confidence"] = True
+    return {"role": "user", "content": user_text}, assistant_turn
 
 
 @router.post("/intelligence/chat", response_model=IntelChatResponse)
@@ -502,6 +662,30 @@ async def intel_chat(
 ):
     start_token_tracking()
     ctx = await _collect_chat_context(req, db, redis)
+
+    # ── Root-cause follow-up short-circuit ────────────────────────────────────
+    # "why did that fail?" against an actually-failed prior turn skips the normal
+    # LLM-generation flow entirely and diagnoses against what really went wrong.
+    _rc_last_turn = _wants_root_cause_followup(req.message, ctx["history"])
+    if _rc_last_turn is not None:
+        rc = await _try_root_cause_followup(
+            req.message, _rc_last_turn, ctx["connection_id"], ctx.get("db_type", "postgresql"),
+            ctx.get("enriched"), priority_tables=ctx.get("priority_tables"),
+            db=db, dashboard_id=req.dashboard_id,
+        )
+        if rc is not None:
+            user_turn, assistant_turn = _build_history_turn(
+                req.message, rc["text"], rc.get("narrative"),
+                ChartExecResult(sql=rc.get("sql"), error=rc.get("error"), low_confidence=rc.get("low_confidence", False)),
+            )
+            updated_history = ctx["history"] + [user_turn, assistant_turn]
+            new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
+            await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
+            return IntelChatResponse(
+                session_id=ctx["session_id"], text=assistant_turn["content"],
+                inline_chart=rc.get("inline_chart"), dashboard_action=None,
+                turn_count=len(updated_history) // 2,
+            )
 
     result = await _agent.respond(
         message=req.message,
@@ -530,23 +714,26 @@ async def intel_chat(
     )
 
     inline_chart = None
+    narrative = None
+    exec_result: Optional[ChartExecResult] = None
     if sql_spec:
-        inline_chart, warning = await _execute_and_build_chart(
+        exec_result = await _execute_and_build_chart(
             sql_spec, ctx["connection_id"],
             db=db, dashboard_id=req.dashboard_id,
             priority_tables=ctx.get("priority_tables"),
             enriched=ctx.get("enriched"),
         )
-        if warning:
-            result["text"] = (result.get("text") or "").rstrip() + warning
+        inline_chart = exec_result.inline_chart
+        if exec_result.warning:
+            result["text"] = (result.get("text") or "").rstrip() + exec_result.warning
+        if inline_chart:
+            narrative = await _narrate_chart_result(req.message, sql_spec, inline_chart)
     elif _is_data_query_request(req.message) or _is_chart_creation_request(req.message):
         result["text"] = (result.get("text") or "").rstrip() + _no_sql_note()
         print("[intel_chat] ⚠ data/chart request but no sql_execute block produced", flush=True)
 
-    updated_history = ctx["history"] + [
-        {"role": "user", "content": req.message},
-        {"role": "assistant", "content": result["text"]},
-    ]
+    user_turn, assistant_turn = _build_history_turn(req.message, result["text"], narrative, exec_result)
+    updated_history = ctx["history"] + [user_turn, assistant_turn]
     new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
     await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
 
@@ -558,7 +745,7 @@ async def intel_chat(
 
     return IntelChatResponse(
         session_id=ctx["session_id"],
-        text=result["text"],
+        text=assistant_turn["content"],
         inline_chart=inline_chart,
         dashboard_action=result.get("dashboard_action"),
         turn_count=len(updated_history) // 2,
@@ -584,6 +771,40 @@ async def intel_chat_stream(
     # bare 500 that the UI can only render as "something went wrong".
     try:
         ctx = await _collect_chat_context(req, db, redis)
+
+        # ── Root-cause follow-up short-circuit ────────────────────────────────
+        # Skips the normal LLM-generation flow entirely — diagnoses against the
+        # actually-recorded failure instead of blindly re-guessing.
+        _rc_last_turn = _wants_root_cause_followup(req.message, ctx["history"])
+        if _rc_last_turn is not None:
+            async def _rc_event_gen():
+                rc = await _try_root_cause_followup(
+                    req.message, _rc_last_turn, ctx["connection_id"], ctx.get("db_type", "postgresql"),
+                    ctx.get("enriched"), priority_tables=ctx.get("priority_tables"),
+                    db=db, dashboard_id=req.dashboard_id,
+                )
+                if rc is None:
+                    yield _sse({"type": "error", "message": "I couldn't diagnose the previous failure."})
+                    yield _sse({"type": "done", "session_id": ctx["session_id"], "turn_count": len(ctx["history"]) // 2})
+                    return
+                user_turn, assistant_turn = _build_history_turn(
+                    req.message, rc["text"], rc.get("narrative"),
+                    ChartExecResult(sql=rc.get("sql"), error=rc.get("error"), low_confidence=rc.get("low_confidence", False)),
+                )
+                yield _sse({"type": "text", "delta": assistant_turn["content"]})
+                if rc.get("inline_chart"):
+                    yield _sse({"type": "chart", "chart": rc["inline_chart"]})
+                updated_history = ctx["history"] + [user_turn, assistant_turn]
+                new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
+                await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
+                yield _sse({"type": "done", "session_id": ctx["session_id"], "turn_count": len(updated_history) // 2})
+
+            return StreamingResponse(
+                _rc_event_gen(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
         system_blocks, messages, model_id, max_tokens = _agent.prepare(
             message=req.message,
             conversation_history=ctx["history"],
@@ -667,20 +888,28 @@ async def intel_chat_stream(
                 sql_spec = retry_sqls[0]
 
         final_text = parsed["text"]
+        narrative = None
+        exec_result: Optional[ChartExecResult] = None
 
         if sql_spec:
-            inline_chart, warning = await _execute_and_build_chart(
+            exec_result = await _execute_and_build_chart(
                 sql_spec, ctx["connection_id"],
                 db=db if ctx.get("is_offline") else None,
                 dashboard_id=req.dashboard_id,
                 priority_tables=ctx.get("priority_tables"),
                 enriched=ctx.get("enriched"),
             )
-            if warning:
-                final_text = (final_text or "").rstrip() + warning
-                yield _sse({"type": "text", "delta": warning})
+            inline_chart = exec_result.inline_chart
+            if exec_result.warning:
+                final_text = (final_text or "").rstrip() + exec_result.warning
+                yield _sse({"type": "text", "delta": exec_result.warning})
             if inline_chart:
+                # Yield the chart FIRST — narration below adds a Sonnet + Haiku
+                # round-trip and must never delay the chart the user is waiting on.
                 yield _sse({"type": "chart", "chart": inline_chart})
+                narrative = await _narrate_chart_result(req.message, sql_spec, inline_chart)
+                if narrative:
+                    yield _sse({"type": "text", "delta": "\n\n" + narrative})
         elif _is_data_query_request(req.message) or _is_chart_creation_request(req.message):
             note = _no_sql_note()
             final_text = (final_text or "").rstrip() + note
@@ -690,10 +919,8 @@ async def intel_chat_stream(
         if parsed.get("dashboard_action"):
             yield _sse({"type": "action", "action": parsed["dashboard_action"]})
 
-        updated_history = ctx["history"] + [
-            {"role": "user", "content": req.message},
-            {"role": "assistant", "content": final_text},
-        ]
+        user_turn, assistant_turn = _build_history_turn(req.message, final_text, narrative, exec_result)
+        updated_history = ctx["history"] + [user_turn, assistant_turn]
         new_memory = IntelligenceChatAgent.distill_memory(ctx["memory"], req.message)
         await IntelligenceChatAgent.save_history(ctx["session_id"], updated_history, redis, memory=new_memory)
 

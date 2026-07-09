@@ -820,3 +820,36 @@ def normalize_string_comparisons_snowflake(sql: str) -> str:
     sql = _STR_IN_RE.sub(_in_sub, sql)
     sql = _STR_EQ_RE.sub(_eq_sub, sql)
     return sql
+
+
+# ── 7. Root-cause follow-up detection ─────────────────────────────────────────
+# Matches an explicit "why did that fail / why is this wrong" follow-up — domain
+# agnostic, shared by orchestrator.py and the chat routers' root-cause gates.
+# Only meaningful when combined with a check that the prior turn actually
+# recorded a failure/low-confidence flag (callers must AND that in themselves).
+
+ROOT_CAUSE_FOLLOWUP_PATTERN = re.compile(
+    r"\bwhy\s+(is|was|did|does|are)\b.{0,40}\b(wrong|fail(ed)?|off|so\s+(high|low)|error|empty|zero|broken)\b"
+    r"|\bwhat('s| is)\s+wrong\b"
+    r"|\bwhat\s+happened\b"
+    r"|\bdebug\s+(this|that)\b"
+    r"|\bexplain\s+(this|that)\s+(error|result|failure|number)\b",
+    re.IGNORECASE,
+)
+
+
+def root_cause_schema_context(enriched, table_names: list) -> list:
+    """Small {name, columns} list for the tables most likely relevant to a
+    root-cause diagnosis. Pure transform — no I/O, no DB, no LLM calls."""
+    if not enriched or not getattr(enriched, "compact_tables", None) or not table_names:
+        return []
+    ct_map = {t["name"]: t for t in enriched.compact_tables}
+    out = []
+    for tn in table_names[:5]:
+        ct = ct_map.get(tn)
+        if ct:
+            out.append({
+                "name": tn,
+                "columns": [c.get("name") for c in ct.get("columns", [])[:20]],
+            })
+    return out

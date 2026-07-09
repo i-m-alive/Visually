@@ -24,21 +24,17 @@ from agent_service.agents.validator_agent import ValidatorAgent
 import agent_service.agents.schema_cache as _schema_cache
 import agent_service.agents.graph_rag_retriever as _graph_rag
 from agent_service.services.ws_manager import manager as _ws_manager
+# Canonical definitions live in sql_utils.py (shared with the chat routers'
+# own root-cause gates); re-imported under the old private name so the rest
+# of this file needs no changes.
+from agent_service.agents.sql_utils import (
+    ROOT_CAUSE_FOLLOWUP_PATTERN as _ROOT_CAUSE_FOLLOWUP_PATTERN,
+    root_cause_schema_context as _root_cause_schema_context_fn,
+)
 
 # Minimum validation score to emit a chart result (was 0.80, kept retrying 4×).
 # 0.65 lets well-formed results pass on the first attempt.
 _VALIDATION_PASS_THRESHOLD = 0.65
-
-# Matches an explicit "why did that fail / why is this wrong" follow-up — domain
-# agnostic, gates the root-cause diagnosis path (see run_single_viz_pipeline).
-_ROOT_CAUSE_FOLLOWUP_PATTERN = re.compile(
-    r"\bwhy\s+(is|was|did|does|are)\b.{0,40}\b(wrong|fail(ed)?|off|so\s+(high|low)|error|empty|zero|broken)\b"
-    r"|\bwhat('s| is)\s+wrong\b"
-    r"|\bwhat\s+happened\b"
-    r"|\bdebug\s+(this|that)\b"
-    r"|\bexplain\s+(this|that)\s+(error|result|failure|number)\b",
-    re.IGNORECASE,
-)
 
 DASHBOARD_DECOMPOSE_MODEL = BEDROCK_HAIKU_MODEL
 DASHBOARD_MAX_CHARTS = 5        # max charts per dashboard (count cap)
@@ -66,19 +62,10 @@ class Orchestrator:
     @staticmethod
     def _root_cause_schema_context(enriched, table_names: list) -> list:
         """Small {name, columns} list for the tables most likely relevant to a
-        diagnosis — reused by both the automatic and on-demand root-cause paths."""
-        if not enriched or not getattr(enriched, "compact_tables", None) or not table_names:
-            return []
-        ct_map = {t["name"]: t for t in enriched.compact_tables}
-        out = []
-        for tn in table_names[:5]:
-            ct = ct_map.get(tn)
-            if ct:
-                out.append({
-                    "name": tn,
-                    "columns": [c.get("name") for c in ct.get("columns", [])[:20]],
-                })
-        return out
+        diagnosis — reused by both the automatic and on-demand root-cause paths.
+        Canonical implementation lives in sql_utils.py; kept as a delegating
+        staticmethod here for backward compat with this class's own call sites."""
+        return _root_cause_schema_context_fn(enriched, table_names)
 
     async def run_single_viz_pipeline(
         self,

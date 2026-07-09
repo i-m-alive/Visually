@@ -10,6 +10,7 @@ from agent_service.agents import schema_scope as _scope
 if TYPE_CHECKING:
     from agent_service.agents.schema_cache import EnrichedSchema
     from agent_service.agents.nl_schema_router import ResolvedContext
+    from agent_service.agents.graph_rag_retriever import RetrievedContext
 
 from agent_service.agents.nl_schema_router import format_routing_hints
 
@@ -100,6 +101,9 @@ CHAT_SELECTED_HOPS_DEFAULT = int(os.getenv("CHAT_SELECTED_HOPS_DEFAULT", "2"))
 
 # In-memory fallback when Redis is unavailable
 _memory_history: dict[str, list[dict]] = {}
+# Distilled conversation memory (gist of prior questions), Redis-less fallback.
+_memory_summary: dict[str, list[str]] = {}
+_CHAT_MEMORY_MAX = 20  # max remembered prior-question gists
 
 _SYSTEM_PROMPT_TEMPLATE = """You are a conversational data analyst embedded in a BI platform called Visually.
 You have full access to the user's live database and their complete multi-page canvas report.
@@ -325,6 +329,18 @@ The user has already provided the full pre-computed report data inline.
 - If the answer is in the data, cite the exact numbers right away.
 - Only generate SQL if the question explicitly asks for something NOT present in the provided data.
 
+WHY / EXPLAIN / ROOT-CAUSE QUESTIONS — DRILL-DOWN PROTOCOL:
+When the user asks WHY a number is what it is, asks you to EXPLAIN a metric or trend, or
+asks HOW a result was reached (e.g. "why is revenue down?", "explain the churn", "what is
+driving this?", "break this down"):
+  1. Acknowledge what metric is being discussed (1 sentence).
+  2. Generate SQL that DECOMPOSES the metric — don't just re-run the same query:
+     break it down by the most useful dimension (segment, region, time, status, etc.),
+     show top contributors (ORDER BY value DESC LIMIT 10-20), or show the trend over time.
+  3. The explanation must come BEFORE the sql_execute block, never after it.
+A vague answer with no SQL ("it's probably because of X") is not acceptable — the user
+needs a real breakdown grounded in a fresh query, not a guess.
+
 TONE: Clear, helpful, and data-focused. For charts/tables/KPIs, always explain the request and what the chart shows in 2–4 sentences BEFORE the block (never after it). Reference actual values when the data is already provided; avoid empty filler phrases."""
 
 # ── Prompt zones (see chat_agent caching design) ──────────────────────────────
@@ -429,7 +445,12 @@ def _is_chart_creation_request(message: str) -> bool:
 
 
 def _is_data_query_request(message: str) -> bool:
-    """Return True when the message is asking a data question that requires SQL."""
+    """Return True when the message is asking a data question that requires SQL.
+
+    Also covers "why/explain/drill-down" requests: even when the user already has a
+    number in front of them, asking WHY it is that value or to EXPLAIN it requires
+    generating SQL to show the underlying breakdown/drivers.
+    """
     lower = message.lower()
     # Question starters that imply a data lookup
     question_starters = (
@@ -438,6 +459,10 @@ def _is_data_query_request(message: str) -> bool:
         "fetch", "retrieve", "calculate", "compute", "sum", "count",
         "total", "average", "top", "bottom", "highest", "lowest",
         "most", "least", "compare", "breakdown", "analyse", "analyze",
+        # WHY / EXPLAIN / ROOT-CAUSE triggers
+        "why", "explain", "reason", "cause", "what caused", "what is driving",
+        "what's driving", "how did", "how come", "drill down", "drill into",
+        "break down", "break this", "justify", "what led", "root cause",
     )
     return any(lower.strip().startswith(s) or f" {s} " in lower for s in question_starters)
 
@@ -710,6 +735,76 @@ class ChatAgent:
             print(f"[chat] ⚠ scoped build failed ({exc!r}) — full schema", flush=True)
             return self._get_cached_schema(enriched, connection_id)
 
+    def _build_true_graphrag_schema(
+        self,
+        enriched: "EnrichedSchema",
+        retrieved: "RetrievedContext",
+        connection_id: Optional[str],
+        total: int,
+    ) -> str:
+        """Schema block driven by graph_rag_retriever.retrieve() results — richer
+        than nl_schema_router because it scores tables using TF-IDF, concept index,
+        entity columns, and FK-graph signals simultaneously (zero LLM calls).
+        Falls back to the full cached schema when nothing resolves."""
+        seed_names = set((retrieved.primary_tables or [])[:8])
+        if not seed_names:
+            print(
+                f"[chat_agent] true-graphrag: no primary tables "
+                f"(confidence={retrieved.confidence:.2f}) — full schema ({total} tables)",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        try:
+            seed, neighbors = _scope.resolve_scope_tables(enriched, seed_names, _GRAPHRAG_SCOPE_HOPS)
+        except Exception as exc:
+            print(f"[chat_agent] ⚠ true-graphrag resolve failed ({exc!r}) — full schema", flush=True)
+            return self._get_cached_schema(enriched, connection_id)
+
+        if not seed:
+            print(
+                f"[chat_agent] true-graphrag: 0 seed matched from "
+                f"{list(seed_names)[:4]} — full schema ({total} tables)",
+                flush=True,
+            )
+            return self._get_cached_schema(enriched, connection_id)
+
+        try:
+            schema = _scope.render_scoped_schema(
+                enriched, seed, neighbors, _GRAPHRAG_SCOPE_HOPS,
+                col_desc_max=_COL_DESC_MAX, table_desc_max=_TABLE_DESC_MAX,
+                sample_limit=_SAMPLE_VALUE_LIMIT,
+                scope_intro=(
+                    "SCOPE: DATABASE (true graph-RAG ranked) — tables selected by "
+                    "TF-IDF, concept matching, entity signals, and FK-graph expansion "
+                    "for this specific query. FOCUSED TABLES have the highest relevance "
+                    "scores. RELATED TABLES are FK-graph neighbours available for JOINs. "
+                    "Graph-RAG column hints follow immediately after this schema block."
+                ),
+                seed_header=(
+                    f"FOCUSED TABLES — {len(seed)} table(s) ranked most relevant "
+                    f"(confidence={retrieved.confidence:.0%}):"
+                ),
+                related_header_fmt=(
+                    "RELATED TABLES — {n} table(s) within {hops} FK-hop(s) of the "
+                    "focused tables (name + purpose + join path):"
+                ),
+            )
+            full_len = len(self._get_cached_schema(enriched, connection_id))
+            scoped_len = len(schema)
+            saved_pct = round((1 - scoped_len / max(full_len, 1)) * 100, 1)
+            print(
+                f"[chat_agent] scope=database(true-graphrag)  "
+                f"seed={len(seed)}  related={len(neighbors)}  total={total}  "
+                f"chars={scoped_len:,}/{full_len:,}  saved={saved_pct}%  "
+                f"≈{(full_len - scoped_len) // 4:,} input tokens saved",
+                flush=True,
+            )
+            return schema
+        except Exception as exc:
+            print(f"[chat_agent] ⚠ true-graphrag render failed ({exc!r}) — full schema", flush=True)
+            return self._get_cached_schema(enriched, connection_id)
+
     def _build_graphrag_scoped_schema(
         self,
         enriched: "EnrichedSchema",
@@ -781,6 +876,7 @@ class ChatAgent:
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
         resolved_context: Optional["ResolvedContext"] = None,
         conversation_history: Optional[list] = None,
+        retrieved_graphrag: Optional["RetrievedContext"] = None,
     ) -> list[dict]:
         """Assemble the system prompt as Bedrock content blocks with a cache
         breakpoint at the end of the schema. Zones 1+2 (instructions + schema)
@@ -801,13 +897,14 @@ class ChatAgent:
 
         if enriched and enriched.compact_tables:
             total = len(enriched.compact_tables)
+            graphrag_hints_text = ""
             if scope == "selected":
                 schema = self._build_selected_schema(
                     enriched, selected_tables or [], selected_hops, connection_id, total
                 )
             else:
-                # scope="database" — use GraphRAG-ranked scoping when the NL router
-                # resolved relevant tables and the schema is large enough to benefit.
+                # scope="database" — prefer true graph-RAG (TF-IDF + concept + entity +
+                # FK-graph signals) over the lighter NL router when both are available.
                 # route_query() resolves tables from the CURRENT message alone, so an
                 # elliptical follow-up ("what about last month") with no table-name
                 # signal of its own can score every table near-zero and get routed to
@@ -818,6 +915,19 @@ class ChatAgent:
                 _top_score = max(resolved_context.table_scores.values(), default=0.0) if resolved_context else 0.0
                 _ambiguous_followup = bool(conversation_history) and _top_score < 0.15
                 if (
+                    retrieved_graphrag
+                    and retrieved_graphrag.candidates
+                    and not _ambiguous_followup
+                ):
+                    schema = self._build_true_graphrag_schema(
+                        enriched, retrieved_graphrag, connection_id, total
+                    )
+                    try:
+                        from agent_service.agents.graph_rag_retriever import format_retrieval_hints
+                        graphrag_hints_text = format_retrieval_hints(retrieved_graphrag)
+                    except Exception as exc:
+                        print(f"[chat] ⚠ format_retrieval_hints failed ({exc!r})", flush=True)
+                elif (
                     resolved_context
                     and not resolved_context.fallback
                     and resolved_context.focused_tables
@@ -842,6 +952,10 @@ class ChatAgent:
                 {"type": "text", "text": _INSTRUCTIONS},
                 {"type": "text", "text": schema, "cache_control": {"type": "ephemeral"}},
             ]
+            # Graph-RAG column-level hints (changes per query — placed AFTER the cached
+            # schema so it doesn't bust the cache key).
+            if graphrag_hints_text:
+                blocks.append({"type": "text", "text": graphrag_hints_text})
             # Zone 2.5 injected only when non-empty (avoids a pointless empty block)
             if routing_hints:
                 blocks.append({"type": "text", "text": routing_hints})
@@ -876,6 +990,8 @@ class ChatAgent:
         selected_tables: Optional[list[str]] = None,
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
         resolved_context: Optional["ResolvedContext"] = None,
+        retrieved_graphrag: Optional["RetrievedContext"] = None,
+        conversation_memory: Optional[list[str]] = None,
     ) -> tuple[list[dict], list[dict], str, int]:
         """Build everything needed for a model call: (system_blocks, messages,
         model_id, max_tokens). Shared by both respond() and the streaming path."""
@@ -892,7 +1008,16 @@ class ChatAgent:
             selected_hops=selected_hops,
             resolved_context=resolved_context,
             conversation_history=conversation_history,
+            retrieved_graphrag=retrieved_graphrag,
         )
+        if conversation_memory:
+            mem_text = (
+                "CONVERSATION MEMORY — earlier in this session the user asked about:\n"
+                + "\n".join(f"- {q}" for q in conversation_memory[-_CHAT_MEMORY_MAX:])
+                + "\n\nStay consistent with these, build on prior answers, and don't "
+                  "re-introduce topics already covered unless the user asks again."
+            )
+            system_blocks = system_blocks + [{"type": "text", "text": mem_text}]
         # Prepend pre-computed date bounds so the LLM can't miss or misinterpret them
         time_hint = _extract_time_filter_hint(message)
         effective_message = f"{time_hint}\n{message}" if time_hint else message
@@ -1000,13 +1125,16 @@ class ChatAgent:
         selected_tables: Optional[list[str]] = None,
         selected_hops: int = CHAT_SELECTED_HOPS_DEFAULT,
         resolved_context: Optional["ResolvedContext"] = None,
+        retrieved_graphrag: Optional["RetrievedContext"] = None,
+        conversation_memory: Optional[list[str]] = None,
     ) -> dict:
         system_blocks, messages, model_id, max_tokens = self.prepare(
             message, conversation_history, schema_doc, dashboard_widgets,
             dashboard_pages, active_page_id, priority_tables, enriched_schema,
             model_override, connection_id,
             scope=scope, selected_tables=selected_tables, selected_hops=selected_hops,
-            resolved_context=resolved_context,
+            resolved_context=resolved_context, retrieved_graphrag=retrieved_graphrag,
+            conversation_memory=conversation_memory,
         )
 
         raw = await bedrock_invoke_with_history(
@@ -1051,20 +1179,52 @@ class ChatAgent:
         return []
 
     @staticmethod
-    async def save_history(session_id: str, messages: list[dict], redis) -> None:
+    async def load_memory(session_id: str, redis) -> list[str]:
+        """Distilled memory = the gist of what the user has asked before (NOT the raw
+        transcript). Lets the assistant stay consistent and build on prior questions
+        without replaying the whole conversation."""
+        if redis is None:
+            return list(_memory_summary.get(session_id, []))
+        raw = await redis.get(f"chat:history:{session_id}")
+        if raw:
+            try:
+                data = json.loads(raw)
+                return data.get("memory", []) if isinstance(data, dict) else []
+            except Exception:
+                return []
+        return []
+
+    @staticmethod
+    def distill_memory(prev: list[str], user_message: str) -> list[str]:
+        """Append the gist of the latest user question to memory (deduped, capped).
+        Cheap + deterministic — no extra LLM call."""
+        q = " ".join((user_message or "").split())[:180]
+        if not q:
+            return list(prev or [])[-_CHAT_MEMORY_MAX:]
+        out = [m for m in (prev or []) if m.strip().lower() != q.strip().lower()]
+        out.append(q)
+        return out[-_CHAT_MEMORY_MAX:]
+
+    @staticmethod
+    async def save_history(
+        session_id: str, messages: list[dict], redis, memory: Optional[list[str]] = None,
+    ) -> None:
         trimmed = messages[-40:]
+        mem = (memory or [])[-_CHAT_MEMORY_MAX:]
         if redis is None:
             _memory_history[session_id] = trimmed
+            _memory_summary[session_id] = mem
             return
         await redis.setex(
             f"chat:history:{session_id}",
             CONVERSATION_TTL_SECONDS,
-            json.dumps({"messages": trimmed}),
+            json.dumps({"messages": trimmed, "memory": mem}),
         )
 
     @staticmethod
     async def clear_history(session_id: str, redis) -> None:
         if redis is None:
             _memory_history.pop(session_id, None)
+            _memory_summary.pop(session_id, None)
             return
         await redis.delete(f"chat:history:{session_id}")
