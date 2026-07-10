@@ -381,6 +381,11 @@ async def bedrock_invoke_stream(
             )
             loop.call_soon_threadsafe(q.put_nowait, ("usage", usage))
         except Exception as exc:  # noqa: BLE001
+            # Print here — this runs in a worker thread with no caller visibility
+            # otherwise, and a silent failure here previously made a Bedrock-side
+            # rejection (e.g. an unexpected key in a `messages` entry) look like
+            # nothing happened at all in the logs.
+            print(f"[bedrock] ✗ stream worker failed: {type(exc).__name__}: {exc}", flush=True)
             loop.call_soon_threadsafe(q.put_nowait, ("error", f"{type(exc).__name__}: {exc}"))
         finally:
             loop.call_soon_threadsafe(q.put_nowait, _DONE)

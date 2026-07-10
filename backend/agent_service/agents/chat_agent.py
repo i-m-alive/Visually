@@ -105,6 +105,14 @@ _memory_history: dict[str, list[dict]] = {}
 _memory_summary: dict[str, list[str]] = {}
 _CHAT_MEMORY_MAX = 20  # max remembered prior-question gists
 
+
+def _sanitize_history_for_llm(history: list[dict]) -> list[dict]:
+    """Strip stored turns down to {role, content} before sending to Bedrock.
+    Stored history carries extra bookkeeping keys (sql/error/low_confidence) for
+    the root-cause follow-up gate — the Messages API rejects any message object
+    with keys other than role/content."""
+    return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in history]
+
 _SYSTEM_PROMPT_TEMPLATE = """You are a conversational data analyst embedded in a BI platform called Visually.
 You have full access to the user's live database and their complete multi-page canvas report.
 The DATABASE SCHEMA and your CURRENT CANVAS REPORT are supplied as additional context blocks below — read them before answering.
@@ -268,7 +276,7 @@ Always put the explanation BEFORE the block — text after the block is never sh
 For conversational questions (greetings, explanations, "what is X concept"): plain English only, no sql_execute.
 
 ```sql_execute
-{{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
+{{"sql": "SELECT ...", "chart_type": "bar_vertical|line|pie|kpi|multi_row_card|scatter|table|waterfall|area|donut|slicer|grouped_bar|stacked_bar", "title": "Chart Title", "x_label": "...", "y_label": "..."}}
 ```
 
 CHART TYPE SELECTION RULES:
@@ -278,6 +286,20 @@ CHART TYPE SELECTION RULES:
     SQL pattern: SELECT dim AS label, COUNT(*)/SUM(metric) AS value FROM table GROUP BY 1 ORDER BY 2 DESC
 - Use "table" for detailed row-level data with many columns
 - Use "bar_vertical" when the user wants to compare values visually
+- Use "grouped_bar" or "stacked_bar" when the user asks to compare TWO OR MORE metrics
+  broken down by the SAME dimension (e.g. "buy vs sell volume by segment", "revenue vs
+  cost by region"): pivot each compared metric into its OWN column with a CASE WHEN,
+  GROUP BY the dimension — never GROUP BY a column derived from the compared metric
+  itself. See Example 5 below.
+
+WHICH-QUESTION DIMENSION RULE — critical, causes wrong answers if ignored:
+When the user asks "which <noun> is highest/lowest/best/worst/most/least in <metric>",
+the SQL's GROUP BY / first output column MUST represent that exact <noun> (an entity/
+dimension column — segment, region, customer, product, etc.), never a column whose
+literal VALUES merely happen to overlap with words in the metric name. For example,
+"which SEGMENT is highest in Buy vs Sell Volume" must GROUP BY a customer/entity
+segment column — grouping by a transaction-type column (whose values are literally
+"Buy"/"Sell") answers a different, wrong question even though it runs without error.
 
 CHART CREATION EXAMPLES — copy these patterns exactly (note the 2–4 sentence explanation BEFORE each block):
 
@@ -316,6 +338,17 @@ NOTE for slicers:
 - The slicer will automatically filter all other charts on the page when the user selects a value
 - Use "checkbox" when the user says "multi-select", "multiple", or "checkboxes"
 - Use "date_range" when filtering by a date/timestamp column
+
+Example 5 — compound comparison by dimension (grouped_bar with CASE WHEN pivot):
+User: "Which segment is highest in buy vs sell volume?"
+Response: "You want to compare buy volume against sell volume for each customer segment. This groups every transaction by the customer's segment and splits the total units into a Buy column and a Sell column, so you can see which segment leads in each. A grouped bar chart fits because you're comparing two metrics side by side across the same dimension."
+```sql_execute
+{{"sql": "SELECT s.segment AS \"Segment\", SUM(CASE WHEN t.transaction_type = 'BUY' THEN t.units ELSE 0 END) AS \"Buy Volume\", SUM(CASE WHEN t.transaction_type = 'SELL' THEN t.units ELSE 0 END) AS \"Sell Volume\" FROM transactions t JOIN customers s ON t.customer_id = s.customer_id GROUP BY s.segment ORDER BY 2 DESC", "chart_type": "grouped_bar", "title": "Buy vs Sell Volume by Segment", "x_label": "Segment", "y_label": "Volume"}}
+```
+Note: GROUP BY is the customer's segment column — NOT transaction_type. transaction_type
+is only used INSIDE the CASE WHEN to split the metric into two columns; it must never be
+the GROUP BY column itself, or the chart answers "which transaction type" instead of
+"which segment."
 
 For dashboard modifications, include:
 ```dashboard_action
@@ -1023,7 +1056,9 @@ class ChatAgent:
         effective_message = f"{time_hint}\n{message}" if time_hint else message
         if time_hint:
             print(f"[chat_agent] time_filter injected: {time_hint.splitlines()[1].strip()}", flush=True)
-        messages = conversation_history[-20:] + [{"role": "user", "content": effective_message}]
+        messages = _sanitize_history_for_llm(conversation_history[-20:]) + [
+            {"role": "user", "content": effective_message}
+        ]
         effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else CHAT_MODEL
         effective_max_tokens = 8192 if model_override == "opus" else 2048  # Opus needs more
 
@@ -1096,7 +1131,9 @@ class ChatAgent:
             "The user is waiting for actual data — you MUST output a sql_execute block.\n"
             f"Original request: {message}"
         )
-        retry_messages = conversation_history[-20:] + [{"role": "user", "content": retry_msg}]
+        retry_messages = _sanitize_history_for_llm(conversation_history[-20:]) + [
+            {"role": "user", "content": retry_msg}
+        ]
         try:
             raw2 = await bedrock_invoke_with_history(
                 model_id=CHAT_MODEL,
@@ -1108,6 +1145,36 @@ class ChatAgent:
             return self.parse_raw(raw2)["sqls_to_execute"]
         except Exception:
             return []  # retry failed — caller falls back to original narration
+
+    async def retry_with_feedback(
+        self, message: str, conversation_history: list[dict], system_blocks: list[dict], feedback: str,
+    ) -> list[dict]:
+        """One silent retry with a specific corrective feedback message — used when
+        the generated SQL executed fine but a deterministic post-check found it
+        likely answers the wrong dimension/question (e.g. a check_dimension_match
+        mismatch). Unlike retry_for_sql (which fires when NO sql was produced at
+        all), this fires when SQL WAS produced but is probably wrong. Returns the
+        parsed sql specs (or [])."""
+        retry_msg = (
+            f"Your previous query executed successfully but has a problem: {feedback}\n"
+            "Rewrite the query to fix this. Output ONLY a corrected sql_execute block — "
+            "no narration, no explanation.\n"
+            f"Original request: {message}"
+        )
+        retry_messages = _sanitize_history_for_llm(conversation_history[-20:]) + [
+            {"role": "user", "content": retry_msg}
+        ]
+        try:
+            raw2 = await bedrock_invoke_with_history(
+                model_id=CHAT_MODEL,
+                system_prompt=system_blocks,
+                messages=retry_messages,
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return self.parse_raw(raw2)["sqls_to_execute"]
+        except Exception:
+            return []  # retry failed — caller falls back to original result
 
     async def respond(
         self,
@@ -1163,6 +1230,9 @@ class ChatAgent:
                 parsed["sqls_to_execute"] = retry_sqls
                 parsed["sql_to_execute"] = retry_sqls[0]
 
+        # Exposed so callers can run a post-execution dimension-mismatch retry
+        # (retry_with_feedback) without re-building the schema/context from scratch.
+        parsed["system_blocks"] = system_blocks
         return parsed
 
     @staticmethod

@@ -389,6 +389,50 @@ async def _narrate_chart_result(user_text: str, sql_spec: dict, inline_chart: di
         return None
 
 
+async def _retry_on_dimension_mismatch(
+    user_text: str,
+    ctx: dict,
+    system_blocks: Optional[list],
+    sql_spec: dict,
+    inline_chart: dict,
+    exec_result: "ChartExecResult",
+) -> tuple[dict, "ChartExecResult"]:
+    """Catch a structurally valid but wrong-dimension query — e.g. "which SEGMENT
+    is highest" answered by grouping by a transaction-type column whose VALUES
+    happen to be "Buy"/"Sell". check_dimension_match is deterministic (no LLM
+    call); only the retry itself costs an extra round-trip, and only fires when
+    a mismatch is actually detected. One silent retry, accepted only if it no
+    longer trips the same check — otherwise the original chart is kept."""
+    from agent_service.agents.sql_utils import check_dimension_match
+    enriched = ctx.get("enriched")
+    compact_tables = getattr(enriched, "compact_tables", None) if enriched else None
+    columns = (inline_chart.get("chart_data") or {}).get("columns") or []
+    feedback = check_dimension_match(user_text, columns, compact_tables)
+    if not feedback or not system_blocks:
+        return inline_chart, exec_result
+
+    print(f"[chat] ⚠ dimension mismatch: {feedback[:150]}", flush=True)
+    retry_sqls = await _agent.retry_with_feedback(user_text, ctx["history"], system_blocks, feedback)
+    if not retry_sqls:
+        return inline_chart, exec_result
+
+    retry_exec = await _execute_and_build_chart(
+        retry_sqls[0], ctx["connection_id"],
+        priority_tables=ctx.get("priority_tables"), enriched=enriched,
+    )
+    if not retry_exec.inline_chart:
+        print("[chat] ✗ dimension-mismatch retry failed to execute — keeping original", flush=True)
+        return inline_chart, exec_result
+
+    retry_columns = (retry_exec.inline_chart.get("chart_data") or {}).get("columns") or []
+    if check_dimension_match(user_text, retry_columns, compact_tables):
+        print("[chat] ✗ dimension-mismatch retry still wrong — keeping original", flush=True)
+        return inline_chart, exec_result
+
+    print("[chat] ✓ dimension-mismatch retry succeeded", flush=True)
+    return retry_exec.inline_chart, retry_exec
+
+
 def _no_sql_note() -> str:
     return ("\n\n⚠️ I wasn't able to generate the query for that. Try rephrasing, or name "
             "the table/columns you'd like me to use.")
@@ -719,6 +763,9 @@ async def chat(
         if exec_result.warning:
             result["text"] = (result.get("text") or "").rstrip() + exec_result.warning
         if inline_chart:
+            inline_chart, exec_result = await _retry_on_dimension_mismatch(
+                req.message, ctx, result.get("system_blocks"), sql_spec, inline_chart, exec_result,
+            )
             narrative = await _narrate_chart_result(req.message, sql_spec, inline_chart)
             # Multi-candidate check: run alternative tables in parallel when routing is ambiguous.
             try:
@@ -860,6 +907,7 @@ async def chat_stream(
                         prose_emitted = len(safe)
             elif kind == "error":
                 errored = True
+                print(f"[chat] ⚠ stream error: {str(payload)[:200]}", flush=True)
                 yield _sse({"type": "error", "message": payload})
 
         if errored:
@@ -903,6 +951,14 @@ async def chat_stream(
                 final_text = (final_text or "").rstrip() + exec_result.warning
                 yield _sse({"type": "text", "delta": exec_result.warning})
             if inline_chart:
+                # Dimension-mismatch check + retry runs BEFORE yielding the chart —
+                # there's no "replace this chart" SSE event, so once a chart is
+                # yielded the frontend renders it as final. Correctness here matters
+                # more than the extra round-trip, which only fires on an actual
+                # mismatch (the check itself is instant/deterministic).
+                inline_chart, exec_result = await _retry_on_dimension_mismatch(
+                    req.message, ctx, system_blocks, sql_spec, inline_chart, exec_result,
+                )
                 # Yield the chart FIRST — narration below adds a Sonnet + Haiku
                 # round-trip and must never delay the chart the user is waiting on.
                 yield _sse({"type": "chart", "chart": inline_chart})

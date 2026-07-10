@@ -41,6 +41,14 @@ _intel_memory_history: dict[str, list[dict]] = {}
 _intel_memory_summary: dict[str, list[str]] = {}
 _MEMORY_MAX = 20  # max remembered prior-question gists
 
+
+def _sanitize_history_for_llm(history: list[dict]) -> list[dict]:
+    """Strip stored turns down to {role, content} before sending to Bedrock.
+    Stored history carries extra bookkeeping keys (sql/error/low_confidence) for
+    the root-cause follow-up gate — the Messages API rejects any message object
+    with keys other than role/content."""
+    return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in history]
+
 print("[intel_chat_agent] module loaded — Report Copilot agent (forked from chat_agent)", flush=True)
 
 # ─── System prompt (forked copy — safe to diverge from the canvas builder) ─────
@@ -1243,7 +1251,9 @@ class IntelligenceChatAgent:
             system_blocks = system_blocks + [{"type": "text", "text": mem_text}]
         # Keep only a short raw window for immediate coherence — the long arc lives in
         # the distilled memory above (vs. previously replaying the last 20 messages).
-        messages = conversation_history[-8:] + [{"role": "user", "content": message}]
+        messages = _sanitize_history_for_llm(conversation_history[-8:]) + [
+            {"role": "user", "content": message}
+        ]
         effective_model = BEDROCK_OPUS_MODEL if model_override == "opus" else INTEL_CHAT_MODEL
         effective_max_tokens = 8192 if model_override == "opus" else 2048
 
@@ -1315,7 +1325,9 @@ class IntelligenceChatAgent:
             "The user is waiting for actual data — you MUST output a sql_execute block.\n"
             f"Original request: {message}"
         )
-        retry_messages = conversation_history[-20:] + [{"role": "user", "content": retry_msg}]
+        retry_messages = _sanitize_history_for_llm(conversation_history[-20:]) + [
+            {"role": "user", "content": retry_msg}
+        ]
         print("[intel_chat_agent] retry_for_sql — model narrated without a sql block, retrying", flush=True)
         try:
             raw2 = await bedrock_invoke_with_history(

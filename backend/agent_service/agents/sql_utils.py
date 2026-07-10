@@ -498,6 +498,11 @@ def extract_unqualified_col_refs(sql: str, extra_skip: Optional[set] = None) -> 
     """
     # Strip single-quoted literals to avoid matching values like 'placed' as identifiers
     clean = re.sub(r"'[^']*'", " ", sql)
+    # Strip double-quoted identifiers/aliases (e.g. AS "Buy Volume") — these are
+    # output names or exact-case quoted references, never bare column refs to
+    # validate. Without this, a multi-word alias like "Total Units" gets tokenized
+    # into "Total" and "Units" and both get flagged as missing columns.
+    clean = re.sub(r'"[^"]*"', " ", clean)
     # Strip comments
     clean = re.sub(r"--[^\n]*", " ", clean)
     clean = re.sub(r"/\*.*?\*/", " ", clean, flags=re.DOTALL)
@@ -665,6 +670,76 @@ def check_result_sanity(
             )
 
     return True, ""
+
+
+# ── 8. "Which <dimension>" question/answer dimension mismatch ────────────────
+# Catches a specific, easy-to-miss failure mode: SQL that runs fine and returns
+# real data, but groups by the WRONG dimension because its values happen to
+# overlap with words in the metric name (e.g. "which SEGMENT is highest in Buy
+# vs Sell Volume" answered by grouping by a transaction_type column whose
+# values are literally "Buy"/"Sell" — a different, wrong question that still
+# executes without error and passes every other check).
+
+_WHICH_DIMENSION_RE = re.compile(r'\bwhich\s+([a-z][a-z_]*)\b', re.IGNORECASE)
+_WHICH_STOPWORDS = frozenset({
+    "one", "of", "is", "are", "was", "were", "has", "have", "the", "a", "an",
+})
+
+
+def extract_which_dimension_hint(message: str) -> Optional[str]:
+    """Extract the noun immediately following 'which' in a ranking question
+    ('which segment is highest' -> 'segment'). Returns None if no match or the
+    matched word is a stopword/pronoun rather than a real dimension noun."""
+    m = _WHICH_DIMENSION_RE.search(message or "")
+    if not m:
+        return None
+    word = m.group(1).lower()
+    if word in _WHICH_STOPWORDS:
+        return None
+    return word
+
+
+def check_dimension_match(
+    user_message: str,
+    result_columns: list,
+    compact_tables: Optional[list] = None,
+) -> Optional[str]:
+    """For a 'which <dimension> is highest/lowest/best/worst/most/least' question,
+    verify the SQL's first output column (the GROUP BY / label column) actually
+    represents that dimension — not a column whose literal VALUES happen to
+    overlap with words in the metric name. Deterministic, no LLM call.
+
+    Returns a retry-feedback string when a likely mismatch is detected, else None.
+    Deliberately lenient (fuzzy match + schema description match) to minimize
+    false positives on genuinely correct queries using a synonymous column name.
+    """
+    hint = extract_which_dimension_hint(user_message)
+    if not hint or not result_columns:
+        return None
+    first_col = str(result_columns[0]).lower()
+    if hint in first_col or first_col in hint or _fuzzy_col_score(hint, first_col) >= 0.60:
+        return None
+    # Output aliases use spaces ("Client Name") while schema columns use
+    # underscores (client_name) — normalize both before comparing so the
+    # description lookup below actually finds the matching schema column.
+    first_col_norm = first_col.replace(" ", "_").replace("-", "_")
+    if compact_tables:
+        for t in compact_tables:
+            for c in (t.get("columns") or []):
+                cname_norm = (c.get("name") or "").lower().replace(" ", "_").replace("-", "_")
+                if cname_norm != first_col_norm:
+                    continue
+                desc = (c.get("description") or "").lower()
+                if hint in desc:
+                    return None
+    return (
+        f"The user asked WHICH {hint.upper()} — the result's first column is "
+        f"'{result_columns[0]}', which does not represent {hint}. GROUP BY a "
+        f"column that represents {hint} (a customer/entity attribute), not a "
+        f"column whose literal values happen to overlap with words in the metric "
+        f"name. If comparing multiple metrics (e.g. 'X vs Y'), pivot them into "
+        f"separate columns with CASE WHEN and GROUP BY the {hint} column instead."
+    )
 
 
 # ── 5c. Filter-value verification ─────────────────────────────────────────────
