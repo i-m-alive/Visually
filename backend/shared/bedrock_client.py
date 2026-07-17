@@ -78,16 +78,90 @@ def get_token_summary() -> dict:
     return agg
 
 
+# ── Pricing ────────────────────────────────────────────────────────────────
+# USD per 1,000,000 tokens, matched by substring against the model id. These are
+# list prices and can be overridden via env (BEDROCK_PRICE_<FAMILY>_IN / _OUT,
+# values in USD per 1M tokens) without a code change if pricing shifts.
+# Anthropic cache pricing: cache_read is billed at 10% of the input rate and
+# cache_creation (write) at 125% — applied in the cost math below, not here.
+def _price_env(family: str, kind: str, default: float) -> float:
+    try:
+        return float(os.getenv(f"BEDROCK_PRICE_{family.upper()}_{kind.upper()}", default))
+    except (TypeError, ValueError):
+        return default
+
+_MODEL_PRICES: dict[str, dict] = {
+    "opus":        {"in": _price_env("opus", "in", 15.00), "out": _price_env("opus", "out", 75.00)},
+    "sonnet":      {"in": _price_env("sonnet", "in", 3.00), "out": _price_env("sonnet", "out", 15.00)},
+    "haiku":       {"in": _price_env("haiku", "in", 1.00), "out": _price_env("haiku", "out", 5.00)},
+    "titan-embed": {"in": _price_env("embed", "in", 0.02), "out": 0.0},
+    "embed":       {"in": _price_env("embed", "in", 0.02), "out": 0.0},
+}
+# Unknown model → assume Sonnet-class so cost is never silently under-reported.
+_DEFAULT_PRICE = {"in": 3.00, "out": 15.00}
+
+
+def _price_for(model_id: str) -> dict:
+    m = (model_id or "").lower()
+    for key, price in _MODEL_PRICES.items():
+        if key in m:
+            return price
+    return _DEFAULT_PRICE
+
+
+def get_cost_summary() -> dict:
+    """Per-query cost from the current tracking bucket, priced per model.
+
+    Returns a dict safe to attach to a result payload / send to the frontend:
+      {input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+       total_tokens, llm_calls, usd, usd_input, usd_output}
+    Empty {} when no tracking data is available.
+    """
+    summary = get_token_summary()
+    if not summary:
+        return {}
+    in_tok = out_tok = cr_tok = cw_tok = calls = 0
+    usd_in = usd_out = 0.0
+    for model_id, s in summary.items():
+        p = _price_for(model_id)
+        in_tok += s["input_tokens"]
+        out_tok += s["output_tokens"]
+        cr_tok += s["cache_read_input_tokens"]
+        cw_tok += s["cache_creation_input_tokens"]
+        calls += s["calls"]
+        # cache_read billed at 10% of input rate, cache_write at 125%.
+        usd_in += (
+            s["input_tokens"] * p["in"]
+            + s["cache_read_input_tokens"] * p["in"] * 0.10
+            + s["cache_creation_input_tokens"] * p["in"] * 1.25
+        ) / 1_000_000
+        usd_out += (s["output_tokens"] * p["out"]) / 1_000_000
+    return {
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cache_read_tokens": cr_tok,
+        "cache_write_tokens": cw_tok,
+        "total_tokens": in_tok + out_tok,
+        "llm_calls": calls,
+        "usd": round(usd_in + usd_out, 6),
+        "usd_input": round(usd_in, 6),
+        "usd_output": round(usd_out, 6),
+    }
+
+
 def format_token_log(label: str, session_id: str = "") -> str:
     """Build a one-line token-usage log entry from the current tracking bucket.
 
     Meant to be printed at the end of every chat/query turn so token consumption
     is easy to compare across the three chat systems (Canvas/DB, Intel/DB, QueryChat).
 
-    Effective-input formula (Bedrock cache pricing):
-      eff_in = (raw_in - cache_read) * 1.0
-             + cache_read           * 0.10   # 10% of full price
-             + cache_write          * 1.25   # 25% premium for cache creation
+    Effective-input formula (Bedrock cache pricing). NOTE: the Bedrock/Anthropic
+    `input_tokens` field does NOT already include cache_read/cache_creation — they
+    are reported as separate, non-overlapping fields — so effective input ADDS the
+    discounted cache components rather than carving them out of raw input:
+      eff_in = raw_in * 1.0
+             + cache_read  * 0.10   # 10% of full price
+             + cache_write * 1.25   # 25% premium for cache creation
     Returns empty string when no tracking data is available.
     """
     summary = get_token_summary()
@@ -109,18 +183,20 @@ def format_token_log(label: str, session_id: str = "") -> str:
         model_short = _m.split(".")[-1]                # drop us.anthropic. prefix
 
     eff_in = int(
-        (total_in - total_cr) * 1.0
+        total_in * 1.0
         + total_cr * 0.10
         + total_cw * 1.25
     )
     total_billed = eff_in + total_out
+    _cost = get_cost_summary()
+    usd = _cost.get("usd", 0.0)
     sess = (session_id[:8] + "…") if len(session_id) > 8 else session_id
 
     return (
         f"[TOKENS:{label}]  sess={sess}  model={model_short}  calls={total_calls}  "
         f"in={total_in:,}  out={total_out:,}  "
         f"cache_read={total_cr:,}  cache_write={total_cw:,}  "
-        f"eff_in={eff_in:,}  total_billed={total_billed:,}"
+        f"eff_in={eff_in:,}  total_billed={total_billed:,}  ${usd:.4f}"
     )
 
 

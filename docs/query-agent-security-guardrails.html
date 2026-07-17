@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Query Agent — Security Guardrails per Agent</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero { background: linear-gradient(135deg, #7f1d1d 0%, #b91c1c 45%, var(--brand) 100%); color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px; box-shadow: 0 20px 50px rgba(185,28,28,.22); }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #fee2e2; max-width: 840px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #fecaca; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.16); color: #fff; }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 52px; }
+  h2 { font-size: 22px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px; }
+  h3 { font-size: 16.5px; font-weight: 700; margin: 26px 0 8px; }
+  .lede { color: var(--muted); margin-bottom: 20px; max-width: 880px; }
+  p { margin-bottom: 13px; max-width: 880px; }
+  ul, ol.body { margin-left: 20px; } ul li, ol.body li { margin-bottom: 5px; }
+
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin: 8px 0 20px; font-size:12.5px; }
+  .st { display:inline-flex; align-items:center; gap:6px; font-weight:700; }
+  .dot { width:10px; height:10px; border-radius:3px; display:inline-block; }
+  .d-enf { background: var(--green); } .d-soft { background: var(--amber); }
+  .d-gap { background: var(--red); } .d-rec { background: var(--blue); }
+
+  .badge { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; padding:2px 8px; border-radius:99px; white-space:nowrap; }
+  .b-enf { background: var(--green-soft); color: var(--green); }
+  .b-soft { background: var(--amber-soft); color: var(--amber); }
+  .b-gap { background: var(--red-soft); color: var(--red); }
+  .b-rec { background: var(--blue-soft); color: var(--blue); }
+
+  .agent { background: var(--surface); border:1px solid var(--border); border-radius: var(--radius); padding: 20px 22px; margin: 14px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  .agent h3 { margin-top: 0; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .agent .file { font-family: "SF Mono", Menlo, monospace; font-size: 11.5px; color: var(--muted); font-weight: 500; }
+  .agent .row { display:grid; grid-template-columns: 120px 1fr; gap: 6px 14px; margin-top: 8px; font-size: 13.5px; }
+  .agent .row .k { font-weight:700; color: var(--brand-dark); font-size: 11.5px; text-transform: uppercase; letter-spacing:.04em; padding-top:2px; }
+  .agent .row .v { color: var(--ink); }
+  .agent .row .v ul { margin: 0 0 0 16px; } .agent .row .v li { margin-bottom: 3px; }
+  .llm-tag { font-size:10px; font-weight:800; padding:2px 8px; border-radius:99px; background: var(--amber-soft); color: var(--amber); }
+  .nollm-tag { font-size:10px; font-weight:800; padding:2px 8px; border-radius:99px; background: var(--green-soft); color: var(--green); }
+
+  .callout { border-radius: var(--radius); padding: 16px 20px; margin: 16px 0; border: 1px solid; }
+  .callout.key { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.key .tag { color: var(--green); }
+  .callout.warn { background: var(--amber-soft); border-color: #fde68a; }
+  .callout.warn .tag { color: var(--amber); }
+  .callout.risk { background: var(--red-soft); border-color: #fecaca; }
+  .callout.risk .tag { color: var(--red); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 7px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13.3px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.center { text-align:center; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Query Agent — Security Guardrails</h1>
+    <p>Every agent in the Query Chat, its trust boundary, the guardrails actually enforced in code, the residual risk, and the recommended posture. Read-only is the design invariant; this document says exactly how it's held and where enforcement is hard vs. prompt-level.</p>
+    <div class="meta">
+      <span>Invariant: <code>read-only</code> — no write ever reaches the DB</span>
+      <span>Keystone control: the query_executor sandbox</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#model">Threat model &amp; trust boundaries</a></li>
+      <li><a href="#layers">Defense in depth</a></li>
+      <li><a href="#classifier">Intent Classifier</a></li>
+      <li><a href="#retriever">GraphRAG Retriever</a></li>
+      <li><a href="#arbiter">Retrieval Arbiter</a></li>
+      <li><a href="#queryagent">Query Agent (SQL generation)</a></li>
+      <li><a href="#validator">Validator &amp; Narrator</a></li>
+      <li><a href="#rootcause">Root-Cause Agent</a></li>
+      <li><a href="#skill">Skill Agents (finance/recruitment)</a></li>
+      <li><a href="#action">ACTION Agent</a></li>
+      <li><a href="#sandbox">The Sandbox (enforcement layer)</a></li>
+      <li><a href="#crosscut">Cross-cutting controls</a></li>
+      <li><a href="#matrix">Guardrail decision matrix</a></li>
+      <li><a href="#gaps">Gaps &amp; recommendations</a></li>
+    </ol>
+  </nav>
+
+  <section id="model">
+    <h2><span class="num">1</span>Threat model &amp; trust boundaries</h2>
+    <p class="lede">Three inputs cross into the agents as <strong>untrusted</strong> and can reach an LLM prompt. Every guardrail exists to contain one of them.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Untrusted input</th><th>Enters via</th><th>Primary threat</th></tr>
+      <tr><td>User's natural-language message</td><td>Query Chat box</td><td>Prompt injection, coercing a write, data exfiltration ("dump every row")</td></tr>
+      <tr><td>Conversation history</td><td>Persisted message tree, replayed into prompts</td><td>Injection persisted across turns; stale/foreign-branch leakage</td></tr>
+      <tr><td>Database-derived values</td><td>Sample values, table/column descriptions, prior SQL — injected into prompts as "context"</td><td>Second-order injection: a malicious string stored in a cell tries to steer the model</td></tr>
+    </table>
+    </div>
+    <div class="callout key">
+      <span class="tag">The load-bearing guarantee</span>
+      <p>No matter what any of those inputs say, and no matter what any LLM emits, <strong>only a SELECT/WITH/SHOW/DESCRIBE statement can ever reach the database</strong>, enforced independently of the agents by the query_executor sandbox (§11). This caps the blast radius of every prompt-injection or jailbreak attempt to "reads only" — the worst case is reading data the connection can already see, never mutating or destroying it.</p>
+    </div>
+  </section>
+
+  <section id="layers">
+    <h2><span class="num">2</span>Defense in depth</h2>
+    <p class="lede">Controls are layered so no single agent is trusted to be the only thing standing between a prompt and the database.</p>
+    <ul>
+      <li><strong>Layer 0 — Auth &amp; tenancy:</strong> JWT auth; project ownership / membership; <code>builder</code> vs <code>end_user</code> route gating; the Brainwave identity + host gate for restricted domains.</li>
+      <li><strong>Layer 1 — Access scoping:</strong> role-based mandatory WHERE-clause (RLS) for restricted recruitment roles; impersonation gated on an explicit <code>can_impersonate</code> flag.</li>
+      <li><strong>Layer 2 — Pre-execution validation (in-pipeline):</strong> the orchestrator runs the sandbox check, column-existence checks, and lint <em>before</em> a query is sent — a friendly retry rather than a raw DB error.</li>
+      <li><strong>Layer 3 — Hard enforcement (out-of-process):</strong> the query_executor <em>independently</em> re-validates every statement. This is the control that cannot be bypassed by any agent bug or prompt.</li>
+      <li><strong>Layer 4 — Output guardrails:</strong> row caps, statement timeouts, and grounding verification on the narrated answer.</li>
+      <li><strong>Layer 5 — Containment:</strong> agents never raise into the request path; on failure they degrade to a safe fallback.</li>
+    </ul>
+    <div class="legend">
+      <span class="st"><span class="dot d-enf"></span>Enforced (hard, in code)</span>
+      <span class="st"><span class="dot d-soft"></span>Prompt-level (soft, model-instructed)</span>
+      <span class="st"><span class="dot d-gap"></span>Gap (not currently controlled)</span>
+      <span class="st"><span class="dot d-rec"></span>Recommended (to add)</span>
+    </div>
+  </section>
+
+  <section id="classifier">
+    <h2><span class="num">3</span>Intent Classifier</h2>
+    <div class="agent">
+      <h3>IntentClassifier <span class="llm-tag">LLM</span> <span class="file">intent_classifier.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Classifies the message into an intent + entities. Decides which pipeline/agent runs.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">User text + last 6 conversation turns.</div></div>
+      <div class="row"><div class="k">Tools</div><div class="v">None. Cannot touch the DB.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> Output is a constrained JSON schema; a parse failure defaults safely to <code>SINGLE_VIZ</code> (never to a write/skill action).</li>
+        <li><span class="badge b-enf">enforced</span> Skill-intent vocabulary is <strong>domain-gated</strong> — a domain with no skill agents can never be classified into one.</li>
+        <li><span class="badge b-enf">enforced</span> Even if it emits <code>ACTION</code>, that routes to the read-only ACTION agent (§10), not a write.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v">Misclassification is a correctness risk, not a security one — no classification outcome can produce a write or bypass access control.</div></div>
+      <div class="row"><div class="k">Recommended</div><div class="v"><span class="badge b-rec">rec</span> Cap injected history length (chars) to bound prompt size and second-order injection surface.</div></div>
+    </div>
+  </section>
+
+  <section id="retriever">
+    <h2><span class="num">4</span>GraphRAG Retriever &amp; experts</h2>
+    <div class="agent">
+      <h3>graph_rag_retriever + expert panel <span class="nollm-tag">no LLM*</span> <span class="file">graph_rag_retriever.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Ranks candidate tables (TF-IDF, embeddings, concept, entity, FK-graph → RRF fusion). *One embedding call for the query when enabled.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">User text (tokenized), table metadata (from the DB).</div></div>
+      <div class="row"><div class="k">Tools</div><div class="v">None. Pure in-memory scoring over the cached schema. Cannot execute SQL.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> <code>retrieve()</code> never raises — returns empty context on any error (fails closed to "no tables", which triggers a clarify, not a guess).</li>
+        <li><span class="badge b-enf">enforced</span> Junk/backup/temp tables are penalized so they can't be surfaced as the primary source.</li>
+        <li><span class="badge b-enf">enforced</span> The query embedding is sent to the embedding model as an opaque vector request; no instructions are executed from it.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v">Retrieval only decides <em>which tables to consider</em>; it grants no data access by itself — access is still bounded by the connection + RLS at execution.</div></div>
+    </div>
+  </section>
+
+  <section id="arbiter">
+    <h2><span class="num">5</span>Retrieval Arbiter</h2>
+    <div class="agent">
+      <h3>retrieval_arbiter <span class="llm-tag">LLM (gated)</span> <span class="file">retrieval_arbiter.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Breaks ties when the cheap experts disagree; reorders the shortlist.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">User text + shortlist metadata (descriptions, column names, sample-free).</div></div>
+      <div class="row"><div class="k">Tools</div><div class="v">None. Returns JSON only.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> Output is filtered to the <strong>shortlist</strong> — a hallucinated/injected table name is dropped, so it cannot introduce a table the retriever didn't already surface.</li>
+        <li><span class="badge b-enf">enforced</span> Gated: runs only on genuine disagreement, bounding cost/DoS exposure.</li>
+        <li><span class="badge b-enf">enforced</span> Never raises — falls back to the retriever's original order.</li>
+        <li><span class="badge b-enf">enforced</span> Shortlist-only prompt (never the full schema), limiting how much metadata is exposed to the model per call.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v">Can only reorder tables already chosen by deterministic retrieval — no new access, no SQL.</div></div>
+    </div>
+  </section>
+
+  <section id="queryagent">
+    <h2><span class="num">6</span>Query Agent (SQL generation)</h2>
+    <div class="agent">
+      <h3>QueryAgent <span class="llm-tag">LLM</span> <span class="file">query_agent.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Writes the SELECT (a <code>QueryPlan</code>). Does <em>not</em> execute it.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">Intent, user text, conversation history, prior SQL (on refinements), retrieved table/column metadata.</div></div>
+      <div class="row"><div class="k">Tools</div><div class="v">None — it returns SQL text; the orchestrator decides whether to run it (after validation).</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> Generated SQL is validated by the sandbox <em>before</em> execution and again <em>inside</em> the executor. A write it emits is rejected, not run.</li>
+        <li><span class="badge b-enf">enforced</span> Column-existence check with fuzzy auto-fix — SQL referencing a non-existent column is caught and retried, not sent blindly.</li>
+        <li><span class="badge b-soft">prompt</span> Given only the <strong>exact column schema</strong> of the top table and told to never invent columns — reduces hallucinated identifiers (soft; the hard check above is the backstop).</li>
+        <li><span class="badge b-soft">prompt</span> RLS: for restricted roles a mandatory WHERE clause is injected into the prompt with "you MUST include this / never omit it."</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v"><span class="badge b-gap">gap</span> RLS at this layer is <strong>prompt-enforced</strong>. If the model omits the mandatory filter, the query would run unfiltered within the connection's visibility. See §14 for the recommended hard-enforcement fix.</div></div>
+    </div>
+  </section>
+
+  <section id="validator">
+    <h2><span class="num">7</span>Validator &amp; Result Narrator</h2>
+    <div class="agent">
+      <h3>ValidatorAgent · ResultNarrator <span class="llm-tag">LLM</span> <span class="file">validator_agent.py · result_narrator.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Validator scores answer-fit; Narrator turns rows into prose.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">Query results (DB-derived values) + user text.</div></div>
+      <div class="row"><div class="k">Tools</div><div class="v">None. Read the result set, emit text/scores.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> <strong>Grounding verification</strong>: a follow-up check confirms the narration didn't state a number the data doesn't support — the anti-hallucination control on user-facing output.</li>
+        <li><span class="badge b-enf">enforced</span> Operate on an already-executed, already-capped result set — they cannot issue new queries or widen access.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v">Values from the DB are rendered to the user — this is expected (it's the user's own data), bounded by row caps and the connection's own scope.</div></div>
+    </div>
+  </section>
+
+  <section id="rootcause">
+    <h2><span class="num">8</span>Root-Cause Agent</h2>
+    <div class="agent">
+      <h3>RootCauseAgent <span class="llm-tag">LLM</span> <span class="file">root_cause_agent.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Diagnoses a failed/low-confidence query; may propose one corrected SQL.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">Failed SQL, DB error text, user text, table context.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> Its proposed <code>fixed_sql</code> runs through the same sandbox + executor path — a corrected statement is still read-only-validated before execution.</li>
+        <li><span class="badge b-enf">enforced</span> Never raises; a failed diagnosis returns an explanation, not an exception.</li>
+        <li><span class="badge b-enf">enforced</span> Fires only when the prior turn actually recorded a failure/low-confidence flag — bounded trigger.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v">One extra corrected-query execution — still SELECT-only, still capped/timed.</div></div>
+    </div>
+  </section>
+
+  <section id="skill">
+    <h2><span class="num">9</span>Skill Agents (finance &amp; recruitment)</h2>
+    <div class="agent">
+      <h3>MATCH · BRIEFING · AUDIT · PROSPECT · ENRICH · RECONCILE · ANOMALY · FORECAST · NETWORK <span class="llm-tag">LLM + tool loop</span> <span class="file">skill_agents/*.py · tool_agent.py · tools/sql_tool.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Multi-turn workflow agents that answer via the <code>run_sql</code> tool (read-only SELECTs) in a bounded loop.</div></div>
+      <div class="row"><div class="k">Untrusted in</div><div class="v">User text, conversation history, schema context, DB values returned mid-loop.</div></div>
+      <div class="row"><div class="k">Tools</div><div class="v"><code>run_sql</code> only (read-only SELECT). No create/update/delete tool exists in the registry for these agents.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> <code>run_sql</code> routes every statement through the query_executor sandbox — read-only validated out-of-process.</li>
+        <li><span class="badge b-enf">enforced</span> Agent queries are capped at <strong>500 rows</strong> and a per-call <strong>timeout</strong>; results carry a <code>truncated</code> flag.</li>
+        <li><span class="badge b-enf">enforced</span> The tool loop is bounded (<code>max_turns</code>, default 8) — a runaway agent can't loop forever.</li>
+        <li><span class="badge b-enf">enforced</span> Domain-gated: an agent only runs for its own domain (<code>SKILL_DOMAINS</code>), and only after the access gate (§12).</li>
+        <li><span class="badge b-soft">prompt</span> Schema/role scoping is injected as context; agents are instructed to respect the user's access scope.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v"><span class="badge b-gap">gap</span> <code>run_sql</code> does <strong>not</strong> auto-inject the RLS WHERE clause — a skill agent can read any table the connection can see, scoped only by the sandbox (read-only) and its prompt. For a restricted-role user this means per-row access control is soft at the skill-agent layer. See §14.</div></div>
+    </div>
+  </section>
+
+  <section id="action">
+    <h2><span class="num">10</span>ACTION Agent</h2>
+    <div class="agent">
+      <h3>action_agent <span class="nollm-tag">read-only by construction</span> <span class="file">skill_agents/action_agent.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">Handles "create/update/delete a record" requests without performing them.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> <strong>No tool of any kind</strong> — a single tool-less LLM call. There is no code path by which it can execute SQL; the read-only guarantee is structural, not prompt-based.</li>
+        <li><span class="badge b-enf">enforced</span> Drafts the SQL for the user to run themselves and is instructed to warn on destructive statements; it never claims to have executed anything.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Residual</div><div class="v">It outputs write-SQL <em>text</em>. That text is not executed here; whoever runs it elsewhere is subject to their own DB permissions. Low risk, explicitly labelled.</div></div>
+    </div>
+  </section>
+
+  <section id="sandbox">
+    <h2><span class="num">11</span>The Sandbox — the enforcement layer</h2>
+    <div class="agent">
+      <h3>query_executor validate_sql <span class="nollm-tag">deterministic</span> <span class="file">query_executor/sandbox.py</span></h3>
+      <div class="row"><div class="k">Role</div><div class="v">The single non-bypassable read-only gate. Runs in the executor process, independent of any agent.</div></div>
+      <div class="row"><div class="k">Guardrails</div><div class="v"><ul>
+        <li><span class="badge b-enf">enforced</span> <strong>Allowlist:</strong> statement must start with <code>SELECT</code> / <code>WITH</code> / <code>SHOW</code> / <code>DESCRIBE</code>.</li>
+        <li><span class="badge b-enf">enforced</span> <strong>Blocklist</strong> (19 keywords): INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, EXEC, EXECUTE, GRANT, REVOKE, COPY, MERGE, CALL, VACUUM, LOCK, UNLOCK, REPLACE, UPSERT.</li>
+        <li><span class="badge b-enf">enforced</span> <strong>Row limit + statement timeout</strong> on execution — bounds data volume and long-running queries.</li>
+        <li><span class="badge b-enf">enforced</span> Runs at <strong>two independent points</strong> (orchestrator pre-check + executor) so an agent bug can't skip it.</li>
+      </ul></div></div>
+      <div class="row"><div class="k">Recommended</div><div class="v"><span class="badge b-rec">rec</span> Back it with a <strong>read-only DB role</strong> at the connection level (defense beyond keyword matching — see §14), and consider blocking stacked statements / comment-obfuscation explicitly.</div></div>
+    </div>
+  </section>
+
+  <section id="crosscut">
+    <h2><span class="num">12</span>Cross-cutting controls</h2>
+    <h3>Access control &amp; tenancy</h3>
+    <ul>
+      <li><span class="badge b-enf">enforced</span> Brainwave-gated domains require a profile row AND a host match (<code>is_brainwave_host</code>) before any agent runs; otherwise access is refused.</li>
+      <li><span class="badge b-enf">enforced</span> Impersonation via <code>X-Impersonate-Role</code> is honored only if the requester's profile has <code>can_impersonate</code>; otherwise it's denied and logged.</li>
+      <li><span class="badge b-enf">enforced</span> Route gating: <code>end_user</code> can't reach builder routes and vice-versa.</li>
+    </ul>
+    <h3>Secrets</h3>
+    <ul>
+      <li><span class="badge b-enf">enforced</span> DB credentials are stored encrypted and decrypted only server-side; live share links proxy queries so anonymous viewers never receive credentials.</li>
+    </ul>
+    <h3>Cost / abuse</h3>
+    <ul>
+      <li><span class="badge b-enf">enforced</span> Per-query retry cap (4), dashboard chart cap (5), arbiter gated on disagreement, bounded tool loops, and full per-query token+USD accounting for visibility.</li>
+      <li><span class="badge b-gap">gap</span> No explicit per-user / per-connection <strong>rate limit</strong> on query submissions — a single user could drive cost via rapid submissions.</li>
+    </ul>
+  </section>
+
+  <section id="matrix">
+    <h2><span class="num">13</span>Guardrail decision matrix</h2>
+    <p class="lede">The agreed posture per control. "Enforced" = hard, in code; "Prompt" = model-instructed; "Gap/Rec" = to harden.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Control</th><th>Classifier</th><th>Retriever</th><th>Arbiter</th><th>QueryAgent</th><th>Skill agents</th><th>ACTION</th></tr>
+      <tr><td>Read-only (no writes)</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">✅ hard</td><td class="center">✅ hard</td><td class="center">✅ structural</td></tr>
+      <tr><td>Tool access</td><td class="center">none</td><td class="center">none</td><td class="center">none</td><td class="center">none</td><td class="center">run_sql only</td><td class="center">none</td></tr>
+      <tr><td>Row cap / timeout</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">✅</td><td class="center">✅ 500 rows</td><td class="center">n/a</td></tr>
+      <tr><td>Loop bound</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">4 retries</td><td class="center">8 turns</td><td class="center">1 call</td></tr>
+      <tr><td>RLS / row access</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">n/a</td><td class="center">🟡 prompt</td><td class="center">🔴 gap</td><td class="center">n/a</td></tr>
+      <tr><td>Hallucination guard</td><td class="center">✅ schema</td><td class="center">✅ fail-closed</td><td class="center">✅ shortlist-filter</td><td class="center">✅ col-check</td><td class="center">✅ sandbox</td><td class="center">🟡 warn-only</td></tr>
+      <tr><td>Never-raise containment</td><td class="center">✅</td><td class="center">✅</td><td class="center">✅</td><td class="center">✅</td><td class="center">✅</td><td class="center">✅</td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="gaps">
+    <h2><span class="num">14</span>Gaps &amp; recommendations</h2>
+    <p class="lede">Honest security-review findings, most important first. None break the read-only invariant; they harden access control and abuse resistance.</p>
+    <div class="callout risk">
+      <span class="tag">Gap 1 · RLS is prompt-enforced, not hard-enforced</span>
+      <p>For restricted roles, the mandatory WHERE clause is injected into the QueryAgent prompt and skill-agent context — but nothing rewrites/validates the final SQL to guarantee the filter is present. A model omission (or a crafted prompt-injection) could produce an unfiltered read within the connection's visibility. <strong>Recommend:</strong> enforce RLS at execution — either wrap agent SQL in an outer filtered subquery, parse-and-assert the filter is present before running, or (strongest) provision per-role DB credentials / row-level security in the database itself.</p>
+    </div>
+    <div class="callout warn">
+      <span class="tag">Gap 2 · Read-only rests on keyword matching</span>
+      <p>The sandbox is a regex allow/block list. It's solid and double-enforced, but keyword lists can in principle be probed (obfuscation, stacked statements, comment tricks). <strong>Recommend:</strong> connect with a <strong>read-only database role</strong> so the DB itself refuses writes — turning read-only from "validated" into "physically impossible," independent of the parser.</p>
+    </div>
+    <div class="callout warn">
+      <span class="tag">Gap 3 · No submission rate limiting</span>
+      <p>Retries, loops, and fan-out are all bounded per query, but there's no per-user/per-connection ceiling on <em>how many queries</em> can be fired. <strong>Recommend:</strong> a lightweight rate limit / concurrency cap per user, plus a per-turn token-budget ceiling (the cost accounting is already in place to drive it).</p>
+    </div>
+    <div class="callout warn">
+      <span class="tag">Gap 4 · Second-order prompt injection surface</span>
+      <p>DB-derived strings (sample values, descriptions, prior SQL) are placed into prompts as context. The read-only invariant caps the damage to reads, but a crafted value could still try to steer table selection or narration. <strong>Recommend:</strong> clearly delimit untrusted context blocks in prompts, cap injected value length, and keep the grounding check (already present) as the output backstop.</p>
+    </div>
+    <div class="callout key">
+      <span class="tag">What's already strong</span>
+      <p>Read-only is genuinely defense-in-depth (two enforcement points + a tool-less ACTION agent). Every agent fails closed and never raises into the request path. Access to the agents is gated by identity + host. Output is grounding-checked. The recommendations above harden <em>access scoping</em> and <em>abuse resistance</em> — they don't patch a hole in the core write-prevention guarantee, which holds.</p>
+    </div>
+  </section>
+
+  <footer>Grounded in the current codebase — each control cites the file it lives in. Read-only enforcement verified at both the orchestrator pre-check and the query_executor sandbox.</footer>
+
+</div>
+</body>
+</html>

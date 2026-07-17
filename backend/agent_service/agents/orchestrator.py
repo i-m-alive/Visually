@@ -314,6 +314,11 @@ class Orchestrator:
                     "narrative":          answer,
                     "validation_details": {},
                 }
+                try:
+                    from shared.bedrock_client import get_cost_summary
+                    agent_result["cost"] = get_cost_summary()
+                except Exception:
+                    pass
                 await emit({
                     "type":           "chart.confirmed",
                     "job_id":         job_id,
@@ -390,12 +395,39 @@ class Orchestrator:
                     domain=domain,
                     query_embedding=_query_embedding,
                 )
+                # ── LLM arbiter (ensemble tie-breaker) ────────────────────────
+                # Only when the cheap experts disagreed (needs_arbiter). Reorders
+                # the candidate list so the arbiter's pick leads. One small call,
+                # fully non-fatal — original order stands on any failure.
+                if retrieved_context and getattr(retrieved_context, "needs_arbiter", False):
+                    try:
+                        from agent_service.agents.retrieval_arbiter import arbitrate
+                        await set_pipeline_state(redis, job_id, "step", "retrieval_arbiter")
+                        _arb = await arbitrate(user_text, retrieved_context, enriched)
+                        if _arb.get("used") and _arb.get("ordered_tables"):
+                            _by_name = {c.table_name: c for c in (retrieved_context.candidates or [])}
+                            _reordered = [_by_name[t] for t in _arb["ordered_tables"] if t in _by_name]
+                            _reordered += [c for c in (retrieved_context.candidates or []) if c not in _reordered]
+                            retrieved_context.candidates = _reordered
+                            retrieved_context.primary_tables = [c.table_name for c in _reordered]
+                            retrieved_context.arbiter_used = True
+                            retrieved_context.arbiter_reason = _arb.get("reason", "")
+                            print(
+                                f"[pipeline:{job_id}] arbiter reordered → "
+                                f"{retrieved_context.primary_tables[:3]}  ({_arb.get('reason','')[:80]})",
+                                flush=True,
+                            )
+                    except Exception as _abe:
+                        print(f"[pipeline:{job_id}] arbiter step failed (non-fatal): {_abe}", flush=True)
+
                 if retrieved_context and retrieved_context.primary_tables:
                     await emit({
                         "type": "rag.retrieved",
                         "job_id": job_id,
                         "tables": retrieved_context.primary_tables[:4],
                         "confidence": round(retrieved_context.confidence, 3),
+                        "agreement": round(getattr(retrieved_context, "agreement", 1.0), 3),
+                        "arbiter_used": getattr(retrieved_context, "arbiter_used", False),
                     })
 
             # ── Explicit "why did that fail?" follow-up ──────────────────────────
@@ -661,7 +693,13 @@ class Orchestrator:
                     should_auto_select, candidate_label,
                 )
                 cand_scores = get_pipeline_candidates(retrieved_context.candidates)
-                if is_ambiguous(cand_scores):
+                # Fan out to best-of-N either when the score spread looks ambiguous
+                # (existing heuristic) OR when the ensemble experts disagreed
+                # (low agreement) — the latter is exactly the "retrieval was
+                # uncertain, generate multiple candidates and let validation pick"
+                # case. Bounded: still only runs on the ambiguous minority.
+                _low_agreement = getattr(retrieved_context, "agreement", 1.0) < 0.5
+                if is_ambiguous(cand_scores) or _low_agreement:
                     print(
                         f"[pipeline:{job_id}] multi-candidate ambiguity: "
                         + " | ".join(
@@ -714,6 +752,21 @@ class Orchestrator:
                     elif len(cand_results) == 1:
                         final_result = self._candidate_to_final_result(job_id, cand_results[0])
 
+            # Phase 6: remember the multi-candidate / arbiter-selected winner. The
+            # attempt loop below (which normally records success) is skipped once a
+            # candidate has produced final_result, so record it here instead — this
+            # is how a validation-judged best-of-N answer becomes a future few-shot.
+            if final_result and final_result.get("sql"):
+                try:
+                    _query_memory.record_success(
+                        connection_id, user_text, final_result["sql"],
+                        final_result.get("table_used", ""),
+                        final_result.get("chart_type", ""),
+                        score=final_result.get("score", 0.7),
+                    )
+                except Exception as _qmw:
+                    print(f"[pipeline:{job_id}] multi-candidate memory record failed (non-fatal): {_qmw}", flush=True)
+
             # STEP 3+4+5+6: Query → Execute → Render → Validate (up to 4 attempts)
             # Skipped when multi-candidate already produced a final_result.
             retry_feedback: Optional[str] = None
@@ -744,7 +797,16 @@ class Orchestrator:
                         user_profile=user_profile,
                         metric_definitions=_metric_defs or None,
                         few_shot_examples=_few_shots or None,
+                        output_mode=output_mode,
                     )
+                # Honor an explicit output-mode selection from the user's toggle.
+                # "table" → force a tabular result no matter what chart type the
+                # model chose; "text" → the narration path already renders prose
+                # (no chart is rendered when output_mode != "chart"). "chart" and
+                # "auto" leave the model's choice intact.
+                if output_mode == "table" and query_plan is not None:
+                    query_plan.chart_type = "table"
+
                 await emit({
                     "type": "query.generated",
                     "job_id": job_id,
@@ -1393,6 +1455,15 @@ class Orchestrator:
                         "Please choose the one that looks right:"
                     ),
                 })
+
+            # Attach the per-query cost/token summary. All LLM calls (classify →
+            # generate → validate → narrate → ground) have completed by now, so
+            # this captures the full turn cost. Non-fatal if tracking is off.
+            try:
+                from shared.bedrock_client import get_cost_summary
+                final_result["cost"] = get_cost_summary()
+            except Exception:
+                pass
 
             await emit({
                 "type": "chart.confirmed",

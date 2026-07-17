@@ -547,6 +547,7 @@ class QueryAgent:
         user_profile: Optional[dict] = None,
         metric_definitions: Optional[list] = None,
         few_shot_examples: Optional[list] = None,
+        output_mode: Optional[str] = None,
     ) -> QueryPlan:
         # ── Table selection: Graph RAG > word-overlap > schema.important_tables ──
         if retrieved_context and retrieved_context.primary_tables and enriched and enriched.compact_tables:
@@ -681,6 +682,25 @@ class QueryAgent:
                 }
                 if getattr(retrieved_context, "needs_join", False) and getattr(retrieved_context, "join_path", []):
                     user_content["exact_column_schema"]["join_path"] = retrieved_context.join_path
+
+        # Honor the user's selected response format so the SQL shape matches it.
+        _om = (output_mode or "").lower()
+        if _om == "text":
+            user_content["response_format"] = (
+                "The user wants a TEXT answer (a single fact/number or short prose), "
+                "not a chart. Prefer a concise query — usually one aggregate value or "
+                "a handful of rows — that directly answers the question."
+            )
+        elif _om == "table":
+            user_content["response_format"] = (
+                "The user wants a TABLE. Return the relevant detail rows and columns "
+                "(not a single aggregate), ordered sensibly, with a reasonable row cap."
+            )
+        elif _om == "chart":
+            user_content["response_format"] = (
+                "The user wants a CHART. Produce a query with a dimension to group by "
+                "and a numeric measure to plot."
+            )
 
         # Inject conversation history so the LLM can resolve follow-up references
         # ("same table", "now add region", "break that down by X", "filter by last year", etc.)

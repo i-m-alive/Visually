@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How the Query Agent Finds the Right Tables &amp; Views</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero { background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%); color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px; box-shadow: 0 20px 50px rgba(79,70,229,.25); }
+  header.hero h1 { font-size: 29px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 800px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 50px; }
+  h2 { font-size: 22px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px; }
+  h3 { font-size: 16.5px; font-weight: 700; margin: 24px 0 8px; }
+  .lede { color: var(--muted); margin-bottom: 20px; max-width: 860px; }
+  p { margin-bottom: 13px; max-width: 860px; }
+  ul, ol.body { margin-left: 20px; } ul li, ol.body li { margin-bottom: 6px; }
+
+  .diagram-stage { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; margin: 8px 0 6px; box-shadow: 0 2px 12px rgba(16,24,40,.05); overflow-x: auto; }
+  .diagram-stage svg { display:block; width: 100%; min-width: 760px; height: auto; }
+  .caption { font-size: 12.5px; color: var(--muted); margin: 6px 2px 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13.6px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.k { font-weight:700; white-space:nowrap; }
+  td.center { text-align:center; }
+
+  .chip { display:inline-flex; align-items:center; font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:99px; white-space:nowrap; }
+  .chip.dense { background: var(--blue-soft); color: var(--blue); }
+  .chip.sparse { background: var(--green-soft); color: var(--green); }
+  .chip.graph { background:#f5f3ff; color:#7c3aed; }
+  .chip.heur { background: var(--amber-soft); color: var(--amber); }
+
+  .callout { border-radius: var(--radius); padding: 16px 20px; margin: 16px 0; border: 1px solid; }
+  .callout.info { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.info .tag { color: var(--blue); }
+  .callout.key { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.key .tag { color: var(--green); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 7px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .ex { background: var(--surface); border:1px solid var(--border); border-left: 4px solid var(--brand); border-radius: 0 10px 10px 0; padding: 14px 18px; margin: 10px 0; font-size: 14px; }
+  .ex b { color: var(--brand-dark); }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Finding the Right Tables &amp; Views</h1>
+    <p>How the query agent narrows a database of hundreds of tables down to the few that actually answer a question — a hybrid retrieval system (keyword + semantic + graph) that votes, fuses, and only asks an AI to break ties when the signals disagree.</p>
+    <div class="meta">
+      <span>Component: <code>graph_rag_retriever.py</code></span>
+      <span>Runs in ~5&nbsp;ms · mostly no AI call</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why">Why this step exists</a></li>
+      <li><a href="#diagram">The retrieval pipeline (diagram)</a></li>
+      <li><a href="#experts">The five experts</a></li>
+      <li><a href="#fusion">How the votes are fused (RRF)</a></li>
+      <li><a href="#boosts">What makes a table win or lose</a></li>
+      <li><a href="#views">Tables vs. views</a></li>
+      <li><a href="#arbiter">The tie-break arbiter</a></li>
+      <li><a href="#joins">Finding related tables (joins)</a></li>
+      <li><a href="#example">Worked example</a></li>
+      <li><a href="#rag">Is this "RAG" / "GraphRAG"?</a></li>
+    </ol>
+  </nav>
+
+  <section id="why">
+    <h2><span class="num">1</span>Why this step exists</h2>
+    <p class="lede">A connected database can have hundreds of tables. You cannot paste all of them into an AI prompt — it's too big, too expensive, and the model would pick the wrong one.</p>
+    <p>So before any SQL is written, a <strong>retriever</strong> scores every table/view against the question and hands the SQL writer only the best 3–6, together with their exact columns and how they join. Getting this step right is the single biggest driver of a correct answer: if the right table isn't retrieved, no amount of clever SQL generation can recover.</p>
+    <div class="callout key">
+      <span class="tag">The core idea</span>
+      <p>Table selection is a <strong>panel of independent experts</strong>, not one formula. Each expert looks at the question a different way and ranks the tables. Their rankings are fused into a consensus; only when they disagree does an AI arbiter step in. This is fast (in-memory), cheap (usually zero AI calls), and accurate (diverse signals catch what any one would miss).</p>
+    </div>
+  </section>
+
+  <section id="diagram">
+    <h2><span class="num">2</span>The retrieval pipeline</h2>
+    <p class="lede">From the raw question to the final short-list of tables + join paths handed to the SQL writer.</p>
+    <div class="diagram-stage">
+      <svg viewBox="0 0 960 860" role="img" aria-label="Table retrieval pipeline diagram">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker>
+          <marker id="arG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+          <marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+        </defs>
+        <style>
+          .bx{rx:10;stroke-width:1.6}
+          .tx{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;fill:#1a2233}
+          .t-main{font-size:14px;font-weight:700}
+          .t-sub{font-size:11.5px;font-weight:500;fill:#5b6579}
+          .t-lbl{font-size:11px;font-weight:700}
+          .ln{stroke:#94a3b8;stroke-width:1.6;fill:none}
+        </style>
+
+        <!-- Question -->
+        <rect x="350" y="20" width="260" height="46" rx="10" fill="#312e81" stroke="#312e81"/>
+        <text class="tx t-main" x="480" y="48" text-anchor="middle" fill="#fff">User's question (plain English)</text>
+
+        <!-- prep -->
+        <rect x="300" y="104" width="360" height="52" rx="10" fill="#eef2ff" stroke="#6366f1"/>
+        <text class="tx t-main" x="480" y="126" text-anchor="middle">Build query text</text>
+        <text class="tx t-sub" x="480" y="144" text-anchor="middle">+ finance jargon expansion  ·  + intent metrics/entities</text>
+
+        <!-- experts row -->
+        <text class="tx t-lbl" x="480" y="190" text-anchor="middle" fill="#5b6579">FIVE EXPERTS SCORE EVERY TABLE — IN PARALLEL, ~5&#160;ms, NO AI CALL</text>
+        <!-- e1 -->
+        <rect x="18"  y="206" width="176" height="74" rx="10" fill="#ecfdf5" stroke="#059669"/>
+        <text class="tx t-main" x="106" y="236" text-anchor="middle">TF-IDF</text>
+        <text class="tx t-sub"  x="106" y="254" text-anchor="middle">keyword overlap</text>
+        <text class="tx t-sub"  x="106" y="269" text-anchor="middle">(sparse / lexical)</text>
+        <!-- e2 -->
+        <rect x="207" y="206" width="176" height="74" rx="10" fill="#f0f9ff" stroke="#0369a1"/>
+        <text class="tx t-main" x="295" y="236" text-anchor="middle">Embeddings</text>
+        <text class="tx t-sub"  x="295" y="254" text-anchor="middle">meaning match</text>
+        <text class="tx t-sub"  x="295" y="269" text-anchor="middle">(dense / vector)</text>
+        <!-- e3 -->
+        <rect x="396" y="206" width="176" height="74" rx="10" fill="#eef2ff" stroke="#4f46e5"/>
+        <text class="tx t-main" x="484" y="236" text-anchor="middle">Concept index</text>
+        <text class="tx t-sub"  x="484" y="254" text-anchor="middle">business term →</text>
+        <text class="tx t-sub"  x="484" y="269" text-anchor="middle">table.column</text>
+        <!-- e4 -->
+        <rect x="585" y="206" width="176" height="74" rx="10" fill="#fffbeb" stroke="#d97706"/>
+        <text class="tx t-main" x="673" y="236" text-anchor="middle">Entity / name</text>
+        <text class="tx t-sub"  x="673" y="254" text-anchor="middle">"customer X" →</text>
+        <text class="tx t-sub"  x="673" y="269" text-anchor="middle">id column</text>
+        <!-- e5 -->
+        <rect x="774" y="206" width="176" height="74" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+        <text class="tx t-main" x="862" y="236" text-anchor="middle">FK-graph</text>
+        <text class="tx t-sub"  x="862" y="254" text-anchor="middle">reachable via</text>
+        <text class="tx t-sub"  x="862" y="269" text-anchor="middle">foreign keys</text>
+
+        <!-- RRF -->
+        <rect x="300" y="342" width="360" height="54" rx="10" fill="#ffffff" stroke="#4f46e5"/>
+        <text class="tx t-main" x="480" y="364" text-anchor="middle">RRF fusion → consensus ranking</text>
+        <text class="tx t-sub"  x="480" y="382" text-anchor="middle">combine by rank position · compute "agreement" score</text>
+
+        <!-- composite -->
+        <rect x="286" y="430" width="388" height="54" rx="10" fill="#ffffff" stroke="#6366f1"/>
+        <text class="tx t-main" x="480" y="452" text-anchor="middle">Calibrated score (0–1) + boosts / penalties</text>
+        <text class="tx t-sub"  x="480" y="470" text-anchor="middle">fact-table&#8593; · kpi&#8593; · view&#8593; · never_use_for&#8595; · junk&#8595; · history bias</text>
+
+        <!-- gate diamond -->
+        <polygon points="480,512 610,558 480,604 350,558" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+        <text class="tx t-main" x="480" y="554" text-anchor="middle">Experts</text>
+        <text class="tx t-main" x="480" y="572" text-anchor="middle">agree?</text>
+
+        <!-- arbiter -->
+        <rect x="686" y="531" width="256" height="54" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text class="tx t-main" x="814" y="553" text-anchor="middle">AI arbiter (LLM)</text>
+        <text class="tx t-sub"  x="814" y="571" text-anchor="middle">breaks the tie on the short-list</text>
+
+        <!-- join resolution -->
+        <rect x="300" y="642" width="360" height="52" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+        <text class="tx t-main" x="480" y="664" text-anchor="middle">Join-path resolution (FK graph)</text>
+        <text class="tx t-sub"  x="480" y="682" text-anchor="middle">connect chosen tables · surface "no path" honestly</text>
+
+        <!-- final -->
+        <rect x="292" y="732" width="376" height="56" rx="10" fill="#ecfdf5" stroke="#059669"/>
+        <text class="tx t-main" x="480" y="756" text-anchor="middle">Top 3–6 tables / views + column · filter · join hints</text>
+        <text class="tx t-sub"  x="480" y="775" text-anchor="middle">→ handed to the Query Agent to write SQL</text>
+
+        <!-- arrows -->
+        <path class="ln" d="M480,66 L480,104" marker-end="url(#ar)"/>
+        <!-- fan out -->
+        <path class="ln" d="M480,156 L106,206" marker-end="url(#ar)"/>
+        <path class="ln" d="M480,156 L295,206" marker-end="url(#ar)"/>
+        <path class="ln" d="M480,156 L484,206" marker-end="url(#ar)"/>
+        <path class="ln" d="M480,156 L673,206" marker-end="url(#ar)"/>
+        <path class="ln" d="M480,156 L862,206" marker-end="url(#ar)"/>
+        <!-- converge -->
+        <path class="ln" d="M106,280 L480,342" marker-end="url(#ar)"/>
+        <path class="ln" d="M295,280 L480,342" marker-end="url(#ar)"/>
+        <path class="ln" d="M484,280 L480,342" marker-end="url(#ar)"/>
+        <path class="ln" d="M673,280 L480,342" marker-end="url(#ar)"/>
+        <path class="ln" d="M862,280 L480,342" marker-end="url(#ar)"/>
+        <!-- spine -->
+        <path class="ln" d="M480,396 L480,430" marker-end="url(#ar)"/>
+        <path class="ln" d="M480,484 L480,512" marker-end="url(#ar)"/>
+        <!-- gate low -> arbiter -->
+        <path class="ln" style="stroke:#d97706" d="M610,558 L686,558" marker-end="url(#arA)"/>
+        <text class="tx t-lbl" x="648" y="550" text-anchor="middle" fill="#d97706">disagree</text>
+        <!-- arbiter -> join -->
+        <path class="ln" style="stroke:#d97706" d="M814,585 L814,618 L560,642" marker-end="url(#arA)"/>
+        <text class="tx t-lbl" x="700" y="612" text-anchor="middle" fill="#d97706">reordered</text>
+        <!-- gate high -> join -->
+        <path class="ln" style="stroke:#059669" d="M480,604 L480,642" marker-end="url(#arG)"/>
+        <text class="tx t-lbl" x="512" y="626" fill="#059669">agree</text>
+        <!-- join -> final -->
+        <path class="ln" d="M480,694 L480,732" marker-end="url(#ar)"/>
+        <!-- clarify note -->
+        <path class="ln" style="stroke-dasharray:5 4" d="M350,558 L214,558 L214,470" marker-end="url(#ar)"/>
+        <rect x="20" y="418" width="194" height="52" rx="10" fill="#fef2f2" stroke="#dc2626"/>
+        <text class="tx t-main" x="117" y="440" text-anchor="middle" fill="#991b1b">Nothing fits?</text>
+        <text class="tx t-sub"  x="117" y="458" text-anchor="middle">ask the user to clarify</text>
+      </svg>
+    </div>
+    <p class="caption">Green = deterministic/fast · Amber = the one conditional AI call (arbiter) · Purple = the foreign-key graph. The dashed red path is the "don't guess" exit: if no table scores above the floor, the agent asks a clarifying question instead.</p>
+  </section>
+
+  <section id="experts">
+    <h2><span class="num">3</span>The five experts</h2>
+    <p class="lede">Each expert reads one pre-computed signal from the enriched schema and produces its own ranked list of tables. They're blind to each other — that independence is what makes the ensemble strong.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Expert</th><th>Family</th><th>How it scores a table</th><th>Catches</th></tr>
+      <tr><td class="k">TF-IDF</td><td class="center"><span class="chip sparse">sparse</span></td><td>Cosine similarity between the question's words and the table's text (name + description + columns)</td><td>Literal keyword hits ("revenue", "region")</td></tr>
+      <tr><td class="k">Embeddings</td><td class="center"><span class="chip dense">dense</span></td><td>Cosine between the question's Titan vector and each table's pre-computed vector</td><td>Meaning when words differ ("earnings" ≈ "revenue")</td></tr>
+      <tr><td class="k">Concept index</td><td class="center"><span class="chip heur">lookup</span></td><td>Maps business-vocabulary terms to specific <code>table.column</code> entries built during enrichment (+ finance glossary)</td><td>Domain jargon → exact column</td></tr>
+      <tr><td class="k">Entity / name</td><td class="center"><span class="chip heur">fuzzy</span></td><td>Matches named entities in the question to identifier/name columns; also table-name overlap</td><td>"account 4021" → the accounts table</td></tr>
+      <tr><td class="k">FK-graph</td><td class="center"><span class="chip graph">graph</span></td><td>Boosts tables reachable in 1–2 foreign-key hops from other strong candidates</td><td>The dimension you need to join but didn't name</td></tr>
+    </table>
+    </div>
+    <div class="callout info">
+      <span class="tag">Where the signals come from</span>
+      <p>All of these read from the <strong>enriched schema</strong> — a cached, pre-built index (TF-IDF vectors, embeddings, concept map, FK graph) computed once per schema version. That's why the whole panel runs in a few milliseconds with (at most) a single embedding call for the query itself.</p>
+    </div>
+  </section>
+
+  <section id="fusion">
+    <h2><span class="num">4</span>How the votes are fused — RRF</h2>
+    <p class="lede">The experts' rankings are combined with <strong>Reciprocal Rank Fusion</strong>, which merges by each table's <em>position</em> in each list, not its raw score.</p>
+    <p>Why by position? Because a raw TF-IDF cosine of 0.3 and an embedding cosine of 0.3 mean very different things — mixing raw numbers lets one signal shout over the others. Rank position is scale-free and consensus-favoring:</p>
+    <div class="ex">
+      <b>RRF(table) = Σ<sub>experts</sub>  weight / (60 + rank)</b><br>
+      A table ranked #1 by three experts beats a table ranked #1 by a single loud expert. The fusion also outputs an <b>agreement score</b> — the fraction of experts that place the winner in their own top-3 — which drives the tie-break gate.
+    </div>
+    <p>RRF gives the consensus <em>order</em>; a calibrated weighted score (kept on a 0–1 scale) gives the <em>confidence number</em> that downstream thresholds use (e.g. "ask to clarify below 0.12").</p>
+  </section>
+
+  <section id="boosts">
+    <h2><span class="num">5</span>What makes a table win or lose</h2>
+    <p class="lede">On top of the fused score, semantic metadata generated at crawl time nudges the ranking — this is how the system uses knowledge about the tables, not just word matching.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Adjustment</th><th>Effect</th><th>Why</th></tr>
+      <tr><td class="k">Consensus boost</td><td>+ small</td><td>Tables multiple experts independently rank in the top-3</td></tr>
+      <tr><td class="k">is_fact_table</td><td>+ boost</td><td>Aggregate/metric questions want the fact table, not a dimension</td></tr>
+      <tr><td class="k">is_kpi_metric</td><td>+ boost</td><td>Single-number ("how many / total") questions favor a table with a KPI column</td></tr>
+      <tr><td class="k">View-first</td><td>+ 0.18</td><td>Views are pre-joined / pre-aggregated — usually the cleanest source (see §6)</td></tr>
+      <tr><td class="k">History bias</td><td>lift to 0.30</td><td>On weak follow-ups, tables used in recent turns stay in contention</td></tr>
+      <tr><td class="k">never_use_for</td><td>× 0.15</td><td>An explicit "don't use this table for X" signal — heavily penalized on a match</td></tr>
+      <tr><td class="k">Junk table</td><td>× 0.40</td><td>Backup / temp / test copies can never outrank their production twin</td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="views">
+    <h2><span class="num">6</span>Tables vs. views</h2>
+    <p class="lede">The retriever treats views as first-class candidates — and generally <strong>prefers</strong> them.</p>
+    <p>A view is detected from its metadata or name (<code>vw_</code> prefix, <code>_view</code>/<code>_v</code> suffix, or a zero-row object with many columns). Because a view usually encapsulates the "right" joins and aggregations an analyst already blessed, a matching view gets a <strong>+0.18 boost</strong> once it has real relevance — so if both a raw table and a curated view can answer the question, the view tends to win. This keeps generated SQL simpler and closer to how the data team intends the data to be read.</p>
+  </section>
+
+  <section id="arbiter">
+    <h2><span class="num">7</span>The tie-break arbiter</h2>
+    <p class="lede">The only AI call in retrieval — and it fires on a minority of queries.</p>
+    <p>After fusion the system checks: do the experts <strong>agree</strong> (high agreement + a clear margin between #1 and #2)? If yes, the deterministic ranking stands and no AI is called. If the experts <strong>conflict</strong> (low agreement or a near-tie), a small LLM arbiter receives just the short-list — each candidate's description, columns, and which experts favored it — and picks the final order with a one-line reason.</p>
+    <div class="callout info">
+      <span class="tag">Guardrails on the arbiter</span>
+      <p>It sees only the short-list (never the full schema), its output is filtered back to those tables (it cannot invent one), and it never raises — on any failure the original ranking is used. Thresholds are tunable via <code>RAG_ARBITER_*</code> env vars, so how often it fires can be dialed against real traffic.</p>
+    </div>
+  </section>
+
+  <section id="joins">
+    <h2><span class="num">8</span>Finding related tables (joins)</h2>
+    <p class="lede">Choosing the primary table is half the job; the other half is connecting it to the tables it needs.</p>
+    <p>Once the top tables are fixed, an explicit stage walks the <strong>foreign-key graph</strong> to connect the primary table to each strong runner-up — a direct FK edge first, then a 2-hop path through a shared intermediate. The chosen path is handed to the SQL writer as an exact <code>JOIN … ON …</code>, so it never guesses join keys. Crucially, if two strong candidates have <strong>no</strong> FK path, that's logged and surfaced honestly rather than letting the model fabricate a join.</p>
+    <p>The FK graph itself is built from declared foreign keys plus inferred ones (shared key-like columns such as <code>customer_id</code>, <code>cust_no</code>, <code>acct_num</code>), so it works even on warehouses that don't enforce constraints.</p>
+  </section>
+
+  <section id="example">
+    <h2><span class="num">9</span>Worked example</h2>
+    <p class="lede">Question: <em>"total revenue by region last quarter"</em></p>
+    <ol class="body">
+      <li><strong>Build query text</strong> — tokens: <code>total, revenue, region, last, quarter</code> (finance glossary also adds <code>income, sales, billed</code>).</li>
+      <li><strong>TF-IDF</strong> ranks tables containing "revenue"/"region" highly.</li>
+      <li><strong>Embeddings</strong> also surface <code>billing_facts</code> described as "billed amounts" — no literal "revenue", but the meaning matches.</li>
+      <li><strong>Concept index</strong> maps "revenue" → <code>billing_facts.amount</code>.</li>
+      <li><strong>FK-graph</strong> sees <code>billing_facts</code> links to a <code>regions</code> dimension one hop away → pulls <code>regions</code> in for the "by region" grouping.</li>
+      <li><strong>RRF</strong> finds <code>billing_facts</code> ranked #1 by three experts → high agreement → <strong>no arbiter needed</strong>.</li>
+      <li><strong>Boosts</strong> — <code>billing_facts</code> is a fact table (+), a curated <code>vw_revenue</code> view if present would win via the view boost.</li>
+      <li><strong>Join resolution</strong> — FK path <code>billing_facts.region_id = regions.id</code> is attached.</li>
+      <li><strong>Result</strong> — <code>[billing_facts, regions]</code> + the amount metric + the join path go to the SQL writer.</li>
+    </ol>
+  </section>
+
+  <section id="rag">
+    <h2><span class="num">10</span>Is this "RAG" / "GraphRAG"?</h2>
+    <p class="lede">Honest terminology, because the component filename is generous.</p>
+    <ul>
+      <li><strong>Is it RAG?</strong> Yes — <em>retrieve</em> the right tables, <em>augment</em> the SQL prompt with them, <em>generate</em> SQL. The "documents" being retrieved are schema elements (tables/views), not text chunks.</li>
+      <li><strong>Is it vector RAG?</strong> Yes — embeddings are one of the five signals, so semantic/dense retrieval is genuinely in the mix alongside classic sparse (TF-IDF).</li>
+      <li><strong>Is it "GraphRAG"?</strong> Only loosely. It uses your database's <strong>foreign-key graph as a retrieval signal and for join resolution</strong>. It does <em>not</em> build an LLM-extracted knowledge graph with entity communities and summaries (the Microsoft-style "GraphRAG"). The accurate label is <strong>hybrid schema retrieval with a graph signal</strong> — which is the right tool for natural-language-to-SQL.</li>
+    </ul>
+  </section>
+
+  <footer>Grounded in <code>graph_rag_retriever.py</code> and the enriched schema in <code>schema_cache.py</code>. Retrieval runs in-memory in ~5&nbsp;ms; the only AI calls are the optional query embedding and the gated arbiter.</footer>
+
+</div>
+</body>
+</html>

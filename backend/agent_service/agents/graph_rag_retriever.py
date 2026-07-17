@@ -61,6 +61,22 @@ class RetrievedContext:
     needs_join: bool = False
     join_path: list = field(default_factory=list)   # list of (from, to, condition) hops
 
+    # ── Ensemble metadata (mixture-of-retrievers) ─────────────────────────────
+    # expert_rankings: {expert_name: [table_name, ...]} — each expert's own top
+    #   picks, in its own order. Powers rank fusion + the arbiter's context.
+    # agreement: 0..1 — how strongly the experts concur on the winner. Low
+    #   agreement means the cheap signals disagree and an LLM arbiter should
+    #   break the tie (see needs_arbiter).
+    # needs_arbiter: set when agreement is low / the top margin is thin AND the
+    #   top candidate is not already trivially weak (that path clarifies instead).
+    # shortlist: the top table names handed to the arbiter when it runs.
+    expert_rankings: dict = field(default_factory=dict)
+    agreement: float = 1.0
+    needs_arbiter: bool = False
+    shortlist: list = field(default_factory=list)
+    arbiter_used: bool = False
+    arbiter_reason: str = ""
+
 
 # ── Tokenisation ──────────────────────────────────────────────────────────────
 
@@ -229,6 +245,68 @@ def _cosine_list(a: list, b: list) -> float:
         return 0.0
     sim = dot / (math.sqrt(na) * math.sqrt(nb) + 1e-10)
     return sim if sim > 0.0 else 0.0
+
+
+# ── Ensemble: expert rankings + Reciprocal Rank Fusion ────────────────────────
+import os as _os
+
+# The experts that vote. Each reads one signal already computed into
+# table_signals. weight scales that expert's rank contribution in RRF.
+_EXPERT_WEIGHTS: dict[str, float] = {
+    "tfidf":   1.0,   # lexical
+    "embed":   1.0,   # semantic
+    "name":    0.9,   # table-name match
+    "concept": 0.9,   # business-vocabulary / glossary
+    "entity":  0.7,   # named-entity → column
+    "graph":   0.4,   # FK reachability
+}
+_RRF_K = 60  # standard damping constant
+
+# Arbiter gate thresholds (env-overridable so they can be tuned against traffic).
+_ARB_AGREEMENT_HIGH = float(_os.getenv("RAG_ARBITER_AGREEMENT_HIGH", "0.6"))
+_ARB_MARGIN_MIN     = float(_os.getenv("RAG_ARBITER_MARGIN_MIN", "0.08"))
+_ARB_SCORE_FLOOR    = float(_os.getenv("RAG_ARBITER_SCORE_FLOOR", "0.12"))
+
+
+def _build_expert_rankings(table_signals: dict) -> dict:
+    """Turn the per-table signal scores into one ranked list PER expert.
+    {expert_name: [table_name, ...]} ordered by that signal, positives only."""
+    rankings: dict[str, list] = {}
+    for expert in _EXPERT_WEIGHTS:
+        scored = [
+            (sigs[expert], tn)
+            for tn, sigs in table_signals.items()
+            if sigs.get(expert, 0.0) > 0.0
+        ]
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            rankings[expert] = [tn for _, tn in scored]
+    return rankings
+
+
+def _rrf_fuse(expert_rankings: dict) -> tuple:
+    """Reciprocal Rank Fusion across experts. Combines by RANK position (scale-
+    free), not raw score. Returns (fused_order, rrf_scores, agreement).
+
+    agreement = fraction of voting experts that place the fused winner in their
+    own top 3 — the signal the arbiter gate keys off.
+    """
+    if not expert_rankings:
+        return [], {}, 1.0
+    rrf: dict[str, float] = {}
+    for expert, order in expert_rankings.items():
+        w = _EXPERT_WEIGHTS.get(expert, 0.5)
+        for rank, tn in enumerate(order):
+            rrf[tn] = rrf.get(tn, 0.0) + w / (_RRF_K + rank)
+    fused_order = sorted(rrf.keys(), key=lambda t: rrf[t], reverse=True)
+    agreement = 1.0
+    if fused_order:
+        winner = fused_order[0]
+        voters = [o for o in expert_rankings.values() if o]
+        if voters:
+            in_top3 = sum(1 for o in voters if winner in o[:3])
+            agreement = in_top3 / len(voters)
+    return fused_order, rrf, agreement
 
 
 def _query_vec(tokens: list, idf: dict) -> dict:
@@ -511,6 +589,15 @@ def _retrieve(
                     table_signals[tn]["embed"] = cos
                     embed_present = True
 
+    # ── Ensemble: each signal votes as an independent expert, fused by RRF ─────
+    # This runs alongside the calibrated weighted-sum below (which still owns the
+    # 0..1 confidence scale that downstream thresholds depend on). RRF gives us a
+    # consensus ordering + an agreement score: strong consensus → trust the cheap
+    # ranking; weak agreement → flag for an LLM arbiter (handled in the orchestrator).
+    expert_rankings = _build_expert_rankings(table_signals)
+    rrf_order, rrf_scores, agreement = _rrf_fuse(expert_rankings)
+    rrf_top3 = set(rrf_order[:3])
+
     # ── Composite ─────────────────────────────────────────────────────────────
     # When an embedding signal is available for this query, rebalance the weights
     # to give it a real vote while keeping the total at 1.0 (so absolute score
@@ -579,6 +666,18 @@ def _retrieve(
     ranked = adjusted
     ranked.sort(key=lambda x: x[0], reverse=True)
 
+    # ── Consensus boost: tables multiple experts independently rank highly ─────
+    # A small, bounded nudge for tables in the RRF top-3 that already have real
+    # signal — the ensemble effect (agreement lifts a table) without disturbing
+    # the calibrated 0..1 scale or letting a single loud signal dominate.
+    if rrf_top3:
+        consensus = []
+        for score, tn, sigs in ranked:
+            extra = 0.05 if (tn in rrf_top3 and score >= 0.10) else 0.0
+            consensus.append((min(score + extra, 1.0), tn, sigs))
+        consensus.sort(key=lambda x: x[0], reverse=True)
+        ranked = consensus
+
     # ── View-first boost: views are pre-joined / pre-aggregated — prefer them ──
     view_names: set[str] = set()
     for t in enriched.compact_tables:
@@ -621,26 +720,43 @@ def _retrieve(
     if not top:
         return RetrievedContext()
 
-    # ── JOIN need detection: does the query span multiple semantic domains? ────
+    # ── JOIN-path resolution: connect the top table to strong runners-up ───────
+    # Explicit stage (not left to the SQL model to guess): for each strong
+    # runner-up, find a 1-hop or 2-hop FK path from the top table. When a strong
+    # candidate has NO path, we record it as UNREACHABLE and log it, so a missing
+    # relationship is surfaced honestly instead of the model inventing a join key.
     needs_join = False
     join_path_result: list = []
+    unreachable: list[str] = []
     if len(top) >= 2 and rg:
-        t1_name, t2_name = top[0][1], top[1][1]
-        # Both tables scored meaningfully AND they are FK-connected → JOIN query
-        if top[1][0] >= 0.25:
+        t1_name = top[0][1]
+        for cand_score, t2_name, _ in top[1:]:
+            if cand_score < 0.25:
+                break  # remaining candidates are too weak to be a real join partner
             cond = rg.get_join_condition(t1_name, t2_name) or rg.get_join_condition(t2_name, t1_name)
             if cond:
                 needs_join = True
-                join_path_result = [(t1_name, t2_name, cond)]
+                join_path_result.append((t1_name, t2_name, cond))
+                continue
+            # 2-hop fallback through a shared intermediate table
+            hop = None
+            for intermediate in (rg.edges.get(t1_name) or {}):
+                mid_cond = rg.get_join_condition(t1_name, intermediate)
+                end_cond = rg.get_join_condition(intermediate, t2_name) or rg.get_join_condition(t2_name, intermediate)
+                if mid_cond and end_cond:
+                    hop = [(t1_name, intermediate, mid_cond), (intermediate, t2_name, end_cond)]
+                    break
+            if hop:
+                needs_join = True
+                join_path_result.extend(hop)
             else:
-                # Check 2-hop path
-                for intermediate in (rg.edges.get(t1_name) or {}):
-                    mid_cond = rg.get_join_condition(t1_name, intermediate)
-                    end_cond = rg.get_join_condition(intermediate, t2_name) or rg.get_join_condition(t2_name, intermediate)
-                    if mid_cond and end_cond:
-                        needs_join = True
-                        join_path_result = [(t1_name, intermediate, mid_cond), (intermediate, t2_name, end_cond)]
-                        break
+                unreachable.append(t2_name)
+        if unreachable:
+            print(
+                f"[graph_rag] ⚠ no FK path from {t1_name} to strong candidate(s) "
+                f"{unreachable} — not fabricating a join",
+                flush=True,
+            )
 
     # ── Build TableCandidates ─────────────────────────────────────────────────
     sem_map = enriched.table_semantics or {}
@@ -701,10 +817,25 @@ def _retrieve(
     date_hints = [f"{c.table_name}.{col}" for c in candidates for col in c.date_columns]
 
     confidence = top[0][0] if top else 0.0
+
+    # ── Arbiter gate ──────────────────────────────────────────────────────────
+    # Escalate to an LLM arbiter (in the orchestrator) only when the cheap experts
+    # are genuinely unsure: low agreement OR a thin margin between the top two —
+    # but only when the top candidate has real signal (below the floor is the
+    # "clarify" path, not the arbiter path) and there's a runner-up to weigh.
+    margin = (top[0][0] - top[1][0]) if len(top) >= 2 else 1.0
+    needs_arbiter = bool(
+        len(top) >= 2
+        and confidence >= _ARB_SCORE_FLOOR
+        and (agreement < _ARB_AGREEMENT_HIGH or margin < _ARB_MARGIN_MIN)
+    )
+    shortlist = [tn for _, tn, _ in top]
+
     print(
         f"[graph_rag] tables={primary_tables[:3]}  "
         f"signals={[c.signals for c in candidates[:3]]}  "
-        f"confidence={confidence:.3f}  filters={len(filter_hints)}",
+        f"confidence={confidence:.3f}  agreement={agreement:.2f}  "
+        f"margin={margin:.3f}  arbiter={needs_arbiter}  filters={len(filter_hints)}",
         flush=True,
     )
 
@@ -718,6 +849,10 @@ def _retrieve(
         confidence=confidence,
         needs_join=needs_join,
         join_path=join_path_result,
+        expert_rankings={k: v[:5] for k, v in expert_rankings.items()},
+        agreement=round(agreement, 3),
+        needs_arbiter=needs_arbiter,
+        shortlist=shortlist,
     )
 
 

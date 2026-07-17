@@ -102,12 +102,12 @@
 
     <ol class="steps">
       <li><h3>The question arrives</h3><p>The user types a question in plain English in the <b>React chat panel</b>. It is sent to the backend, which immediately starts a background job and opens a live connection so the user can watch progress.</p></li>
-      <li><h3>Understand the intent</h3><p>The pipeline first works out <b>what is being asked</b> — the metric, the time range, the level of detail, and how the user wants to see it (chart, table, or text).</p></li>
+      <li><h3>Understand the intent — once</h3><p>The pipeline works out <b>what is being asked</b> — the metric, the time range, the level of detail, and how the user wants to see it (chart, table, or text). This runs a <b>single</b> history-aware classification (it reads recent turns to resolve follow-ups like "now by region"). If the request is a workflow action rather than a chart — e.g. a finance <b>reconcile / anomaly / forecast</b> ask — it branches to a domain <b>skill agent</b> that answers through read-only queries.</p></li>
       <li><h3>Load &amp; enrich the schema</h3><p>It pulls a plain-language map of the connected database — what each table means and how tables relate — from a fast cache, so it knows what data is available.</p></li>
-      <li><h3>Rank &amp; pick the best tables</h3><p>A retriever scores every table by name, meaning, and how tables link together, then hands the SQL writer only the few tables that best and fully answer the question. If nothing fits well enough, it <b>asks the user to clarify</b> instead of guessing.</p></li>
-      <li><h3>Write the query</h3><p>The AI writes the exact query (SQL), then auto-corrects column names, filter values, and syntax before anything runs.</p></li>
-      <li><h3>Run &amp; validate</h3><p>The query runs against the live database. A separate <b>validator</b> scores the answer on whether it matches the question — the right shape, detail, and completeness.</p></li>
-      <li><h3>Deliver the answer</h3><p>Once the answer clears the confidence bar, the system writes a short plain-English explanation, renders the chart or table, saves the result, and streams it to the screen.</p></li>
+      <li><h3>Rank the tables — a panel of experts</h3><p>Instead of one score, several independent <b>experts</b> each rank the tables their own way — by keywords, by meaning (embeddings), by business vocabulary, by how tables link. Their votes are fused (<b>RRF</b>) into one consensus with an <b>agreement</b> measure. When the experts strongly agree, that ranking stands; when they <b>disagree</b>, a brief AI <b>arbiter</b> breaks the tie. If nothing fits well enough, it <b>asks the user to clarify</b> instead of guessing.</p></li>
+      <li><h3>Write the query</h3><p>The AI writes the exact query (SQL) in the format the user picked (chart / table / text), then auto-corrects column names, filter values, and syntax before anything runs. Only read queries are ever produced.</p></li>
+      <li><h3>Run &amp; validate</h3><p>The query runs against the live database. A separate <b>validator</b> scores the answer on whether it matches the question — the right shape, detail, and completeness. When retrieval was uncertain, a few candidate queries run in parallel and the best-validated one wins.</p></li>
+      <li><h3>Deliver the answer</h3><p>Once the answer clears the confidence bar, the system writes a short plain-English explanation, <b>checks it is grounded</b> in the real numbers, renders the chart or table, records the <b>token + dollar cost</b> of the turn, saves the result, and streams it to the screen.</p></li>
     </ol>
 
     <div class="cards">
@@ -116,12 +116,20 @@
         <p>If the validator's score is below <code>0.65</code>, the pipeline loops back and tries again — a different table or a rewritten query — <b>up to 4 times</b> before it settles. The user only sees answers the system is confident in.</p>
       </div>
       <div class="card">
-        <h3>Tables are chosen before any SQL</h3>
-        <p>Table selection is a fast, in-memory ranking (name + meaning + relationships) — no AI call. This keeps the SQL focused and accurate on large databases.</p>
+        <h3>A panel of experts, not one score</h3>
+        <p>Table selection runs several independent rankers (keywords, embeddings, vocabulary, table links) and fuses their votes. The AI <b>arbiter</b> only spends a call when they disagree — accuracy on the hard questions, near-zero cost on the easy ones.</p>
+      </div>
+      <div class="card">
+        <h3>Read-only by construction</h3>
+        <p>Only <code>SELECT</code>-style queries can ever reach the database — checked before sending and again inside the executor. The "create / update / delete" assistant drafts SQL for you but has <b>no tool to run it</b>.</p>
       </div>
       <div class="card">
         <h3>The right AI model for each job</h3>
-        <p>Fast, low-cost <b>Claude Haiku</b> handles intent and quick checks; heavier <b>Claude Sonnet</b> writes the SQL and the final explanation; <b>Titan</b> turns text into embeddings for table search.</p>
+        <p>Fast, low-cost <b>Claude Haiku</b> handles intent and quick checks; heavier <b>Claude Sonnet</b> writes the SQL, arbitrates, and explains; <b>Titan</b> turns text into embeddings for semantic table search.</p>
+      </div>
+      <div class="card">
+        <h3>Every turn's cost is measured</h3>
+        <p>Input + output tokens and the exact <b>dollar cost</b> (cache-aware, priced per model) are tallied for each question and shown right under the answer — no black-box spend.</p>
       </div>
       <div class="card">
         <h3>Live, not a black box</h3>
@@ -129,7 +137,84 @@
       </div>
     </div>
 
-    <p class="foot">This shows the pipeline for a single visual/answer. A full dashboard request simply fans out into several of these pipelines running in parallel, one per chart.</p>
+    <p class="foot">This shows the pipeline for a single visual/answer. A full dashboard request fans out into several of these pipelines running in parallel, one per chart; a workflow request (finance reconcile/anomaly/forecast, etc.) is handled by a domain skill agent through the same read-only query path.</p>
+  </section>
+
+  <section class="explain" id="agents">
+    <style>
+      #agents table{width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--line);
+        border-radius:12px;overflow:hidden;margin:12px 0 8px;font-size:14px}
+      #agents th,#agents td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+      #agents th{background:#f1f5f9;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#64748b;font-weight:700}
+      #agents tr:last-child td{border-bottom:none}
+      #agents td.k{font-weight:700;white-space:nowrap}
+      #agents td.m{text-align:center;white-space:nowrap;font-size:13px}
+      #agents .fn{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;color:var(--faint)}
+      #agents h3.grp{font-size:15.5px;font-weight:800;margin:26px 0 2px}
+      #agents .grp-sub{font-size:13px;color:var(--soft);margin:0 0 6px}
+      #agents .keylegend{font-size:13px;color:var(--soft);margin:2px 0 14px}
+      .pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;background:#ecfdf8;color:#0d7a72;border:1px solid #cdeee8}
+      .pill.rec{background:#f5f3ff;color:#7c3aed;border-color:#ddd6fe}
+      .pill.fin{background:#eff6ff;color:#0369a1;border-color:#bfdbfe}
+      .tag-wrap{display:flex;flex-wrap:wrap;gap:7px;margin:6px 0 2px}
+    </style>
+
+    <h2 class="sec">Every agent &amp; its responsibility</h2>
+    <p class="sec-sub">A reference map of who does what. <b>💬</b> = makes an AI-model call (has cost/latency); <b>⚙️</b> = deterministic (in-memory, free).</p>
+
+    <h3 class="grp">1 · Pipeline spine — runs on (nearly) every query</h3>
+    <table>
+      <tr><th>Agent</th><th>Type</th><th>Responsibility</th></tr>
+      <tr><td class="k">Orchestrator</td><td class="m">⚙️</td><td>The conductor — runs every stage in order, owns the retry loop, routing, and result assembly. <span class="fn">orchestrator.py</span></td></tr>
+      <tr><td class="k">Intent Classifier</td><td class="m">💬</td><td>Reads the question + last 6 turns; decides intent, entities (metric/dimension/time/filters) and output mode. Runs <b>once</b>, history- &amp; domain-aware. <span class="fn">intent_classifier.py</span></td></tr>
+      <tr><td class="k">GraphRAG Retriever</td><td class="m">⚙️</td><td>Ranks which tables best answer the question; emits column / JOIN / filter hints. ~5&nbsp;ms in-memory. <span class="fn">graph_rag_retriever.py</span></td></tr>
+      <tr><td class="k">Query Agent</td><td class="m">💬</td><td>Writes the actual SQL (a <code>QueryPlan</code>) grounded in the exact column schema. Emits text only — never executes. <span class="fn">query_agent.py</span></td></tr>
+      <tr><td class="k">Validator Agent</td><td class="m">💬</td><td>Scores whether the result truly answers the question (shape, detail, axis labels); writes retry feedback on failure. <span class="fn">validator_agent.py</span></td></tr>
+      <tr><td class="k">Result Narrator</td><td class="m">💬</td><td>Turns rows into a plain-English answer, then a <b>grounding check</b> confirms it didn't invent a number. <span class="fn">result_narrator.py</span></td></tr>
+      <tr><td class="k">Root-Cause Agent</td><td class="m">💬</td><td>On a hard failure or "why did that fail?" follow-up, diagnoses the bad SQL and attempts one corrected re-run. <span class="fn">root_cause_agent.py</span></td></tr>
+    </table>
+
+    <h3 class="grp">2 · Retrieval ensemble — the "panel of experts"</h3>
+    <p class="grp-sub">Five deterministic experts each rank the tables their own way; their votes are fused by RRF into a consensus + agreement score. The arbiter is the only LLM here, and only fires on disagreement.</p>
+    <table>
+      <tr><th>Expert</th><th>Type</th><th>What it judges</th></tr>
+      <tr><td class="k">Lexical (TF-IDF)</td><td class="m">⚙️</td><td>Keyword overlap with each table's text</td></tr>
+      <tr><td class="k">Semantic (embeddings)</td><td class="m">⚙️</td><td>Meaning / paraphrase match via Titan vectors</td></tr>
+      <tr><td class="k">Concept / glossary</td><td class="m">⚙️</td><td>Business-vocabulary terms → table.column (+ finance jargon expansion)</td></tr>
+      <tr><td class="k">Entity / name</td><td class="m">⚙️</td><td>Named entities → identifier columns; table-name hits</td></tr>
+      <tr><td class="k">FK-graph</td><td class="m">⚙️</td><td>Reachability from other strong candidates</td></tr>
+      <tr><td class="k">Retrieval Arbiter</td><td class="m">💬</td><td><b>Only when experts disagree</b> — reads the shortlist and breaks the tie. <span class="fn">retrieval_arbiter.py</span></td></tr>
+    </table>
+
+    <h3 class="grp">3 · Skill agents — domain workflows</h3>
+    <p class="grp-sub">Fire only when the intent is a workflow action, only for their domain, and always through a bounded read-only <code>run_sql</code> loop.</p>
+    <table>
+      <tr><th>Agent</th><th>Domain</th><th>Responsibility</th></tr>
+      <tr><td class="k">MATCH</td><td class="m"><span class="pill">both</span></td><td>Rank / flag accounts, transactions, candidates by risk / priority / fit</td></tr>
+      <tr><td class="k">BRIEFING</td><td class="m"><span class="pill">both</span></td><td>Daily "what needs attention" overview; personal "my …" queries</td></tr>
+      <tr><td class="k">AUDIT</td><td class="m"><span class="pill">both</span></td><td>Data-quality / integrity issues (missing, stale, mismatched)</td></tr>
+      <tr><td class="k">PROSPECT</td><td class="m"><span class="pill">both</span></td><td>Gaps, at-risk items, opportunities</td></tr>
+      <tr><td class="k">ENRICH</td><td class="m"><span class="pill fin">finance</span></td><td>Consolidate everything known about one entity into one view</td></tr>
+      <tr><td class="k">RECONCILE</td><td class="m"><span class="pill fin">finance</span></td><td>Match two sources and pinpoint what doesn't tie out</td></tr>
+      <tr><td class="k">ANOMALY</td><td class="m"><span class="pill fin">finance</span></td><td>Compute outlier / suspicious activity from raw data (no pre-existing flag)</td></tr>
+      <tr><td class="k">FORECAST</td><td class="m"><span class="pill fin">finance</span></td><td>Transparent projection from history (no black-box ML)</td></tr>
+      <tr><td class="k">NETWORK</td><td class="m"><span class="pill fin">finance</span></td><td>Trace relationships / fund-flows between entities</td></tr>
+      <tr><td class="k">ACTION</td><td class="m"><span class="pill">both</span></td><td>Handles "create / update / delete" requests <b>read-only</b> — drafts the SQL for you, warns on destructive ops, has <b>no tool to execute</b>. <span class="fn">action_agent.py</span></td></tr>
+    </table>
+    <p class="grp-sub">Recruitment additionally defines <b>SCREEN · VERIFY · PRESENT</b> (and its own ENRICH), but these are not yet implemented — they return a "coming soon" stub rather than an error.</p>
+
+    <h3 class="grp">4 · Enforcement &amp; support</h3>
+    <p class="grp-sub">Deterministic components that guard, speed up, or sharpen the agents above.</p>
+    <table>
+      <tr><th>Component</th><th>Responsibility</th></tr>
+      <tr><td class="k">Sandbox</td><td>The non-bypassable read-only gate — allowlist (SELECT/WITH/SHOW/DESCRIBE) + 19-keyword blocklist, enforced inside the executor independent of any agent. <span class="fn">query_executor/sandbox.py</span></td></tr>
+      <tr><td class="k">Candidate ranker</td><td>Decides when table candidates are ambiguous enough to run best-of-N. <span class="fn">candidate_ranker.py</span></td></tr>
+      <tr><td class="k">Table-role classifier</td><td>Pre-labels finance tables (transaction / account / ledger …) so skill agents skip a discovery turn. <span class="fn">table_role_classifier.py</span></td></tr>
+      <tr><td class="k">Query memory</td><td>Stores successful (question → SQL) pairs as future few-shot examples. <span class="fn">query_memory.py</span></td></tr>
+      <tr><td class="k">Metric registry</td><td>Canonical SQL for named metrics so "revenue" / "AUM" answer consistently. <span class="fn">metric_registry.py</span></td></tr>
+    </table>
+
+    <p class="foot">The short version: classify → pick tables (5 experts + tie-break arbiter) → write SQL → run read-only → validate → narrate + ground-check → record cost. Skill agents handle workflow-shaped asks through the same read-only path; ACTION handles write requests without ever writing.</p>
   </section>
 </div>
 
@@ -171,21 +256,24 @@ const NODES = [
   {id:'run',   shape:'proc', group:'api',     x:330, y:185, w:230, h:52, label:'Run pipeline\n(background)'},
   {id:'job',   shape:'cyl',  group:'api',     x:585, y:181, w:190, h:60, label:'PipelineJob\n(status + result)'},
   // orchestrator spine
-  {id:'ic',    shape:'proc', group:'orch',    x:270, y:340, w:300, h:54, label:'1 · Understand the question\n(intent)'},
+  {id:'ic',    shape:'proc', group:'orch',    x:270, y:340, w:300, h:54, label:'1 · Understand the question\n(intent · history-aware · once)'},
   {id:'sch',   shape:'proc', group:'orch',    x:270, y:430, w:300, h:54, label:'2 · Load & enrich\nthe data schema'},
-  {id:'rag',   shape:'proc', group:'orch',    x:270, y:520, w:300, h:54, label:'3 · Rank & pick\nthe best tables'},
+  {id:'rag',   shape:'proc', group:'orch',    x:270, y:520, w:300, h:54, label:'3 · Rank tables — expert panel\n+ RRF fusion + agreement'},
+  {id:'skill', shape:'proc', group:'ai',      x:55,  y:427, w:185, h:60, label:'or → Skill agent\n(finance / recruitment)\nread-only run_sql loop'},
   {id:'conf',  shape:'dec',  group:'dec',     x:330, y:610, w:180, h:96, label:'Confident a\ntable fits?'},
   {id:'gen',   shape:'proc', group:'orch',    x:270, y:760, w:300, h:54, label:'4 · Write the SQL query\n(auto-checks columns / filters)'},
   {id:'exec',  shape:'proc', group:'orch',    x:270, y:880, w:300, h:54, label:'5 · Run the query'},
   {id:'val',   shape:'proc', group:'orch',    x:270, y:970, w:300, h:54, label:'6 · Validate & score\nthe result'},
   {id:'pass',  shape:'dec',  group:'dec',     x:330, y:1060,w:180, h:96, label:'Score high\nenough? (≥ 0.65)'},
-  {id:'out',   shape:'proc', group:'orch',    x:270, y:1210,w:300, h:54, label:'7 · Narrate & format\nthe answer'},
+  {id:'out',   shape:'proc', group:'orch',    x:270, y:1210,w:300, h:54, label:'7 · Narrate & format\n(+ grounding check)'},
+  {id:'cost',  shape:'term', group:'term',    x:290, y:1300,w:260, h:46, label:'Cost tracked · tokens in/out · $'},
   {id:'clarify',shape:'term',group:'term',    x:70,  y:631, w:170, h:54, label:'Ask the user\nto clarify'},
   // right column — models / services / storage
   {id:'R_redis', shape:'proc',group:'storage',x:850, y:181, w:350, h:56, label:'Redis — live events + cache'},
   {id:'R_haiku', shape:'proc',group:'ai',     x:850, y:341, w:350, h:52, label:'Claude Haiku — intent & checks'},
   {id:'R_pg',    shape:'cyl', group:'storage',x:850, y:426, w:350, h:60, label:'Postgres — schema · jobs · sessions'},
-  {id:'R_titan', shape:'proc',group:'ai',     x:850, y:521, w:350, h:52, label:'Titan — embeddings (table search)'},
+  {id:'R_titan', shape:'proc',group:'ai',     x:850, y:521, w:350, h:52, label:'Titan — table embeddings (semantic match)'},
+  {id:'R_arb',   shape:'proc',group:'ai',     x:850, y:615, w:350, h:52, label:'Retrieval arbiter — LLM tie-break\n(only when experts disagree)'},
   {id:'R_sonnet',shape:'proc',group:'ai',     x:850, y:759, w:350, h:54, label:'Claude Sonnet — SQL & narration'},
   {id:'R_qe',    shape:'proc',group:'service',x:850, y:879, w:350, h:52, label:'Query executor service'},
   {id:'R_db',    shape:'cyl', group:'service',x:850, y:945, w:350, h:60, label:'Your database'},
@@ -200,6 +288,7 @@ const EDGES = [
   {from:'ep',   fs:'r', to:'run',  ts:'l', c:'slate'},
   {from:'run',  fs:'r', to:'job',  ts:'l', c:'slate', label:'track'},
   {from:'run',  fs:'b', to:'ic',   ts:'t', c:'slate', label:'start'},
+  {from:'ic',   fs:'l', to:'skill',ts:'t', c:'green', label:'skill action'},
   {from:'ic',   fs:'b', to:'sch',  ts:'t', c:'slate'},
   {from:'sch',  fs:'b', to:'rag',  ts:'t', c:'slate'},
   {from:'rag',  fs:'b', to:'conf', ts:'t', c:'slate'},
@@ -216,10 +305,13 @@ const EDGES = [
   {from:'ic',   fs:'r', to:'R_haiku', ts:'l', c:'teal',   dashed:true, label:'classify'},
   {from:'sch',  fs:'r', to:'R_pg',    ts:'l', c:'purple', label:'read schema'},
   {from:'rag',  fs:'r', to:'R_titan', ts:'l', c:'teal',   dashed:true, label:'embed & match'},
+  {from:'rag',  fs:'r', to:'R_arb',   ts:'l', c:'teal',   dashed:true, width:2,
+   path:[[570,547],[625,547],[625,641],[850,641]], label:'tie-break (gated)', labelPos:[700,641]},
   {from:'gen',  fs:'r', to:'R_sonnet',ts:'l', c:'teal',   dashed:true, label:'generate SQL'},
   {from:'exec', fs:'r', to:'R_qe',    ts:'l', c:'slate',  label:'run SQL'},
   {from:'R_qe', fs:'b', to:'R_db',    ts:'t', c:'slate'},
   {from:'out',  fs:'r', to:'R_render',ts:'l', c:'slate',  label:'render'},
+  {from:'out',  fs:'b', to:'cost',   ts:'t', c:'slate',  label:'+ cost'},
   // streaming
   {from:'job',  fs:'r', to:'R_redis', ts:'l', c:'purple', dashed:true, label:'progress'},
   {from:'R_redis', fs:'t', to:'answer', ts:'b', c:'purple', dashed:true, label:'live updates + answer'},

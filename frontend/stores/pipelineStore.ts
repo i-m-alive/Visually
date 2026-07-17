@@ -28,6 +28,22 @@ export interface ChartResult {
   // Display-only table column renames { originalColumn: "Display Name" } — applied
   // to table headers by ChartRenderer when no columnLabels prop is passed.
   column_labels?: Record<string, string>
+  // Per-query token + dollar cost, attached by the backend once all LLM calls
+  // for the turn have completed. Undefined when token tracking was off.
+  cost?: QueryCost
+}
+
+/** Token + dollar cost of answering one query (see bedrock_client.get_cost_summary). */
+export interface QueryCost {
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  total_tokens: number
+  llm_calls: number
+  usd: number
+  usd_input: number
+  usd_output: number
 }
 
 /** One entry in a multi-candidate response — each backed by a different table. */
@@ -272,6 +288,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
               validation_details: fr?.validation_details as Record<string, unknown>,
               output_mode: (fr?.output_mode as string) || 'chart',
               narrative: (fr?.narrative as string) || '',
+              cost: (fr?.cost as ChartResult['cost']) || undefined,
             }
             updated.chartResult = newResult
             updated.chartResults = [...(job.chartResults || []), newResult]

@@ -852,6 +852,25 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                           }
                           const fb = feedbackGiven[msgKey]
 
+                          const cost = cr.cost
+                          const CostLine = () => (
+                            cost ? (
+                              <div
+                                className="flex items-center gap-2 text-[11px] text-gray-400 mt-1.5 select-none"
+                                title={`Input ${cost.input_tokens.toLocaleString()} tok · Output ${cost.output_tokens.toLocaleString()} tok · ${cost.llm_calls} LLM call(s)`}
+                              >
+                                <span className="inline-flex items-center gap-1">
+                                  <span className="font-medium text-gray-500">${cost.usd.toFixed(4)}</span>
+                                </span>
+                                <span className="text-gray-300">·</span>
+                                <span>{cost.input_tokens.toLocaleString()} in</span>
+                                <span className="text-gray-300">/</span>
+                                <span>{cost.output_tokens.toLocaleString()} out tok</span>
+                                {cost.llm_calls ? <><span className="text-gray-300">·</span><span>{cost.llm_calls} call{cost.llm_calls === 1 ? '' : 's'}</span></> : null}
+                              </div>
+                            ) : null
+                          )
+
                           const HoverActions = () => (
                             <div className="opacity-0 group-hover:opacity-100 transition-all duration-150 flex items-center gap-1 flex-wrap pt-2 border-t border-gray-100 mt-1">
                               {cr.low_confidence && <span className="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full">Low confidence</span>}
@@ -899,6 +918,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                                   <div className="mt-0.5 p-1.5 bg-brand/10 rounded-lg flex-shrink-0"><FileText size={14} className="text-brand" /></div>
                                   <div className="flex-1 min-w-0">{cr.narrative ? <MarkdownRenderer text={cr.narrative} /> : <ChartRenderer result={cr} />}</div>
                                 </div>
+                                <CostLine />
                                 <HoverActions />
                               </div>
                             )
@@ -922,6 +942,7 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
                                 </div>
                               )}
                               {cr.narrative && <MarkdownRenderer text={cr.narrative} className="border-l-2 border-brand/30 pl-3 text-gray-600" />}
+                              <CostLine />
                               <HoverActions />
                               {messageNotes[msgKey] && (
                                 <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
