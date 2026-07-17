@@ -69,15 +69,30 @@ _store: dict[str, "EnrichedSchema"] = {}
 
 def compute_schema_hash(schema_doc: dict) -> str:
     """
-    Lightweight fingerprint for change detection.
-    Hashes sorted(table_name:column_count) — invalidated by new tables/columns
-    (a migration) but stable across description-only edits.
+    Content-based fingerprint for change detection.
+
+    Fingerprints each table's actual column NAMES and TYPES (not just the column
+    COUNT). The old count-only version collided whenever a re-crawl changed
+    structure without changing the count — a renamed column, a retyped column, or
+    a drop+add in the same table all kept the same hash, so a warm cache entry
+    (Redis / filesystem) could serve a stale enriched schema built against the old
+    structure. Hashing names+types makes any such structural change produce a new
+    hash that self-invalidates the cache.
+
+    Note: this still can't see purely SEMANTIC re-crawls (same structure, better
+    LLM descriptions / role flags) — those live in the DB metadata tables, not in
+    schema_doc. Freshness for that case is handled by the explicit invalidate()
+    call the metadata extractor makes when it finishes (see metadata_extractor.py).
     """
     tables = schema_doc.get("tables", [])
-    sig = "|".join(
-        f"{t.get('name', '')}:{len(t.get('columns', []))}"
-        for t in sorted(tables, key=lambda x: x.get("name", ""))
-    )
+    parts = []
+    for t in sorted(tables, key=lambda x: x.get("name", "")):
+        cols = sorted(
+            (f"{(c.get('name') or '').lower()}:{(c.get('type') or '').lower()}")
+            for c in t.get("columns", [])
+        )
+        parts.append(f"{t.get('name', '')}[{','.join(cols)}]")
+    sig = "|".join(parts)
     return hashlib.md5(sig.encode()).hexdigest()[:12]
 
 
@@ -150,6 +165,12 @@ class EnrichedSchema:
     # {(table_a, table_b): "table_a JOIN table_b ON table_a.fk = table_b.pk"}
     join_templates: dict = field(default_factory=dict)
 
+    # table_embeddings: normalized semantic embedding vector per table, computed
+    # once at build time (Bedrock Titan) and reused for cosine similarity in
+    # graph_rag_retriever. {table_name: [float, ...]}. Empty when embeddings are
+    # disabled or unavailable — retrieval then falls back to lexical signals only.
+    table_embeddings: dict = field(default_factory=dict)
+
     def get_disambiguation_text(self) -> str:
         if not self.disambiguation:
             return ""
@@ -202,6 +223,7 @@ def _serialize_enriched(enriched: EnrichedSchema) -> str:
         "entity_columns": enriched.entity_columns,
         "tfidf_index": enriched.tfidf_index,
         "join_templates": enriched.join_templates,
+        "table_embeddings": enriched.table_embeddings,
     }
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
@@ -225,60 +247,86 @@ def _deserialize_enriched(json_str: str) -> EnrichedSchema:
         entity_columns=data.get("entity_columns") or {},
         tfidf_index=data.get("tfidf_index") or {},
         join_templates=data.get("join_templates") or {},
+        table_embeddings=data.get("table_embeddings") or {},
     )
 
 
 # ── Public cache API ──────────────────────────────────────────────────────────
 
-async def get_or_build(connection_id: str, schema_doc: dict, db_type: str) -> EnrichedSchema:
+async def get_or_build(
+    connection_id: str,
+    schema_doc: dict,
+    db_type: str,
+    force: bool = False,
+) -> "EnrichedSchema":
     """
     Return the enriched schema for this connection (L1 → L2 → L3).
-    """
-    # L1: in-process
-    if connection_id in _store:
-        print(f"[schema_cache] ✓ in-process hit  connection={connection_id}", flush=True)
-        return _store[connection_id]
 
-    # L2: Redis (preferred) → filesystem (fallback when Redis is unavailable)
+    force=True skips all cache tiers and rebuilds from scratch, then repopulates
+    every tier.  Use this after a hard-refresh request where the caller already
+    called invalidate() — the force flag closes the race window where Redis may
+    not have finished clearing by the time this function checks it.
+    """
     schema_hash = compute_schema_hash(schema_doc)
     redis_key = f"{_REDIS_KEY_PREFIX}:{connection_id}:{schema_hash}"
     redis_available = False
-    try:
-        from shared.redis_client import get_redis
-        redis = await get_redis()
-        if redis is not None:
-            redis_available = True
-            cached_json = await redis.get(redis_key)
-            if cached_json:
-                enriched = _deserialize_enriched(cached_json)
-                _store[connection_id] = enriched
-                print(
-                    f"[schema_cache] ✓ Redis hit  connection={connection_id}  hash={schema_hash}",
-                    flush=True,
-                )
-                return enriched
-    except Exception as _re:
-        print(f"[schema_cache] ⚠ Redis read failed (non-fatal): {_re}", flush=True)
 
-    # L2b: filesystem cache — always check after a Redis miss (not only when Redis is down)
-    fs_json = _fs_read(connection_id, schema_hash)
-    if fs_json:
-        enriched = _deserialize_enriched(fs_json)
-        _store[connection_id] = enriched
+    if not force:
+        # L1: in-process
+        if connection_id in _store:
+            print(f"[schema_cache] ✓ in-process hit  connection={connection_id}", flush=True)
+            return _store[connection_id]
+
+        # L2: Redis (preferred) → filesystem (fallback when Redis is unavailable)
+        try:
+            from shared.redis_client import get_redis
+            redis = await get_redis()
+            if redis is not None:
+                redis_available = True
+                cached_json = await redis.get(redis_key)
+                if cached_json:
+                    enriched = _deserialize_enriched(cached_json)
+                    _store[connection_id] = enriched
+                    print(
+                        f"[schema_cache] ✓ Redis hit  connection={connection_id}  hash={schema_hash}",
+                        flush=True,
+                    )
+                    return enriched
+        except Exception as _re:
+            print(f"[schema_cache] ⚠ Redis read failed (non-fatal): {_re}", flush=True)
+
+        # L2b: filesystem cache — always check after a Redis miss (not only when Redis is down)
+        fs_json = _fs_read(connection_id, schema_hash)
+        if fs_json:
+            enriched = _deserialize_enriched(fs_json)
+            _store[connection_id] = enriched
+            print(
+                f"[schema_cache] ✓ filesystem hit  connection={connection_id}  hash={schema_hash}",
+                flush=True,
+            )
+            # Backfill Redis while we're here so the next hit is faster
+            if redis_available:
+                try:
+                    redis = await get_redis()
+                    if redis is not None:
+                        await redis.setex(redis_key, SCHEMA_CACHE_TTL, fs_json)
+                        print(f"[schema_cache] ✓ backfilled Redis from filesystem  connection={connection_id}", flush=True)
+                except Exception:
+                    pass
+            return enriched
+    else:
+        # force=True: probe Redis availability for the write-back below, but don't read
         print(
-            f"[schema_cache] ✓ filesystem hit  connection={connection_id}  hash={schema_hash}",
+            f"[schema_cache] 🔄 force-rebuild requested  connection={connection_id}  hash={schema_hash}",
             flush=True,
         )
-        # Backfill Redis while we're here so the next hit is faster
-        if redis_available:
-            try:
-                redis = await get_redis()
-                if redis is not None:
-                    await redis.setex(redis_key, SCHEMA_CACHE_TTL, fs_json)
-                    print(f"[schema_cache] ✓ backfilled Redis from filesystem  connection={connection_id}", flush=True)
-            except Exception:
-                pass
-        return enriched
+        try:
+            from shared.redis_client import get_redis
+            redis = await get_redis()
+            if redis is not None:
+                redis_available = True
+        except Exception:
+            pass
 
     # L3: cold build
     print(
@@ -683,13 +731,19 @@ def _build_relationship_graph(tables: list, qualified_name_map: dict) -> Relatio
     # Pass 2: heuristic FK inference from shared column names.
     # Critical for Redshift / data warehouses where FKs are declared but unenforced
     # (or not declared at all).  Two rules:
-    #   Rule A: underscore-delimited IDs — _id / _key / _sk / _fk / _ref
-    #   Rule B: compact IDs without underscore (Bullhorn / legacy style) — ends in "id"
-    #           with length > 4 to exclude bare "id" column (which exists in every table
-    #           and would create false edges everywhere).  e.g. joborderid, placementid,
-    #           clientcorporationid, candidateid all qualify; "id" itself does not.
+    #   Rule A: underscore-delimited IDs — _id / _key / _sk / _fk / _ref, plus
+    #           legacy/finance/mainframe key styles — _no / _num / _nbr / _cd /
+    #           _code / _ref# — so keys like cust_no, acct_num, txn_cd, party_ref
+    #           form edges too (these never matched the recruitment-era suffixes).
+    #   Rule B: compact IDs without underscore (Bullhorn / legacy style) — ends in
+    #           "id" (len > 4), or the compact finance forms "no"/"num"/"nbr"
+    #           (len > 5) e.g. custno, acctnum, partynbr. Bare "id"/"no"/"num" are
+    #           excluded by the length floor so they don't create edges everywhere.
     # O(n²) on table count but pure-Python set intersection is negligible for ≤500 tables.
-    _FK_SUFFIXES = ("_id", "_key", "_sk", "_fk", "_ref")
+    _FK_SUFFIXES = (
+        "_id", "_key", "_sk", "_fk", "_ref",
+        "_no", "_num", "_nbr", "_cd", "_code",
+    )
     tbl_col_index: dict[str, set] = {}
     for table in tables:
         bare_tname = table.get("name", "")
@@ -701,6 +755,9 @@ def _build_relationship_graph(tables: list, qualified_name_map: dict) -> Relatio
         return (
             any(col_name.endswith(s) for s in _FK_SUFFIXES)
             or (col_name.endswith("id") and len(col_name) > 4)
+            or (col_name.endswith("no") and len(col_name) > 5)
+            or (col_name.endswith("num") and len(col_name) > 5)
+            or (col_name.endswith("nbr") and len(col_name) > 5)
         )
 
     # Noise words stripped when deriving the "bare" table name for FK column matching.
@@ -799,11 +856,24 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
     # DB metadata enriches each column: richer descriptions + example_values as top_values
     # (so value_sampler skips live DB queries for pre-collected filter values).
     compact_tables = []
+    _meta_attached = 0   # tables that matched a persisted metadata row
+    _meta_missed = 0     # tables with NO metadata match despite metadata existing
     for t in tables:
         qualified_tname = qualified_name_map.get(t.get("name", ""), t.get("name", ""))
         all_cols = t.get("columns", [])
         db_tbl = db_tables.get(qualified_tname)
         tbl_cols_meta = db_cols.get(qualified_tname, {})
+        if db_tbl is not None:
+            _meta_attached += 1
+        elif db_tables:
+            # Metadata exists for this connection but nothing matched THIS table's
+            # qualified name — the classic silent-failure mode where crawler /
+            # extractor / cache disagree on how a name is qualified, so the table
+            # loses every LLM-generated business name, role flag and example value
+            # and falls back to its bare heuristic description. Count it; logged
+            # once below so this becomes visible instead of degrading retrieval
+            # invisibly.
+            _meta_missed += 1
 
         # Table-level: prefer DB description / business_name
         tbl_description = (
@@ -865,6 +935,32 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
                 or (t.get("row_count", 1) == 0 and len(t.get("columns", [])) > 8)
             ),
         })
+
+    # ── Metadata-attach visibility ───────────────────────────────────────────
+    # If persisted metadata exists but a meaningful share of tables failed to
+    # match it, that's almost certainly a qualified-name normalization drift
+    # between crawler/extractor/cache — retrieval quality silently collapses for
+    # the unmatched tables. Surface it loudly rather than letting it hide.
+    if db_tables:
+        _total = _meta_attached + _meta_missed
+        if _meta_missed:
+            _sample_stored = list(db_tables.keys())[:3]
+            _sample_built = [
+                qualified_name_map.get(t.get("name", ""), t.get("name", ""))
+                for t in tables[:3]
+            ]
+            print(
+                f"[schema_cache] ⚠ METADATA_ATTACH: {_meta_attached}/{_total} tables "
+                f"matched persisted metadata, {_meta_missed} MISSED "
+                f"(likely qualified-name drift). "
+                f"stored_sample={_sample_stored} built_sample={_sample_built}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[schema_cache] metadata attached to all {_meta_attached} table(s)",
+                flush=True,
+            )
 
     # relationship_graph — Pass 1 (declared) + Pass 2 (heuristic)
     relationship_graph = _build_relationship_graph(tables, qualified_name_map)
@@ -978,6 +1074,14 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
     # ── TF-IDF index for Graph RAG retrieval ─────────────────────────────────
     tfidf_index = _build_tfidf_index(compact_tables, table_semantics)
 
+    # ── Semantic embeddings (once per schema version, then cached) ────────────
+    # Computed here so cosine similarity in graph_rag_retriever can catch
+    # paraphrases/synonyms that the lexical signals (TF-IDF, concept index) miss.
+    # Fully optional: disabled via RAG_EMBEDDINGS_ENABLED=false, and any failure
+    # (no model access, throttling) leaves table_embeddings empty so retrieval
+    # falls back to exactly today's lexical behavior.
+    table_embeddings = await _build_table_embeddings(compact_tables, table_semantics)
+
     return EnrichedSchema(
         schema_doc=schema_doc,
         db_type=db_type,
@@ -991,7 +1095,61 @@ async def _build(schema_doc: dict, db_type: str, connection_id: str = "") -> Enr
         entity_columns=heuristic_entity_columns,
         tfidf_index=tfidf_index,
         join_templates=join_templates,
+        table_embeddings=table_embeddings,
     )
+
+
+def _table_embed_text(ct: dict, sem: dict) -> str:
+    """Compact natural-language blob describing a table, for embedding."""
+    name = ct.get("name", "")
+    parts = [name.split(".")[-1].replace("_", " ")]
+    if ct.get("description"):
+        parts.append(ct["description"])
+    if sem:
+        if sem.get("business_name"):
+            parts.append(sem["business_name"])
+        if sem.get("purpose"):
+            parts.append(sem["purpose"])
+    # A few representative column names/descriptions add discriminating signal.
+    col_bits = []
+    for c in (ct.get("columns") or [])[:20]:
+        cn = (c.get("business_name") or c.get("name") or "").replace("_", " ")
+        if cn:
+            col_bits.append(cn)
+    if col_bits:
+        parts.append("columns: " + ", ".join(col_bits))
+    return ". ".join(p for p in parts if p)[:2000]
+
+
+async def _build_table_embeddings(compact_tables: list, table_semantics: dict) -> dict:
+    """
+    Embed each table's text blob (bounded concurrency). Returns
+    {table_name: vector}; empty dict when disabled/unavailable. Never raises.
+    """
+    if os.getenv("RAG_EMBEDDINGS_ENABLED", "true").lower() not in ("1", "true", "yes"):
+        return {}
+    if not compact_tables:
+        return {}
+    try:
+        from shared.bedrock_client import bedrock_embed_batch
+        names = [t.get("name", "") for t in compact_tables]
+        texts = [
+            _table_embed_text(t, table_semantics.get(t.get("name", ""), {}))
+            for t in compact_tables
+        ]
+        vectors = await bedrock_embed_batch(texts)
+        out = {
+            n: v for n, v in zip(names, vectors)
+            if n and isinstance(v, list) and v
+        }
+        print(
+            f"[schema_cache] table embeddings: {len(out)}/{len(names)} computed",
+            flush=True,
+        )
+        return out
+    except Exception as exc:
+        print(f"[schema_cache] ⚠ embedding build failed (non-fatal): {exc}", flush=True)
+        return {}
 
 
 def _parse_disambiguation_response(raw: str) -> dict:

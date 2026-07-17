@@ -443,12 +443,15 @@ export function QueryChatPanel({ projectId, connectionLabel, onSwitchConnection 
           role: 'assistant',
           content: cr?.narrative || cr?.title || (m.dashboardResult ? 'Dashboard with multiple charts' : ''),
           chart_title: cr?.title, sql: cr?.sql,
+          error: m.error,
+          low_confidence: cr?.low_confidence || undefined,
         }
       })
 
     try {
       const resp = await agentApi.submitIntent({
         text, project_id: projectId,
+        session_id: sid,
         conversation_history: conversationHistory.length > 0 ? conversationHistory : undefined,
         ...(outputMode !== 'auto' ? { output_mode: outputMode } : {}),
         ...(scopeState.scope === 'selected' && scopeState.selectedTables.length > 0 ? {

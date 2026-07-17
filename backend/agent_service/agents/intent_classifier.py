@@ -177,7 +177,10 @@ class IntentClassifier:
         user_message = text
         if conversation_history:
             context_lines = []
-            for turn in conversation_history[-2:]:
+            # Last 6 turns (was 2) so a refinement chain that reaches back more
+            # than one exchange ("go back to the regional view from before") can
+            # still be resolved — matches the window the SQL agent already uses.
+            for turn in conversation_history[-6:]:
                 role = turn.get("role", "user")
                 content = (turn.get("content") or "").strip()
                 if content:

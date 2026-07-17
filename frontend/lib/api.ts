@@ -149,6 +149,8 @@ export const projectApi = {
     ),
   getSchemaMetadata: (projectId: string) =>
     api.get(`/projects/${projectId}/schema/metadata`),
+  hardRefreshSchema: (projectId: string) =>
+    api.post(`/projects/${projectId}/schema/hard-refresh`),
   executeConnectionQuery: (projectId: string, connectionId: string, sql: string, rowLimit = 1000) =>
     api.post(`/projects/${projectId}/connections/${connectionId}/query`, { sql, row_limit: rowLimit }),
 }
@@ -158,6 +160,8 @@ export interface ConversationTurn {
   content: string          // user text or chart title/narrative
   chart_title?: string     // if assistant turn had a chart
   sql?: string             // SQL that produced the last chart
+  error?: string           // set when this turn's query failed — lets a "why did that fail?" follow-up be diagnosed
+  low_confidence?: boolean // set when this turn's result was flagged low-confidence
 }
 
 export const agentApi = {
@@ -165,6 +169,7 @@ export const agentApi = {
     text: string
     project_id: string
     connection_id?: string
+    session_id?: string
     conversation_history?: ConversationTurn[]
     output_mode?: string
     scope?: 'database' | 'selected'

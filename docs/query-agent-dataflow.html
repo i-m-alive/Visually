@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Query Agent — Data Flow</title>
+<style>
+  :root{
+    --paper:#ffffff; --bg:#f4f6fa; --ink:#0f172a; --soft:#475569; --faint:#8a97a8;
+    --line:#e4e9f0; --accent:#0d7a72; --amber:#c2680a;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto;padding:44px 22px 80px}
+
+  header.masthead{margin-bottom:22px}
+  .eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:700;margin:0 0 10px}
+  h1{font-size:clamp(26px,4.4vw,38px);line-height:1.12;margin:0 0 12px;letter-spacing:-.02em;font-weight:800}
+  .lede{font-size:16.5px;color:var(--soft);margin:0;max-width:74ch}
+
+  .toolbar{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0 8px}
+  .btn{display:inline-flex;align-items:center;gap:7px;font-size:13.5px;font-weight:600;font-family:var(--sans);
+    color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:9px 14px;cursor:pointer;
+    box-shadow:0 1px 2px rgba(15,23,42,.05);transition:transform .06s ease,border-color .15s ease,background .15s ease}
+  .btn:hover{border-color:#c3cede;background:#fbfcfe}
+  .btn:active{transform:translateY(1px)}
+  .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn.primary:hover{background:#0b6b64}
+  .btn svg{width:15px;height:15px}
+  .hint{font-size:12.5px;color:var(--faint);margin:2px 0 0}
+
+  .stage{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:10px;margin-top:14px;
+    box-shadow:0 1px 2px rgba(15,23,42,.05),0 14px 40px rgba(15,23,42,.06);overflow-x:auto}
+  #diagram{display:block;width:100%;min-width:880px;height:auto}
+
+  section.explain{margin-top:44px}
+  h2.sec{font-size:20px;font-weight:800;letter-spacing:-.01em;margin:0 0 4px}
+  .sec-sub{font-size:14px;color:var(--soft);margin:0 0 20px}
+
+  ol.steps{list-style:none;counter-reset:s;margin:0;padding:0;display:grid;gap:12px}
+  ol.steps li{counter-increment:s;position:relative;background:var(--paper);border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px 16px 60px}
+  ol.steps li::before{content:counter(s);position:absolute;left:16px;top:16px;width:28px;height:28px;border-radius:8px;
+    background:#ecfdf8;color:var(--accent);font-weight:800;font-size:14px;display:flex;align-items:center;justify-content:center;
+    border:1px solid #cdeee8}
+  ol.steps h3{margin:0 0 3px;font-size:15.5px;font-weight:700}
+  ol.steps p{margin:0;font-size:14.5px;color:var(--soft)}
+  ol.steps b{color:var(--ink)}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px;margin-top:22px}
+  .card{background:var(--paper);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:16px 18px}
+  .card.warn{border-left-color:var(--amber)}
+  .card h3{margin:0 0 6px;font-size:14.5px;font-weight:700}
+  .card p{margin:0;font-size:14px;color:var(--soft)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:#f1f5f9;border:1px solid #e4e9f0;
+    padding:1px 6px;border-radius:5px}
+
+  .foot{margin-top:36px;padding-top:20px;border-top:1px solid var(--line);font-size:13px;color:var(--faint)}
+
+  @media print{
+    body{background:#fff}
+    .toolbar,.hint{display:none}
+    .stage{box-shadow:none;border-color:#d7dde6}
+    .card,ol.steps li{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Conversation BI · Query Agent</p>
+    <h1>How a question flows through the query agent</h1>
+    <p class="lede">A business user asks a question in plain English. Behind the scenes an AI-driven pipeline understands it, finds the right data, writes and runs the query, and checks its own answer — retrying automatically until it is confident — then streams the result back to the screen. The diagram below traces that journey end to end.</p>
+  </header>
+
+  <div class="toolbar" role="group" aria-label="Export options">
+    <button class="btn primary" onclick="downloadDrawio()" title="Opens and stays fully editable in draw.io / diagrams.net">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+      Download .drawio</button>
+    <button class="btn" onclick="downloadSVG()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+      Download SVG</button>
+    <button class="btn" onclick="downloadPNG()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+      Download PNG</button>
+    <button class="btn" onclick="window.print()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9V3h12v6M6 18H4a2 2 0 01-2-2v-3a2 2 0 012-2h16a2 2 0 012 2v3a2 2 0 01-2 2h-2M6 14h12v7H6z"/></svg>
+      Print / Save PDF</button>
+  </div>
+  <p class="hint">Tip: the <b>.drawio</b> file opens directly in <b>draw.io / diagrams.net</b> and stays fully editable. You can also import the <b>SVG</b> there (File → Import). Everything works offline — no internet needed.</p>
+
+  <div class="stage">
+    <!-- diagram injected here -->
+    <div id="diagram-host"></div>
+  </div>
+
+  <section class="explain">
+    <h2 class="sec">Reading the diagram</h2>
+    <p class="sec-sub">Colours show which part of the system owns each step — see the legend inside the diagram. Solid arrows carry data; dashed arrows are calls to the AI models or live status updates. The orange loop is the automatic retry.</p>
+
+    <ol class="steps">
+      <li><h3>The question arrives</h3><p>The user types a question in plain English in the <b>React chat panel</b>. It is sent to the backend, which immediately starts a background job and opens a live connection so the user can watch progress.</p></li>
+      <li><h3>Understand the intent</h3><p>The pipeline first works out <b>what is being asked</b> — the metric, the time range, the level of detail, and how the user wants to see it (chart, table, or text).</p></li>
+      <li><h3>Load &amp; enrich the schema</h3><p>It pulls a plain-language map of the connected database — what each table means and how tables relate — from a fast cache, so it knows what data is available.</p></li>
+      <li><h3>Rank &amp; pick the best tables</h3><p>A retriever scores every table by name, meaning, and how tables link together, then hands the SQL writer only the few tables that best and fully answer the question. If nothing fits well enough, it <b>asks the user to clarify</b> instead of guessing.</p></li>
+      <li><h3>Write the query</h3><p>The AI writes the exact query (SQL), then auto-corrects column names, filter values, and syntax before anything runs.</p></li>
+      <li><h3>Run &amp; validate</h3><p>The query runs against the live database. A separate <b>validator</b> scores the answer on whether it matches the question — the right shape, detail, and completeness.</p></li>
+      <li><h3>Deliver the answer</h3><p>Once the answer clears the confidence bar, the system writes a short plain-English explanation, renders the chart or table, saves the result, and streams it to the screen.</p></li>
+    </ol>
+
+    <div class="cards">
+      <div class="card warn">
+        <h3>The self-correcting loop</h3>
+        <p>If the validator's score is below <code>0.65</code>, the pipeline loops back and tries again — a different table or a rewritten query — <b>up to 4 times</b> before it settles. The user only sees answers the system is confident in.</p>
+      </div>
+      <div class="card">
+        <h3>Tables are chosen before any SQL</h3>
+        <p>Table selection is a fast, in-memory ranking (name + meaning + relationships) — no AI call. This keeps the SQL focused and accurate on large databases.</p>
+      </div>
+      <div class="card">
+        <h3>The right AI model for each job</h3>
+        <p>Fast, low-cost <b>Claude Haiku</b> handles intent and quick checks; heavier <b>Claude Sonnet</b> writes the SQL and the final explanation; <b>Titan</b> turns text into embeddings for table search.</p>
+      </div>
+      <div class="card">
+        <h3>Live, not a black box</h3>
+        <p>Every step publishes progress through <b>Redis → WebSocket</b>, so the user watches the work happen in real time instead of staring at a spinner.</p>
+      </div>
+    </div>
+
+    <p class="foot">This shows the pipeline for a single visual/answer. A full dashboard request simply fans out into several of these pipelines running in parallel, one per chart.</p>
+  </section>
+</div>
+
+<script>
+/* ============================================================
+   Single source of truth: nodes + edges.
+   Rendered to SVG (for the page, SVG & PNG export) and to
+   draw.io XML (for the .drawio export) from the same model.
+   ============================================================ */
+
+const VB = { x:0, y:-120, w:1280, h:1600 };
+
+const COLORS = {
+  browser:['#eef2ff','#6366f1','#312e81'],
+  api:    ['#e0f2fe','#0284c7','#075985'],
+  orch:   ['#ecfdf5','#059669','#065f46'],
+  ai:     ['#ccfbf1','#0d9488','#115e59'],
+  service:['#f1f5f9','#64748b','#334155'],
+  storage:['#f5f3ff','#7c3aed','#5b21b6'],
+  dec:    ['#fff7ed','#ea580c','#9a3412'],
+  term:   ['#fef9c3','#ca8a04','#854d0e'],
+};
+
+// background bands / boxes
+const BANDS = [
+  {id:'b_browser', x:40,  y:30,  w:1200, h:100,  fill:'#f6f8ff', stroke:'#e2e8f8', title:'BROWSER — React app'},
+  {id:'b_api',     x:40,  y:155, w:760,  h:105,  fill:'#f2faff', stroke:'#dceffb', title:'API LAYER — agent_service'},
+  {id:'b_orch',    x:40,  y:290, w:760,  h:1095, fill:'#f4fdf9', stroke:'#d5f0e5', title:'ORCHESTRATOR — the query agent pipeline'},
+];
+
+// nodes: shape = proc | dec | cyl | term
+const NODES = [
+  // browser
+  {id:'user',  shape:'proc', group:'browser', x:70,  y:55,  w:230, h:52, label:'User asks a question\n(plain English)'},
+  {id:'fe',    shape:'proc', group:'browser', x:330, y:55,  w:230, h:52, label:'Query Chat Panel\n(React UI)'},
+  {id:'answer',shape:'proc', group:'browser', x:940, y:55,  w:250, h:52, label:'Answer in the UI:\nchart · table · text'},
+  // api
+  {id:'ep',    shape:'proc', group:'api',     x:70,  y:185, w:230, h:52, label:'POST /agent/intent\nstart job'},
+  {id:'run',   shape:'proc', group:'api',     x:330, y:185, w:230, h:52, label:'Run pipeline\n(background)'},
+  {id:'job',   shape:'cyl',  group:'api',     x:585, y:181, w:190, h:60, label:'PipelineJob\n(status + result)'},
+  // orchestrator spine
+  {id:'ic',    shape:'proc', group:'orch',    x:270, y:340, w:300, h:54, label:'1 · Understand the question\n(intent)'},
+  {id:'sch',   shape:'proc', group:'orch',    x:270, y:430, w:300, h:54, label:'2 · Load & enrich\nthe data schema'},
+  {id:'rag',   shape:'proc', group:'orch',    x:270, y:520, w:300, h:54, label:'3 · Rank & pick\nthe best tables'},
+  {id:'conf',  shape:'dec',  group:'dec',     x:330, y:610, w:180, h:96, label:'Confident a\ntable fits?'},
+  {id:'gen',   shape:'proc', group:'orch',    x:270, y:760, w:300, h:54, label:'4 · Write the SQL query\n(auto-checks columns / filters)'},
+  {id:'exec',  shape:'proc', group:'orch',    x:270, y:880, w:300, h:54, label:'5 · Run the query'},
+  {id:'val',   shape:'proc', group:'orch',    x:270, y:970, w:300, h:54, label:'6 · Validate & score\nthe result'},
+  {id:'pass',  shape:'dec',  group:'dec',     x:330, y:1060,w:180, h:96, label:'Score high\nenough? (≥ 0.65)'},
+  {id:'out',   shape:'proc', group:'orch',    x:270, y:1210,w:300, h:54, label:'7 · Narrate & format\nthe answer'},
+  {id:'clarify',shape:'term',group:'term',    x:70,  y:631, w:170, h:54, label:'Ask the user\nto clarify'},
+  // right column — models / services / storage
+  {id:'R_redis', shape:'proc',group:'storage',x:850, y:181, w:350, h:56, label:'Redis — live events + cache'},
+  {id:'R_haiku', shape:'proc',group:'ai',     x:850, y:341, w:350, h:52, label:'Claude Haiku — intent & checks'},
+  {id:'R_pg',    shape:'cyl', group:'storage',x:850, y:426, w:350, h:60, label:'Postgres — schema · jobs · sessions'},
+  {id:'R_titan', shape:'proc',group:'ai',     x:850, y:521, w:350, h:52, label:'Titan — embeddings (table search)'},
+  {id:'R_sonnet',shape:'proc',group:'ai',     x:850, y:759, w:350, h:54, label:'Claude Sonnet — SQL & narration'},
+  {id:'R_qe',    shape:'proc',group:'service',x:850, y:879, w:350, h:52, label:'Query executor service'},
+  {id:'R_db',    shape:'cyl', group:'service',x:850, y:945, w:350, h:60, label:'Your database'},
+  {id:'R_render',shape:'proc',group:'service',x:850, y:1210,w:350, h:54, label:'Render service — chart / table'},
+];
+const N = Object.fromEntries(NODES.map(n=>[n.id,n]));
+
+// edges: color keys -> slate/green/orange/teal/purple
+const EDGES = [
+  {from:'user', fs:'r', to:'fe',   ts:'l', c:'slate'},
+  {from:'fe',   fs:'b', to:'ep',   ts:'t', c:'slate'},
+  {from:'ep',   fs:'r', to:'run',  ts:'l', c:'slate'},
+  {from:'run',  fs:'r', to:'job',  ts:'l', c:'slate', label:'track'},
+  {from:'run',  fs:'b', to:'ic',   ts:'t', c:'slate', label:'start'},
+  {from:'ic',   fs:'b', to:'sch',  ts:'t', c:'slate'},
+  {from:'sch',  fs:'b', to:'rag',  ts:'t', c:'slate'},
+  {from:'rag',  fs:'b', to:'conf', ts:'t', c:'slate'},
+  {from:'conf', fs:'b', to:'gen',  ts:'t', c:'green',  label:'yes'},
+  {from:'conf', fs:'l', to:'clarify', ts:'r', c:'orange', label:'no'},
+  {from:'gen',  fs:'b', to:'exec', ts:'t', c:'slate'},
+  {from:'exec', fs:'b', to:'val',  ts:'t', c:'slate'},
+  {from:'val',  fs:'b', to:'pass', ts:'t', c:'slate'},
+  {from:'pass', fs:'b', to:'out',  ts:'t', c:'green',  label:'yes'},
+  // retry loop (custom path)
+  {from:'pass', fs:'l', to:'gen',  ts:'l', c:'orange', dashed:false, width:2.4,
+   path:[[330,1108],[150,1108],[150,787],[270,787]], label:'no · retry ≤ 4×\nother table / rewrite', labelPos:[150,952]},
+  // model / service / storage links
+  {from:'ic',   fs:'r', to:'R_haiku', ts:'l', c:'teal',   dashed:true, label:'classify'},
+  {from:'sch',  fs:'r', to:'R_pg',    ts:'l', c:'purple', label:'read schema'},
+  {from:'rag',  fs:'r', to:'R_titan', ts:'l', c:'teal',   dashed:true, label:'embed & match'},
+  {from:'gen',  fs:'r', to:'R_sonnet',ts:'l', c:'teal',   dashed:true, label:'generate SQL'},
+  {from:'exec', fs:'r', to:'R_qe',    ts:'l', c:'slate',  label:'run SQL'},
+  {from:'R_qe', fs:'b', to:'R_db',    ts:'t', c:'slate'},
+  {from:'out',  fs:'r', to:'R_render',ts:'l', c:'slate',  label:'render'},
+  // streaming
+  {from:'job',  fs:'r', to:'R_redis', ts:'l', c:'purple', dashed:true, label:'progress'},
+  {from:'R_redis', fs:'t', to:'answer', ts:'b', c:'purple', dashed:true, label:'live updates + answer'},
+];
+
+const EDGECOLOR = { slate:'#64748b', green:'#059669', orange:'#ea580c', teal:'#0d9488', purple:'#7c3aed' };
+
+/* ---------- geometry helpers ---------- */
+function anchor(n, side){
+  const cx=n.x+n.w/2, cy=n.y+n.h/2;
+  if(side==='t') return [cx, n.y];
+  if(side==='b') return [cx, n.y+n.h];
+  if(side==='l') return [n.x, cy];
+  return [n.x+n.w, cy]; // 'r'
+}
+function routePoints(e){
+  if(e.path) return e.path.slice();
+  const a=anchor(N[e.from], e.fs), b=anchor(N[e.to], e.ts);
+  const horiz = (e.fs==='l'||e.fs==='r') && (e.ts==='l'||e.ts==='r');
+  const vert  = (e.fs==='t'||e.fs==='b') && (e.ts==='t'||e.ts==='b');
+  if(horiz){
+    if(Math.abs(a[1]-b[1])<1) return [a,b];
+    const mx=(a[0]+b[0])/2; return [a,[mx,a[1]],[mx,b[1]],b];
+  }
+  if(vert){
+    if(Math.abs(a[0]-b[0])<1) return [a,b];
+    const my=(a[1]+b[1])/2; return [a,[a[0],my],[b[0],my],b];
+  }
+  return [a,[b[0],a[1]],b]; // mixed L-shape
+}
+function labelPoint(e, pts){
+  if(e.labelPos) return e.labelPos;
+  if(pts.length===2) return [(pts[0][0]+pts[1][0])/2,(pts[0][1]+pts[1][1])/2];
+  const p1=pts[1], p2=pts[2]||pts[1];
+  return [(p1[0]+p2[0])/2,(p1[1]+p2[1])/2];
+}
+
+/* ---------- SVG rendering ---------- */
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function textLines(cx, cy, label, fill, weightFirst){
+  const lines=label.split('\n'); const lh=17;
+  const start=cy - (lines.length*lh)/2 + 13;
+  return lines.map((ln,i)=>{
+    const w=(i===0&&weightFirst)?'600':'500';
+    return `<text x="${cx}" y="${start+i*lh}" text-anchor="middle" font-family="var(--sans)" font-size="14" font-weight="${w}" fill="${fill}">${esc(ln)}</text>`;
+  }).join('');
+}
+
+function nodeSVG(n){
+  const [fill,stroke,text]=COLORS[n.group];
+  const cx=n.x+n.w/2, cy=n.y+n.h/2;
+  let shape='';
+  if(n.shape==='dec'){
+    const p=`${cx},${n.y} ${n.x+n.w},${cy} ${cx},${n.y+n.h} ${n.x},${cy}`;
+    shape=`<polygon points="${p}" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>`;
+  } else if(n.shape==='cyl'){
+    shape=`<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="12" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>`+
+          `<path d="M${n.x+2},${n.y+13} Q ${cx},${n.y+26} ${n.x+n.w-2},${n.y+13}" fill="none" stroke="${stroke}" stroke-width="1.3" opacity=".7"/>`;
+  } else if(n.shape==='term'){
+    shape=`<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="${n.h/2}" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>`;
+  } else {
+    shape=`<rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="11" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>`;
+  }
+  return shape + textLines(cx, cy, n.label, text, true);
+}
+
+function edgeSVG(e){
+  const pts=routePoints(e);
+  const col=EDGECOLOR[e.c];
+  const poly=pts.map(p=>p.join(',')).join(' ');
+  const dash=e.dashed?` stroke-dasharray="6 5"`:'';
+  const wdt=e.width||2;
+  const line=`<polyline points="${poly}" fill="none" stroke="${col}" stroke-width="${wdt}" stroke-linejoin="round" stroke-linecap="round"${dash} marker-end="url(#ar-${e.c})"/>`;
+  let lbl='';
+  if(e.label){
+    const [lx,ly]=labelPoint(e,pts);
+    const lns=e.label.split('\n'); const lh=13.5;
+    const maxlen=Math.max(...lns.map(s=>s.length));
+    const bw=maxlen*6.0+12, bh=lns.length*lh+7;
+    lbl=`<g><rect x="${lx-bw/2}" y="${ly-bh/2}" width="${bw}" height="${bh}" rx="5" fill="#ffffff" stroke="#eef1f5"/>`+
+      lns.map((s,i)=>`<text x="${lx}" y="${ly - (lns.length-1)*lh/2 + i*lh + 4}" text-anchor="middle" font-family="var(--sans)" font-size="11.5" font-weight="600" fill="${col}">${esc(s)}</text>`).join('')+
+      `</g>`;
+  }
+  return {line, lbl};
+}
+
+function bandSVG(b){
+  return `<rect x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="16" fill="${b.fill}" stroke="${b.stroke}" stroke-width="1.4"/>`+
+    `<text x="${b.x+16}" y="${b.y+22}" font-family="var(--sans)" font-size="11.5" font-weight="700" letter-spacing="0.08em" fill="#94a3b8">${esc(b.title)}</text>`;
+}
+
+function legendSVG(){
+  const items=[
+    ['Browser',COLORS.browser[0],COLORS.browser[1]],
+    ['API',COLORS.api[0],COLORS.api[1]],
+    ['Orchestrator',COLORS.orch[0],COLORS.orch[1]],
+    ['Decision',COLORS.dec[0],COLORS.dec[1]],
+    ['AI models',COLORS.ai[0],COLORS.ai[1]],
+    ['Data service',COLORS.service[0],COLORS.service[1]],
+    ['Storage',COLORS.storage[0],COLORS.storage[1]],
+  ];
+  let x=40; const y=-42; let out='';
+  items.forEach(([t,f,s])=>{
+    out+=`<rect x="${x}" y="${y}" width="15" height="15" rx="4" fill="${f}" stroke="${s}" stroke-width="1.3"/>`+
+         `<text x="${x+21}" y="${y+12}" font-family="var(--sans)" font-size="12.5" font-weight="600" fill="#475569">${esc(t)}</text>`;
+    x += 40 + t.length*7.4 + 24;
+  });
+  return out;
+}
+
+function markers(){
+  return Object.entries(EDGECOLOR).map(([k,c])=>
+    `<marker id="ar-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">`+
+    `<path d="M0,0 L10,5 L0,10 z" fill="${c}"/></marker>`).join('');
+}
+
+function buildSVG(forExport){
+  const edgeParts=EDGES.map(edgeSVG);
+  const svg =
+`<svg id="diagram" xmlns="http://www.w3.org/2000/svg" viewBox="${VB.x} ${VB.y} ${VB.w} ${VB.h}"${forExport?` width="${VB.w}" height="${VB.h}"`:''}>
+<defs>${markers()}</defs>
+<rect x="${VB.x}" y="${VB.y}" width="${VB.w}" height="${VB.h}" fill="#ffffff"/>
+<text x="40" y="-84" font-family="var(--sans)" font-size="22" font-weight="800" fill="#0f172a">Query Agent — Data Flow</text>
+<text x="40" y="-62" font-family="var(--sans)" font-size="13.5" fill="#64748b">From a plain-English question to a validated, streamed answer.</text>
+${legendSVG()}
+${BANDS.map(bandSVG).join('\n')}
+${edgeParts.map(p=>p.line).join('\n')}
+${NODES.map(nodeSVG).join('\n')}
+${edgeParts.map(p=>p.lbl).join('\n')}
+</svg>`;
+  return svg;
+}
+
+document.getElementById('diagram-host').innerHTML = buildSVG(false);
+
+/* ---------- exports ---------- */
+function download(blob, name){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},400);
+}
+// inline the CSS var for the font so exports render correctly
+function exportSVGString(){
+  return buildSVG(true).replace(/var\(--sans\)/g,
+    "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif");
+}
+function downloadSVG(){
+  download(new Blob([exportSVGString()],{type:'image/svg+xml;charset=utf-8'}), 'query-agent-dataflow.svg');
+}
+function downloadPNG(){
+  const svg=exportSVGString();
+  const scale=2;
+  const img=new Image();
+  const url='data:image/svg+xml;base64,'+btoa(unescape(encodeURIComponent(svg)));
+  img.onload=function(){
+    const canvas=document.createElement('canvas');
+    canvas.width=VB.w*scale; canvas.height=VB.h*scale;
+    const ctx=canvas.getContext('2d');
+    ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.scale(scale,scale);
+    ctx.drawImage(img,0,0,VB.w,VB.h);
+    canvas.toBlob(b=>download(b,'query-agent-dataflow.png'),'image/png');
+  };
+  img.onerror=function(){alert('PNG export failed in this browser — please use Download SVG.');};
+  img.src=url;
+}
+
+/* ---------- draw.io / diagrams.net XML ---------- */
+function dxEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/\n/g,'&#10;');}
+function nodeStyle(n){
+  const [fill,stroke,text]=COLORS[n.group];
+  const base=`whiteSpace=wrap;html=1;fillColor=${fill};strokeColor=${stroke};fontColor=${text};fontSize=13;`;
+  if(n.shape==='dec') return `rhombus;${base}`;
+  if(n.shape==='cyl') return `shape=cylinder3;boundedLbl=1;backgroundOutline=1;${base}`;
+  if(n.shape==='term') return `rounded=1;arcSize=50;${base}`;
+  return `rounded=1;arcSize=12;${base}`;
+}
+function buildDrawio(){
+  let cells=`<mxCell id="0"/><mxCell id="1" parent="0"/>`;
+  // bands first (behind)
+  BANDS.forEach(b=>{
+    cells+=`<mxCell id="${b.id}" value="${dxEsc(b.title)}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${b.fill};strokeColor=${b.stroke};verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;fontColor=#94a3b8;fontSize=11;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" as="geometry"/></mxCell>`;
+  });
+  NODES.forEach(n=>{
+    cells+=`<mxCell id="${n.id}" value="${dxEsc(n.label)}" style="${nodeStyle(n)}" vertex="1" parent="1"><mxGeometry x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" as="geometry"/></mxCell>`;
+  });
+  EDGES.forEach((e,i)=>{
+    const col=EDGECOLOR[e.c];
+    const dash=e.dashed?'dashed=1;':'dashed=0;';
+    const style=`edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;${dash}strokeColor=${col};fontColor=${col};fontSize=11;`;
+    cells+=`<mxCell id="e${i}" value="${e.label?dxEsc(e.label):''}" style="${style}" edge="1" parent="1" source="${e.from}" target="${e.to}"><mxGeometry relative="1" as="geometry"/></mxCell>`;
+  });
+  return `<mxfile host="app.diagrams.net"><diagram name="Query Agent Data Flow" id="query-agent">`+
+    `<mxGraphModel dx="1280" dy="1600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="1700" math="0" shadow="0">`+
+    `<root>${cells}</root></mxGraphModel></diagram></mxfile>`;
+}
+function downloadDrawio(){
+  download(new Blob([buildDrawio()],{type:'application/xml;charset=utf-8'}), 'query-agent-dataflow.drawio');
+}
+</script>
+</body>
+</html>

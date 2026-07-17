@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Metadata → RAG → Conversation Memory — Deep Analysis</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+  pre { background: #0f172a; color: #e2e8f0; border-radius: 10px; padding: 16px 18px; overflow-x: auto; font-size: 12.8px; line-height: 1.6; margin: 14px 0; }
+  pre code { background: none; color: inherit; padding: 0; }
+  .tok-c { color: #64748b; } .tok-k { color: #c084fc; } .tok-s { color: #86efac; } .tok-f { color: #7dd3fc; }
+
+  header.hero { background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%); color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px; box-shadow: 0 20px 50px rgba(79,70,229,.25); }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 820px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 58px; }
+  h2 { font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px; }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 30px 0 10px; }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 880px; }
+  p { margin-bottom: 14px; max-width: 880px; }
+
+  .callout { border-radius: var(--radius); padding: 18px 22px; margin: 18px 0; border: 1px solid; }
+  .callout.bug { background: var(--red-soft); border-color: #fecaca; }
+  .callout.bug .tag { color: var(--red); }
+  .callout.fix { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.fix .tag { color: var(--green); }
+  .callout.info { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.info .tag { color: var(--blue); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 8px; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .file { font-family: "SF Mono", Menlo, monospace; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 20px 0; }
+  .flow .step { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 9px 14px; font-size: 12.5px; font-weight: 600; box-shadow: 0 2px 8px rgba(16,24,40,.04); }
+  .flow .step small { display:block; font-weight: 500; color: var(--muted); font-size: 11px; }
+  .flow .arrow { color: var(--muted); font-size: 15px; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 11px 15px; border-bottom: 1px solid var(--border); font-size: 13.6px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
+  .chip::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .chip.crit { background: var(--red-soft); color: var(--red); }
+  .chip.high { background: #fef2f2; color: #b91c1c; }
+  .chip.med { background: var(--amber-soft); color: var(--amber); }
+  .chip.low { background: var(--green-soft); color: var(--green); }
+  .chip.done { background: var(--green-soft); color: var(--green); }
+
+  ul.list { list-style: none; margin: 0; }
+  ul.list li { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--brand); border-radius: 0 10px 10px 0; padding: 14px 18px; margin-bottom: 10px; font-size: 14px; }
+  ul.list li strong { display: block; margin-bottom: 4px; }
+  ul.list li.c-crit { border-left-color: var(--red); }
+  ul.list li.c-high { border-left-color: #b91c1c; }
+  ul.list li.c-med { border-left-color: var(--amber); }
+  ul.list li.c-low { border-left-color: var(--green); }
+  .plain { margin-left: 20px; } .plain li { margin-bottom: 6px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Metadata → RAG → Conversation Memory</h1>
+    <p>An end-to-end trace of how schema metadata is created, how it becomes the retrieval index the query agent searches, and how conversation context is reconstructed on follow-ups — with the concrete bugs, gaps, and optimizations found by reading the actual code. Diagnosis only; nothing changed.</p>
+    <div class="meta">
+      <span>Symptom under investigation: follow-ups sometimes get no answer / lose context</span>
+      <span>Verdict: one confirmed headline bug + several accuracy gaps</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#tldr">TL;DR — what's actually wrong</a></li>
+      <li><a href="#pipeA">Metadata creation pipeline</a></li>
+      <li><a href="#pipeB">Metadata → RAG conversion</a></li>
+      <li><a href="#pipeC">Conversation memory &amp; follow-ups</a></li>
+      <li><a href="#bugs">Bug register (severity-ranked)</a></li>
+      <li><a href="#accuracy">Accuracy optimizations</a></li>
+      <li><a href="#fixplan">Suggested fix order</a></li>
+    </ol>
+  </nav>
+
+  <section id="tldr">
+    <h2><span class="num">0</span>TL;DR — what's actually wrong</h2>
+    <p class="lede">Three findings explain the "no response / forgot context" symptom on follow-ups. They are independent — fixing one doesn't fix the others.</p>
+    <ul class="list">
+      <li class="c-crit"><span class="chip crit">Critical</span> &nbsp;<strong>The reconstructed history includes the current question as its own last turn.</strong> The frontend saves the user's message to the session <em>before</em> asking the backend to answer it, which moves the session's "active leaf" onto that message. When the backend then rebuilds the conversation from the active leaf, the message being answered right now shows up as the most recent prior turn. This quietly breaks the "why did that fail?" follow-up (it inspects the wrong turn) and feeds the current question to the agent twice.</li>
+      <li class="c-high"><span class="chip high">High</span> &nbsp;<strong>Retrieval is purely lexical — no semantic/vector matching.</strong> If a user's wording doesn't share literal words with the stored metadata (or a hand-built synonym), the right table may not surface. On finance vocabulary especially, this reads to the user as "it forgot / doesn't understand my data."</li>
+      <li class="c-med"><span class="chip med">Medium</span> &nbsp;<strong>The intent is classified twice per query, and the first pass is context-blind.</strong> The router that decides single-chart vs. dashboard runs on the bare follow-up text with no history, so a follow-up can be routed down the wrong pipeline before the history-aware classifier ever runs.</li>
+    </ul>
+    <div class="callout info">
+      <span class="tag">Context</span>
+      <p>A related frontend gap — the client never sent its <code>session_id</code>, so the backend's history reconstruction never actually ran — was already corrected earlier. That fix is what makes the critical bug above <em>reachable</em>: now that the server path runs, its off-by-one in what counts as "the last turn" matters. Both need to be right for follow-ups to work.</p>
+    </div>
+  </section>
+
+  <section id="pipeA">
+    <h2><span class="num">1</span>Metadata creation pipeline</h2>
+    <p class="lede">How raw tables become semantic metadata. Files: <code>schema_crawler/crawlers/*.py</code>, <code>schema_crawler/metadata_extractor.py</code>, persisted to <code>SchemaTableMetadata</code> / <code>SchemaColumnMetadata</code>.</p>
+
+    <div class="flow">
+      <div class="step">Crawl<small>tables, columns, FKs</small></div><span class="arrow">→</span>
+      <div class="step">Heuristic descriptions<small>zero-LLM placeholder</small></div><span class="arrow">→</span>
+      <div class="step">Phase A: LLM batch<small>business names, roles, flags</small></div><span class="arrow">→</span>
+      <div class="step">Phase B: FK confirm<small>SQL overlap ≥60%</small></div><span class="arrow">→</span>
+      <div class="step">Phase C: sample values<small>filter-eligible cols</small></div><span class="arrow">→</span>
+      <div class="step">Persist + invalidate cache</div>
+    </div>
+
+    <h3>What's solid</h3>
+    <ul class="plain">
+      <li>Batched LLM analysis (3 tables/batch, bounded concurrency) with a mop-up retry for tables dropped from a batch, and structured <code>EXTRACTION_FAILED</code> logging for tables still missing after mop-up.</li>
+      <li>Diff-aware extraction: only changed + never-extracted tables are re-analyzed; dropped tables' metadata is cleaned up unconditionally.</li>
+      <li>FK confirmation is empirical (samples both columns and checks value overlap), not just name-guessing.</li>
+      <li>The enriched cache is explicitly invalidated after extraction completes (<code>metadata_extractor.py:965</code>), on hard-refresh (<code>projects.py:437</code>), and on crawl (<code>main.py:1007</code>).</li>
+    </ul>
+
+    <h3>Flaws &amp; fragilities</h3>
+
+    <div class="callout bug">
+      <span class="tag">Flaw · Medium</span>
+      <div class="file">agent_service/agents/schema_cache.py:70 — compute_schema_hash()</div>
+      <p>The cache-change fingerprint only hashes <code>table_name : column_count</code>. A re-crawl that <strong>changes semantics but not structure</strong> (better descriptions, corrected KPI/dimension flags, new FK confirmations — with the same tables and column counts) produces an <em>identical</em> hash. Cache freshness therefore depends entirely on someone calling <code>invalidate()</code>; the hash itself will never detect a semantic-only change. Today the known write-paths do call invalidate, so this is latent rather than actively broken — but any future path that regenerates metadata without invalidating will silently serve stale enriched schema, and there's no self-healing safety net.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Fragility · High if it ever drifts</span>
+      <div class="file">schema_cache.py:830 — _build() metadata attach</div>
+      <p>Persisted metadata is keyed by <strong>qualified name</strong> (<code>schema.table</code>) and attached by looking up <code>qualified_name_map.get(bare_name)</code>. This works only as long as the crawler, the extractor, and the cache builder all normalize the qualified name identically. If any one of them ever disagrees (a casing difference, a missing/extra schema prefix, a vendor-prefix quirk), the lookup misses and the table <strong>silently falls back to its bare heuristic description</strong> — losing every LLM-generated business name, role flag, and example value for that table, with no error. Retrieval quality for that table collapses invisibly. There is currently no assertion or log when a compact table ends up with zero attached DB metadata.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Gap · Medium (finance-specific)</span>
+      <div class="file">schema_cache.py:717–729 — heuristic FK inference</div>
+      <p>When a database doesn't declare/enforce foreign keys (Redshift, most warehouses, Snowflake), edges are inferred by column-name heuristics: a column is treated as an FK if it ends in <code>_id/_key/_sk/_fk/_ref</code>, or ends in "id" with length &gt; 4. Legacy/mainframe finance schemas frequently name keys <code>CUST_NO</code>, <code>ACCT_REF</code>, <code>TXN_CD</code> — none of which match these rules. A missed FK means no edge in the relationship graph, which means a follow-up that needs a join has no valid join path, which surfaces to the user as a wrong or low-confidence answer.</p>
+    </div>
+
+    <div class="callout info">
+      <span class="tag">Timing note</span>
+      <p>Crawler-level descriptions are now a zero-cost heuristic placeholder; the real semantics come from the async Phase A extraction. During the gap between "crawl finished" and "extraction finished," any query uses the weaker placeholder text for TF-IDF. This is by design (avoids blocking), but it means the <em>first</em> questions right after onboarding a connection retrieve on thinner signal than questions asked a minute later.</p>
+    </div>
+  </section>
+
+  <section id="pipeB">
+    <h2><span class="num">2</span>Metadata → RAG conversion</h2>
+    <p class="lede">How that metadata becomes the searchable index. File: <code>agent_service/agents/graph_rag_retriever.py</code>, index built in <code>schema_cache.py</code>'s <code>EnrichedSchema</code>.</p>
+
+    <p>Retrieval combines four signals, all computed in-memory in under 5ms: <strong>TF-IDF cosine</strong> over each table's text blob, a <strong>concept-index</strong> keyword lookup (business-vocabulary term → table.column), <strong>entity-column</strong> fuzzy matching, and <strong>FK-graph</strong> 1–2 hop traversal. Recent session fixes also wired in a <code>never_use_for</code> penalty and <code>is_fact_table</code> / <code>is_kpi_metric</code> boosts.</p>
+
+    <div class="callout bug">
+      <span class="tag">Gap · High — the core accuracy ceiling</span>
+      <div class="file">graph_rag_retriever.py — entire retrieval path</div>
+      <p><strong>There are no embeddings or vector search anywhere.</strong> Every signal is lexical: it needs a shared literal token, or a synonym that someone (or the LLM, at metadata time) happened to write into the description/concept index. So "income" won't match a table described only as "billed amount," "clients we lost" won't match "churned accounts," and finance jargon ("AUM," "NAV," "delinquency") won't match unless those exact words landed in the metadata. When retrieval misses, the user experiences it as the agent "not understanding my data" or "forgetting" — even though nothing was forgotten; the right table simply never ranked.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Gap · Medium</span>
+      <div class="file">graph_rag_retriever.py — history biasing via extract_recent_tables()</div>
+      <p>Follow-ups are biased toward tables used in recent turns — but only by regex-scraping <code>FROM</code>/<code>JOIN</code> out of the <strong>prior turn's SQL</strong>. If the prior turn produced a text answer (no SQL), or <em>failed</em> (no valid SQL), there is no bias signal at all, and the follow-up is retrieved as if it were a brand-new cold question. This is exactly the situation in a "that didn't work — try again" exchange, so the follow-up most in need of continuity is the one least likely to get it.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Gap · Medium</span>
+      <div class="file">schema_cache.py — concept_index construction</div>
+      <p>The concept index (the closest thing to a semantic layer) is built heuristically from the LLM-written descriptions. Its recall is therefore bounded by whatever vocabulary the extractor chose at metadata time — there is no curated, client-specific glossary mapping domain terms to schema elements. For a finance engagement this is the single highest-leverage accuracy investment, because it directly compensates for the no-embeddings limitation above on the exact terms that matter most.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Coupling · Low</span>
+      <div class="file">schema_cache.py — enriched cache keyed by the coarse hash</div>
+      <p>The enriched (RAG-ready) schema is cached under the same coarse <code>schema_hash</code> from §1. Combined with that hash's blindness to semantic-only changes, this is a second place the stale-metadata risk can bite: after a semantics-only re-crawl, a still-warm Redis/filesystem entry under the unchanged hash could serve the pre-update index if the invalidate step were ever skipped or lost.</p>
+    </div>
+  </section>
+
+  <section id="pipeC">
+    <h2><span class="num">3</span>Conversation memory &amp; follow-ups</h2>
+    <p class="lede">How prior turns are reconstructed and fed to the agent. Files: <code>agent_service/main.py</code> (<code>_load_session_history</code>, <code>submit_intent</code>), <code>routers/query_sessions.py</code>, <code>orchestrator.py</code>, <code>query_agent.py</code>, <code>intent_classifier.py</code>.</p>
+
+    <h3>The critical bug, step by step</h3>
+    <p>When you type a follow-up, the frontend does this, in order:</p>
+    <pre><code><span class="tok-c">// QueryChatPanel.tsx · runTurn()</span>
+<span class="tok-k">const</span> sid = <span class="tok-k">await</span> ensureSession()
+<span class="tok-k">await</span> querySessionApi.<span class="tok-f">addMessage</span>(sid, { role: <span class="tok-s">'user'</span>, content: text, parent_id }) <span class="tok-c">// ① saves the question</span>
+<span class="tok-c">// ...builds client-side history from prior messages...</span>
+<span class="tok-k">await</span> agentApi.<span class="tok-f">submitIntent</span>({ text, session_id: sid, ... })                <span class="tok-c">// ② asks backend to answer</span></code></pre>
+    <p>Step ① hits <code>add_message</code>, which sets <code>sess.active_leaf_id = m.id</code> — the session's active branch now <strong>ends at the question we're about to answer</strong>:</p>
+    <pre><code><span class="tok-c"># routers/query_sessions.py:182</span>
+sess.active_leaf_id = m.id  <span class="tok-c"># m is the just-saved USER message</span></code></pre>
+    <p>Step ② then calls <code>_load_session_history</code>, which walks from <code>active_leaf_id</code> back to the root and reverses it — so the last element of the returned history is that very question:</p>
+    <pre><code><span class="tok-c"># main.py:1281 — walk active_leaf → parent → ... → root, then reverse</span>
+cur_id = sess.active_leaf_id
+<span class="tok-k">while</span> cur_id ...: branch.append(by_id[cur_id]); cur_id = m.parent_id
+branch.<span class="tok-f">reverse</span>()   <span class="tok-c"># branch[-1] == the current user question</span></code></pre>
+
+    <div class="callout bug">
+      <span class="tag">Bug · Critical — consequences</span>
+      <p><strong>1. "Why did that fail?" follow-ups silently stop working.</strong> The root-cause path checks the last turn for a failure flag:</p>
+      <pre style="margin:8px 0"><code><span class="tok-c"># orchestrator.py:365</span>
+_last_turn = conversation_history[-1] <span class="tok-k">if</span> conversation_history <span class="tok-k">else</span> <span class="tok-k">None</span>
+_wants_root_cause = <span class="tok-f">bool</span>(_last_turn <span class="tok-k">and</span> (_last_turn.get(<span class="tok-s">"error"</span>) <span class="tok-k">or</span> _last_turn.get(<span class="tok-s">"low_confidence"</span>)) <span class="tok-k">and</span> ...)</code></pre>
+      <p>But <code>[-1]</code> is now the current user question (a user turn — no <code>error</code>/<code>low_confidence</code> field), so <code>_wants_root_cause</code> is always False. The actually-failed answer sits at <code>[-2]</code>, unread. The feature is dead whenever server-side history is used — which, after the session_id fix, is always.</p>
+      <p><strong>2. The current question is duplicated into the agent's context.</strong> It's passed once as <code>user_text</code> and again as the tail of <code>conversation_history</code>, so the intent classifier's "recent conversation" block and the SQL agent's last-6-turns window both contain the question twice. Not fatal, but noisy — and on a genuine follow-up it can make the model over-anchor on the literal current wording instead of resolving it against the real prior turn.</p>
+    </div>
+
+    <div class="callout fix">
+      <span class="tag">Fix</span>
+      <p>In <code>_load_session_history</code>, drop the trailing turn when it is the in-flight user question — i.e. if <code>branch[-1].role == "user"</code>, exclude it before shaping the history (the current question is already passed separately as <code>user_text</code>). Equivalent alternative: have the frontend send <code>session_id</code> <em>and</em> the parent id, and reconstruct history from the parent rather than the leaf. Either way, history must mean "everything before the current question," and the root-cause check at <code>orchestrator.py:365</code> should then find the real prior answer at <code>[-1]</code>.</p>
+    </div>
+
+    <h3>Secondary issues on the follow-up path</h3>
+
+    <div class="callout bug">
+      <span class="tag">Inefficiency + misroute risk · Medium</span>
+      <div class="file">main.py:1334 (QuickClassifier) vs orchestrator.py:106 (full classify)</div>
+      <p>Intent is classified <strong>twice</strong>. First, <code>_run_pipeline</code> runs a <code>QuickClassifier</code> on the bare text — <em>with no conversation history</em> — purely to decide single-chart vs. dashboard. Then the orchestrator runs the full, history-aware classifier. So the routing decision that picks the whole downstream pipeline is made context-blind: a follow-up like "now turn that into a full dashboard" or "just give me the one number" can be routed down the wrong pipeline before the history-aware pass ever runs. It's also a second Bedrock call on the critical path for every query.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Dead branch · Low</span>
+      <div class="file">intent_classifier.py:16 defines FOLLOWUP; orchestrator has no handler</div>
+      <p>The classifier can return <code>intent_type = "FOLLOWUP"</code> and a <code>followup_ref</code>, but the orchestrator has no dedicated FOLLOWUP branch — it isn't an agent-skill intent, isn't SCHEMA_EXPLORE, and falls through into the normal single-viz attempt loop. It works by accident, but <code>followup_ref</code> is never consumed and there's no fast-path that reuses the prior SQL for a pure refinement (e.g. "same chart, just last month"), so a refinement is regenerated from scratch each time.</p>
+    </div>
+
+    <div class="callout bug">
+      <span class="tag">Context window · Low</span>
+      <div class="file">intent_classifier.py:180 (last 2 turns) vs query_agent.py:689 (last 6)</div>
+      <p>The classifier only sees the last <strong>2</strong> turns when resolving references, while the SQL agent sees 6. A refinement chain that reaches back more than two turns ("go back to the regional view from before") can lose the thread at the classification step even though the SQL agent would have had the context.</p>
+    </div>
+
+    <div class="callout fix">
+      <span class="tag">Already corrected this session</span>
+      <p>The client-side fallback history now carries <code>error</code> / <code>low_confidence</code> per turn, and the frontend now actually sends <code>session_id</code>. Those were prerequisites; the critical off-by-one above is what remains.</p>
+    </div>
+  </section>
+
+  <section id="bugs">
+    <h2><span class="num">4</span>Bug register (severity-ranked)</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>#</th><th>Finding</th><th>Area</th><th>Severity</th><th>Status</th></tr>
+      <tr><td>1</td><td>History includes the current question as its own last turn → breaks root-cause follow-ups, duplicates context</td><td>Memory</td><td><span class="chip crit">Critical</span></td><td>Open</td></tr>
+      <tr><td>2</td><td>Retrieval is purely lexical — no embeddings; paraphrase/synonym misses surface as "doesn't understand my data"</td><td>RAG</td><td><span class="chip high">High</span></td><td>Open</td></tr>
+      <tr><td>3</td><td>Metadata attach depends on exact qualified-name agreement; any drift silently drops all semantics for a table</td><td>Metadata</td><td><span class="chip high">High</span></td><td>Open (latent)</td></tr>
+      <tr><td>4</td><td>Intent classified twice; first (routing) pass is context-blind → follow-up misroute + extra LLM call</td><td>Memory</td><td><span class="chip med">Medium</span></td><td>Open</td></tr>
+      <tr><td>5</td><td>Coarse schema hash can't detect semantic-only re-crawls; freshness relies solely on invalidate()</td><td>Metadata</td><td><span class="chip med">Medium</span></td><td>Open (latent)</td></tr>
+      <tr><td>6</td><td>History table-biasing needs prior SQL; a failed/text prior turn gives zero continuity signal</td><td>RAG</td><td><span class="chip med">Medium</span></td><td>Open</td></tr>
+      <tr><td>7</td><td>FK heuristics miss legacy finance key names (CUST_NO, ACCT_REF) → missing join paths</td><td>Metadata</td><td><span class="chip med">Medium</span></td><td>Open</td></tr>
+      <tr><td>8</td><td>No curated concept/synonym glossary; concept index bounded by extractor vocabulary</td><td>RAG</td><td><span class="chip med">Medium</span></td><td>Open</td></tr>
+      <tr><td>9</td><td>FOLLOWUP intent has no handler / followup_ref unused; refinements regenerate from scratch</td><td>Memory</td><td><span class="chip low">Low</span></td><td>Open</td></tr>
+      <tr><td>10</td><td>Classifier sees only last 2 turns; long refinement chains lose the thread</td><td>Memory</td><td><span class="chip low">Low</span></td><td>Open</td></tr>
+      <tr><td>11</td><td>Client fallback history missing error/low_confidence; session_id never sent</td><td>Memory</td><td><span class="chip done">Fixed</span></td><td>Done</td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="accuracy">
+    <h2><span class="num">5</span>Accuracy optimizations</h2>
+    <p class="lede">Beyond the bug fixes — where accuracy can genuinely move up, ordered by leverage.</p>
+
+    <h3>Highest leverage</h3>
+    <ul class="list">
+      <li class="c-high"><strong>Add a semantic embedding signal to retrieval.</strong> A single embedding-similarity term (query embedding vs. per-table metadata embedding), blended into the existing composite score, directly attacks the paraphrase/synonym miss that is today's accuracy ceiling. It complements the lexical signals rather than replacing them — TF-IDF still wins on exact matches, embeddings catch the rest.</li>
+      <li class="c-high"><strong>Curate a client concept/synonym glossary for finance.</strong> An explicit map of domain terms (AUM, NAV, delinquency, YoY, run-rate, ...) to specific tables/columns, injected into the concept index. Cheap to build, and it compensates for the no-embeddings gap on exactly the terms a Fidelity-style client will actually use.</li>
+      <li class="c-high"><strong>Populate the metric registry.</strong> Canonical SQL for named metrics turns "re-derive from schema every time" (variance, latency, low confidence) into "look up the agreed definition" — the single biggest consistency win for repeated finance questions.</li>
+    </ul>
+
+    <h3>Solid, medium effort</h3>
+    <ul class="list">
+      <li class="c-med"><strong>Fall back to prior-turn <em>table</em> continuity even without prior SQL.</strong> When a follow-up's prior turn has no usable SQL (text answer or failure), bias retrieval using the tables from the last turn that <em>did</em> have SQL, so continuity survives a failed exchange (finding #6).</li>
+      <li class="c-med"><strong>Broaden FK heuristics for finance key styles</strong> and, where cheap, confirm candidate joins empirically (the Phase B overlap check already exists — extend the candidate set feeding it) (finding #7).</li>
+      <li class="c-med"><strong>Add a "zero metadata attached" guard-log</strong> in <code>_build()</code> so the qualified-name-drift failure (finding #3) becomes visible instead of silent.</li>
+      <li class="c-med"><strong>Collapse the double classification.</strong> Make the routing decision from the single history-aware classifier (or pass history into the quick pass), removing both the misroute risk and a Bedrock call from the critical path (finding #4).</li>
+    </ul>
+
+    <h3>Lower effort / hygiene</h3>
+    <ul class="list">
+      <li class="c-low"><strong>Version the schema hash on a metadata-content fingerprint,</strong> not just table/column counts, so semantic-only re-crawls self-invalidate (finding #5).</li>
+      <li class="c-low"><strong>Give FOLLOWUP a real fast path</strong> that reuses the prior SQL for pure refinements instead of regenerating (finding #9), and widen the classifier's context window past 2 turns (finding #10).</li>
+    </ul>
+  </section>
+
+  <section id="fixplan">
+    <h2><span class="num">6</span>Suggested fix order</h2>
+    <p class="lede">If/when you decide to act — safest and highest-impact first. No code has been changed yet.</p>
+    <ol class="plain">
+      <li><strong>Fix the history off-by-one (finding #1).</strong> One-function change in <code>_load_session_history</code>; restores the root-cause follow-up and de-duplicates context. Highest impact, lowest risk, directly addresses the reported symptom.</li>
+      <li><strong>Collapse the double classification (finding #4).</strong> Removes a follow-up misroute path and a per-query LLM call.</li>
+      <li><strong>Add the "zero metadata attached" guard-log (finding #3)</strong> and the content-based schema fingerprint (finding #5) — cheap safety nets that make the latent metadata risks visible/self-healing before they ever bite.</li>
+      <li><strong>Curate the finance glossary + populate the metric registry (accuracy §5).</strong> Real work, but the biggest confidence gains for the finance domain, and independent of the code fixes above.</li>
+      <li><strong>Add the embedding retrieval signal (accuracy §5).</strong> The structural upgrade that raises the accuracy ceiling; worth planning deliberately rather than rushing.</li>
+    </ol>
+  </section>
+
+  <footer>Diagnosis grounded in the current codebase — every finding cites the file/line it was read from. Nothing in this analysis modified any code.</footer>
+
+</div>
+</body>
+</html>

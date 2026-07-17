@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Query Agent — Finance Domain: Latency &amp; Confidence Analysis</title>
+<style>
+  :root {
+    --bg: #f6f8fb;
+    --surface: #ffffff;
+    --ink: #1a2233;
+    --muted: #5b6579;
+    --brand: #4f46e5;
+    --brand-soft: #eef2ff;
+    --red: #dc2626;
+    --red-soft: #fef2f2;
+    --amber: #d97706;
+    --amber-soft: #fffbeb;
+    --green: #059669;
+    --green-soft: #ecfdf5;
+    --border: #e5e9f0;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.92em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero {
+    background: linear-gradient(135deg, #312e81 0%, #4f46e5 55%, #7c3aed 100%);
+    color: #fff; border-radius: 16px; padding: 44px 40px; margin-bottom: 40px;
+    box-shadow: 0 20px 50px rgba(79,70,229,.25);
+  }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 780px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 56px; }
+  h2 {
+    font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px;
+    padding-top: 12px; scroll-margin-top: 24px;
+  }
+  h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 9px; background: var(--brand);
+    color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px;
+  }
+  h3 { font-size: 17px; font-weight: 700; margin: 28px 0 10px; }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 860px; }
+  p { margin-bottom: 14px; max-width: 860px; }
+
+  .callout {
+    border-radius: var(--radius); padding: 20px 24px; margin: 18px 0; border: 1px solid;
+  }
+  .callout.finding { background: var(--red-soft); border-color: #fecaca; }
+  .callout.finding .tag { color: var(--red); }
+  .callout.fix { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.fix .tag { color: var(--green); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 8px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
+  .chip::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .chip.high { background: var(--red-soft); color: var(--red); }
+  .chip.med { background: var(--amber-soft); color: var(--amber); }
+  .chip.low { background: var(--green-soft); color: var(--green); }
+
+  .flow { display: flex; flex-direction: column; gap: 0; margin: 20px 0; }
+  .flow-step { display: grid; grid-template-columns: 34px 1fr 120px 90px; gap: 16px; align-items: center; padding: 12px 16px; background: var(--surface); border: 1px solid var(--border); border-top: none; font-size: 13.5px; }
+  .flow-step:first-child { border-top: 1px solid var(--border); border-radius: var(--radius) var(--radius) 0 0; }
+  .flow-step:last-child { border-radius: 0 0 var(--radius) var(--radius); }
+  .flow-step .n { font-weight: 800; color: var(--brand); font-size: 13px; }
+  .flow-step .who { font-weight: 700; }
+  .flow-step .what { color: var(--muted); font-size: 12.5px; }
+  .flow-step .model { font-family: monospace; font-size: 11.5px; }
+  .flow-step .time { font-family: monospace; font-size: 12.5px; text-align: right; color: var(--ink); font-weight: 600; }
+  .flow-step.retry { background: var(--amber-soft); }
+  .flow-total { display: grid; grid-template-columns: 34px 1fr 120px 90px; gap: 16px; padding: 12px 16px; background: var(--ink); color: #fff; border-radius: 0 0 var(--radius) var(--radius); margin-top: -1px; font-size: 13.5px; font-weight: 700; }
+  .flow-total .time { text-align: right; font-family: monospace; }
+
+  ul.gaps { list-style: none; margin: 0; }
+  ul.gaps li { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--brand); border-radius: 0 10px 10px 0; padding: 14px 18px; margin-bottom: 10px; font-size: 14px; }
+  ul.gaps li strong { display: block; margin-bottom: 4px; }
+  ul.gaps li.risk-high { border-left-color: var(--red); }
+  ul.gaps li.risk-med { border-left-color: var(--amber); }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Query Agent — Finance Domain</h1>
+    <p>A full pipeline walkthrough for the finance-domain Query Chat: where the time actually goes on every question, why confidence comes back low, and where the semantic layer doesn't yet track what a finance user means. Grounded in the current code, not a general checklist.</p>
+    <div class="meta">
+      <span>Scope: <code>orchestrator.py</code> → <code>graph_rag_retriever.py</code> → <code>query_agent.py</code> → <code>validator_agent.py</code></span>
+      <span>Domain: finance only</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#pipeline">The full call chain, timed</a></li>
+      <li><a href="#latency">Why it's slow</a></li>
+      <li><a href="#confidence">Why confidence comes back low</a></li>
+      <li><a href="#semantic">Semantic layer &amp; intent-matching gaps</a></li>
+      <li><a href="#gaps">Consolidated gap list</a></li>
+      <li><a href="#recs">Recommendations, ranked</a></li>
+    </ol>
+  </nav>
+
+  <section id="pipeline">
+    <h2><span class="num">1</span>The full call chain, timed</h2>
+    <p class="lede">Every finance query — even one that succeeds on the first try — walks through five sequential model calls before the user sees an answer. This is the happy path; a retry adds three more calls per attempt, up to four attempts.</p>
+
+    <div class="flow">
+      <div class="flow-step">
+        <span class="n">1</span>
+        <div><span class="who">Intent classification</span><br><span class="what">Domain-aware prompt (finance vocabulary + RECONCILE/ANOMALY/FORECAST/NETWORK signals) → SINGLE_VIZ / DASHBOARD / skill intent</span></div>
+        <span class="model">Sonnet</span>
+        <span class="time">~3–4s</span>
+      </div>
+      <div class="flow-step">
+        <span class="n">2</span>
+        <div><span class="who">GraphRAG retrieval</span><br><span class="what">TF-IDF + concept-index + FK-graph scoring — in-memory, not the bottleneck</span></div>
+        <span class="model">none</span>
+        <span class="time">&lt;5ms</span>
+      </div>
+      <div class="flow-step">
+        <span class="n">3</span>
+        <div><span class="who">QueryAgent.generate()</span><br><span class="what">Writes the SQL — the one call that repeats on every retry</span></div>
+        <span class="model">Sonnet</span>
+        <span class="time">~4–8s</span>
+      </div>
+      <div class="flow-step">
+        <span class="n">4</span>
+        <div><span class="who">SQL execution</span><br><span class="what">Network round-trip to Snowflake, up to 30s statement timeout</span></div>
+        <span class="model">n/a</span>
+        <span class="time">1–5s typical</span>
+      </div>
+      <div class="flow-step">
+        <span class="n">5</span>
+        <div><span class="who">ValidatorAgent.validate_axis_labels()</span><br><span class="what">Runs on <strong>every single attempt</strong>, pass or fail — see finding below</span></div>
+        <span class="model">"Haiku"*</span>
+        <span class="time">~2–4s</span>
+      </div>
+      <div class="flow-step retry">
+        <span class="n">5b</span>
+        <div><span class="who">ValidatorAgent.generate_structured_feedback()</span><br><span class="what">Only when validation fails — writes the retry instruction</span></div>
+        <span class="model">Sonnet</span>
+        <span class="time">~2–3s</span>
+      </div>
+      <div class="flow-step">
+        <span class="n">6</span>
+        <div><span class="who">result_narrator.narrate_stream()</span><br><span class="what">Streams the prose answer — real Sonnet, masked somewhat by streaming</span></div>
+        <span class="model">Sonnet</span>
+        <span class="time">~4–7s</span>
+      </div>
+      <div class="flow-step">
+        <span class="n">7</span>
+        <div><span class="who">verify_narrative_grounding()</span><br><span class="what">Checks the narration didn't hallucinate a number</span></div>
+        <span class="model">"Haiku"*</span>
+        <span class="time">~2–3s</span>
+      </div>
+    </div>
+    <div class="flow-total">
+      <span></span><span>Best case (attempt 1 passes, no retry)</span><span></span><span class="time">~18–34s</span>
+    </div>
+    <p style="font-size:13px;color:var(--muted);margin-top:10px;">Each additional retry attempt (steps 3–5b repeated) adds roughly <strong>10–15s</strong>. Up to 4 attempts are allowed, so a query needing 2 retries realistically lands in the <strong>40–60s</strong> range. Times are estimates from observed Bedrock call durations in this codebase's own logs (comparable calls in the Report Copilot pipeline logged 3.1–10.7s each).</p>
+    <p style="font-size:13px;color:var(--muted);">* — see the headline finding in Section 2. These are not actually running on a Haiku-tier model today.</p>
+  </section>
+
+  <section id="latency">
+    <h2><span class="num">2</span>Why it's slow</h2>
+
+    <div class="callout finding">
+      <span class="tag">Headline finding</span>
+      <p><code>BEDROCK_HAIKU_MODEL</code> and <code>BEDROCK_SONNET_MODEL</code> currently resolve to the <strong>same model ID</strong> (<code>us.anthropic.claude-sonnet-4-5-...</code>). Every call in the pipeline that was written to use the cheap/fast tier — <code>validate_axis_labels()</code>, <code>verify_narrative_grounding()</code> — is actually running full Sonnet. These two calls alone run on <strong>every single query</strong>, not just retries, purely to (a) check if two axis-label strings mean the same thing and (b) check the narration didn't invent a number. Neither task needs Sonnet-level reasoning; both are exactly what Haiku exists for.</p>
+    </div>
+    <div class="callout fix">
+      <span class="tag">Fix</span>
+      <p>Set <code>BEDROCK_HAIKU_MODEL_ID</code> to an actual Haiku model in your environment. This is a one-line env var change, not a code change, and it cuts latency on two calls that run on <em>every</em> query — plus it retroactively fixes the same issue flagged in the metadata-pipeline audit for <code>schema_cache.py</code>'s LLM concept-index pass. One root cause, three places it costs you time.</p>
+    </div>
+
+    <h3>Sequential, not parallel</h3>
+    <p>Steps 5 and 6 (label validation, narration) have no data dependency on each other — both only need <code>query_plan</code> and <code>execute_result</code>, which exist by step 4. They currently run one after another. Running them concurrently (<code>asyncio.gather</code>) would remove one full call's worth of wall-clock time from every query, independent of the model-tier fix above.</p>
+
+    <h3>No fast path for high-confidence queries</h3>
+    <p>A query that GraphRAG scores at 0.9 confidence, matches a known-good pattern in query memory, and executes cleanly still runs the full validator (including the LLM label-check) and full grounding-check. There's no short-circuit for the case where every deterministic signal already says "this is fine" — every query pays the same five-call tax regardless of how obviously correct it is.</p>
+
+    <h3>Finance retries more than the fix accounts for</h3>
+    <p>The finance skill agents (RECONCILE, ANOMALY, FORECAST, NETWORK, and the schema-driven versions of MATCH/AUDIT/PROSPECT/ENRICH) are schema-driven with no fixed table names — unlike recruitment's hardcoded agents, which write against exact, pre-verified columns. Schema-driven generation against an unfamiliar schema has inherently higher retry odds, and each retry is the ~10–15s block from Section 1, not a cheap operation.</p>
+  </section>
+
+  <section id="confidence">
+    <h2><span class="num">3</span>Why confidence comes back low</h2>
+
+    <h3>Metadata quality is only as good as the last crawl — and the fixes made this session haven't necessarily reached your data yet</h3>
+    <p>This session fixed real bugs in the metadata pipeline: a <code>concept_index</code> dict-key bug that silently dropped table business names, missing <code>never_use_for</code>/<code>is_fact_table</code>/<code>is_kpi_metric</code> wiring in retrieval scoring, and a structural gap where freshly-crawled tables got weaker semantics than already-enriched ones. <strong>None of these fixes are retroactive.</strong> If your finance Snowflake connection was crawled before this session's changes, its persisted metadata doesn't have the benefit of them — the code is fixed, but the data sitting in <code>schema_table_metadata</code>/<code>schema_column_metadata</code> for this connection was generated by the old logic.</p>
+    <div class="callout fix"><span class="tag">Action</span><p>Trigger a fresh crawl on the finance connection. The diff-aware extraction added this session means this is now cheap to do — it won't re-run full extraction on unchanged tables, only on ones that look different from what's stored (and everything looks "different" relative to metadata generated before the concept-index fix, since invalidating the schema cache forces a rebuild either way).</p></div>
+
+    <h3>The finance classifier vocabulary has never been validated against real questions</h3>
+    <p>The RECONCILE/ANOMALY/FORECAST/NETWORK intents and their trigger phrases were authored this session from first principles — reasonable signal words, but zero real usage data behind them yet. If users are asking about reconciliation or anomalies in phrasing that doesn't match the authored signals, those questions fall through to plain SINGLE_VIZ and get treated as an ordinary chart request — which is itself a form of "low confidence," just invisible as such, since the wrong pipeline runs instead of the right one silently.</p>
+
+    <h3>No canonical metric definitions populated for this client</h3>
+    <p><code>metric_registry.py</code> exists specifically to give the LLM authoritative, pre-agreed SQL for named metrics instead of re-deriving them from schema alone every time. For finance vocabulary specific to this engagement — AUM, NAV, delinquency rate, YoY movement, whatever Fidelity's own terms are — if nothing has been registered yet, every question about them gets reconstructed from scratch, with all the variance that implies for both speed and consistency of the answer.</p>
+
+    <h3>Query memory starts empty for a new connection</h3>
+    <p><code>query_memory.find_similar()</code> feeds the LLM few-shot examples of past successful queries on this exact connection — but a newly onboarded finance connection has no history yet, so this signal is unavailable right when it would help most. It self-improves with organic usage, but there's no mechanism today to seed it upfront with a curated set of known-good finance query examples for a new engagement.</p>
+
+    <h3>Finance-style column naming likely under-detects foreign keys</h3>
+    <p>FK candidate detection (both the crawler's own naming heuristic and the LLM's guess, independently SQL-validated by Phase B) works best when a column name closely mirrors its target table's name (<code>customer_id</code> → <code>customers</code>). Financial schemas — especially anything with a legacy/mainframe lineage — more often use abbreviated or coded column names (<code>CUST_ID</code>, <code>ACCT_NO</code>, <code>TXN_REF</code>) that don't cleanly pattern-match. A missed FK means no edge in the relationship graph, which means a query that needs to join two tables may not find a valid join path — showing up to the user as either a wrong answer or a low-confidence one.</p>
+  </section>
+
+  <section id="semantic">
+    <h2><span class="num">4</span>Semantic layer &amp; intent-matching gaps</h2>
+    <p class="lede">The part of "does the system understand what the user actually wants" that's about matching finance vocabulary specifically, not query mechanics.</p>
+
+    <h3>Binary disambiguation, no middle ground</h3>
+    <p>Today there's exactly one disambiguation behavior: if GraphRAG confidence is below 0.12, the system asks a clarifying question; otherwise it just answers, however weak the underlying signal. There's nothing for the wide middle band — a query that scores, say, 0.25 confidence isn't wrong enough to trigger clarification, but isn't strong enough to trust either. That's exactly the "what does the user actually want" gap: the system doesn't have a way to say "did you mean transaction volume or transaction count?" for a moderately-ambiguous finance term — it picks one and hopes.</p>
+
+    <h3>No finance glossary layer</h3>
+    <p>Concept matching today depends entirely on whatever vocabulary the LLM happened to use when it wrote each table/column's <code>description</code>/<code>business_name</code> during metadata extraction. There's no curated mapping from finance jargon → schema elements sitting alongside it — so if a user says "AUM" and the extracted description says "total account balance," the concept index has to get lucky on token overlap rather than knowing these are the same thing by design.</p>
+
+    <h3>Domain immaturity is real and worth naming plainly</h3>
+    <p>Recruitment's skill agents are hardcoded against a schema that's been used and refined over a long production history. Finance's are schema-driven and built this session. It is expected and normal for finance query confidence to be systematically lower right now — the fair comparison isn't "finance vs. recruitment today," it's "finance today vs. finance after a comparable amount of real usage and metadata re-crawls."</p>
+  </section>
+
+  <section id="gaps">
+    <h2><span class="num">5</span>Consolidated gap list</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Gap</th><th>Type</th><th>Severity</th></tr>
+      <tr><td><code>BEDROCK_HAIKU_MODEL</code> resolves to Sonnet — two unconditional calls per query pay full price</td><td>Latency</td><td><span class="chip high">High</span></td></tr>
+      <tr><td>Label-validation and grounding-check run sequentially with no data dependency between them</td><td>Latency</td><td><span class="chip med">Medium</span></td></tr>
+      <tr><td>No fast path — every query pays the full 5-call tax regardless of how confident earlier stages already are</td><td>Latency</td><td><span class="chip med">Medium</span></td></tr>
+      <tr><td>Finance connection's persisted metadata may predate this session's retrieval fixes</td><td>Confidence</td><td><span class="chip high">High</span></td></tr>
+      <tr><td>RECONCILE/ANOMALY/FORECAST/NETWORK trigger phrases are unvalidated against real usage</td><td>Confidence</td><td><span class="chip med">Medium</span></td></tr>
+      <tr><td>No canonical metric definitions registered for this client's finance vocabulary</td><td>Confidence + Semantic</td><td><span class="chip high">High</span></td></tr>
+      <tr><td>Query memory has no seed data for a new finance connection</td><td>Confidence</td><td><span class="chip med">Medium</span></td></tr>
+      <tr><td>FK detection under-recalls on abbreviated/legacy-style finance column names</td><td>Confidence</td><td><span class="chip med">Medium</span></td></tr>
+      <tr><td>No moderate-confidence disambiguation path — binary ask-or-guess only</td><td>Semantic matching</td><td><span class="chip high">High</span></td></tr>
+      <tr><td>No curated finance-jargon-to-schema glossary layer</td><td>Semantic matching</td><td><span class="chip med">Medium</span></td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="recs">
+    <h2><span class="num">6</span>Recommendations, ranked</h2>
+
+    <h3>Do first — cheap, safe, high impact</h3>
+    <ul class="gaps">
+      <li class="risk-high"><strong>Wire a real Haiku model into <code>BEDROCK_HAIKU_MODEL_ID</code>.</strong> One env var. Cuts two full-price calls down to the tier they were designed for, on every single query.</li>
+      <li class="risk-high"><strong>Re-crawl the finance Snowflake connection.</strong> Now cheap thanks to diff-aware extraction. Ensures the metadata this session's retrieval fixes depend on actually reflects the fixed code.</li>
+      <li><strong>Parallelize label-validation and grounding-check.</strong> No dependency between them; straightforward <code>asyncio.gather</code>.</li>
+    </ul>
+
+    <h3>Do next — real work, real payoff</h3>
+    <ul class="gaps">
+      <li class="risk-med"><strong>Populate <code>metric_registry</code> with Fidelity's actual finance vocabulary</strong> — AUM, NAV, delinquency rate, whatever terms come up in real conversations. Turns "re-derive from scratch" into "look up the agreed definition" for the terms that matter most.</li>
+      <li class="risk-med"><strong>Seed query memory with a curated set of known-good finance queries</strong> for this connection instead of waiting for organic accumulation.</li>
+      <li><strong>Validate the finance intent vocabulary against real transcripts</strong> once there's usage to look at — confirm RECONCILE/ANOMALY/FORECAST/NETWORK are actually firing when they should.</li>
+    </ul>
+
+    <h3>Structural — worth planning, not urgent</h3>
+    <ul class="gaps">
+      <li><strong>Add a moderate-confidence disambiguation path</strong> — offer 2–3 candidate interpretations instead of silently picking one when GraphRAG confidence sits in the uncertain middle band.</li>
+      <li><strong>Add a fast path</strong> for queries where GraphRAG confidence, a query-memory hit, and clean execution all already agree — skip the full validator/grounding chain when the deterministic signal is already strong.</li>
+      <li><strong>A finance glossary layer</strong> alongside the auto-extracted metadata, mapping domain jargon to schema elements explicitly rather than hoping token overlap catches it.</li>
+    </ul>
+  </section>
+
+  <footer>Scope: finance-domain Query Chat pipeline only. Recruitment and the Intelligence report-rendering surface are out of scope for this analysis.</footer>
+
+</div>
+</body>
+</html>

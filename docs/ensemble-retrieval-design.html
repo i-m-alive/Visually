@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ensemble Retrieval — Multi-Agent Table Selection Design</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+  pre { background: #0f172a; color: #e2e8f0; border-radius: 10px; padding: 16px 18px; overflow-x: auto; font-size: 12.6px; line-height: 1.6; margin: 14px 0; }
+  pre code { background: none; color: inherit; padding: 0; }
+  .c-c { color: #64748b; } .c-k { color: #c084fc; } .c-s { color: #86efac; } .c-n { color: #fbbf24; }
+
+  header.hero { background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%); color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px; box-shadow: 0 20px 50px rgba(79,70,229,.25); }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 840px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 56px; }
+  h2 { font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px; }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 30px 0 10px; }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 880px; }
+  p { margin-bottom: 14px; max-width: 880px; }
+  ul, ol.body { margin-left: 20px; } ul li, ol.body li { margin-bottom: 6px; }
+
+  .callout { border-radius: var(--radius); padding: 18px 22px; margin: 18px 0; border: 1px solid; }
+  .callout.warn { background: var(--amber-soft); border-color: #fde68a; }
+  .callout.warn .tag { color: var(--amber); }
+  .callout.info { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.info .tag { color: var(--blue); }
+  .callout.good { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.good .tag { color: var(--green); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 8px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  /* architecture diagram */
+  .arch { background: var(--surface); border:1px solid var(--border); border-radius: var(--radius); padding: 22px; margin: 20px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  .lane { text-align:center; margin-bottom: 6px; }
+  .lane .label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 0 8px; }
+  .boxrow { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  .box { background: var(--brand-soft); border:1px solid #c7d2fe; border-radius:10px; padding:9px 13px; font-size:12.5px; font-weight:600; color: var(--brand-dark); }
+  .box.exp { background:#f5f3ff; border-color:#ddd6fe; }
+  .box.llm { background: var(--amber-soft); border-color:#fde68a; color:#92400e; }
+  .box.big { background: var(--ink); color:#fff; border-color: var(--ink); }
+  .arrow-d { text-align:center; color: var(--muted); font-size: 18px; margin: 4px 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 10px 15px; border-bottom: 1px solid var(--border); font-size: 13.6px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.center { text-align:center; }
+
+  .chip { display:inline-flex; align-items:center; font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:99px; white-space:nowrap; }
+  .chip.det { background: var(--green-soft); color: var(--green); }
+  .chip.llm { background: var(--amber-soft); color: var(--amber); }
+  .chip.new { background: var(--brand-soft); color: var(--brand); }
+
+  ul.phase { list-style:none; margin:0; }
+  ul.phase li { background: var(--surface); border:1px solid var(--border); border-left:4px solid var(--brand); border-radius:0 10px 10px 0; padding:14px 18px; margin-bottom:10px; }
+  ul.phase li strong { display:block; margin-bottom:3px; }
+  ul.phase li .p { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.05em; background:var(--brand-soft); color:var(--brand); padding:2px 8px; border-radius:99px; margin-right:8px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Ensemble Retrieval for Table Selection</h1>
+    <p>A design for turning table selection into a panel of independent expert retrievers whose rankings are fused, with an LLM arbiter that steps in only when the experts disagree — plus multi-candidate SQL generation judged by the validation loop. Maximum accuracy, without paying N LLM calls on every query.</p>
+    <div class="meta">
+      <span>Status: design proposal · no code changed</span>
+      <span>Scope: retrieval + SQL selection · read-only</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#idea">Your idea, sharpened</a></li>
+      <li><a href="#today">Where we are today</a></li>
+      <li><a href="#arch">Proposed architecture</a></li>
+      <li><a href="#experts">The expert panel</a></li>
+      <li><a href="#fusion">Rank fusion (how votes combine)</a></li>
+      <li><a href="#arbiter">The disagreement gate &amp; LLM arbiter</a></li>
+      <li><a href="#joins">Join-path resolution</a></li>
+      <li><a href="#sql">Multi-candidate SQL + validation judging</a></li>
+      <li><a href="#budget">Performance &amp; cost budget</a></li>
+      <li><a href="#accuracy">What each piece buys (accuracy)</a></li>
+      <li><a href="#roadmap">Implementation roadmap</a></li>
+      <li><a href="#risks">Risks &amp; honest caveats</a></li>
+    </ol>
+  </nav>
+
+  <section id="idea">
+    <h2><span class="num">1</span>Your idea, sharpened</h2>
+    <p class="lede">The instinct — several agents that each analyze the metadata a different way, then combine their outputs to rank tables and their FK connections — is a genuinely strong architecture (it's the "mixture of retrievers" / ensemble pattern). Two refinements make it a win instead of a cost sink.</p>
+
+    <div class="callout warn">
+      <span class="tag">The trap to avoid</span>
+      <p><strong>Do not make every signal its own LLM agent.</strong> Most of your retrieval signals (TF-IDF, embeddings, graph traversal) are deterministic math that runs in microseconds. Wrapping each one in an LLM "agent" would turn a &lt;5&nbsp;ms step into 5–8 sequential LLM calls per query — adding 15–40&nbsp;seconds and multiplying cost, for signals that don't need reasoning at all. Experts should be <em>cheap and parallel</em>; the LLM's judgment is reserved for the one place it adds value: breaking ties.</p>
+    </div>
+    <div class="callout good">
+      <span class="tag">The version that wins</span>
+      <p><strong>1. Decouple the signals into independent experts</strong> that each emit their own ranked list (not one pre-blended score). This lets you fuse by <em>rank</em> and see which expert found what.<br>
+      <strong>2. Escalate to an LLM arbiter only on disagreement.</strong> When the cheap experts already agree on the top table (the common case), answer immediately. When they conflict or all score low, <em>then</em> spend one LLM call to reason over the shortlist. You get ensemble accuracy at roughly single-signal cost on the majority of queries.</p>
+    </div>
+  </section>
+
+  <section id="today">
+    <h2><span class="num">2</span>Where we are today</h2>
+    <p class="lede">Worth being precise: retrieval is already multi-signal — but it's a single fused scorer, not a panel of independent experts.</p>
+    <p>In <code>graph_rag_retriever.py</code>, one function scores every table against the query using six signals and combines them with a fixed <strong>weighted sum</strong>:</p>
+    <pre><code><span class="c-c"># current: one blended score per table (weights sum to 1.0)</span>
+score = 0.28·tfidf + 0.22·embed + 0.20·name + 0.18·concept + 0.10·entity + 0.02·graph
+        <span class="c-c"># then: never_use_for penalty, is_fact_table / is_kpi boosts, junk penalty, history bias</span></code></pre>
+    <p>Two structural limits of the weighted-sum approach:</p>
+    <ul>
+      <li><strong>Scale coupling.</strong> A weighted sum mixes signals whose raw scores live on different scales (a TF-IDF cosine of 0.3 is "strong"; an embedding cosine of 0.3 is "weak"). One signal can quietly dominate.</li>
+      <li><strong>No visibility into disagreement.</strong> The blend collapses everything to one number, so you can't tell whether the top table won by consensus or because one signal shouted. That's exactly the information an arbiter needs.</li>
+    </ul>
+    <p>The proposal keeps all six signals but restructures how their opinions are combined.</p>
+  </section>
+
+  <section id="arch">
+    <h2><span class="num">3</span>Proposed architecture</h2>
+    <p class="lede">Four lanes: parallel experts → rank fusion → conditional arbiter → join resolution. Only the amber boxes cost an LLM call, and the arbiter is conditional.</p>
+
+    <div class="arch">
+      <div class="lane"><div class="label">1 · Expert panel (parallel, cheap)</div>
+        <div class="boxrow">
+          <div class="box exp">TF-IDF expert</div>
+          <div class="box exp">Embedding expert</div>
+          <div class="box exp">Concept/glossary expert</div>
+          <div class="box exp">FK-graph expert</div>
+          <div class="box exp">Entity/name expert</div>
+        </div>
+      </div>
+      <div class="arrow-d">▼ each emits its own ranked list + confidence</div>
+      <div class="lane"><div class="label">2 · Rank fusion (deterministic)</div>
+        <div class="boxrow"><div class="box big">Reciprocal Rank Fusion → consensus shortlist (top 6) + agreement score</div></div>
+      </div>
+      <div class="arrow-d">▼ agreement high? ── yes ──▶ skip arbiter</div>
+      <div class="lane"><div class="label">3 · Arbiter (LLM — only on disagreement / low agreement)</div>
+        <div class="boxrow"><div class="box llm">LLM arbiter: reason over shortlist + metadata, pick final tables &amp; justify</div></div>
+      </div>
+      <div class="arrow-d">▼</div>
+      <div class="lane"><div class="label">4 · Join-path resolution (deterministic)</div>
+        <div class="boxrow"><div class="box">FK graph: find + rank join paths connecting the chosen tables</div></div>
+      </div>
+      <div class="arrow-d">▼ tables + columns + join path → QueryAgent (existing) → validation loop (existing)</div>
+    </div>
+  </section>
+
+  <section id="experts">
+    <h2><span class="num">4</span>The expert panel</h2>
+    <p class="lede">Each expert is a small, independent component with one job: emit a ranked list of tables with a self-reported confidence. Five are deterministic (fast, free); one optional expert is an LLM.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Expert</th><th>Method</th><th>Catches</th><th>Type</th></tr>
+      <tr><td>Lexical</td><td>TF-IDF cosine over table text blobs</td><td>Exact keyword matches, column-name hits</td><td class="center"><span class="chip det">deterministic</span></td></tr>
+      <tr><td>Semantic</td><td>Embedding cosine (Titan vectors)</td><td>Paraphrases, synonyms, jargon</td><td class="center"><span class="chip det">deterministic</span></td></tr>
+      <tr><td>Concept / glossary</td><td>Business-term → table.column index + finance jargon expansion</td><td>Domain vocabulary ("AUM", "delinquency")</td><td class="center"><span class="chip det">deterministic</span></td></tr>
+      <tr><td>Structural (FK-graph)</td><td>Graph centrality + reachability from other strong candidates</td><td>Hub/fact tables, join-reachable dimensions</td><td class="center"><span class="chip det">deterministic</span></td></tr>
+      <tr><td>Entity / name</td><td>Fuzzy match of named entities to identifier/name columns + table-name match</td><td>"customer X", "account Y" style lookups</td><td class="center"><span class="chip det">deterministic</span></td></tr>
+      <tr><td>Reasoner <em>(optional)</em></td><td>LLM reads the shortlist's metadata and ranks by task fit</td><td>Intent nuance the math misses; multi-table asks</td><td class="center"><span class="chip llm">LLM</span></td></tr>
+    </table>
+    </div>
+    <p>Crucially, the deterministic experts run <strong>concurrently</strong> and share the pre-computed indexes already in <code>EnrichedSchema</code> — so the whole panel is still a few milliseconds. The LLM reasoner, if used, is folded into the arbiter step rather than run separately.</p>
+  </section>
+
+  <section id="fusion">
+    <h2><span class="num">5</span>Rank fusion — how votes combine</h2>
+    <p class="lede">Replace the weighted sum of raw scores with <strong>Reciprocal Rank Fusion (RRF)</strong>, which combines by each expert's <em>ranking position</em>, not its raw score — sidestepping the scale-coupling problem entirely.</p>
+    <pre><code><span class="c-c"># For each table t, sum over experts. k dampens the tail (typical k=60).</span>
+RRF(t) = Σ<sub>expert</sub>  weight[expert] / (k + rank<sub>expert</sub>(t))
+
+<span class="c-c"># A table ranked #1 by three experts beats one ranked #1 by a single loud expert.</span>
+<span class="c-c"># Agreement score = how many experts put the winner in their top 3.</span></code></pre>
+    <ul>
+      <li><strong>Scale-free.</strong> Only positions matter, so a "weak-looking" 0.3 embedding cosine that still ranks a table #1 counts fully.</li>
+      <li><strong>Consensus-favoring.</strong> Tables multiple experts agree on rise; single-expert outliers are dampened — precisely the ensemble effect you want.</li>
+      <li><strong>Produces an agreement score for free</strong> — the exact signal the arbiter gate needs (below).</li>
+    </ul>
+    <p>Keep per-expert weights (an expert can be trusted more), but they now weight <em>rank contributions</em>, which is far more stable than weighting raw scores across different scales.</p>
+  </section>
+
+  <section id="arbiter">
+    <h2><span class="num">6</span>The disagreement gate &amp; LLM arbiter</h2>
+    <p class="lede">This is what keeps the ensemble cheap. The LLM only runs when the cheap panel is uncertain.</p>
+    <pre><code>fused, agreement = rrf_fuse(expert_rankings)
+
+<span class="c-k">if</span> agreement &gt;= HIGH <span class="c-k">and</span> fused[0].margin &gt;= MARGIN:
+    <span class="c-c"># experts agree, clear winner → answer now, NO LLM arbiter</span>
+    <span class="c-k">return</span> fused[:top_k]
+
+<span class="c-k">elif</span> fused[0].score &lt; FLOOR:
+    <span class="c-c"># everyone scored low → ask the user to clarify (existing behavior)</span>
+    <span class="c-k">return</span> clarify()
+
+<span class="c-k">else</span>:
+    <span class="c-c"># genuine disagreement / ambiguity → spend ONE arbiter call over the shortlist</span>
+    <span class="c-k">return</span> llm_arbiter(question, shortlist=fused[:8], metadata, expert_rationales)</code></pre>
+    <p>The arbiter receives only the <strong>shortlist</strong> (top ~8 tables), each expert's vote, and the compact metadata — a small, cheap prompt — and returns the final table set plus a one-line justification (which also improves explainability and can seed better few-shot examples).</p>
+    <div class="callout info">
+      <span class="tag">Why this matters</span>
+      <p>On a healthy schema most questions produce clear consensus, so the arbiter fires on a minority of queries. You pay for LLM judgment exactly where it changes the outcome, and nowhere else. Tune <code>HIGH</code>/<code>MARGIN</code>/<code>FLOOR</code> against real traffic to set how often the arbiter runs.</p>
+    </div>
+  </section>
+
+  <section id="joins">
+    <h2><span class="num">7</span>Join-path resolution</h2>
+    <p class="lede">You specifically called out "tables <em>and their foreign key connections</em>." Make join resolution an explicit stage after the tables are chosen — not an afterthought inside SQL generation.</p>
+    <ul>
+      <li>Once the final table set is fixed, query the FK relationship graph (already built in <code>EnrichedSchema</code>, now including confirmed FKs and broadened legacy-key heuristics) for the <strong>shortest join path(s)</strong> connecting them.</li>
+      <li>Rank candidate paths: prefer confirmed FKs &gt; declared FKs &gt; heuristic FKs; prefer fewer hops; penalize paths through junk/bridge tables.</li>
+      <li>Hand the chosen path to <code>QueryAgent</code> as an explicit <code>join_path</code> (the plumbing for this already exists) so the model writes the JOIN it's told to, rather than guessing keys.</li>
+      <li>If <em>no</em> path exists between two required tables, that's a signal to surface ("these don't appear to be related") rather than let the model invent a join.</li>
+    </ul>
+  </section>
+
+  <section id="sql">
+    <h2><span class="num">8</span>Multi-candidate SQL + validation judging</h2>
+    <p class="lede">Your "perform multiple validations and fit whatever" maps onto a proven technique: <strong>self-consistency</strong>. Generate a few candidate queries, run them, and let the validation loop pick the best — instead of trusting one generation.</p>
+    <ol class="body">
+      <li>Generate <strong>N candidate SQLs</strong> (e.g. 2–3) in parallel — vary the plan slightly (different top table from the shortlist, or different temperature). This is N generation calls, run concurrently, not sequentially.</li>
+      <li>Run each through the <strong>existing</strong> guardrails + execution + sanity checks.</li>
+      <li><strong>Score each candidate</strong> by: passes read-only + column checks, returns a non-empty sensibly-shaped result, matches the intent contract, and the validator's answer-fit score.</li>
+      <li>Keep the top-scoring candidate; discard the rest. Only escalate to the retry-feedback loop if <em>none</em> pass.</li>
+    </ol>
+    <div class="callout warn">
+      <span class="tag">Cost dial</span>
+      <p>N-candidate generation multiplies the generation cost by N. Gate it: use N=1 for high-agreement / high-confidence retrievals (most queries), and only fan out to N=2–3 when retrieval was ambiguous or a first attempt already failed. This spends the extra generations only where accuracy is actually at risk.</p>
+    </div>
+  </section>
+
+  <section id="budget">
+    <h2><span class="num">9</span>Performance &amp; cost budget</h2>
+    <p class="lede">The whole point of the tiered design is that the common case stays as cheap as today. Rough per-query LLM-call count:</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Scenario</th><th>Today</th><th>Naïve "everything an agent"</th><th>This design</th></tr>
+      <tr><td>Clear question, experts agree</td><td>1 gen + validate/narrate</td><td class="center">~6–9 calls</td><td class="center">same as today (no arbiter, N=1)</td></tr>
+      <tr><td>Ambiguous retrieval</td><td>1 gen (often wrong)</td><td class="center">~6–9 calls</td><td class="center">+1 arbiter, maybe N=2 gen</td></tr>
+      <tr><td>First attempt failed</td><td>retry loop</td><td class="center">~6–9 calls/attempt</td><td class="center">+ N=2–3 gen on that attempt</td></tr>
+    </table>
+    </div>
+    <ul>
+      <li><strong>Expert panel:</strong> deterministic + parallel → single-digit milliseconds, whatever the schema size. No added LLM cost.</li>
+      <li><strong>Arbiter:</strong> conditional; fires on the minority of ambiguous queries. One small-prompt call (shortlist only).</li>
+      <li><strong>Multi-candidate SQL:</strong> gated on ambiguity/failure; concurrent so wall-clock ≈ one generation even at N=3.</li>
+    </ul>
+    <p>Net: the median query is no slower or costlier than today, while the <em>hard</em> queries — exactly the ones that fail now — get materially more machinery thrown at them.</p>
+  </section>
+
+  <section id="accuracy">
+    <h2><span class="num">10</span>What each piece buys (accuracy)</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Change</th><th>Accuracy effect</th><th>Effort</th></tr>
+      <tr><td>RRF fusion (vs weighted sum)</td><td>Fixes scale-coupling; consensus tables rank correctly; frees an agreement score</td><td class="center">Low</td></tr>
+      <tr><td>Independent expert lists + rationales</td><td>Explainability; enables the gate; easier to debug "why this table"</td><td class="center">Low–Med</td></tr>
+      <tr><td>Disagreement-gated LLM arbiter</td><td>Big lift on ambiguous/multi-table questions, near-zero cost on easy ones</td><td class="center">Med</td></tr>
+      <tr><td>Explicit join-path resolution</td><td>Fewer wrong/invented JOINs; catches "unrelated tables" honestly</td><td class="center">Med</td></tr>
+      <tr><td>Multi-candidate SQL + validation judging</td><td>Turns a coin-flip generation into best-of-N on hard queries</td><td class="center">Med</td></tr>
+    </table>
+    </div>
+    <p>The two lowest-effort items (RRF + independent expert lists) are worth doing first regardless of the rest — they improve ranking quality and are the foundation the gate/arbiter build on.</p>
+  </section>
+
+  <section id="roadmap">
+    <h2><span class="num">11</span>Implementation roadmap</h2>
+    <ul class="phase">
+      <li><span class="p">Phase 1</span><strong>Refactor signals into named experts returning ranked lists.</strong> Pure restructure of <code>graph_rag_retriever.py</code> — no behavior change yet. Each existing signal becomes a function returning <code>(table, rank, confidence)</code>.</li>
+      <li><span class="p">Phase 2</span><strong>Swap weighted-sum for RRF fusion</strong> and compute an agreement score. Verify ranking parity/improvement on a fixture set before shipping.</li>
+      <li><span class="p">Phase 3</span><strong>Add the disagreement gate + LLM arbiter.</strong> Start conservative (arbiter fires only on clear disagreement), log how often it triggers, then tune thresholds against real traffic.</li>
+      <li><span class="p">Phase 4</span><strong>Promote join-path resolution to an explicit stage</strong> feeding <code>QueryAgent</code>'s <code>join_path</code>, with the confirmed &gt; declared &gt; heuristic preference and "no path" surfacing.</li>
+      <li><span class="p">Phase 5</span><strong>Add gated multi-candidate SQL</strong> with validation-based selection, fanning out only on ambiguous retrieval or after a first failed attempt.</li>
+      <li><span class="p">Phase 6</span><strong>Feed arbiter justifications + winning candidates back into query memory</strong> as few-shot examples, so the cheap experts get sharper over time and the arbiter fires less.</li>
+    </ul>
+    <p>Each phase is independently shippable and independently verifiable; Phases 1–2 are safe refactors, and the expensive behaviors (3, 5) are all gated so they can be dialed to zero if traffic doesn't justify them.</p>
+  </section>
+
+  <section id="risks">
+    <h2><span class="num">12</span>Risks &amp; honest caveats</h2>
+    <ul>
+      <li><strong>Diminishing returns on a small schema.</strong> If a connection has few tables and clean names, today's blended scorer already nails it — the ensemble earns its keep mainly on large, messy, or jargon-heavy finance schemas. Measure before assuming it helps everywhere.</li>
+      <li><strong>Threshold tuning is real work.</strong> The gate's <code>HIGH</code>/<code>MARGIN</code>/<code>FLOOR</code> need calibration against actual queries; set them wrong and the arbiter either never fires (no benefit) or always fires (cost blowup). Log-then-tune, don't guess once.</li>
+      <li><strong>The arbiter is only as good as the metadata it reads.</strong> Ensemble ranking can't rescue tables whose descriptions are empty or wrong — the metadata-quality and re-crawl work stays the prerequisite.</li>
+      <li><strong>Multi-candidate SQL multiplies cost if ungated.</strong> The gating is not optional polish; it's what makes the feature affordable.</li>
+      <li><strong>Complexity budget.</strong> More moving parts means more to debug. The phased rollout and the "deterministic-first, LLM-only-on-disagreement" discipline are what keep this from becoming an over-engineered pipeline that's slower <em>and</em> harder to reason about.</li>
+    </ul>
+    <div class="callout good">
+      <span class="tag">Bottom line</span>
+      <p>Your ensemble instinct is right. The winning form is: <strong>cheap independent experts → RRF fusion → LLM arbiter only on disagreement → explicit join resolution → gated best-of-N SQL</strong>. It raises accuracy most on exactly the hard queries that fail today, while keeping the median query as fast and cheap as it is now.</p>
+    </div>
+  </section>
+
+  <footer>Design proposal — no code has been changed. Builds directly on the existing <code>graph_rag_retriever.py</code> signals, <code>EnrichedSchema</code> indexes, FK graph, and validation loop.</footer>
+
+</div>
+</body>
+</html>

@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 import httpx
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -380,6 +380,88 @@ async def trigger_schema_crawl(
             return resp.json()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Schema crawler unavailable: {e}")
+
+
+@router.post("/{project_id}/schema/hard-refresh")
+async def hard_refresh_schema_metadata(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Force-regenerate the enriched schema metadata (AI descriptions, concept index,
+    column disambiguation) even when the underlying tables have not changed.
+
+    Steps:
+      1. Evict all three cache tiers (in-process, Redis, filesystem) for this connection.
+      2. Fire a background task that calls get_or_build(force=True) — this skips every
+         cache check and runs the full LLM enrichment pass immediately.
+
+    Returns immediately; enrichment runs in the background (usually 30–120 s).
+    """
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid project ID: {project_id!r}")
+
+    conn_result = await db.execute(
+        select(DatabaseConnection).where(
+            DatabaseConnection.project_id == uuid.UUID(project_id),
+            DatabaseConnection.is_active == True,
+        ).limit(1)
+    )
+    conn = conn_result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="No active connection found for this project")
+
+    snap_result = await db.execute(
+        select(SchemaSnapshot)
+        .where(SchemaSnapshot.connection_id == conn.id)
+        .order_by(SchemaSnapshot.version.desc())
+        .limit(1)
+    )
+    snapshot = snap_result.scalar_one_or_none()
+    if not snapshot:
+        raise HTTPException(
+            status_code=404,
+            detail="No schema snapshot found — run a schema crawl first, then hard-refresh.",
+        )
+
+    connection_id = str(conn.id)
+    schema_doc = snapshot.schema_document or {}
+    db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+
+    # Step 1: synchronous eviction (in-process + filesystem) + async Redis eviction
+    from agent_service.agents import schema_cache as _sc
+    _sc.invalidate(connection_id)
+
+    # Step 2: eager background rebuild (force=True bypasses any cache race)
+    async def _rebuild() -> None:
+        try:
+            await _sc.get_or_build(connection_id, schema_doc, db_type, force=True)
+            print(
+                f"[hard-refresh] ✓ metadata rebuilt  connection={connection_id}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[hard-refresh] ✗ rebuild failed  connection={connection_id}: {exc}",
+                flush=True,
+            )
+
+    background_tasks.add_task(_rebuild)
+
+    return {
+        "status": "started",
+        "connection_id": connection_id,
+        "snapshot_version": snapshot.version,
+        "tables": len(schema_doc.get("tables", [])),
+        "message": (
+            "Cache cleared and metadata rebuild started in the background. "
+            "The AI copilot will use the fresh metadata on the next request (usually ready in 30–120 s)."
+        ),
+    }
 
 
 @router.get("/{project_id}/schema")

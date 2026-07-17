@@ -4,7 +4,7 @@ import contextvars
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import boto3
 from botocore.config import Config as BotocoreConfig
@@ -29,9 +29,13 @@ _BEDROCK_EXECUTOR = ThreadPoolExecutor(max_workers=24, thread_name_prefix="bedro
 # Configurable model IDs — read from env so .env values always win over any
 # stale system-level env vars that point to old model IDs.
 BEDROCK_SONNET_MODEL = os.getenv("BEDROCK_SONNET_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-BEDROCK_HAIKU_MODEL  = os.getenv("BEDROCK_HAIKU_MODEL_ID",  "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+BEDROCK_HAIKU_MODEL  = os.getenv("BEDROCK_HAIKU_MODEL_ID",  "global.anthropic.claude-haiku-4-5-20251001-v1:0")
 BEDROCK_OPUS_MODEL   = os.getenv("BEDROCK_OPUS_MODEL_ID",   "us.anthropic.claude-opus-4-5-20251101-v1:0")
 BEDROCK_VISION_MODEL = os.getenv("BEDROCK_VISION_MODEL_ID", "us.anthropic.claude-opus-4-5-20251101-v1:0")
+# Titan Text Embeddings V2 — used for semantic table retrieval (graph_rag_retriever).
+# Dimensions 256 keeps the persisted per-table vectors small in the schema cache.
+BEDROCK_EMBED_MODEL = os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+BEDROCK_EMBED_DIMS  = int(os.getenv("BEDROCK_EMBED_DIMS", "256"))
 
 BEDROCK_MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "8192"))
 BEDROCK_TEMPERATURE = float(os.getenv("BEDROCK_TEMPERATURE", "0.0"))
@@ -205,6 +209,59 @@ async def bedrock_invoke(
     ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))
+
+
+async def bedrock_embed(text: str, dimensions: int = BEDROCK_EMBED_DIMS) -> Optional[list]:
+    """
+    Return a normalized embedding vector for `text` via Titan Text Embeddings V2,
+    or None on any failure (missing model access, throttling, bad input). Callers
+    MUST treat None as "no embedding signal" and degrade gracefully — embeddings
+    are an additive retrieval signal, never a hard dependency.
+    """
+    if not text or not text.strip():
+        return None
+
+    def _invoke():
+        client = get_bedrock_client()
+        body = {
+            "inputText": text[:8000],   # Titan v2 input cap safety
+            "dimensions": dimensions,
+            "normalize": True,
+        }
+        response = client.invoke_model(
+            modelId=BEDROCK_EMBED_MODEL,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(response["body"].read())
+        return result.get("embedding")
+
+    try:
+        ctx = contextvars.copy_context()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_BEDROCK_EXECUTOR, lambda: ctx.run(_invoke))
+    except Exception as exc:
+        print(f"[bedrock-embed] ⚠ embed failed (non-fatal): {exc}", flush=True)
+        return None
+
+
+async def bedrock_embed_batch(
+    texts: list, dimensions: int = BEDROCK_EMBED_DIMS, concurrency: int = 8
+) -> list:
+    """
+    Embed many texts concurrently (bounded). Returns a list aligned to `texts`;
+    any individual failure yields None at that position. Never raises.
+    """
+    if not texts:
+        return []
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(t):
+        async with sem:
+            return await bedrock_embed(t, dimensions)
+
+    return await asyncio.gather(*[_one(t) for t in texts], return_exceptions=False)
 
 
 async def bedrock_invoke_with_history(

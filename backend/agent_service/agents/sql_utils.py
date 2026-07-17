@@ -100,16 +100,23 @@ def extract_recent_tables(
     recent_tables: list[str] = []
     for turn in conversation_history[-max_turns:]:
         sql_text = turn.get("sql") or ""
-        if not sql_text:
-            continue
-        for m in re.finditer(r'\bFROM\s+([\w.]+)\b', sql_text, re.IGNORECASE):
-            tname = m.group(1).strip('"').strip("'")
-            if tname and tname not in recent_tables:
-                recent_tables.append(tname)
-        for m in re.finditer(r'\bJOIN\s+([\w.]+)\b', sql_text, re.IGNORECASE):
-            tname = m.group(1).strip('"').strip("'")
-            if tname and tname not in recent_tables:
-                recent_tables.append(tname)
+        if sql_text:
+            for m in re.finditer(r'\bFROM\s+([\w.]+)\b', sql_text, re.IGNORECASE):
+                tname = m.group(1).strip('"').strip("'")
+                if tname and tname not in recent_tables:
+                    recent_tables.append(tname)
+            for m in re.finditer(r'\bJOIN\s+([\w.]+)\b', sql_text, re.IGNORECASE):
+                tname = m.group(1).strip('"').strip("'")
+                if tname and tname not in recent_tables:
+                    recent_tables.append(tname)
+        else:
+            # No SQL to scrape (text answer, low-confidence result) — fall back to
+            # the table the turn recorded, so continuity survives a turn that
+            # produced prose or a soft failure instead of a chart. A hard failure
+            # with no result at all legitimately contributes nothing.
+            tu = (turn.get("table_used") or "").strip()
+            if tu and tu not in recent_tables:
+                recent_tables.append(tu)
     return recent_tables[:max_tables]
 
 

@@ -83,6 +83,7 @@ class Orchestrator:
         output_mode_override: Optional[str] = None,
         user_profile: Optional[dict] = None,
         domain: str = "recruitment",
+        preclassified_intent=None,
     ) -> dict:
         async def emit(event: dict):
             # Direct in-process broadcast (works with or without Redis)
@@ -101,11 +102,16 @@ class Orchestrator:
             await db.commit()
 
         try:
-            # STEP 1: Classify intent
+            # STEP 1: Classify intent — reuse the classification already computed
+            # upstream (main._run_pipeline) when provided, so we never pay for a
+            # second, redundant classification pass on the critical path.
             await set_pipeline_state(redis, job_id, "step", "classifying")
-            intent = await self._intent.classify(
-                user_text, conversation_history=conversation_history, domain=domain,
-            )
+            if preclassified_intent is not None:
+                intent = preclassified_intent
+            else:
+                intent = await self._intent.classify(
+                    user_text, conversation_history=conversation_history, domain=domain,
+                )
             await emit({
                 "type": "intent.classified",
                 "job_id": job_id,
@@ -167,7 +173,7 @@ class Orchestrator:
                         )
                         if _enriched and _enriched.compact_tables:
                             _rag = _graph_rag.retrieve(
-                                user_text, intent, _enriched, top_k=20
+                                user_text, intent, _enriched, top_k=20, domain=domain
                             )
                             _candidates = (
                                 _rag.candidates if (_rag and _rag.candidates) else []
@@ -236,6 +242,28 @@ class Orchestrator:
                         flush=True,
                     )
 
+                # ── Conversation history for the skill agent ─────────────────
+                # Without this, a follow-up like "how much has THIS customer
+                # invested?" reaches the agent with no idea who "this customer"
+                # is (the SQL pipeline already gets history; the agent path did
+                # not) and it asks the user to re-identify the entity. Inject a
+                # compact recent-turns block ahead of the request so the agent
+                # can resolve the reference against what was already discussed.
+                if conversation_history:
+                    _hist_lines = []
+                    for _turn in conversation_history[-6:]:
+                        _role = _turn.get("role", "user")
+                        _content = (_turn.get("content") or "").strip()
+                        if _content:
+                            _hist_lines.append(f"{_role}: {_content[:600]}")
+                    if _hist_lines:
+                        _hist_block = (
+                            "## Recent conversation (resolve references like "
+                            "'this customer', 'that account', 'the same one' "
+                            "against it):\n" + "\n".join(_hist_lines)
+                        )
+                        agent_user_text = _hist_block + "\n\n" + agent_user_text
+
                 ctx = AgentContext(
                     project_id=project_id,
                     connection_id=connection_id,
@@ -246,6 +274,7 @@ class Orchestrator:
                     schema_tables=_schema_tables,
                     user_profile=user_profile,
                     domain=domain,
+                    conversation_history=conversation_history or [],
                 )
                 await emit({
                     "type":       "agent.started",
@@ -342,12 +371,24 @@ class Orchestrator:
             if enriched:
                 from agent_service.agents.sql_utils import extract_recent_tables
                 _history_tables = extract_recent_tables(conversation_history)
+                # Embed the question once so the retriever can add a semantic
+                # cosine signal — only worth it when the schema actually carries
+                # per-table embeddings. Fully non-fatal: None → lexical-only.
+                _query_embedding = None
+                if getattr(enriched, "table_embeddings", None):
+                    try:
+                        from shared.bedrock_client import bedrock_embed
+                        _query_embedding = await bedrock_embed(user_text)
+                    except Exception as _ee:
+                        print(f"[pipeline:{job_id}] query embed failed (non-fatal): {_ee}", flush=True)
                 retrieved_context = _graph_rag.retrieve(
                     user_text=user_text,
                     intent=intent,
                     enriched=enriched,
                     top_k=6,
                     history_tables=_history_tables,
+                    domain=domain,
+                    query_embedding=_query_embedding,
                 )
                 if retrieved_context and retrieved_context.primary_tables:
                     await emit({

@@ -570,6 +570,47 @@ async def delete_project(project_id: str, current_user: User = Depends(get_curre
             .execution_options(synchronize_session=False)
         )
 
+    # ── Clear connection-scoped rows that have NO ON DELETE CASCADE ───────────
+    # Deleting the project cascades to its DatabaseConnections; for schema
+    # snapshots/alerts (and query history) SQLAlchemy would otherwise try to NULL
+    # connection_id — which is NOT NULL on schema_snapshots — and the whole delete
+    # fails. Clear them explicitly first, exactly as delete_connection does.
+    conn_rows = await db.execute(
+        select(DatabaseConnection.id).where(DatabaseConnection.project_id == project.id)
+    )
+    conn_ids = [r[0] for r in conn_rows.all()]
+    if conn_ids:
+        from shared.models.schema_snapshots import SchemaSnapshot
+        from shared.models.phase2 import SchemaChangeAlert, QueryHistory
+        await db.execute(sa_delete(SchemaChangeAlert)
+                         .where(SchemaChangeAlert.connection_id.in_(conn_ids))
+                         .execution_options(synchronize_session=False))
+        await db.execute(sa_delete(SchemaSnapshot)
+                         .where(SchemaSnapshot.connection_id.in_(conn_ids))
+                         .execution_options(synchronize_session=False))
+        await db.execute(sa_update(QueryHistory)
+                         .where(QueryHistory.connection_id.in_(conn_ids))
+                         .values(connection_id=None)
+                         .execution_options(synchronize_session=False))
+
+    # ── Clear project-scoped rows that reference projects.id without cascade ──
+    # These would otherwise raise a FK violation on the final project DELETE.
+    # (Tables whose project_id FK already has ON DELETE CASCADE — export_jobs,
+    # query_history, query_sessions — clean themselves up and are skipped here.)
+    from shared.models.chat_sessions import ChatSession
+    from shared.models.phase4 import ExportToken, ExportChatSession
+    pid = project.id
+    await db.execute(sa_delete(PipelineJob).where(PipelineJob.project_id == pid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_delete(ProjectMember).where(ProjectMember.project_id == pid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_delete(ChatSession).where(ChatSession.project_id == pid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_delete(ExportToken).where(ExportToken.project_id == pid)
+                     .execution_options(synchronize_session=False))
+    await db.execute(sa_update(ExportChatSession).where(ExportChatSession.project_id == pid)
+                     .values(project_id=None).execution_options(synchronize_session=False))
+
     await db.delete(project)
     await db.commit()
     return {"deleted": project_id}
@@ -974,6 +1015,56 @@ async def trigger_schema_crawl(project_id: str, current_user: User = Depends(get
         raise HTTPException(status_code=502, detail=f"Schema crawler unavailable: {e}")
 
 
+@app.post("/projects/{project_id}/schema/hard-refresh")
+async def hard_refresh_schema_metadata(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Evict all enriched-schema cache tiers and force a full LLM metadata rebuild."""
+    conn_result = await db.execute(select(DatabaseConnection).where(
+        DatabaseConnection.project_id == uuid.UUID(project_id), DatabaseConnection.is_active == True).limit(1))
+    conn = conn_result.scalar_one_or_none()
+    if not conn:
+        raise HTTPException(status_code=404, detail="No active connection found for this project")
+
+    from shared.models.schema_snapshots import SchemaSnapshot
+    snap_result = await db.execute(
+        select(SchemaSnapshot)
+        .where(SchemaSnapshot.connection_id == conn.id)
+        .order_by(SchemaSnapshot.version.desc())
+        .limit(1)
+    )
+    snapshot = snap_result.scalar_one_or_none()
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="No schema snapshot found — run a schema crawl first, then hard-refresh.")
+
+    connection_id = str(conn.id)
+    schema_doc = snapshot.schema_document or {}
+    db_type = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+
+    from agent_service.agents import schema_cache as _sc
+    _sc.invalidate(connection_id)
+
+    async def _rebuild() -> None:
+        try:
+            await _sc.get_or_build(connection_id, schema_doc, db_type, force=True)
+            print(f"[hard-refresh] ✓ metadata rebuilt  connection={connection_id}", flush=True)
+        except Exception as exc:
+            print(f"[hard-refresh] ✗ rebuild failed  connection={connection_id}: {exc}", flush=True)
+
+    background_tasks.add_task(_rebuild)
+    print(f"[agent] hard-refresh started project={project_id[:8]} conn={connection_id[:8]}", flush=True)
+    return {
+        "status": "started",
+        "connection_id": connection_id,
+        "snapshot_version": snapshot.version,
+        "tables": len(schema_doc.get("tables", [])),
+        "message": "Cache cleared and metadata rebuild started in the background (ready in ~60 s).",
+    }
+
+
 @app.get("/projects/{project_id}/schema/crawl/{job_id}")
 async def get_crawl_status(project_id: str, job_id: str, current_user: User = Depends(get_current_user)):
     try:
@@ -1236,6 +1327,18 @@ async def _load_session_history(session_id: str, user_id: uuid.UUID, db: AsyncSe
         branch.append(m)
         cur_id = m.parent_id
     branch.reverse()
+    # ── Drop the in-flight current question ───────────────────────────────────
+    # The client persists the user's message (which advances active_leaf_id onto
+    # it) BEFORE calling /agent/intent, so the branch's last turn is the very
+    # question being answered right now. It's already passed separately as
+    # user_text; leaving it here would (a) duplicate it into the agent's context
+    # and (b) shift the root-cause follow-up check off by one (it inspects the
+    # last turn for a failure flag, which would land on this user turn instead of
+    # the prior assistant answer). "history" must mean everything BEFORE the
+    # current question. Only strip a trailing *user* turn — if the client's
+    # persist failed, the leaf is the prior assistant answer and must be kept.
+    if branch and (branch[-1].role or "").lower() == "user":
+        branch = branch[:-1]
     if not branch:
         return None
     history = []
@@ -1246,6 +1349,11 @@ async def _load_session_history(session_id: str, user_id: uuid.UUID, db: AsyncSe
                 turn["sql"] = m.result["sql"]
             if m.result.get("title"):
                 turn["chart_title"] = m.result["title"]
+            # Carry the table this turn used even when there's no SQL to scrape
+            # (text answers, low-confidence results) so a follow-up still gets a
+            # table-continuity signal for retrieval biasing (see extract_recent_tables).
+            if m.result.get("table_used"):
+                turn["table_used"] = m.result["table_used"]
             # Carried through so a later "why did that fail?" follow-up can be
             # diagnosed against what actually went wrong (see orchestrator.py's
             # root-cause follow-up handling) instead of silently regenerating a
@@ -1276,24 +1384,16 @@ async def _run_pipeline(
     from shared.database import AsyncSessionLocal
     redis = await get_redis()
 
-    # Classify here (background) instead of blocking the HTTP response.
-    # If classification returns DASHBOARD we switch pipelines; otherwise SINGLE_VIZ.
+    # Intent classification is deferred to the background (below, after the
+    # project domain is resolved) instead of blocking the HTTP response. It runs
+    # exactly ONCE — history-aware and domain-aware — and the resulting IntentResult
+    # is threaded into the pipeline so run_single_viz_pipeline never re-classifies.
+    # (Previously a context-blind "quick" pass ran here to pick DASHBOARD vs
+    # SINGLE_VIZ, then the orchestrator classified again with full context — a
+    # follow-up could be routed down the wrong pipeline before the history-aware
+    # pass ever ran, and it cost an extra Bedrock call on the critical path.)
     resolved_type = job_type
-    if job_type == "SINGLE_VIZ":
-        try:
-            intent_preview = await _quick_classifier.classify(user_text)
-            resolved_type = intent_preview.intent_type or "SINGLE_VIZ"
-        except Exception:
-            resolved_type = "SINGLE_VIZ"
-
-    print(
-        f"[DIAG pipeline:{job_id[:8]}] "
-        f"quick_intent={resolved_type!r} "
-        f"user_email={user_email!r} "
-        f"impersonate={impersonate_email!r} "
-        f"text={user_text[:60]!r}",
-        flush=True,
-    )
+    preclassified_intent = None
 
     async with AsyncSessionLocal() as db:
         # ── Resolve project domain — drives which persona/skill-agents/access-gate
@@ -1334,6 +1434,33 @@ async def _run_pipeline(
             _is_brainwave_db = is_brainwave_host(_conn_for_domain.host if _conn_for_domain else None)
         except Exception as _cde:
             print(f"[pipeline:{job_id}] connection domain-override lookup failed (non-fatal): {_cde}", flush=True)
+
+        # ── Single, context-aware intent classification ──────────────────────
+        # Now that the domain is final, classify ONCE with conversation history
+        # and the domain's skill vocabulary. The result decides DASHBOARD vs the
+        # single-viz pipeline AND is handed to run_single_viz_pipeline so it does
+        # not classify a second time. Non-fatal: on any failure we fall back to
+        # SINGLE_VIZ and let the orchestrator classify itself (preclassified=None).
+        if job_type == "SINGLE_VIZ":
+            try:
+                preclassified_intent = await _quick_classifier.classify(
+                    user_text,
+                    conversation_history=conversation_history,
+                    domain=project_domain,
+                )
+                resolved_type = preclassified_intent.intent_type or "SINGLE_VIZ"
+            except Exception as _ce:
+                print(f"[pipeline:{job_id}] intent classification failed (non-fatal): {_ce}", flush=True)
+                preclassified_intent = None
+                resolved_type = "SINGLE_VIZ"
+
+        print(
+            f"[DIAG pipeline:{job_id[:8]}] "
+            f"intent={resolved_type!r} domain={project_domain!r} "
+            f"user_email={user_email!r} impersonate={impersonate_email!r} "
+            f"text={user_text[:60]!r}",
+            flush=True,
+        )
 
         # ── Load Brainwave user profile (platform-level, no project_id) ────────
         # Only the "recruitment" domain, on a connection whose host actually
@@ -1432,6 +1559,7 @@ async def _run_pipeline(
                 job_id=job_id, user_text=user_text, project_id=project_id,
                 user_id=user_id, connection_id=connection_id, redis=redis, db=db,
                 conversation_history=conversation_history,
+                preclassified_intent=preclassified_intent,
                 scope=scope,
                 selected_tables=selected_tables,
                 selected_hops=selected_hops,

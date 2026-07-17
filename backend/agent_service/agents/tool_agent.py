@@ -49,6 +49,11 @@ class AgentContext:
     # Project domain ("recruitment" | "finance" | "generic") — selects which
     # skill-agent persona/tools this request should use. See domain_config.py.
     domain: str = "recruitment"
+    # Prior conversation turns (see main._load_session_history) so a skill agent
+    # can resolve follow-up references like "this customer" / "the same account"
+    # against earlier turns. Each turn: {role, content, sql?, chart_title?, ...}.
+    # Empty on the first turn of a conversation.
+    conversation_history: list = field(default_factory=list)
 
 
 # ── Write-tool gate ──────────────────────────────────────────────────────────

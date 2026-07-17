@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visually — Capabilities, Use Cases &amp; Edge Cases</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px;
+  }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero {
+    background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%);
+    color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px;
+    box-shadow: 0 20px 50px rgba(79,70,229,.25);
+  }
+  header.hero h1 { font-size: 31px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 820px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 58px; }
+  h2 { font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 9px; background: var(--brand);
+    color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px;
+  }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 30px 0 10px; }
+  h4 { font-size: 14.5px; font-weight: 700; margin: 18px 0 6px; color: var(--brand-dark); }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 880px; }
+  p { margin-bottom: 14px; max-width: 880px; }
+
+  .persona {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin: 18px 0 30px;
+  }
+  .persona-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 22px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  .persona-card .tag {
+    display: inline-block; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--brand); background: var(--brand-soft); padding: 3px 9px; border-radius: 99px; margin-bottom: 10px;
+  }
+  .persona-card h4 { margin: 0 0 8px; color: var(--ink); font-size: 15.5px; }
+  .persona-card ul { margin-left: 18px; font-size: 13.5px; color: var(--muted); }
+  .persona-card li { margin-bottom: 5px; }
+
+  .callout { border-radius: var(--radius); padding: 20px 24px; margin: 18px 0; border: 1px solid; }
+  .callout.finding { background: var(--red-soft); border-color: #fecaca; }
+  .callout.finding .tag { color: var(--red); }
+  .callout.fix { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.fix .tag { color: var(--green); }
+  .callout.info { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.info .tag { color: var(--blue); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 8px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 13.8px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.center, th.center { text-align: center; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
+  .chip::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .chip.live { background: var(--green-soft); color: var(--green); }
+  .chip.partial { background: var(--amber-soft); color: var(--amber); }
+  .chip.planned { background: var(--red-soft); color: var(--red); }
+  .dot { display:inline-block; }
+
+  ul.gaps { list-style: none; margin: 0; }
+  ul.gaps li {
+    background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--brand);
+    border-radius: 0 10px 10px 0; padding: 14px 18px; margin-bottom: 10px; font-size: 14px;
+  }
+  ul.gaps li strong { display: block; margin-bottom: 4px; }
+  ul.gaps li.edge-recruit { border-left-color: #7c3aed; }
+  ul.gaps li.edge-finance { border-left-color: #0369a1; }
+  ul.gaps li.edge-generic { border-left-color: var(--green); }
+
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 20px 0; }
+  .flow .step {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 16px; font-size: 13px; font-weight: 600; box-shadow: 0 2px 8px rgba(16,24,40,.04);
+  }
+  .flow .arrow { color: var(--muted); font-size: 16px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Visually — Capabilities, Use Cases &amp; Edge Cases</h1>
+    <p>What the platform actually does today, for the person using it and for the firm selling it: the concrete scenarios it handles, the rough edges it already has guardrails for, what's genuinely extensible, and where the honest gaps are.</p>
+    <div class="meta">
+      <span>Domains live today: <code>recruitment</code> · <code>finance</code> · <code>generic</code></span>
+      <span>Connectors: <code>PostgreSQL</code> · <code>MySQL</code> · <code>Redshift</code> · <code>Snowflake</code></span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#shape">The shape of the product</a></li>
+      <li><a href="#personas">End-user use cases, by persona</a></li>
+      <li><a href="#edge">Edge cases the platform already handles</a></li>
+      <li><a href="#firm">The firm's point of view — what's sellable</a></li>
+      <li><a href="#matrix">Capability matrix by domain</a></li>
+      <li><a href="#extend">Extensibility — how each layer grows</a></li>
+      <li><a href="#gaps">Honest gaps — what's not there yet</a></li>
+    </ol>
+  </nav>
+
+  <section id="shape">
+    <h2><span class="num">1</span>The shape of the product</h2>
+    <p class="lede">Every project follows the same spine, regardless of domain. What differs by domain is which skill agents light up on top of it.</p>
+    <div class="flow">
+      <div class="step">Create project</div><span class="arrow">→</span>
+      <div class="step">Connect a database</div><span class="arrow">→</span>
+      <div class="step">Crawl + auto-enrich schema</div><span class="arrow">→</span>
+      <div class="step">Pick a domain</div><span class="arrow">→</span>
+      <div class="step">Query Chat / Canvas / Dashboard</div><span class="arrow">→</span>
+      <div class="step">Share / embed / export</div>
+    </div>
+    <p>A <strong>project</strong> owns one or more live database connections (Postgres, MySQL, Redshift, or Snowflake). Connecting triggers a <strong>crawl</strong>: the schema is pulled, then an LLM pass enriches it with business names, semantic types, KPI/dimension flags, and relationships — this enrichment is what every downstream feature (Query Chat, Canvas's AI chart builder, the metric registry) actually reads, not the raw column names.</p>
+    <p>A project's <strong>domain</strong> (recruitment / finance / generic) decides which extra workflow-shaped agents are available on top of plain chart/dashboard generation — see Section 5 for exactly what that unlocks.</p>
+    <p>From there, a user builds either a <strong>Canvas</strong> (a multi-page, drag-and-drop report with ~40 chart/widget types, built manually or via an in-canvas "ask AI to build a chart" assistant), a <strong>Dashboard</strong> (one natural-language request auto-decomposed into up to 5 charts, laid out automatically), or works conversationally in <strong>Query Chat</strong>. Any Canvas can be opened as a report-specific <strong>Intelligence</strong> copilot for executive-level analysis, and any Canvas or Dashboard can be shared as a live or snapshot link, embedded via iframe, or exported to <code>.vly</code> for fully offline use.</p>
+  </section>
+
+  <section id="personas">
+    <h2><span class="num">2</span>End-user use cases, by persona</h2>
+    <p class="lede">The same platform serves genuinely different jobs depending on who's logged in — the product enforces this at the routing level (a <code>builder</code> can't reach end-user routes and vice versa), not just in the UI copy.</p>
+
+    <div class="persona">
+      <div class="persona-card">
+        <span class="tag">Builder / analyst</span>
+        <h4>Owns projects, connects data, sets up the workspace</h4>
+        <ul>
+          <li>Connects a new database and gets a crawled, AI-enriched schema in minutes — no manual data dictionary.</li>
+          <li>Defines canonical metrics ("revenue" = this SQL, always) so every downstream question about revenue answers consistently.</li>
+          <li>Builds a Canvas by hand for a recurring report, or asks the in-canvas AI to draft a chart in plain language.</li>
+          <li>Sets up a Dashboard from one sentence ("give me an overview of Q3 performance") and gets 5 coordinated charts back.</li>
+          <li>Shares a finished report with a client as a live link, an embeddable iframe, or invites a teammate as viewer/editor.</li>
+          <li>Sets a plain-language alert on a chart ("tell me if daily applications drop below 5") instead of checking manually.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">End user / report consumer</span>
+        <h4>No project setup — just asks questions or opens what's shared</h4>
+        <ul>
+          <li>Opens "reports shared with me" without ever seeing a projects/connections UI.</li>
+          <li>Pastes a share link, or imports a <code>.vly</code> file someone emailed them, and it just opens — no DB credentials involved.</li>
+          <li>Can self-serve connect their own database from <code>/end-user/query</code> and start asking questions immediately.</li>
+          <li>Asks a follow-up in plain language ("now break that down by region") and the system resolves the reference to the prior chart, not a brand-new unrelated one.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Recruitment ops (finance-adjacent domain)</span>
+        <h4>Domain-specific workflow agents, not just charts</h4>
+        <ul>
+          <li>"Who are the best candidates for this role?" → ranked by ML score, not a manual chart build.</li>
+          <li>"What's my daily briefing?" → open exceptions, stale applications, what needs attention today.</li>
+          <li>"Audit the pipeline for billing issues" → flags rate mismatches, missing bill rates, inverted margins.</li>
+          <li>Data is filtered to what that person's role is allowed to see (placement specialists only see their own book), enforced in the generated SQL itself, not just hidden in the UI.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Finance / operations (Fidelity-style engagement)</span>
+        <h4>Nine schema-driven agents for finance-specific workflows</h4>
+        <ul>
+          <li>"Does this tie out?" → Reconcile agent finds exactly where a ledger and a statement disagree.</li>
+          <li>"Anything look unusual this month?" → Anomaly agent computes an outlier signal directly from the data, no pre-existing fraud flag required.</li>
+          <li>"Where's this headed?" → Forecast agent projects a balance or cash flow forward with a transparent, explainable method.</li>
+          <li>"Who else is connected to this account?" → Network agent traces shared attributes and fund flows across entities.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Team admin</span>
+        <h4>Manages who can see what, across two independent access layers</h4>
+        <ul>
+          <li>Shares a project with teammates as owner/editor/viewer — projects aren't single-owner.</li>
+          <li>For the recruitment domain specifically, maps each person to their identity in the source database and can impersonate a role to test what they'd see.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Executive / report reader</span>
+        <h4>Opens Intelligence for a narrative, not a query box</h4>
+        <ul>
+          <li>Report-scoped AI copilot gives trend analysis and executive summaries grounded in that specific report's data — no need to know what to ask.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="edge">
+    <h2><span class="num">3</span>Edge cases the platform already handles</h2>
+    <p class="lede">These aren't hypothetical — each corresponds to a specific guardrail already in the pipeline. Purple = recruitment-specific, blue = finance-specific, green = domain-agnostic.</p>
+
+    <ul class="gaps">
+      <li class="edge-generic"><strong>"Why did that fail?" / "why is this wrong?"</strong> — an explicit root-cause agent diagnoses the previous failed or low-confidence turn against what the SQL actually did, and attempts one automatic corrected re-run before answering, instead of silently trying again from scratch.</li>
+      <li class="edge-generic"><strong>Vague or unanswerable questions</strong> — if retrieval confidence is very low, the system asks a clarifying question ("could you mention the specific metric or table?") instead of confidently guessing at a chart.</li>
+      <li class="edge-generic"><strong>Compound questions</strong> — "how many X and what's the average Y" is detected and split back to the user rather than muddling both asks into one confused query.</li>
+      <li class="edge-generic"><strong>Follow-up references</strong> — "that chart," "same table," "now also by region," "filter by last year" all resolve against actual prior turns (SQL, tables, chart title) reconstructed server-side from the persisted conversation tree, not just guessed from raw text.</li>
+      <li class="edge-generic"><strong>Write attempts</strong> — INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE/GRANT and friends are blocked at two independent layers (the pipeline and the sandboxed executor itself), so a query can never mutate the connected database, accidentally or otherwise.</li>
+      <li class="edge-generic"><strong>Schema drift after a re-crawl</strong> — dropped tables/columns and type changes are diffed and any widget whose stored SQL references the changed object is flagged as affected.</li>
+      <li class="edge-generic"><strong>Ambiguous table/column matches</strong> — a "never use this for X" signal generated during schema enrichment actively penalizes tables that look superficially relevant but were explicitly marked wrong for that kind of question.</li>
+      <li class="edge-generic"><strong>Multiple plausible interpretations</strong> — when more than one table/query candidate is a close match, the platform surfaces the candidates instead of silently picking one.</li>
+      <li class="edge-generic"><strong>Snowflake connections</strong> — auto-forced into the finance domain regardless of what a user picks, since that combination is finance-only in practice today.</li>
+      <li class="edge-generic"><strong>Sharing without exposing credentials</strong> — live share links proxy queries server-side; the anonymous viewer never receives DB credentials, and snapshot-mode links serve frozen cached data with zero live DB access at all.</li>
+      <li class="edge-generic"><strong>A canvas with no live connection</strong> — <code>.vly</code> imports run entirely against bundled cached/offline data (in-process, no external DB) when no matching live connection exists, and auto-reattach to a live connection when one does match by host+database fingerprint.</li>
+      <li class="edge-recruit"><strong>Restricted recruitment roles</strong> — a placement specialist's questions are automatically filtered to their own book of business via a mandatory WHERE clause injected into every generated query for that role — not an app-layer filter that could be bypassed.</li>
+      <li class="edge-recruit"><strong>"Create a customer" / "delete a record" style requests</strong> — correctly recognized as out of scope for a read-only analytics agent and answered with an explicit "not available" message rather than attempting something dangerous or hallucinating success.</li>
+      <li class="edge-finance"><strong>Anomaly detection with no existing fraud/risk column</strong> — the Anomaly agent computes the outlier signal itself from raw historical data via SQL instead of assuming a pre-built flag exists in the schema.</li>
+      <li class="edge-finance"><strong>Forecast requests</strong> — explicitly built as a transparent, explainable SQL-based projection, and the agent is instructed never to claim it used a trained ML model it doesn't have.</li>
+      <li class="edge-finance"><strong>Reconciliation across two differently-named sources</strong> — the Reconcile agent is schema-driven, so it works whether the ledger and statement tables are named consistently or not, rather than assuming fixed table names.</li>
+    </ul>
+  </section>
+
+  <section id="firm">
+    <h2><span class="num">4</span>The firm's point of view — what's sellable</h2>
+    <p class="lede">The pitch that actually holds up against the code, not marketing language layered on top of it.</p>
+
+    <h3>The genuine differentiator</h3>
+    <p>Almost everything in this platform is <strong>schema-driven, not hardcoded</strong>. The finance agents don't assume a table called <code>transactions</code> exists — they read whatever schema is actually connected and write SQL against it. That means onboarding a new client's database is a connect-and-crawl exercise, not a bespoke integration project, and it's the reason the same finance agent set can plausibly be pointed at Fidelity's Snowflake environment without a rewrite.</p>
+
+    <h3>What's directly pitchable today</h3>
+    <ul class="gaps">
+      <li><strong>Time-to-first-insight.</strong> Connect → crawl → ask a question, no data modeling phase required up front, because schema enrichment happens automatically at crawl time.</li>
+      <li><strong>A domain-specific workflow layer, not just BI.</strong> Nine finance agents (risk ranking, daily briefing, audit, gap-finding, entity enrichment, reconciliation, anomaly detection, forecasting, relationship tracing) go meaningfully beyond "ask a question, get a chart" — this is the "Four Agents" story the NAVIKENZ deck is telling, and it's substantively real, not vaporware.</li>
+      <li><strong>Governed by design, not by policy.</strong> Read-only enforcement, role-scoped data access, and audit-of-the-audit (data-quality/integrity checks as their own agent) are built into the pipeline itself — a meaningful answer to a client's security/compliance diligence questions.</li>
+      <li><strong>White-label distribution via <code>.vly</code>.</strong> A finished report can leave the platform entirely as a self-contained offline file with its own cached data, openable by someone who was never given a login — useful for one-off client deliverables or air-gapped environments.</li>
+      <li><strong>Embeddable, not just shareable.</strong> Live or snapshot canvases can sit inside a client's own portal via iframe, not just live as a standalone link.</li>
+    </ul>
+
+    <h3>What to say carefully</h3>
+    <div class="callout info">
+      <span class="tag">Calibrate the framing</span>
+      <p>The finance domain's nine agents and the domain-toggle system are new — built and wired this engagement. They're real and functional, but have not yet accumulated the production mileage the recruitment domain has. When positioning to a client, "purpose-built for this engagement" is accurate and strong; "battle-tested over years" is not, and shouldn't be implied. The honest gaps in Section 7 are the same list worth having ready if a technical stakeholder asks probing questions.</p>
+    </div>
+  </section>
+
+  <section id="matrix">
+    <h2><span class="num">5</span>Capability matrix by domain</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Capability</th><th class="center">Generic</th><th class="center">Recruitment</th><th class="center">Finance</th></tr>
+      <tr><td>Chart / dashboard generation from natural language</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Follow-up / conversation memory</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Root-cause diagnosis on failure</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Schema exploration ("what data do I have?")</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Ranking / scoring workflow agent (Match)</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Daily briefing agent</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Data-quality / integrity audit agent</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Gap / opportunity-finding agent</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Entity enrichment agent</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Reconciliation agent</td><td class="center">—</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Anomaly detection agent</td><td class="center">—</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Forecasting agent</td><td class="center">—</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Relationship / network agent</td><td class="center">—</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td></tr>
+      <tr><td>Screen / Verify / Present / Action agents</td><td class="center">—</td><td class="center"><span class="chip planned">Planned</span></td><td class="center"><span class="chip planned">Planned</span></td></tr>
+      <tr><td>Role-scoped mandatory data filtering</td><td class="center">—</td><td class="center"><span class="chip live">Live</span></td><td class="center"><span class="chip partial">Gated on host</span></td></tr>
+    </table>
+    </div>
+    <p style="font-size:13px;color:var(--muted);">"Gated on host" — the finance role-scoping mechanism piggybacks on the recruitment ("Brainwave") identity model and is currently only enforced when the connected database is confirmed to be that specific host; a general finance-role access model would need its own identity mapping, not reuse of the recruitment one.</p>
+  </section>
+
+  <section id="extend">
+    <h2><span class="num">6</span>Extensibility — how each layer grows</h2>
+
+    <h3>Adding a new domain</h3>
+    <p>The domain system was built to make this a config change, not a rewrite: a new entry in the valid-domains set, an optional new skill-intent vocabulary block for the classifier, and a set of skill-agent modules registered against the new domain name. A project can be switched to it from its connection settings, with auto-detection available from the schema alone.</p>
+
+    <h3>Adding a new skill agent to an existing domain</h3>
+    <p>Every finance/recruitment agent follows the same shape: a system prompt, a tool (run SQL against whatever's connected), and one registration call tying it to a domain + intent name. Because the agents are schema-driven rather than hardcoded, a new agent for a new workflow (say, a covenant-compliance checker for finance) is a new prompt + registration, not new schema assumptions.</p>
+
+    <h3>Adding a new database connector</h3>
+    <p>The connector interface is already wider than what's exposed in the UI — the underlying type system reserves slots for SQLite, BigQuery, SQL Server, and REST-API-backed sources that have no crawler or frontend form yet. Lighting one up is a crawler implementation plus a frontend option, not new pipeline logic — the schema-enrichment, GraphRAG retrieval, and every skill agent downstream are already connector-agnostic.</p>
+
+    <h3>Adding a new chart/widget type to Canvas</h3>
+    <p>The canvas already supports roughly 40 chart and layout widget types via a central registry — extending it is additive (register a new type + renderer), and it doesn't touch the AI chart-builder or Query Chat, which both just describe intent and let the existing type system render it.</p>
+
+    <h3>Adding a new distribution channel</h3>
+    <p>Sharing already spans four distinct surfaces — live link, snapshot link, iframe embed, and offline <code>.vly</code> export — built on the same underlying canvas/dashboard model. A new surface (e.g. a scheduled emailed PDF) fits the same pattern: a new renderer over the same data, not a parallel reporting system.</p>
+  </section>
+
+  <section id="gaps">
+    <h2><span class="num">7</span>Honest gaps — what's not there yet</h2>
+    <p class="lede">Worth having ready alongside the pitch, not discovered by a client later.</p>
+    <ul class="gaps">
+      <li><strong>Screen / Verify / Present / Action agents are recognized but not implemented</strong> in either domain — a request that classifies into one of these today gets a graceful "not available" message, not a working feature.</li>
+      <li><strong>No general write/action capability.</strong> "Create a customer," "update this record's status," "add a note" are all correctly declined today — the platform is read-only analytics, not a system-of-record write layer, by design rather than oversight, but worth being explicit about with a client who might expect otherwise.</li>
+      <li><strong>Finance role-based access control isn't a standalone model</strong> — it currently depends on the recruitment ("Brainwave") identity mapping and a host-based gate, not a finance-native permission system.</li>
+      <li><strong>The finance domain is new</strong> — functional and schema-driven, but without the recruitment domain's production mileage. Confidence and query-generation quality should be expected to improve with real usage and a fresh metadata crawl, not assumed to already match recruitment's maturity.</li>
+      <li><strong>Schema-drift alerts are recorded but not surfaced.</strong> The backend detects and logs breaking schema changes and flags affected widgets, but nothing in the UI shows this to a user today — it's a silent safety net, not a notification feature yet.</li>
+      <li><strong>Several DB connector types are reserved but unbuilt</strong> (SQLite, BigQuery, SQL Server, REST API) — listed in the type system, not available to connect to yet.</li>
+    </ul>
+  </section>
+
+  <footer>Grounded in the current codebase as of this writing — routes, agents, and constraints described here reflect what is actually implemented, not aspirational scope.</footer>
+
+</div>
+</body>
+</html>

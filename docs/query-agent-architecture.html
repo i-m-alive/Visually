@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Query Agent — How It Works (Architecture &amp; Flow)</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero { background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%); color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px; box-shadow: 0 20px 50px rgba(79,70,229,.25); }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 840px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 56px; }
+  h2 { font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px; }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 30px 0 10px; }
+  h4 { font-size: 14px; font-weight: 700; margin: 18px 0 6px; color: var(--brand-dark); text-transform: uppercase; letter-spacing: .04em; }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 880px; }
+  p { margin-bottom: 14px; max-width: 880px; }
+  ul, ol.body { margin-left: 20px; } ul li, ol.body li { margin-bottom: 6px; }
+
+  /* Vertical flow */
+  .pipe { counter-reset: step; margin: 22px 0; }
+  .pstep { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 20px 16px 62px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  .pstep::before { counter-increment: step; content: counter(step); position: absolute; left: 16px; top: 16px; width: 30px; height: 30px; border-radius: 8px; background: var(--brand); color: #fff; font-weight: 800; font-size: 14px; display: flex; align-items: center; justify-content: center; }
+  .pstep h4 { margin: 0 0 4px; color: var(--ink); font-size: 15px; text-transform: none; letter-spacing: 0; }
+  .pstep .who { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--brand); }
+  .pstep p { margin: 4px 0 0; font-size: 13.5px; color: var(--muted); }
+  .pstep .tag { display:inline-block; font-size: 10.5px; font-weight:700; padding: 2px 8px; border-radius: 99px; margin-left: 6px; }
+  .tag.llm { background: var(--amber-soft); color: var(--amber); }
+  .tag.fast { background: var(--green-soft); color: var(--green); }
+  .tag.net { background: var(--blue-soft); color: var(--blue); }
+
+  .callout { border-radius: var(--radius); padding: 18px 22px; margin: 18px 0; border: 1px solid; }
+  .callout.info { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.info .tag { color: var(--blue); }
+  .callout.safe { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.safe .tag { color: var(--green); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 8px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 10px 15px; border-bottom: 1px solid var(--border); font-size: 13.6px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
+  .chip.rec { background: #f5f3ff; color: #7c3aed; }
+  .chip.fin { background: var(--blue-soft); color: var(--blue); }
+  .chip.both { background: var(--green-soft); color: var(--green); }
+
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 16px 0; }
+  .kv { background: var(--surface); border:1px solid var(--border); border-radius:10px; padding: 14px 16px; }
+  .kv h4 { margin: 0 0 6px; }
+  .kv p { font-size: 13px; margin: 0; color: var(--muted); }
+  @media (max-width: 720px){ .grid2 { grid-template-columns: 1fr; } nav.toc ol { columns: 1; } }
+
+  ul.opt { list-style: none; margin: 0; }
+  ul.opt li { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--brand); border-radius: 0 10px 10px 0; padding: 13px 18px; margin-bottom: 10px; font-size: 14px; }
+  ul.opt li strong { display:block; margin-bottom: 3px; }
+  ul.opt li.done { border-left-color: var(--green); }
+  ul.opt li.next { border-left-color: var(--amber); }
+  .badge { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.05em; padding:2px 7px; border-radius:99px; }
+  .badge.done { background: var(--green-soft); color: var(--green); }
+  .badge.next { background: var(--amber-soft); color: var(--amber); }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Query Agent — How It Works</h1>
+    <p>The complete read-only flow, end to end: from a natural-language question, through intent detection and semantic table retrieval, to schema-grounded SQL generation, validation, execution, and a narrated answer. Plus every agent it can trigger and where accuracy can still improve.</p>
+    <div class="meta">
+      <span>Mode: <code>read-only</code> (SELECT / WITH / SHOW / DESCRIBE only)</span>
+      <span>Connectors: PostgreSQL · MySQL · Redshift · Snowflake</span>
+      <span>Reflects current code incl. recent fixes</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#mental">Your mental model, mapped to the code</a></li>
+      <li><a href="#flow">The full flow, stage by stage</a></li>
+      <li><a href="#retrieval">How table selection actually works</a></li>
+      <li><a href="#agents">Every agent it can trigger</a></li>
+      <li><a href="#readonly">Read-only enforcement</a></li>
+      <li><a href="#capabilities">Capabilities at a glance</a></li>
+      <li><a href="#optimize">Optimization &amp; accuracy roadmap</a></li>
+    </ol>
+  </nav>
+
+  <section id="mental">
+    <h2><span class="num">0</span>Your mental model, mapped to the code</h2>
+    <p class="lede">The way you described it is exactly right. Here's your model with the real component names attached, so the rest of this doc lines up with what you already have in your head.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>What you said</th><th>What actually runs</th><th>File</th></tr>
+      <tr><td>User gives an NLU (natural-language question)</td><td>Request hits <code>POST /agent/intent</code>, a job is created, work runs in the background</td><td>main.py</td></tr>
+      <tr><td>The agent finds the intent</td><td><code>IntentClassifier.classify()</code> — one history- &amp; domain-aware LLM call</td><td>intent_classifier.py</td></tr>
+      <tr><td>Semantic search to identify which table / group / ranks of tables</td><td><code>graph_rag_retriever.retrieve()</code> — multi-signal ranking (lexical + embeddings + FK graph)</td><td>graph_rag_retriever.py</td></tr>
+      <tr><td>Extract that table's column details</td><td>Enriched schema's <code>compact_tables</code> + exact column schema for the top table</td><td>schema_cache.py</td></tr>
+      <tr><td>Use the schema to create a proper query</td><td><code>QueryAgent.generate()</code> — produces a <code>QueryPlan</code> (SQL + chart type)</td><td>query_agent.py</td></tr>
+      <tr><td>Execute the query to solve the intent</td><td>Sandbox validate → <code>query_executor /execute</code> → validation → narration</td><td>orchestrator.py, sandbox.py</td></tr>
+    </table>
+    </div>
+    <p>The orchestrator (<code>orchestrator.py :: run_single_viz_pipeline</code>) is the conductor that runs these stages in order, with a retry loop wrapped around generation→execution→validation.</p>
+  </section>
+
+  <section id="flow">
+    <h2><span class="num">1</span>The full flow, stage by stage</h2>
+    <p class="lede">A single question walks through this chain. Tags mark whether a stage costs an LLM call <span class="tag llm" style="display:inline">LLM</span>, is in-memory <span class="tag fast" style="display:inline">fast</span>, or a network hop <span class="tag net" style="display:inline">net</span>.</p>
+
+    <div class="pipe">
+      <div class="pstep">
+        <span class="who">main.py · submit_intent</span>
+        <h4>Ingest &amp; reconstruct context</h4>
+        <p>The question, project, connection, and <code>session_id</code> arrive. The server rebuilds the true conversation history from the persisted message tree (active branch only), dropping the in-flight question itself so "history" means everything <em>before</em> the current turn.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">intent_classifier.py</span>
+        <h4>Intent classification <span class="tag llm">LLM</span></h4>
+        <p>ONE call (recently collapsed from two). Reads up to the last 6 turns to resolve follow-ups, and uses the project's domain vocabulary. Returns an intent type, entities (metrics/dimensions/time/filters), output mode (chart vs text), and a vagueness score.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">orchestrator.py · routing</span>
+        <h4>Route: skill agent or SQL pipeline <span class="tag fast">fast</span></h4>
+        <p>If the intent is a skill action (MATCH, BRIEFING, RECONCILE, …) <em>and</em> the domain has skill agents, it hands off to that agent. Otherwise it stays on the SQL pipeline (SINGLE_VIZ / FOLLOWUP / SCHEMA_EXPLORE / DASHBOARD). Both paths now receive conversation history.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">schema_cache.py</span>
+        <h4>Load the enriched schema <span class="tag fast">fast</span></h4>
+        <p>An <code>EnrichedSchema</code> is fetched from a 3-tier cache (memory → Redis → filesystem). It carries compact tables, table semantics, a concept index, TF-IDF vectors, per-table embeddings, an FK relationship graph, and join templates — all built once per schema version.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">graph_rag_retriever.py</span>
+        <h4>Retrieve &amp; rank tables <span class="tag fast">fast</span></h4>
+        <p>The semantic-search step. Scores every table against the question using six blended signals (see §2), applies metadata boosts/penalties, biases toward tables used in recent turns, and returns the top candidates with column, filter and JOIN hints. One embedding call for the query <span class="tag llm">LLM</span> when embeddings are enabled.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">orchestrator.py · guards</span>
+        <h4>Clarify or proceed <span class="tag fast">fast</span></h4>
+        <p>If retrieval confidence is very low (no table plausibly matches) or the question packs two asks into one, the agent asks a clarifying question instead of guessing. Otherwise it proceeds.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">query_agent.py</span>
+        <h4>Generate SQL <span class="tag llm">LLM</span></h4>
+        <p>Builds a tightly-scoped prompt: the top tables' <strong>exact</strong> column schemas, JOIN templates, any registered canonical metric definitions, similar past successful queries (few-shot), and — on a follow-up — the prior SQL to refine from. Returns a <code>QueryPlan</code> (SQL + chart type + title). On attempt 1, a registered metric can produce deterministic SQL with no LLM call.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">orchestrator.py + sandbox.py</span>
+        <h4>Pre-flight guardrails <span class="tag fast">fast</span></h4>
+        <p>Before touching the DB: read-only sandbox check (blocks any write), intent-contract check, SQL lint, column-existence check (with fuzzy auto-fix for near-miss names), and filter-value correction. A failure here rewrites feedback and retries — cheaply, without a DB round-trip.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">query_executor · /execute</span>
+        <h4>Execute the read query <span class="tag net">net</span></h4>
+        <p>The validated SELECT runs in the sandboxed executor against the live connection (row-limited, 30s statement timeout). The executor independently re-validates read-only — a second, non-bypassable safety layer.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">orchestrator.py · sanity</span>
+        <h4>Result sanity checks <span class="tag fast">fast</span></h4>
+        <p>Zero-row, bad-JOIN, missing-time-buckets, wrong-granularity, KPI-shape, cartesian-JOIN, all-null / all-zero checks — each can trigger a corrective retry (up to 4 attempts total). Catches "ran fine but the answer is shaped wrong" before the user ever sees it.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">validator_agent.py</span>
+        <h4>Validate the answer <span class="tag llm">LLM</span></h4>
+        <p>Scores whether the result actually answers the question and whether axis labels match; on failure it writes structured feedback for the next retry.</p>
+      </div>
+      <div class="pstep">
+        <span class="who">result_narrator.py</span>
+        <h4>Narrate &amp; ground <span class="tag llm">LLM</span></h4>
+        <p>Streams a plain-language answer/caption, then a grounding check confirms the narration didn't state a number the data doesn't support. The final chart + narrative + SQL are emitted over WebSocket and persisted to the job.</p>
+      </div>
+    </div>
+
+    <div class="callout info">
+      <span class="tag">If generation keeps failing</span>
+      <p>After the final attempt, or when a follow-up explicitly asks "why did that fail?", a <strong>root-cause agent</strong> diagnoses the failed SQL against what actually went wrong and attempts one corrected re-run before giving up — so the user gets an explanation, not a dead end.</p>
+    </div>
+  </section>
+
+  <section id="retrieval">
+    <h2><span class="num">2</span>How table selection actually works</h2>
+    <p class="lede">This is the "semantic search / ranking" step you asked about. It is <strong>not</strong> a single method — it's a blend of six signals scored per table, all in-memory (&lt;5&nbsp;ms) except the one query-embedding call.</p>
+
+    <div class="table-wrap">
+    <table>
+      <tr><th>Signal</th><th>What it measures</th><th>Weight*</th></tr>
+      <tr><td>TF-IDF cosine</td><td>Lexical overlap between the question and each table's text blob (name + description + columns)</td><td>0.28</td></tr>
+      <tr><td>Embedding cosine</td><td>Semantic similarity via Titan vectors — catches paraphrases/synonyms with no shared words ("earnings" ≈ "revenue")</td><td>0.22</td></tr>
+      <tr><td>Name match</td><td>Question terms appearing in the table name itself (hub tables win over satellites)</td><td>0.20</td></tr>
+      <tr><td>Concept index</td><td>Business-vocabulary term → table.column mapping built from metadata</td><td>0.18</td></tr>
+      <tr><td>Entity columns</td><td>Fuzzy match of named entities to identifier/name columns</td><td>0.10</td></tr>
+      <tr><td>FK graph</td><td>Whether a table is reachable (1–2 hops) from other strong candidates</td><td>0.02</td></tr>
+    </table>
+    </div>
+    <p style="font-size:13px;color:var(--muted);">* Weights when embeddings are available. With embeddings off/unavailable, the original lexical-only weights (TF-IDF 0.35 / name 0.25 / concept 0.20 / entity 0.15 / graph 0.05) are used unchanged, so behavior degrades gracefully to exactly the prior lexical ranking.</p>
+
+    <h3>On top of the blended score</h3>
+    <ul>
+      <li><strong>Metadata boosts/penalties:</strong> a <code>never_use_for</code> match heavily penalizes a table; <code>is_fact_table</code> / <code>is_kpi_metric</code> boost when the question looks like an aggregate/KPI ask.</li>
+      <li><strong>Finance glossary expansion:</strong> for finance projects, jargon in the question (AUM, NAV, delinquency, YoY) is expanded to plain-English synonyms before scoring, so it matches auto-generated metadata that never contains the jargon verbatim.</li>
+      <li><strong>Junk-table penalty:</strong> backup / temp / test copies can never outrank their production twin.</li>
+      <li><strong>History biasing:</strong> tables used in recent turns stay in the candidate set for elliptical follow-ups ("what about last month") — and now survive even when the prior turn had no SQL, via a recorded <code>table_used</code> fallback.</li>
+    </ul>
+    <p>The output is a ranked candidate list plus, for the top table, its <strong>exact column schema</strong> (names + types + semantic hints) and any JOIN path — this is what gets handed to SQL generation so the model never invents a column.</p>
+  </section>
+
+  <section id="agents">
+    <h2><span class="num">3</span>Every agent it can trigger</h2>
+    <p class="lede">The classifier decides which of these runs. Skill agents only fire on their domain; everything else stays on the SQL pipeline.</p>
+
+    <h3>Core pipeline (all domains)</h3>
+    <div class="grid2">
+      <div class="kv"><h4>SINGLE_VIZ</h4><p>One chart or one text answer from a generated SELECT — the default path.</p></div>
+      <div class="kv"><h4>DASHBOARD</h4><p>One request decomposed into up to 5 sub-questions, each run through the single-viz pipeline in parallel, then auto-laid-out.</p></div>
+      <div class="kv"><h4>FOLLOWUP</h4><p>A refinement of the previous result — now starts from the prior SQL and applies only the requested delta.</p></div>
+      <div class="kv"><h4>SCHEMA_EXPLORE</h4><p>"What data / tables do I have?" — returns a plain-English overview instead of running SQL.</p></div>
+      <div class="kv"><h4>Root-cause agent</h4><p>Diagnoses hard failures and "why did that fail?" follow-ups; attempts one corrected re-run.</p></div>
+      <div class="kv"><h4>ACTION (read-only)</h4><p>Write requests (create/update/delete) are NOT executed — the agent drafts the SQL you could run yourself and warns on destructive ops. No DB mutation.</p></div>
+    </div>
+
+    <h3>Skill agents by domain</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Intent</th><th>What it does</th><th>Domains</th></tr>
+      <tr><td>MATCH</td><td>Rank/score entities by risk, priority, or fit</td><td><span class="chip both">both</span></td></tr>
+      <tr><td>BRIEFING</td><td>Daily "what needs attention" overview; personal "my …" queries</td><td><span class="chip both">both</span></td></tr>
+      <tr><td>AUDIT</td><td>Data-quality / integrity issues (missing values, stale records, mismatches)</td><td><span class="chip both">both</span></td></tr>
+      <tr><td>PROSPECT</td><td>Find gaps / at-risk items / opportunities</td><td><span class="chip both">both</span></td></tr>
+      <tr><td>ENRICH</td><td>Consolidate everything known about one entity into one view</td><td><span class="chip fin">finance</span></td></tr>
+      <tr><td>RECONCILE</td><td>Match two sources and pinpoint what doesn't tie out</td><td><span class="chip fin">finance</span></td></tr>
+      <tr><td>ANOMALY</td><td>Compute outlier/suspicious activity from raw data (no pre-existing flag needed)</td><td><span class="chip fin">finance</span></td></tr>
+      <tr><td>FORECAST</td><td>Transparent, explainable projection from history (no black-box ML)</td><td><span class="chip fin">finance</span></td></tr>
+      <tr><td>NETWORK</td><td>Trace relationships/fund-flows between entities</td><td><span class="chip fin">finance</span></td></tr>
+      <tr><td>SCREEN / VERIFY / PRESENT</td><td>Defined in the classifier but not yet implemented — return a "coming soon" stub</td><td><span class="chip rec">recruitment</span></td></tr>
+    </table>
+    </div>
+    <p style="font-size:13px;color:var(--muted);">Every skill agent is schema-driven (no hardcoded table names), receives the ranked schema context + conversation history, and — except ACTION — uses a bounded <code>run_sql</code> tool loop. ACTION deliberately has no <code>run_sql</code> tool, so it is structurally read-only.</p>
+  </section>
+
+  <section id="readonly">
+    <h2><span class="num">4</span>Read-only enforcement</h2>
+    <p class="lede">You want read-only, full stop. Here is exactly how that is guaranteed today — at three independent layers, so a single bug or prompt slip can't produce a write.</p>
+    <div class="callout safe">
+      <span class="tag">Three independent layers</span>
+      <p><strong>1. Orchestrator pre-check</strong> — before any DB call, generated SQL runs through <code>sandbox.validate_sql()</code>; a write is caught here and turned into a retry, never sent.<br>
+      <strong>2. Executor re-validation</strong> — the query_executor service independently re-runs the same validation on every statement, so even a direct call can't bypass it.<br>
+      <strong>3. ACTION agent has no write tool</strong> — the one agent that handles "create/update/delete" requests holds no <code>run_sql</code> tool at all; it can only draft SQL text for you to run yourself.</p>
+    </div>
+    <h4>The rule</h4>
+    <p>A statement is allowed only if it starts with <code>SELECT</code>, <code>WITH</code>, <code>SHOW</code>, or <code>DESCRIBE</code>, AND contains none of these blocked keywords:</p>
+    <p><code>INSERT · UPDATE · DELETE · DROP · CREATE · ALTER · TRUNCATE · EXEC · EXECUTE · GRANT · REVOKE · COPY · MERGE · CALL · VACUUM · LOCK · UNLOCK · REPLACE · UPSERT</code></p>
+    <p>Anything else is rejected with "Only SELECT / WITH / SHOW / DESCRIBE queries are allowed." Combined with role-scoped WHERE-clause injection for restricted users, this is a genuine "reads only, and only the rows you're allowed to see" guarantee.</p>
+  </section>
+
+  <section id="capabilities">
+    <h2><span class="num">5</span>Capabilities at a glance</h2>
+    <ul>
+      <li>Natural-language → SQL over four warehouse/DB engines, no hand-written queries.</li>
+      <li>Conversation memory: pronoun/ellipsis follow-ups ("that chart", "now by region", "this customer") resolved from prior turns on <em>both</em> the SQL and skill-agent paths.</li>
+      <li>~40 chart types plus text answers; auto-decomposed multi-chart dashboards.</li>
+      <li>Self-correcting retry loop with shape/sanity checks and a root-cause explainer.</li>
+      <li>Domain personas (recruitment / finance) with workflow-specific skill agents.</li>
+      <li>Canonical metric definitions and per-connection few-shot memory of proven queries.</li>
+      <li>Clarifies genuinely ambiguous questions instead of guessing.</li>
+      <li>Read-only by construction; role-scoped data access where configured.</li>
+    </ul>
+  </section>
+
+  <section id="optimize">
+    <h2><span class="num">6</span>Optimization &amp; accuracy roadmap</h2>
+    <p class="lede">What's already in place (recent work) and where accuracy can still climb — all within the read-only model you want.</p>
+
+    <h3>Already shipped</h3>
+    <ul class="opt">
+      <li class="done"><span class="badge done">done</span> &nbsp;<strong>Semantic embedding signal</strong> — Titan cosine blended into ranking, catching paraphrases the lexical signals miss. Degrades gracefully when unavailable.</li>
+      <li class="done"><span class="badge done">done</span> &nbsp;<strong>Finance jargon glossary</strong> — AUM/NAV/delinquency/YoY expanded to plain-English before retrieval (turned real 0-confidence misses into confident hits).</li>
+      <li class="done"><span class="badge done">done</span> &nbsp;<strong>Single context-aware classification</strong> — removed a redundant context-blind pass that could misroute follow-ups and cost an extra call.</li>
+      <li class="done"><span class="badge done">done</span> &nbsp;<strong>Follow-up SQL reuse</strong> — refinements start from the prior SQL instead of regenerating from scratch.</li>
+      <li class="done"><span class="badge done">done</span> &nbsp;<strong>Content-based schema fingerprint + metadata-drift guard log</strong> — stale metadata self-invalidates on structural change; silent name-drift is now surfaced.</li>
+      <li class="done"><span class="badge done">done</span> &nbsp;<strong>Broader FK inference</strong> — legacy finance key styles (<code>cust_no</code>, <code>acct_num</code>) now form join edges.</li>
+    </ul>
+
+    <h3>Highest-leverage next steps</h3>
+    <ul class="opt">
+      <li class="next"><span class="badge next">next</span> &nbsp;<strong>Populate the metric registry</strong> — register the client's canonical definitions (revenue, AUM, NAV, delinquency rate). Turns "re-derive every time" into "look up the agreed SQL" — the single biggest win for speed + consistency of repeated questions.</li>
+      <li class="next"><span class="badge next">next</span> &nbsp;<strong>Seed query memory</strong> — preload a curated set of known-good queries for a new connection so few-shot examples exist from day one instead of accumulating slowly.</li>
+      <li class="next"><span class="badge next">next</span> &nbsp;<strong>Move embedding generation into the background crawl</strong> — compute per-table embeddings during metadata extraction (already async) instead of on the first cold query, removing a one-time latency spike after a re-crawl.</li>
+      <li class="next"><span class="badge next">next</span> &nbsp;<strong>Curated finance glossary per engagement</strong> — extend the jargon map with the client's own vocabulary as real questions reveal it.</li>
+      <li class="next"><span class="badge next">next</span> &nbsp;<strong>Middle-confidence disambiguation</strong> — for moderately-ambiguous questions, offer 2–3 interpretations to pick from instead of silently choosing one.</li>
+      <li class="next"><span class="badge next">next</span> &nbsp;<strong>Wire a true low-cost model for the cheap calls</strong> — confirm axis-label validation and grounding run on a genuine Haiku-tier model, not full Sonnet, to shave latency on calls that run every query.</li>
+    </ul>
+  </section>
+
+  <footer>Reflects the current codebase, including the recent conversation-memory, retrieval, and read-only-ACTION changes. Every stage names the file it lives in for quick navigation.</footer>
+
+</div>
+</body>
+</html>

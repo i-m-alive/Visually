@@ -216,6 +216,21 @@ def _cosine(a: dict, b: dict) -> float:
     return dot / (na * nb + 1e-10)
 
 
+def _cosine_list(a: list, b: list) -> float:
+    """Cosine similarity between two dense float vectors. Returns 0.0 on any
+    length/emptiness mismatch. Clamped to [0, 1] since negative similarity is
+    not a useful retrieval signal here."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0; na = 0.0; nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y; na += x * x; nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    sim = dot / (math.sqrt(na) * math.sqrt(nb) + 1e-10)
+    return sim if sim > 0.0 else 0.0
+
+
 def _query_vec(tokens: list, idf: dict) -> dict:
     if not tokens:
         return {}
@@ -253,6 +268,8 @@ def retrieve(
     enriched: "EnrichedSchema",
     top_k: int = 5,
     history_tables: Optional[list] = None,
+    domain: str = "",
+    query_embedding: Optional[list] = None,
 ) -> RetrievedContext:
     """
     Multi-signal Graph RAG retrieval. Never raises — returns empty context on error.
@@ -263,9 +280,18 @@ def retrieve(
     retrieval signal is weak — typical of elliptical follow-ups like
     "what about last month" — these are kept in the candidate set so their
     schema still reaches the LLM instead of being silently dropped.
+
+    domain: when "finance", the query is expanded with finance jargon synonyms
+    (see finance_glossary) so terms like "AUM"/"delinquency"/"YoY" match the
+    plain-english wording in auto-generated metadata.
+
+    query_embedding: optional pre-computed embedding of the user's question. When
+    provided AND the enriched schema carries per-table embeddings, cosine
+    similarity becomes an additional retrieval signal (catches paraphrases the
+    lexical signals miss). Absent/empty → pure lexical scoring, exactly as before.
     """
     try:
-        return _retrieve(user_text, intent, enriched, top_k, history_tables)
+        return _retrieve(user_text, intent, enriched, top_k, history_tables, domain, query_embedding)
     except Exception as exc:
         print(f"[graph_rag] ⚠ retrieval failed (non-fatal): {exc}", flush=True)
         return RetrievedContext()
@@ -277,6 +303,8 @@ def _retrieve(
     enriched: "EnrichedSchema",
     top_k: int,
     history_tables: Optional[list] = None,
+    domain: str = "",
+    query_embedding: Optional[list] = None,
 ) -> RetrievedContext:
     if not enriched or not enriched.compact_tables:
         return RetrievedContext()
@@ -285,7 +313,21 @@ def _retrieve(
     metrics = list(getattr(intent, "metrics", None) or [])
     entity_list = getattr(intent, "entities", None) or []
     entity_texts = [e.text for e in entity_list if hasattr(e, "text")]
-    query_text = " ".join([user_text] + metrics + entity_texts)
+    # Finance jargon expansion — additive tokens only, never replaces user words.
+    glossary_tokens: list[str] = []
+    if (domain or "").lower() == "finance":
+        try:
+            from agent_service.agents.finance_glossary import expand_finance_terms
+            glossary_tokens = expand_finance_terms(user_text)
+            if glossary_tokens:
+                print(
+                    f"[graph_rag] finance glossary expanded query with "
+                    f"{len(glossary_tokens)} synonym token(s)",
+                    flush=True,
+                )
+        except Exception as _ge:
+            print(f"[graph_rag] glossary expansion failed (non-fatal): {_ge}", flush=True)
+    query_text = " ".join([user_text] + metrics + entity_texts + glossary_tokens)
     query_tokens = _tokenize(query_text)
 
     tnames = [t["name"] for t in enriched.compact_tables]
@@ -455,8 +497,30 @@ def _retrieve(
                         )
                         break
 
-    # ── Composite: TF-IDF 35 | name 25 | concept 20 | entity 15 | graph 5 ─────
-    W = {"tfidf": 0.35, "name": 0.25, "concept": 0.20, "entity": 0.15, "graph": 0.05}
+    # ── Signal 6: semantic embedding cosine ──────────────────────────────────
+    # Titan vectors are L2-normalized, so cosine == dot product; _cosine_list
+    # still divides by norms defensively in case a non-normalized model is used.
+    embed_present = False
+    table_embs = getattr(enriched, "table_embeddings", None) or {}
+    if query_embedding and table_embs:
+        for tn in table_signals:
+            vec = table_embs.get(tn)
+            if vec:
+                cos = _cosine_list(query_embedding, vec)
+                if cos > 0:
+                    table_signals[tn]["embed"] = cos
+                    embed_present = True
+
+    # ── Composite ─────────────────────────────────────────────────────────────
+    # When an embedding signal is available for this query, rebalance the weights
+    # to give it a real vote while keeping the total at 1.0 (so absolute score
+    # thresholds downstream — clarify < 0.12, history boost < 0.20 — stay valid).
+    # When no embedding signal exists, use the original lexical-only weights
+    # unchanged, so behavior is byte-for-byte identical to before this feature.
+    if embed_present:
+        W = {"tfidf": 0.28, "embed": 0.22, "name": 0.20, "concept": 0.18, "entity": 0.10, "graph": 0.02}
+    else:
+        W = {"tfidf": 0.35, "name": 0.25, "concept": 0.20, "entity": 0.15, "graph": 0.05}
     ranked: list[tuple] = []
     for tn, sigs in table_signals.items():
         # A concept hit with near-zero TF-IDF means the table merely shares a

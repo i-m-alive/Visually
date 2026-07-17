@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.bedrock_client import BEDROCK_SONNET_MODEL
 from shared.database import get_db
 from shared.models.dashboards import Dashboard
 from shared.models.users import User
@@ -27,11 +28,7 @@ DEV_MODE    = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
 DEV_USER_ID = os.getenv("DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
 
 BEDROCK_REGION = os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "us-east-1"))
-BEDROCK_MODEL  = (
-    os.getenv("BEDROCK_MODEL_ID")
-    or os.getenv("BEDROCK_SONNET_MODEL_ID")
-    or "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-)
+BEDROCK_MODEL  = BEDROCK_SONNET_MODEL
 
 
 async def _get_user(

@@ -5,7 +5,7 @@ import { projectApi } from '@/lib/api'
 import {
   ChevronDown, ChevronRight, RefreshCw, Database, Hash,
   Loader2, AlertCircle, Sparkles, Link2, Filter, BarChart2,
-  Calendar, Layers, Tag, X, Download, Terminal, Play,
+  Calendar, Layers, Tag, X, Download, Terminal, Play, Zap, CheckCircle2,
 } from 'lucide-react'
 
 // ── Raw schema types ──────────────────────────────────────────────────────────
@@ -146,6 +146,11 @@ export default function SchemaPage() {
   const [crawlError, setCrawlError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // Hard-refresh state
+  const [hardRefreshing, setHardRefreshing] = useState(false)
+  const [hardRefreshDone, setHardRefreshDone] = useState(false)
+  const [hardRefreshError, setHardRefreshError] = useState('')
+
   // Metadata state
   const [metadata, setMetadata] = useState<MetadataResponse | null>(null)
   const [metaLoading, setMetaLoading] = useState(false)
@@ -268,6 +273,28 @@ export default function SchemaPage() {
 
   useEffect(() => () => stopPoll(), [])
 
+  const handleHardRefresh = async () => {
+    if (hardRefreshing || crawling) return
+    setHardRefreshing(true)
+    setHardRefreshError('')
+    setHardRefreshDone(false)
+    try {
+      await projectApi.hardRefreshSchema(projectId)
+      setHardRefreshDone(true)
+      // Clear and reload metadata after a short delay so the background build has started
+      setMetadata(null)
+      setTimeout(() => {
+        setHardRefreshDone(false)
+        if (tab === 'metadata') fetchMetadata()
+      }, 4000)
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } } }
+      setHardRefreshError(err.response?.data?.detail || 'Hard refresh failed')
+    } finally {
+      setHardRefreshing(false)
+    }
+  }
+
   const toggleTable = (name: string) =>
     setExpandedTables(prev => { const n = new Set(prev); n.has(name) ? n.delete(name) : n.add(name); return n })
   const toggleMeta = (name: string) =>
@@ -314,11 +341,37 @@ export default function SchemaPage() {
               <AlertCircle size={12} />{crawlError}
             </p>
           )}
+          {hardRefreshing && (
+            <p className="text-sm text-violet-600 flex items-center gap-1 mt-0.5">
+              <Loader2 size={12} className="animate-spin" />Rebuilding AI metadata...
+            </p>
+          )}
+          {hardRefreshDone && (
+            <p className="text-sm text-green-600 flex items-center gap-1 mt-0.5">
+              <CheckCircle2 size={12} />Rebuild started — metadata will be ready in ~60 s
+            </p>
+          )}
+          {hardRefreshError && (
+            <p className="text-sm text-red-600 flex items-center gap-1 mt-0.5">
+              <AlertCircle size={12} />{hardRefreshError}
+            </p>
+          )}
         </div>
-        <button onClick={handleRecrawl} disabled={crawling} className="btn-secondary flex items-center gap-2 text-sm">
-          <RefreshCw size={14} className={crawling ? 'animate-spin' : ''} />
-          {crawling ? 'Crawling...' : 'Re-crawl'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleHardRefresh}
+            disabled={hardRefreshing || crawling}
+            title="Clear the metadata cache and force a full AI enrichment rebuild — even if the tables haven't changed"
+            className="flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Zap size={14} className={hardRefreshing ? 'animate-pulse' : ''} />
+            {hardRefreshing ? 'Rebuilding...' : 'Rebuild Metadata'}
+          </button>
+          <button onClick={handleRecrawl} disabled={crawling || hardRefreshing} className="btn-secondary flex items-center gap-2 text-sm">
+            <RefreshCw size={14} className={crawling ? 'animate-spin' : ''} />
+            {crawling ? 'Crawling...' : 'Re-crawl'}
+          </button>
+        </div>
       </div>
 
       {/* Tab bar */}
@@ -583,9 +636,24 @@ export default function SchemaPage() {
             <div className="text-center py-12 px-6">
               <Sparkles size={40} className="mx-auto text-gray-200 mb-3" />
               <p className="text-gray-500 text-sm max-w-sm mx-auto">{metaError}</p>
-              <button onClick={fetchMetadata} className="btn-secondary mt-3 text-sm mx-auto flex items-center gap-2">
-                <RefreshCw size={13} />Retry
-              </button>
+              <div className="mt-4 flex items-center justify-center gap-3">
+                <button
+                  onClick={handleHardRefresh}
+                  disabled={hardRefreshing || crawling}
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-violet-600 text-white hover:bg-violet-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Zap size={14} className={hardRefreshing ? 'animate-pulse' : ''} />
+                  {hardRefreshing ? 'Rebuilding...' : 'Build Metadata'}
+                </button>
+                <button onClick={fetchMetadata} className="btn-secondary text-sm flex items-center gap-2">
+                  <RefreshCw size={13} />Retry
+                </button>
+              </div>
+              {hardRefreshDone && (
+                <p className="mt-3 text-sm text-green-600 flex items-center justify-center gap-1">
+                  <CheckCircle2 size={13} />Build started — check back in ~60 s
+                </p>
+              )}
             </div>
           )}
           {metadata && !metaLoading && (
@@ -608,9 +676,25 @@ export default function SchemaPage() {
                 <span className="text-xs text-gray-400">
                   {filteredMeta.length} / {metadata.total_tables} tables
                 </span>
-                <button onClick={fetchMetadata} className="ml-auto text-gray-400 hover:text-gray-600">
-                  <RefreshCw size={14} />
-                </button>
+                <div className="ml-auto flex items-center gap-2">
+                  <button
+                    onClick={handleHardRefresh}
+                    disabled={hardRefreshing || crawling}
+                    title="Force-rebuild AI metadata (bypasses cache)"
+                    className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Zap size={12} className={hardRefreshing ? 'animate-pulse' : ''} />
+                    {hardRefreshing ? 'Rebuilding...' : 'Rebuild'}
+                  </button>
+                  <button
+                    onClick={fetchMetadata}
+                    disabled={metaLoading}
+                    title="Reload metadata from cache"
+                    className="text-gray-400 hover:text-gray-600 disabled:opacity-50"
+                  >
+                    <RefreshCw size={14} className={metaLoading ? 'animate-spin' : ''} />
+                  </button>
+                </div>
               </div>
 
               <div className="p-4 space-y-3">

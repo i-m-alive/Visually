@@ -696,6 +696,33 @@ class QueryAgent:
                 "If it is a follow-up, build the SQL that satisfies both the prior intent "
                 "and the new refinement."
             )
+            # Explicit refinement fast-path: when the classifier flagged this turn
+            # as a FOLLOWUP (or set a followup_ref), and the immediately prior
+            # assistant turn has SQL, tell the agent to START from that SQL and
+            # apply only the requested delta — instead of regenerating from
+            # scratch and risking a different table/shape than the user was
+            # already looking at.
+            _is_followup = (
+                getattr(intent, "intent_type", "") == "FOLLOWUP"
+                or bool(getattr(intent, "followup_ref", None))
+            )
+            _prior_sql = next(
+                (t.get("sql") for t in reversed(trimmed)
+                 if t.get("role") == "assistant" and t.get("sql")),
+                None,
+            )
+            if _is_followup and _prior_sql:
+                user_content["refine_from_sql"] = {
+                    "previous_sql": _prior_sql,
+                    "instruction": (
+                        "This is a refinement of the previous result. Start from "
+                        "previous_sql and modify ONLY what the new message asks to "
+                        "change (add/remove a grouping, adjust a filter or time range, "
+                        "swap the metric, change ordering). Keep the same base "
+                        "table(s) and overall shape unless the user explicitly asks "
+                        "to change them."
+                    ),
+                }
 
         # Recently-used table memory: tables used in recent turns get priority
         if conversation_history:

@@ -68,6 +68,8 @@ def registered_intents(domain: str | None = None) -> list[str]:
 # The list is evaluated once at service startup.
 
 _SKILL_MODULES: list[str] = [
+    # Cross-domain (registers for both finance + recruitment)
+    "agent_service.agents.skill_agents.action_agent",
     # Recruitment domain
     "agent_service.agents.skill_agents.match_agent",
     "agent_service.agents.skill_agents.briefing_agent",
