@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Technical Prerequisites — Conversational BI Platform</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero { background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%); color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 20px; box-shadow: 0 20px 50px rgba(79,70,229,.25); }
+  header.hero h1 { font-size: 29px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 800px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; }
+  .intro-note { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--brand); border-radius: 0 10px 10px 0; padding: 16px 20px; margin-bottom: 34px; font-size: 14px; color: var(--muted); }
+
+  nav.toc { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 46px; }
+  h2 { font-size: 22px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px; }
+  h3 { font-size: 16px; font-weight: 700; margin: 22px 0 8px; }
+  .lede { color: var(--muted); margin-bottom: 18px; max-width: 840px; }
+  p { margin-bottom: 12px; max-width: 840px; }
+  ul, ol.body { margin-left: 20px; } ul li, ol.body li { margin-bottom: 6px; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 14px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13.6px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.k { font-weight:700; white-space:nowrap; }
+
+  .callout { border-radius: var(--radius); padding: 16px 20px; margin: 16px 0; border: 1px solid; }
+  .callout.sec { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.sec .tag { color: var(--green); }
+  .callout.note { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.note .tag { color: var(--blue); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 7px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .models { display:flex; gap:10px; flex-wrap:wrap; margin: 8px 0; }
+  .pill { display:inline-block; font-size:12px; font-weight:700; padding:4px 12px; border-radius:99px; background: var(--brand-soft); color: var(--brand); }
+  .who { display:inline-block; font-size:10.5px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; padding:2px 8px; border-radius:99px; }
+  .who.client { background: var(--amber-soft); color: var(--amber); }
+  .who.us { background: var(--green-soft); color: var(--green); }
+  .who.both { background: var(--blue-soft); color: var(--blue); }
+
+  .check td:first-child { width: 38px; text-align:center; font-size:16px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+  @media print { header.hero{ -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Technical Prerequisites</h1>
+    <p>What we need in place to connect the Conversational BI platform to your data and go live. The platform lets business users ask questions of your database in plain English and get charts, tables, and answers back — securely and read-only.</p>
+    <div class="meta">Prepared for client onboarding · covers connectivity, model access, hosting, security &amp; data readiness</div>
+  </header>
+
+  <div class="intro-note">
+    A few items below depend on the <strong>deployment model</strong> — whether the platform is <strong>run as a managed service (we host)</strong> or <strong>deployed inside your own environment (self-hosted)</strong>. Each item is tagged
+    <span class="who client">You&nbsp;provide</span>
+    <span class="who us">We&nbsp;provide</span>
+    <span class="who both">Depends&nbsp;on&nbsp;model</span>
+    so it's clear who owns what. Confirm the deployment model and we'll trim this to the exact list for your setup.
+  </div>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#db">1 · Database connection</a></li>
+      <li><a href="#creds">2 · Read-only credentials &amp; permissions</a></li>
+      <li><a href="#net">3 · Network connectivity</a></li>
+      <li><a href="#ai">4 · AI model access (AWS Bedrock)</a></li>
+      <li><a href="#data">5 · Data handling &amp; residency</a></li>
+      <li><a href="#infra">6 · Hosting &amp; infrastructure</a></li>
+      <li><a href="#ready">7 · Data readiness</a></li>
+      <li><a href="#checklist">8 · Onboarding checklist</a></li>
+    </ol>
+  </nav>
+
+  <section id="db">
+    <h2><span class="num">1</span>Database connection <span class="who client">You provide</span></h2>
+    <p class="lede">The platform connects directly to your existing database — no data migration or ETL required. One of the following engines:</p>
+    <div class="models">
+      <span class="pill">PostgreSQL</span>
+      <span class="pill">MySQL</span>
+      <span class="pill">Amazon Redshift</span>
+      <span class="pill">Snowflake</span>
+    </div>
+    <p>For each connection we need the standard connection parameters:</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Engine</th><th>Required connection details</th></tr>
+      <tr><td class="k">PostgreSQL / MySQL / Redshift</td><td>Host, port, database name, username, password, and the schema(s) to expose.</td></tr>
+      <tr><td class="k">Snowflake</td><td>Account identifier, warehouse, role, database, schema, username, and password (or key-pair). A modestly-sized warehouse is sufficient — queries are read-only and row-limited.</td></tr>
+    </table>
+    </div>
+    <p>Multiple connections can be added per project if the data spans more than one database.</p>
+  </section>
+
+  <section id="creds">
+    <h2><span class="num">2</span>Read-only credentials &amp; permissions <span class="who client">You provide</span></h2>
+    <p class="lede">The platform is <strong>read-only by design</strong>. It never issues writes — but we ask that the credentials themselves also be read-only, as defense in depth.</p>
+    <div class="callout sec">
+      <span class="tag">Recommended: a dedicated read-only role</span>
+      <p>Provision a service account / role that can only <code>SELECT</code>. This makes "read-only" a property of the database, not just the application — the strongest guarantee for a finance environment, and something we actively recommend rather than requiring you to trust the app alone.</p>
+    </div>
+    <p>The account needs:</p>
+    <ul>
+      <li><strong>SELECT</strong> on the tables and views you want to make available for analysis.</li>
+      <li><strong>Catalog / metadata read</strong> (e.g. <code>INFORMATION_SCHEMA</code>, or <code>USAGE</code> on the schema in Snowflake) — used once at onboarding to map out the tables, columns, and relationships.</li>
+      <li>No INSERT/UPDATE/DELETE/DDL grants are needed or wanted.</li>
+    </ul>
+    <p>You control exactly which schemas and tables the role can see — that is the outer boundary of what the platform can ever read.</p>
+  </section>
+
+  <section id="net">
+    <h2><span class="num">3</span>Network connectivity <span class="who both">Depends on model</span></h2>
+    <p class="lede">The platform's backend must be able to reach your database over the network.</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Scenario</th><th>What's needed</th></tr>
+      <tr><td class="k">Managed service (we host)</td><td>Allow inbound access from our backend's egress IP address(es) — we'll share the fixed IPs to add to your firewall / security-group allowlist. TLS is used for the connection.</td></tr>
+      <tr><td class="k">Private / VPC-only warehouse</td><td>For databases with no public endpoint (e.g. a private Redshift/Snowflake in a VPC), we support connectivity via VPC peering / PrivateLink, or the platform can be deployed inside your network so no data leaves your perimeter.</td></tr>
+      <tr><td class="k">Self-hosted (you deploy)</td><td>The platform runs inside your environment and reaches the database over your internal network — typically no external firewall changes required.</td></tr>
+    </table>
+    </div>
+    <p>Standard database ports apply (e.g. 5432 Postgres, 3306 MySQL, 5439 Redshift, 443 Snowflake). All connections use TLS.</p>
+  </section>
+
+  <section id="ai">
+    <h2><span class="num">4</span>AI model access — AWS Bedrock <span class="who both">Depends on model</span></h2>
+    <p class="lede">The platform's language understanding, SQL generation, and answer narration run on managed AI models via <strong>Amazon Bedrock</strong>. No models run on your database server.</p>
+    <p>Models used:</p>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Purpose</th><th>Model</th></tr>
+      <tr><td class="k">SQL generation &amp; narration</td><td>Anthropic Claude Sonnet (via Bedrock)</td></tr>
+      <tr><td class="k">Intent &amp; fast checks</td><td>Anthropic Claude Haiku (via Bedrock)</td></tr>
+      <tr><td class="k">Semantic table search</td><td>Amazon Titan Text Embeddings</td></tr>
+    </table>
+    </div>
+    <p><strong>If we host:</strong> Bedrock access is provided by us — nothing required from you. <br>
+    <strong>If self-hosted in your AWS account:</strong> you'll need an AWS account with <strong>Bedrock enabled in your chosen region</strong>, <strong>model access granted</strong> for the models above, and IAM credentials (an access key/secret or an instance role) for the backend. We'll provide the exact model IDs and a minimal IAM policy.</p>
+  </section>
+
+  <section id="data">
+    <h2><span class="num">5</span>Data handling &amp; residency <span class="who both">Depends on model</span></h2>
+    <p class="lede">Transparency on what data is processed, so your security team can review it up front.</p>
+    <p>To answer a question, the following is sent to the AI model (Bedrock):</p>
+    <ul>
+      <li><strong>Schema metadata</strong> — table and column names plus auto-generated descriptions (used to find the right tables).</li>
+      <li><strong>A small sample of values</strong> from filter-eligible columns, collected once at onboarding (capped and used to interpret filters like "region = EMEA").</li>
+      <li><strong>Query results</strong> — the rows returned by a question, used to write the plain-English answer. Results are row-limited.</li>
+    </ul>
+    <div class="callout note">
+      <span class="tag">Controls</span>
+      <p>Amazon Bedrock does <strong>not use your data to train models</strong>, and inference stays within the AWS region you select — so data residency is under your control. Combined with read-only access and the schema/table allowlist, you decide exactly what is reachable. If any tables must never be exposed to the model, simply exclude them from the connection's grants.</p>
+    </div>
+  </section>
+
+  <section id="infra">
+    <h2><span class="num">6</span>Hosting &amp; infrastructure <span class="who both">Depends on model</span></h2>
+    <p class="lede">Required only for a self-hosted deployment. For the managed service, we run all of this.</p>
+    <h3>Application stack</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Component</th><th>Requirement</th></tr>
+      <tr><td class="k">Backend services</td><td>Python 3.11 runtime (containerized). Runs as a small set of services: the agent/API service, a schema crawler, a sandboxed query executor, and a chart-render service.</td></tr>
+      <tr><td class="k">Application database</td><td>A PostgreSQL instance (13+) for the platform's own state — projects, jobs, chat sessions, schema snapshots. Separate from your data warehouse.</td></tr>
+      <tr><td class="k">Cache / events</td><td>A Redis instance (6+) for live progress streaming and caching.</td></tr>
+      <tr><td class="k">Frontend</td><td>Next.js web application (Node.js 18+ to build), served over HTTPS.</td></tr>
+      <tr><td class="k">Outbound access</td><td>The backend needs HTTPS egress to the AWS Bedrock endpoint in your region.</td></tr>
+    </table>
+    </div>
+    <p>Typical footprint is modest — the heavy lifting is your database and the managed AI models, not the platform tier. Container images and deployment manifests are provided.</p>
+  </section>
+
+  <section id="ready">
+    <h2><span class="num">7</span>Data readiness <span class="who both">Shared</span></h2>
+    <p class="lede">Not strict prerequisites, but these materially improve accuracy from day one.</p>
+    <ul>
+      <li><strong>Reasonably named tables/columns.</strong> The platform auto-generates business descriptions, but meaningful names (or an existing data dictionary) improve matching.</li>
+      <li><strong>Foreign keys, where available.</strong> Declared relationships make multi-table questions more accurate. Where they aren't declared (common in warehouses), consistent key naming (<code>customer_id</code>, <code>acct_no</code>) lets the platform infer them.</li>
+      <li><strong>Curated views.</strong> If you already expose "blessed" reporting views, the platform prefers them — cleaner answers with less risk.</li>
+      <li><strong>Key business terms.</strong> A short glossary of the metrics that matter (e.g. how "AUM" or "revenue" is defined) can be registered so answers stay consistent with your definitions.</li>
+    </ul>
+  </section>
+
+  <section id="checklist">
+    <h2><span class="num">8</span>Onboarding checklist</h2>
+    <p class="lede">The short list to hand to your database / cloud / security teams.</p>
+    <div class="table-wrap">
+    <table class="check">
+      <tr><th></th><th>Item</th><th>Owner</th></tr>
+      <tr><td>☐</td><td>Confirm the database engine (Postgres / MySQL / Redshift / Snowflake) and version</td><td>Client</td></tr>
+      <tr><td>☐</td><td>Provision a <strong>read-only</strong> service account with SELECT + catalog read on the target schemas</td><td>Client</td></tr>
+      <tr><td>☐</td><td>Share connection details (host/account, port, database, warehouse/role, schema)</td><td>Client</td></tr>
+      <tr><td>☐</td><td>Allow network access from the platform to the database (IP allowlist / PrivateLink / internal)</td><td>Client + Us</td></tr>
+      <tr><td>☐</td><td>Decide deployment model — managed service vs. self-hosted</td><td>Client + Us</td></tr>
+      <tr><td>☐</td><td>If self-hosted: enable Bedrock + grant model access in your AWS region; provide IAM credentials</td><td>Client</td></tr>
+      <tr><td>☐</td><td>If self-hosted: provision the app stack (Python service tier, PostgreSQL, Redis, web app)</td><td>Client + Us</td></tr>
+      <tr><td>☐</td><td>Security review of the data-handling summary (§5)</td><td>Client</td></tr>
+      <tr><td>☐</td><td>Optional: share a data dictionary / list of "blessed" views / key metric definitions</td><td>Client</td></tr>
+    </table>
+    </div>
+    <div class="callout note">
+      <span class="tag">Fastest path to a demo</span>
+      <p>The minimum to see the platform working against your data is just <strong>one read-only connection + network access</strong>. Everything else (self-hosting, glossary, curated views) can follow once the value is proven on a first dataset.</p>
+    </div>
+  </section>
+
+  <footer>Technical prerequisites for connecting the Conversational BI platform. Final infrastructure and network specifics are confirmed once the deployment model is chosen.</footer>
+
+</div>
+</body>
+</html>

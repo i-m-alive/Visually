@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visually Mobile — BYOK, Model-Agnostic App: Research &amp; Roadmap</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --surface: #ffffff; --ink: #1a2233; --muted: #5b6579;
+    --brand: #4f46e5; --brand-soft: #eef2ff; --brand-dark: #312e81;
+    --red: #dc2626; --red-soft: #fef2f2;
+    --amber: #d97706; --amber-soft: #fffbeb;
+    --green: #059669; --green-soft: #ecfdf5;
+    --blue: #0369a1; --blue-soft: #f0f9ff;
+    --border: #e5e9f0; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.65; font-size: 15.5px;
+  }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 0.9em; }
+  code { background: var(--brand-soft); color: var(--brand); padding: 1px 6px; border-radius: 5px; }
+
+  header.hero {
+    background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 55%, #7c3aed 100%);
+    color: #fff; border-radius: 16px; padding: 46px 42px; margin-bottom: 40px;
+    box-shadow: 0 20px 50px rgba(79,70,229,.25);
+  }
+  header.hero h1 { font-size: 31px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 10px; }
+  header.hero p { color: #e0e7ff; max-width: 820px; font-size: 16px; }
+  header.hero .meta { margin-top: 18px; font-size: 13px; color: #c7d2fe; display: flex; gap: 18px; flex-wrap: wrap; }
+  header.hero code { background: rgba(255,255,255,.15); color: #fff; }
+
+  nav.toc {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 26px; margin-bottom: 40px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  nav.toc strong { display:block; margin-bottom: 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  nav.toc ol { margin-left: 20px; columns: 2; column-gap: 40px; }
+  nav.toc a { color: var(--brand); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  nav.toc li { margin-bottom: 4px; break-inside: avoid; }
+
+  section { margin-bottom: 58px; }
+  h2 { font-size: 23px; font-weight: 800; letter-spacing: -.3px; margin-bottom: 6px; padding-top: 12px; scroll-margin-top: 24px; }
+  h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 9px; background: var(--brand);
+    color:#fff; font-size: 15px; margin-right: 10px; vertical-align: -4px;
+  }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 30px 0 10px; }
+  h4 { font-size: 14.5px; font-weight: 700; margin: 18px 0 6px; color: var(--brand-dark); }
+  .lede { color: var(--muted); margin-bottom: 22px; max-width: 880px; }
+  p { margin-bottom: 14px; max-width: 880px; }
+
+  .persona {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin: 18px 0 30px;
+  }
+  .persona-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 22px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  .persona-card .tag {
+    display: inline-block; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--brand); background: var(--brand-soft); padding: 3px 9px; border-radius: 99px; margin-bottom: 10px;
+  }
+  .persona-card h4 { margin: 0 0 8px; color: var(--ink); font-size: 15.5px; }
+  .persona-card ul { margin-left: 18px; font-size: 13.5px; color: var(--muted); }
+  .persona-card li { margin-bottom: 5px; }
+
+  .callout { border-radius: var(--radius); padding: 20px 24px; margin: 18px 0; border: 1px solid; }
+  .callout.finding { background: var(--red-soft); border-color: #fecaca; }
+  .callout.finding .tag { color: var(--red); }
+  .callout.fix { background: var(--green-soft); border-color: #a7f3d0; }
+  .callout.fix .tag { color: var(--green); }
+  .callout.info { background: var(--blue-soft); border-color: #bae6fd; }
+  .callout.info .tag { color: var(--blue); }
+  .callout .tag { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; display:block; margin-bottom: 8px; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; margin: 16px 0; box-shadow: 0 2px 10px rgba(16,24,40,.04); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 13.8px; vertical-align: top; }
+  th { background: #f1f3fa; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.center, th.center { text-align: center; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
+  .chip::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .chip.live { background: var(--green-soft); color: var(--green); }
+  .chip.partial { background: var(--amber-soft); color: var(--amber); }
+  .chip.planned { background: var(--red-soft); color: var(--red); }
+  .dot { display:inline-block; }
+
+  ul.gaps { list-style: none; margin: 0; }
+  ul.gaps li {
+    background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--brand);
+    border-radius: 0 10px 10px 0; padding: 14px 18px; margin-bottom: 10px; font-size: 14px;
+  }
+  ul.gaps li strong { display: block; margin-bottom: 4px; }
+  ul.gaps li.edge-recruit { border-left-color: #7c3aed; }
+  ul.gaps li.edge-finance { border-left-color: #0369a1; }
+  ul.gaps li.edge-generic { border-left-color: var(--green); }
+
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 20px 0; }
+  .flow .step {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 16px; font-size: 13px; font-weight: 600; box-shadow: 0 2px 8px rgba(16,24,40,.04);
+  }
+  .flow .arrow { color: var(--muted); font-size: 16px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } .nav.toc ol { columns: 1; } }
+  .col-box {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px 22px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+  }
+  .col-box h4 { margin-top: 0; }
+  .col-box ul { margin-left: 18px; font-size: 13.8px; }
+  .col-box li { margin-bottom: 6px; }
+  .col-box.out { border-color: #fecaca; }
+  .col-box.out h4 { color: var(--red); }
+  .col-box.in { border-color: #a7f3d0; }
+  .col-box.in h4 { color: var(--green); }
+
+  .badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 20px; }
+  .badge { font-size: 11.5px; font-weight: 700; padding: 4px 11px; border-radius: 99px; background: var(--brand-soft); color: var(--brand); }
+
+  .phase-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px 22px; margin-bottom: 14px; box-shadow: 0 2px 10px rgba(16,24,40,.04);
+    display: grid; grid-template-columns: 90px 1fr; gap: 18px; align-items: start;
+  }
+  .phase-card .len { font-weight: 800; color: var(--brand); font-size: 13px; }
+  .phase-card h4 { margin: 0 0 6px; }
+  .phase-card p { margin-bottom: 6px; font-size: 13.8px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 60px; }
+  .refs { font-size: 12.5px; color: var(--muted); }
+  .refs li { margin-bottom: 6px; word-break: break-all; }
+  .refs a { color: var(--brand); }
+  sup.cite { color: var(--brand); font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Visually Mobile — a model-agnostic, bring-your-own-key AI analytics app</h1>
+    <p>Research and build plan for an iOS + Android companion to Visually that lets each user plug in their own AWS Bedrock, OpenAI, Anthropic, or other provider key — so the product never locks anyone into one model vendor. Covers tech stack, the LLM-agnostic architecture, the security "firewall" around API keys, App Store/Play Store compliance, market landscape, and a phased build plan.</p>
+    <div class="meta">
+      <span>Target: <code>iOS App Store</code> · <code>Google Play</code></span>
+      <span>Core principle: <code>BYOK</code> — user owns the key, the model, and the bill</span>
+      <span>Recommended stack: <code>React Native (New Architecture)</code></span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#summary">Executive summary</a></li>
+      <li><a href="#concept">Product concept &amp; positioning</a></li>
+      <li><a href="#market">Market &amp; competitive landscape</a></li>
+      <li><a href="#personas">End users &amp; use cases</a></li>
+      <li><a href="#stack">Mobile tech stack decision</a></li>
+      <li><a href="#llm">Model-agnostic LLM architecture (BYOK core)</a></li>
+      <li><a href="#security">Security architecture — the "firewall"</a></li>
+      <li><a href="#compliance">App Store &amp; Play Store compliance</a></li>
+      <li><a href="#roadmap">Development roadmap</a></li>
+      <li><a href="#scope">Scope — v1 in / out</a></li>
+      <li><a href="#monetization">Monetization</a></li>
+      <li><a href="#risks">Risks &amp; open questions</a></li>
+      <li><a href="#sources">Sources</a></li>
+    </ol>
+  </nav>
+
+  <section id="summary">
+    <h2><span class="num">1</span>Executive summary</h2>
+    <p class="lede">The short version, if you read nothing else.</p>
+    <div class="callout info">
+      <span class="tag">Recommendation</span>
+      <p><strong>Stack:</strong> React Native with the New Architecture (fully default since RN 0.82, Oct 2025)<sup class="cite">[1]</sup> — not Flutter, not native Swift/Kotlin from scratch. The team already owns a React + TypeScript + Next.js codebase; React Native lets components, state logic, and most business logic move over directly, and its charting/streaming ecosystem is mature enough for a BI-copilot UI.</p>
+      <p><strong>LLM layer:</strong> don't hand-roll five provider SDKs. Put a thin, self-hosted <strong>gateway</strong> (LiteLLM proxy or an equivalent OpenAI-shaped router) between the app and every provider, so the app only ever speaks one request/response shape while the gateway does per-provider translation, including Bedrock's non-standard streaming and signing<sup class="cite">[2,3,4]</sup>.</p>
+      <p><strong>Security:</strong> never store or transmit provider keys in plaintext. iOS Keychain with a biometric-gated <code>SecAccessControl</code>, Android Keystore with hardware-backed, per-operation biometric-gated keys<sup class="cite">[5,6,7,8]</sup> — and route Bedrock calls through the backend proxy always (SigV4 signing can't reasonably happen on-device), with an optional "direct mode" for OpenAI/Anthropic power users who want zero server in the loop.</p>
+      <p><strong>Compliance:</strong> plan for Apple's Guideline 5.1.2(i) third-party-AI data-sharing disclosure (Nov 2025)<sup class="cite">[9]</sup>, encryption export compliance (usually a one-line self-classification since HTTPS via platform TLS is normally exempt)<sup class="cite">[10,11]</sup>, and Google Play's AI-generated-content policy for chat-style apps<sup class="cite">[12]</sup>.</p>
+      <p><strong>Monetization:</strong> follow the pattern the whole BYOK category already uses — charge for the app/sync/extra features, let the user pay each LLM provider directly for usage. TypingMind ($39–99 one-time)<sup class="cite">[13]</sup> and Chatbox AI (subscription <em>or</em> BYOK)<sup class="cite">[14]</sup> are the two live templates worth studying.</p>
+    </div>
+  </section>
+
+  <section id="concept">
+    <h2><span class="num">2</span>Product concept &amp; positioning</h2>
+    <p class="lede">Visually today is a web platform: connect a database, get an AI-enriched schema, ask questions in natural language, get charts, canvases, and dashboards back — currently wired to Anthropic models and AWS Bedrock on the backend. The mobile app is not a port of that whole surface; it's a focused companion built around two ideas that don't exist yet in the web product.</p>
+    <div class="grid2">
+      <div class="col-box in">
+        <h4>What's genuinely new</h4>
+        <ul>
+          <li><strong>Bring your own key.</strong> Every user supplies their own provider credential(s) — the app (and its backend) never resells LLM access or marks up tokens. This is the entire value proposition, not a feature flag.</li>
+          <li><strong>Model-agnostic by design.</strong> Switch between GPT-5-class models, Claude, Bedrock-hosted models, or a local/open model mid-conversation without losing context, history, or chart state.</li>
+          <li><strong>On-the-go analytics.</strong> Push notifications for scheduled report/alert results, quick natural-language Q&amp;A against a connected project, and a lightweight canvas viewer — not a full drag-and-drop builder (that stays on web/desktop, where a mouse and a large canvas are the right tools).</li>
+        </ul>
+      </div>
+      <div class="col-box">
+        <h4>Relationship to the existing platform</h4>
+        <ul>
+          <li>Shares the account, project, and connection model with the web app — a user logs into the same project on mobile.</li>
+          <li>The mobile app's own backend-proxy service is new infrastructure, separate from (but able to sit alongside) the existing <code>agent_service</code> / <code>query_executor</code> stack, since its job is credential handling and provider translation, not query execution.</li>
+          <li>Positions the mobile app as the BYOK, model-agnostic front door — while the web app can remain the fuller-featured workspace.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="market">
+    <h2><span class="num">3</span>Market &amp; competitive landscape</h2>
+    <p class="lede">Two separate markets converge here: the established mobile-BI market (Power BI Mobile, Tableau Mobile, Qlik) and the newer, fast-growing "bring your own key" AI-chat-client category (TypingMind, Chatbox AI, Enchanted, LibreChat-style clients). Nobody occupies the overlap — a BYOK, model-agnostic app purpose-built for <em>data analytics</em> rather than general chat.</p>
+
+    <h3>Incumbent mobile BI — AI is already a bundled feature, not a differentiator</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Product</th><th>Pricing (subscription, per user/mo)</th><th>AI feature</th><th>Take</th></tr>
+      <tr><td>Power BI Mobile</td><td>Pro ≈ $14 (raised Apr 2025); Premium/PPU ≈ $20–24<sup class="cite">[15,16]</sup></td><td>Built-in "Copilot" natural-language Q&amp;A in-report<sup class="cite">[15]</sup></td><td>AI is a bundled Microsoft-model feature — no BYOK, no model choice.</td></tr>
+      <tr><td>Tableau Mobile</td><td>Creator ≈ $70–75; Explorer ≈ $42; Viewer ≈ $15<sup class="cite">[15,17]</sup></td><td>Tableau Pulse — AI-driven personalized insights<sup class="cite">[18]</sup></td><td>Same story: AI locked to Salesforce/Tableau's own model.</td></tr>
+      <tr><td>Qlik Sense</td><td>Starter ≈ $300/mo (10-user min); Professional ≈ $70–150<sup class="cite">[15,17]</sup></td><td>Associative + AI insights</td><td>Enterprise-priced, desktop-first; mobile is a viewer.</td></tr>
+      <tr><td>Looker</td><td>Custom, ≈ $35k–150k/yr platform cost<sup class="cite">[19]</sup></td><td>Gemini-based (GCP-tied) assistant</td><td>Enterprise-only footprint, not an individual/mobile buyer.</td></tr>
+    </table>
+    </div>
+
+    <h3>BYOK AI-chat clients — the pattern this app should borrow, applied to analytics</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Product</th><th>Model</th><th>Providers</th><th>Signal</th></tr>
+      <tr><td>TypingMind</td><td>One-time license: $39 / $79 / $99, API cost excluded<sup class="cite">[13]</sup></td><td>~18 providers<sup class="cite">[20]</sup></td><td>Proof that "pay once for the app, pay the provider separately" works as a real business.</td></tr>
+      <tr><td>Chatbox AI</td><td>Subscription $3.50–33.30/mo <em>or</em> BYOK<sup class="cite">[20]</sup></td><td>OpenAI, Claude, Gemini, DeepSeek, xAI, Perplexity<sup class="cite">[20]</sup></td><td>Ships iOS + Android natively alongside desktop — the closest cross-platform precedent<sup class="cite">[14]</sup>; ~15.8K GitHub stars on the OSS core<sup class="cite">[21]</sup>.</td></tr>
+      <tr><td>Enchanted</td><td>Free / open source</td><td>Ollama-compatible local models only<sup class="cite">[22]</sup></td><td>Different niche (fully local/private), but validates that iOS users want model choice, not just a ChatGPT wrapper.</td></tr>
+      <tr><td>OpenRouter / Cloudflare AI Gateway (infra, not consumer apps)</td><td>5% fee on BYOK usage (OpenRouter, first 1M req/mo free)<sup class="cite">[23]</sup></td><td>Proxies with the user's own credentials</td><td>Validates the "proxy signs/relays on the user's behalf" architecture this app needs for Bedrock.</td></tr>
+    </table>
+    </div>
+
+    <div class="callout finding">
+      <span class="tag">Gap this app can own</span>
+      <p>Every BYOK client above is a <em>chat</em> app that happens to answer questions well. None of them connect to a live database, generate charts, or carry the schema-aware grounding Visually already has on the web. Positioning: <strong>"the BYOK AI copilot that actually understands your data" </strong> — not another ChatGPT skin.</p>
+    </div>
+
+    <p class="lede" style="margin-top:18px">On market sizing: analyst-firm figures (e.g. BI software ~$40B in 2025 growing at ~9%/yr) are directionally useful but not something to hang a plan on — the more concrete, verifiable signal is <strong>BYOK going mainstream in developer tooling</strong>: JetBrains shipped BYOK across all its IDEs in December 2025<sup class="cite">[24]</sup>, which is a much stronger indicator that "let the user own their model relationship" is becoming an expected feature, not a niche one.</p>
+  </section>
+
+  <section id="personas">
+    <h2><span class="num">4</span>End users &amp; use cases</h2>
+    <div class="persona">
+      <div class="persona-card">
+        <span class="tag">Data analyst, on the go</span>
+        <h4>Already a Visually web user; wants mobile for quick checks</h4>
+        <ul>
+          <li>Gets a push notification that a scheduled metric crossed a threshold, opens the chart on the train.</li>
+          <li>Asks a quick natural-language follow-up against a project they already set up on desktop.</li>
+          <li>Cares about which model answers — may prefer Claude for narrative summaries, a cheaper model for simple lookups.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Founder / executive</span>
+        <h4>Wants an answer, not a dashboard</h4>
+        <ul>
+          <li>Asks "how did we do this week" and gets a narrative answer plus a chart, not a BI tool to learn.</li>
+          <li>Values that their own OpenAI/Anthropic key means no seat-based SaaS markup and no new vendor to security-review.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Consultant / agency</span>
+        <h4>Manages multiple clients' data and multiple provider accounts</h4>
+        <ul>
+          <li>Switches between client projects, each possibly using a different provider key (client A pays for Bedrock, client B for OpenAI).</li>
+          <li>Needs strict per-project key isolation — never wants client A's key or data reachable from client B's session.</li>
+        </ul>
+      </div>
+      <div class="persona-card">
+        <span class="tag">Security-conscious technical buyer</span>
+        <h4>The person who has to approve the app for their org</h4>
+        <ul>
+          <li>Wants to see exactly where their API key is stored, whether it ever leaves the device unencrypted, and whether traffic can be intercepted.</li>
+          <li>This persona is effectively also the audience for Section 7 below — the security architecture is itself a sales asset for this buyer.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="stack">
+    <h2><span class="num">5</span>Mobile tech stack decision</h2>
+    <p class="lede">"OS-independent" in practice means one codebase targeting both iOS and Android app stores. The real choice is React Native vs. Flutter vs. fully native (Swift/SwiftUI + Kotlin/Jetpack Compose, two codebases).</p>
+
+    <div class="table-wrap">
+    <table>
+      <tr><th>Criterion</th><th>React Native</th><th>Flutter</th><th>Native (Swift + Kotlin)</th></tr>
+      <tr><td>Team fit</td><td>Direct reuse of React/TS skills and patterns already in the Next.js frontend</td><td>Requires learning Dart; UI code not reusable from the web app</td><td>Two separate teams/skillsets, slowest to ship</td></tr>
+      <tr><td>Rendering</td><td>New Architecture (Fabric/TurboModules) is the <em>only</em> mode since RN 0.82 (Oct 2025) — legacy opt-outs are now ignored on both platforms<sup class="cite">[1]</sup></td><td>Impeller renderer precompiles shaders to avoid jank; the <em>only</em> supported renderer on iOS, but on Android it's default only on API 29+ with Vulkan — older/non-Vulkan devices silently fall back to legacy OpenGL, i.e. inconsistent behavior across the Android fleet<sup class="cite">[25,26,27]</sup></td><td>Full control, but every optimization is built twice</td></tr>
+      <tr><td>Chart-heavy, streaming UI</td><td>Mature (Skia-backed via New Architecture, plus native chart libraries); good WebSocket/streaming support carried over from existing frontend patterns</td><td>Strong rendering performance once on Impeller; smaller BI-specific component ecosystem</td><td>Best possible performance ceiling; highest cost to reach it</td></tr>
+      <tr><td>Native module needs (Keychain/Keystore, biometrics, cert pinning)</td><td>Well-trodden via native modules / TurboModules; large ecosystem of vetted libraries</td><td>Plugin ecosystem exists but thinner for security-specific APIs</td><td>Direct platform API access, no bridge</td></tr>
+      <tr><td>Net</td><td colspan="3" class="center"><strong>React Native (New Architecture) — best fit given existing React/TS investment and BYOK security-module maturity</strong></td></tr>
+    </table>
+    </div>
+
+    <div class="callout info">
+      <span class="tag">Practical note</span>
+      <p>Regardless of framework, credential storage, biometric gating, and certificate pinning should be implemented as thin native modules (Swift/Kotlin) wrapped by a small cross-platform interface — this is true in React Native and Flutter alike, since these are exactly the APIs neither framework abstracts well by default (see Section 7).</p>
+    </div>
+  </section>
+
+  <section id="llm">
+    <h2><span class="num">6</span>Model-agnostic LLM architecture (the BYOK core)</h2>
+    <p class="lede">"Independent of any model" is an architecture decision, not a marketing line. The hard part isn't calling multiple providers — it's normalizing their differences so the rest of the app (chat UI, tool-calling, chart generation, token/cost display) never has to know which provider answered.</p>
+
+    <h3>Where the differences actually bite</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Dimension</th><th>OpenAI</th><th>Anthropic</th><th>AWS Bedrock</th></tr>
+      <tr><td>Streaming transport</td><td>Server-Sent Events (SSE), plain text</td><td>SSE, plain text</td><td><code>InvokeModelWithResponseStream</code> uses AWS's own binary <code>event-stream</code> encoding (<code>application/vnd.amazon.eventstream</code>), not plain SSE<sup class="cite">[3]</sup> — needs a dedicated decoder</td></tr>
+      <tr><td>Unified request shape</td><td><code>/chat/completions</code> or newer <code>/responses</code></td><td>Messages API</td><td><code>Converse</code>/<code>ConverseStream</code> gives one schema across Bedrock-hosted models, but only for models that support it<sup class="cite">[28]</sup></td></tr>
+      <tr><td>Tool/function calling</td><td>Broad support across the line-up</td><td>Broad support</td><td>Only a <em>subset</em> of Bedrock models support tools via Converse (e.g. Claude 3, Cohere Command R/R+, Mistral Large) — not all Bedrock models<sup class="cite">[29]</sup></td></tr>
+      <tr><td>Auth</td><td>Bearer API key</td><td>API key header</td><td>AWS SigV4 request signing — cannot be done safely as a bare header on-device without exposing long-lived AWS credentials</td></tr>
+    </table>
+    </div>
+
+    <h3>Recommended pattern: a thin, self-hosted gateway — not a client-side multi-SDK mess</h3>
+    <div class="flow">
+      <div class="step">Mobile app</div><span class="arrow">→</span>
+      <div class="step">One normalized request format</div><span class="arrow">→</span>
+      <div class="step">Gateway (LiteLLM-style proxy)</div><span class="arrow">→</span>
+      <div class="step">Per-provider adapter + signing</div><span class="arrow">→</span>
+      <div class="step">OpenAI / Anthropic / Bedrock / others</div>
+    </div>
+    <p>LiteLLM is the most direct fit: an open-source proxy/SDK that already speaks 100+ provider APIs behind one OpenAI-shaped interface, including a <code>/responses</code> endpoint that explicitly bridges <code>openai</code>, <code>anthropic</code>, <code>bedrock</code>, <code>vertex_ai</code>, <code>azure</code> and others, falling back to <code>/chat/completions</code> for providers without native <code>/responses</code> support<sup class="cite">[2,4]</sup>. Running it as the app's own backend component (not a third-party SaaS) keeps the "your key, your data" promise intact — the gateway holds provider credentials only transiently per-request, it doesn't become a new custodian of them. Vercel's AI SDK is a viable alternative if the team prefers a TypeScript-native, non-proxy library approach with official adapters for OpenAI, Anthropic, Bedrock, Azure, and 15+ others — but a self-hosted gateway is the better fit here because it also gives a natural place to enforce rate limiting and abuse controls (Section 7) without touching client code per provider.</p>
+
+    <div class="callout fix">
+      <span class="tag">Design rule</span>
+      <p>The mobile client should never contain provider-specific branching logic for streaming parsing or tool-call formats. It sends one shape to the gateway and receives one shape back; every provider quirk is absorbed at the gateway boundary. This is what makes "switch models mid-conversation" actually safe to ship.</p>
+    </div>
+  </section>
+
+  <section id="security">
+    <h2><span class="num">7</span>Security architecture — the "firewall" around API keys</h2>
+    <p class="lede">Three separate problems, each with its own control: where the key rests on the device, whether calls should ever leave the device unproxied, and what stops the network path itself from being abused.</p>
+
+    <h3>7.1 — On-device key storage</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Platform</th><th>Mechanism</th><th>Key behavior</th></tr>
+      <tr><td>iOS</td><td>Keychain + <code>SecAccessControl</code></td><td>Store with an accessibility class like <code>kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly</code> (blocks storage if no device passcode is set, excludes the item from iCloud Keychain sync/restore) combined with the <code>userPresence</code> flag, so every subsequent read demands Face ID/Touch ID or device passcode<sup class="cite">[5]</sup>. The actual biometric match happens inside the Secure Enclave — the app and OS never see the underlying biometric data itself, only a pass/fail gating the keychain read<sup class="cite">[5]</sup>.</td></tr>
+      <tr><td>Android</td><td>Android Keystore</td><td>Keys are non-exportable and can be hardware-backed (TEE/Secure Element) so key material never leaves secure hardware<sup class="cite">[6,7]</sup>. <code>KeyGenParameterSpec.Builder.setUserAuthenticationRequired(true)</code> ties key usage to biometric/device-credential authentication, enforced per-operation via <code>BiometricPrompt</code> wrapping a <code>CryptoObject</code><sup class="cite">[7,8]</sup>.</td></tr>
+    </table>
+    </div>
+    <p>API keys are never hardcoded, bundled, or logged — OWASP's mobile weakness catalog flags exactly this failure mode (MASWE-0005) because keys embedded in app source/resources are trivially recoverable via decompilation, regardless of how well runtime storage is otherwise handled.</p>
+
+    <h3>7.2 — Direct-to-provider vs. backend proxy</h3>
+    <div class="grid2">
+      <div class="col-box out">
+        <h4>Direct-from-device — only where it's actually safe</h4>
+        <ul>
+          <li>Works for simple bearer-token providers (OpenAI, Anthropic) where the "signing" is just an HTTP header.</li>
+          <li>Fundamentally <strong>not viable for AWS Bedrock</strong>: SigV4 signing requires long-lived AWS credentials on-device, which is a much larger blast radius than an API key if the device is compromised.</li>
+          <li>Even for simple providers, direct calls mean no central point to rate-limit abusive prompts, meter spend, or kill a compromised key remotely.</li>
+        </ul>
+      </div>
+      <div class="col-box in">
+        <h4>Recommended: gateway proxy by default, direct mode as an option</h4>
+        <ul>
+          <li>The gateway (Section 6) holds the signing/translation logic; the pattern mirrors how Cloudflare AI Gateway's BYOK feature signs Bedrock requests server-side on the caller's behalf, and how OpenRouter's BYOK proxies requests through its own infrastructure using the user's stored credentials<sup class="cite">[30,31]</sup>.</li>
+          <li>User-supplied keys are still encrypted at rest server-side and used only transiently per-request — the proxy is a relay, not a shadow custodian.</li>
+          <li>Offer an explicit "direct mode" toggle for OpenAI/Anthropic-only power users who want zero server in the request path, accepting they lose rate-limiting/abuse protection in exchange.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>7.3 — Network-level controls (mapped to OWASP MASVS)</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>MASVS control</th><th>Requirement</th><th>Applied here</th></tr>
+      <tr><td>MASVS-NETWORK-1</td><td>Secure all network traffic per current best practice</td><td>TLS 1.3 everywhere; no cleartext fallback for gateway or direct-mode traffic</td></tr>
+      <tr><td>MASVS-NETWORK-2</td><td>Identity pinning for endpoints under the developer's control, instead of trusting all default OS root CAs<sup class="cite">[32]</sup></td><td>Certificate pin the app's own gateway domain; provider domains (api.openai.com etc.) are outside developer control so pinning there is optional/lower-value</td></tr>
+      <tr><td>MASVS-STORAGE</td><td>Sensitive data protected at rest</td><td>Keychain / Keystore as above; no provider keys in logs, crash reports, or analytics payloads</td></tr>
+      <tr><td>MASVS-RESILIENCE</td><td>Tamper/reverse-engineering resistance (jailbreak/root detection, anti-debugging)</td><td>Lower priority than storage/network for a v1 — worth adding once the app handles real spend, since a compromised device undermines biometric gating regardless of storage mechanism</td></tr>
+      <tr><td>MASWE-0005</td><td>No hardcoded credentials</td><td>Zero provider keys in app binary/config; gateway credentials for its own infra use short-lived tokens, rotated independently of user keys</td></tr>
+    </table>
+    </div>
+
+    <h3>7.4 — Abuse &amp; prompt-injection protection</h3>
+    <p>Because the gateway is the single choke point for every LLM call, it's also the natural place to enforce: per-user/per-key rate limits (protects the user's own provider account from runaway loops or bugs), spend caps with alerting, and basic prompt/response sanitization for anything that flows from an LLM response into a rendered chart spec or SQL fragment — the same class of guardrail Visually's web backend already applies before executing generated SQL should be mirrored for anything the mobile gateway passes downstream.</p>
+  </section>
+
+  <section id="compliance">
+    <h2><span class="num">8</span>App Store &amp; Play Store compliance</h2>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Requirement</th><th>What it means here</th></tr>
+      <tr><td>Apple encryption export compliance</td><td>Any app using encryption is technically an "export of encryption software" subject to U.S. export compliance<sup class="cite">[10]</sup> — but standard OS-level encryption (HTTPS via <code>URLSession</code>) is typically exempt from the documentation-upload requirement; only proprietary/custom crypto isn't<sup class="cite">[11]</sup>. Since this app uses standard TLS, this is usually a same-day self-classification in App Store Connect, not a blocker.</td></tr>
+      <tr><td>Apple Guideline 5.1.2(i) — third-party AI data sharing</td><td>Apple's Nov 2025 guideline update requires apps to explicitly disclose when personal data is shared with third-party AI, and get explicit user permission first<sup class="cite">[9]</sup>. Directly relevant here: the app must clearly disclose, at key-entry time, that queries/data are sent to whichever provider (OpenAI/Anthropic/AWS/etc.) the user configures.</td></tr>
+      <tr><td>Apple In-App Purchase boundary</td><td>Apple requires IAP for unlocking features/functionality within the app (subscriptions, premium content, etc.)<sup class="cite">[33]</sup>. The industry-common (though not judicially tested) interpretation BYOK apps rely on: paying the LLM provider directly for usage is a transaction with a separate third party for a service consumed outside the app's own feature set — not an "unlock" of the app itself — so it sits outside IAP the same way a ride-hailing fare isn't an IAP transaction. App-side paid features (sync, extra projects, premium UI) should go through IAP regardless. <strong>Get explicit legal sign-off on this boundary before launch</strong> — Apple's review stance on BYOK specifically has shifted before and isn't fully codified.</td></tr>
+      <tr><td>Google Play AI-generated content policy</td><td>Google Play has a dedicated AI-Generated Content policy that applies to apps where AI-generated interaction is a central feature<sup class="cite">[12]</sup> — this app's chat/analysis surface almost certainly qualifies and needs the associated disclosures and content moderation posture.</td></tr>
+      <tr><td>Privacy nutrition labels (both stores)</td><td>Must disclose that user-entered API keys and query data are transmitted to third-party AI providers the user selects — treat this as "linked to identity" data sharing with clear per-provider disclosure, not a blanket "we don't collect data" claim.</td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="roadmap">
+    <h2><span class="num">9</span>Development roadmap</h2>
+    <div class="phase-card">
+      <div class="len">2–3 wks</div>
+      <div><h4>Phase 0 — Foundation &amp; spike</h4><p>Stand up the RN New Architecture project, wire login against the existing account system, and spike the two riskiest pieces first: (1) Keychain/Keystore biometric-gated key storage as native modules, (2) the gateway's Bedrock adapter (SigV4 signing + binary event-stream decoding), since Bedrock is the hardest provider by a wide margin.</p></div>
+    </div>
+    <div class="phase-card">
+      <div class="len">4–6 wks</div>
+      <div><h4>Phase 1 — MVP</h4><p>Single-provider-at-a-time chat against a connected project (reuse existing schema/query pipeline via the gateway), key entry + secure storage flow, basic chart rendering for query results, push notifications for one saved alert type. One platform first (iOS or Android, whichever the team ships faster), then port.</p></div>
+    </div>
+    <div class="phase-card">
+      <div class="len">4–6 wks</div>
+      <div><h4>Phase 2 — Model-agnostic core</h4><p>Add the remaining providers behind the gateway, mid-conversation model switching, token/cost display normalized across providers, per-project key isolation for multi-client users, direct-mode toggle, and the compliance disclosures from Section 8.</p></div>
+    </div>
+    <div class="phase-card">
+      <div class="len">3–4 wks</div>
+      <div><h4>Phase 3 — Hardening &amp; store submission</h4><p>Certificate pinning, rate limiting/abuse controls on the gateway, jailbreak/root detection, privacy nutrition labels, legal review of the IAP/BYOK boundary, App Store + Play Store submission (budget extra review cycles for the AI-disclosure and encryption-export questions).</p></div>
+    </div>
+    <div class="phase-card">
+      <div class="len">ongoing</div>
+      <div><h4>Phase 4 — Post-launch</h4><p>Canvas viewer (read-only, not full builder), more alert types, additional providers/open-model support, usage analytics on which providers/models users actually pick.</p></div>
+    </div>
+  </section>
+
+  <section id="scope">
+    <h2><span class="num">10</span>Scope — v1 in / out</h2>
+    <div class="grid2">
+      <div class="col-box in">
+        <h4>In scope for v1</h4>
+        <ul>
+          <li>Login to existing account/projects</li>
+          <li>BYOK key entry + secure storage for OpenAI, Anthropic, AWS Bedrock</li>
+          <li>Natural-language Q&amp;A against one connected project at a time</li>
+          <li>Chart rendering for query results (view-only)</li>
+          <li>Push notifications for saved alerts</li>
+          <li>Model switching mid-conversation</li>
+          <li>Gateway-based rate limiting and spend visibility</li>
+        </ul>
+      </div>
+      <div class="col-box out">
+        <h4>Explicitly out of scope for v1</h4>
+        <ul>
+          <li>Full drag-and-drop Canvas builder (stays web/desktop)</li>
+          <li>Local/open-model (Ollama-style) support — revisit post-launch based on demand signal like Enchanted's</li>
+          <li>Offline mode / <code>.vly</code> import (useful on web, lower priority on mobile)</li>
+          <li>Team/role management UI (manage from web, consume on mobile)</li>
+          <li>Domain-specific workflow agents (recruitment/finance skill agents) — mobile is Q&amp;A + charts first</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="monetization">
+    <h2><span class="num">11</span>Monetization</h2>
+    <p>Charge for the app and its infrastructure (sync, gateway hosting, extra saved projects/alerts beyond a free tier) via a subscription through Apple/Google IAP as required. Never charge a markup on LLM usage — usage is billed by the provider directly to the user's own account, which is both the entire competitive pitch (no vendor markup) and the thing that keeps the app on the right side of the IAP boundary question in Section 8. TypingMind's one-time-license model and Chatbox AI's "subscription or BYOK" dual model are the two concrete templates to choose between; a modest recurring subscription (Chatbox AI-style) is likely the better fit here since it also covers ongoing gateway hosting costs that a one-time purchase (TypingMind-style) doesn't naturally fund.</p>
+  </section>
+
+  <section id="risks">
+    <h2><span class="num">12</span>Risks &amp; open questions</h2>
+    <ul class="gaps">
+      <li class="edge-generic"><strong>Apple's BYOK/IAP stance isn't fully codified.</strong> Review outcomes for "pay the AI provider directly" apps have varied case by case — budget time for App Review back-and-forth and get legal input before relying on the interpretation in Section 8.</li>
+      <li class="edge-generic"><strong>Bedrock is disproportionately expensive to support well.</strong> SigV4 signing, the proprietary event-stream format, and partial tool-calling support across models mean Bedrock alone could be as much engineering effort as OpenAI + Anthropic combined — confirm early whether Bedrock support is a v1 must-have or can slip to Phase 2.</li>
+      <li class="edge-generic"><strong>Flutter's Android rendering inconsistency</strong> (Impeller only on API 29+/Vulkan) reinforces the React Native choice, but if the team later reconsiders Flutter, re-verify this hasn't changed by then.</li>
+      <li class="edge-generic"><strong>Analyst market-size figures for BI/BYOK are directional, not load-bearing.</strong> Don't size the business case on a single analyst-firm number; the stronger evidence is competitor traction (TypingMind, Chatbox AI shipping revenue) and BYOK's spread into adjacent tooling (JetBrains).</li>
+      <li class="edge-generic"><strong>Gateway becomes a single point of trust.</strong> Even though it's a relay, not a custodian, it is still where decrypted keys pass through in-memory per request — its own security posture (isolation, no logging of key material, short-lived secrets for its own infra) needs the same rigor as the on-device storage.</li>
+    </ul>
+  </section>
+
+  <section id="sources">
+    <h2><span class="num">13</span>Sources</h2>
+    <p class="lede">Findings above were gathered and adversarially cross-checked via automated multi-source research; citations point to primary/official sources wherever available.</p>
+    <ol class="refs">
+      <li>[1] <a href="https://reactnative.dev/blog/2025/10/08/react-native-0.82">React Native 0.82 release notes</a> — New Architecture fully default, legacy opt-outs ignored (Oct 2025)</li>
+      <li>[2] <a href="https://github.com/BerriAI/litellm">BerriAI/litellm on GitHub</a> — 100+ provider proxy/SDK</li>
+      <li>[3] <a href="https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModelWithResponseStream.html">AWS Bedrock InvokeModelWithResponseStream API reference</a> — binary event-stream encoding</li>
+      <li>[4] <a href="https://docs.litellm.ai/docs/response_api">LiteLLM /responses API docs</a> — unified endpoint across providers incl. Bedrock</li>
+      <li>[5] <a href="https://developer.apple.com/documentation/LocalAuthentication/accessing-keychain-items-with-face-id-or-touch-id">Apple — Accessing Keychain Items with Face ID or Touch ID</a></li>
+      <li>[6] <a href="https://developer.android.com/privacy-and-security/keystore">Android Keystore system docs</a></li>
+      <li>[7] <a href="https://developer.android.com/identity/sign-in/biometric-auth">Android biometric authentication docs</a></li>
+      <li>[8] Android <code>KeyGenParameterSpec.Builder.setUserAuthenticationRequired</code> — per-operation biometric gating (Android developer docs)</li>
+      <li>[9] <a href="https://techcrunch.com/2025/11/13/apples-new-app-review-guidelines-clamp-down-on-apps-sharing-personal-data-with-third-party-ai/">TechCrunch — Apple's new App Review guidelines on third-party AI data sharing</a> (Nov 2025)</li>
+      <li>[10] <a href="https://developer.apple.com/documentation/security/complying-with-encryption-export-regulations">Apple — Complying with Encryption Export Regulations</a></li>
+      <li>[11] Same as [10] — HTTPS via platform TLS typically exempt from export documentation upload</li>
+      <li>[12] <a href="https://support.google.com/googleplay/android-developer/answer/14094294?hl=en">Google Play — AI-Generated Content policy</a></li>
+      <li>[13] <a href="https://www.typingmind.com/buy">TypingMind pricing page</a> — one-time license, BYOK</li>
+      <li>[14] <a href="https://chatboxai.app/en">Chatbox AI product site</a></li>
+      <li>[15] <a href="https://checkthat.ai/answers/what-are-the-best-mobile-bi-platforms">CheckThat.ai — Best Mobile BI Platforms 2026</a></li>
+      <li>[16] <a href="https://promethium.ai/guides/self-service-analytics-vendor-comparison/">Promethium — self-service analytics vendor comparison</a></li>
+      <li>[17] <a href="https://metricasoftware.com/power-bi-vs-tableau-vs-looker-enterprise-bi-comparison-for-2026/">Metrica Software — Power BI vs Tableau vs Looker 2026</a></li>
+      <li>[18] <a href="https://www.datacamp.com/blog/power-bi-vs-tableau-which-one-should-you-choose">DataCamp — Power BI vs Tableau</a></li>
+      <li>[19] <a href="https://www.holistics.io/bi-tools/comparison/tableau-vs-looker/">Holistics — Tableau vs Looker pricing comparison</a></li>
+      <li>[20] <a href="https://geekflare.com/best/top-multi-ai-chat-clients/">Geekflare — top multi-AI chat clients</a> (2026)</li>
+      <li>[21] <a href="https://www.producthunt.com/products/chatbox/alternatives">Product Hunt — Chatbox alternatives</a></li>
+      <li>[22] <a href="https://www.aibase.com/tool/31643">Enchanted app profile — AIBase</a></li>
+      <li>[23] <a href="https://openrouter.ai/docs/guides/overview/auth/byok">OpenRouter — BYOK auth docs</a></li>
+      <li>[24] <a href="https://blog.jetbrains.com/ai/2025/12/bring-your-own-key-byok-is-now-live-in-jetbrains-ides/">JetBrains blog — BYOK live in JetBrains IDEs</a> (Dec 2025)</li>
+      <li>[25] <a href="https://docs.flutter.dev/perf/impeller">Flutter — Impeller rendering engine docs</a></li>
+      <li>[26] Flutter docs — Impeller is the only supported renderer on iOS</li>
+      <li>[27] Flutter docs — Impeller default on Android API 29+/Vulkan only, else falls back to OpenGL</li>
+      <li>[28] <a href="https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html">AWS Bedrock Converse API reference</a></li>
+      <li>[29] <a href="https://jonbarnett.hashnode.dev/tool-calling-with-the-new-bedrock-converse-api-vs-openai">Tool calling with Bedrock Converse vs OpenAI</a> — subset of models support tools</li>
+      <li>[30] <a href="https://developers.cloudflare.com/ai-gateway/usage/providers/bedrock/">Cloudflare AI Gateway — Amazon Bedrock BYOK docs</a></li>
+      <li>[31] Same as [23] — OpenRouter BYOK proxy architecture</li>
+      <li>[32] <a href="https://mas.owasp.org/MASVS/">OWASP MASVS</a> and <a href="https://mas.owasp.org/MASVS/controls/MASVS-NETWORK-2/">MASVS-NETWORK-2 control detail</a></li>
+      <li>[33] <a href="https://developer.apple.com/app-store/review/guidelines/">Apple App Store Review Guidelines</a></li>
+    </ol>
+  </section>
+
+  <footer>Visually Mobile — internal research &amp; roadmap document. Verify store-policy interpretations with counsel before submission; policies shift.</footer>
+
+</div>
+</body>
+</html>

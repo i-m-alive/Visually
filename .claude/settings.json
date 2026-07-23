@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:mas.owasp.org)",
+      "WebFetch(domain:web.archive.org)",
+      "Bash(curl -sL -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36\" \"https://www.buildmvpfast.com/blog/byok-bring-your-own-key-ai-saas-pricing-model-2026\" -o /private/tmp/claude-501/-Users-kumarshivrajbhakat-Desktop-Visually-Visually/9f8ada0e-060b-4ee3-b5b1-007923ac5d70/scratchpad/byok.html -w \"HTTP_CODE:%{http_code}\\\\n\")",
+      "WebFetch(domain:www.kinde.com)",
+      "WebFetch(domain:www.dyad.sh)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sL \"http://archive.org/wayback/available?url=buildmvpfast.com/blog/byok-bring-your-own-key-ai-saas-pricing-model-2026\")",
+      "WebFetch(domain:ai-sdk.dev)",
+      "WebFetch(domain:techcrunch.com)",
+      "WebFetch(domain:dev.to)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:jonbarnett.hashnode.dev)",
+      "Bash(curl -sL -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36\" \"http://web.archive.org/web/20260616053405/https://www.buildmvpfast.com/blog/byok-bring-your-own-key-ai-saas-pricing-model-2026\" -o /private/tmp/claude-501/-Users-kumarshivrajbhakat-Desktop-Visually-Visually/9f8ada0e-060b-4ee3-b5b1-007923ac5d70/scratchpad/byok.html -w \"HTTP_CODE:%{http_code}\\\\n\")",
+      "WebFetch(domain:support.google.com)",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0 Safari/537.36\" \"https://developer.apple.com/tutorials/data/documentation/security/complying-with-encryption-export-regulations.json\")",
+      "Bash(curl -s -A \"Mozilla/5.0\" \"https://developer.apple.com/tutorials/data/documentation/localauthentication/accessing-keychain-items-with-face-id-or-touch-id.json\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" -A \"Mozilla/5.0\" https://jonbarnett.hashnode.dev/tool-calling-with-the-new-bedrock-converse-api-vs-openai --max-time 15)",
+      "WebFetch(domain:www.grandviewresearch.com)",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0 Safari/537.36\" \"https://developer.apple.com/tutorials/data/documentation/security/complying-with-encryption-export-regulations.json\" -o /private/tmp/claude-501/-Users-kumarshivrajbhakat-Desktop-Visually-Visually/9f8ada0e-060b-4ee3-b5b1-007923ac5d70/scratchpad/enc.json)",
+      "WebFetch(domain:r.jina.ai)",
+      "WebFetch(domain:www.typingmind.com)",
+      "Bash(curl -sL -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36\" \"https://web.archive.org/web/20260616053405id_/https://www.buildmvpfast.com/blog/byok-bring-your-own-key-ai-saas-pricing-model-2026\" -o /private/tmp/claude-501/-Users-kumarshivrajbhakat-Desktop-Visually-Visually/9f8ada0e-060b-4ee3-b5b1-007923ac5d70/scratchpad/byok2.html -w \"HTTP_CODE:%{http_code}\\\\n\")",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -sL --compressed -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36\" \"https://web.archive.org/web/20260616053405id_/https://www.buildmvpfast.com/blog/byok-bring-your-own-key-ai-saas-pricing-model-2026\" -o /private/tmp/claude-501/-Users-kumarshivrajbhakat-Desktop-Visually-Visually/9f8ada0e-060b-4ee3-b5b1-007923ac5d70/scratchpad/byok3.html -w \"HTTP_CODE:%{http_code}\\\\n\")",
+      "Bash(curl -s https://raw.githubusercontent.com/yatsyk/awesome-byok-apps/main/README.md)",
+      "WebFetch(domain:swmansion.com)",
+      "WebFetch(domain:docs.litellm.ai)",
+      "WebFetch(domain:ptkd.com)",
+      "WebFetch(domain:help.apple.com)",
+      "WebFetch(domain:law.stackexchange.com)",
+      "Bash(grep -n \"existing backend\\\\|existing .agent_service\\\\|Visually/backend\\\\|BACKEND_URL\\\\|8001\\\\|real backend\\\\|the real Visually\\\\|existing \\\\`chat.py\\\\`\\\\|against the real\" execution-plan.html)"
+    ],
+    "additionalDirectories": [
+      "/Users/kumarshivrajbhakat/Desktop/Visually/VisuallyMobile/docs"
+    ]
+  }
+}

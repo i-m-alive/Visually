@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canvas / Report Builder — Agentic BI Audit</title>
+<style>
+:root{
+  --bg:#f6f7f9; --surface:#ffffff; --surface-2:#f0f2f6; --border:#dfe3ea;
+  --ink:#171a21; --ink-2:#3d4453; --muted:#5b6472; --faint:#8a93a3;
+  --accent:#4f46e5; --accent-soft:#eef0ff; --accent-line:#c7ccff;
+  --ok:#0f9d6a; --ok-soft:#e3f5ec;
+  --warn:#c07b00; --warn-soft:#fbf1dd;
+  --gap:#d63a5e; --gap-soft:#fbe6ec;
+  --shadow:0 1px 2px rgba(18,22,34,.06),0 8px 24px rgba(18,22,34,.05);
+  --mono:"SF Mono",ui-monospace,"JetBrains Mono","Menlo",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Inter",Roboto,Helvetica,Arial,sans-serif;
+}
+:root[data-theme="dark"],
+:root:not([data-theme="light"]) {}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0d0f14; --surface:#14171f; --surface-2:#191d27; --border:#262c3a;
+    --ink:#eef1f6; --ink-2:#c4cbd8; --muted:#9099a9; --faint:#6b7484;
+    --accent:#8b93ff; --accent-soft:#1b1f33; --accent-line:#343c66;
+    --ok:#3fd39a; --ok-soft:#122820;
+    --warn:#e6b25a; --warn-soft:#2b2312;
+    --gap:#ff7a97; --gap-soft:#2c1620;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0d0f14; --surface:#14171f; --surface-2:#191d27; --border:#262c3a;
+  --ink:#eef1f6; --ink-2:#c4cbd8; --muted:#9099a9; --faint:#6b7484;
+  --accent:#8b93ff; --accent-soft:#1b1f33; --accent-line:#343c66;
+  --ok:#3fd39a; --ok-soft:#122820;
+  --warn:#e6b25a; --warn-soft:#2b2312;
+  --gap:#ff7a97; --gap-soft:#2c1620;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+}
+:root[data-theme="light"]{
+  --bg:#f6f7f9; --surface:#ffffff; --surface-2:#f0f2f6; --border:#dfe3ea;
+  --ink:#171a21; --muted:#5b6472; --faint:#8a93a3;
+  --accent:#4f46e5; --accent-soft:#eef0ff; --accent-line:#c7ccff;
+  --ok:#0f9d6a; --ok-soft:#e3f5ec; --warn:#c07b00; --warn-soft:#fbf1dd;
+  --gap:#d63a5e; --gap-soft:#fbe6ec;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  font-size:15px;line-height:1.6;letter-spacing:-.006em;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px 120px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.85em;background:var(--surface-2);
+  padding:.1em .4em;border-radius:5px;border:1px solid var(--border);color:var(--ink-2,var(--ink));
+  white-space:nowrap}
+
+/* ---- hero ---- */
+header.hero{padding:64px 0 40px;border-bottom:1px solid var(--border);margin-bottom:44px}
+.eyebrow{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);
+  font-weight:650;margin:0 0 18px}
+h1{font-size:clamp(30px,4.6vw,46px);line-height:1.08;margin:0 0 18px;font-weight:720;
+  letter-spacing:-.025em;text-wrap:balance;max-width:16ch}
+.lede{font-size:18px;color:var(--muted);max-width:64ch;margin:0}
+.meta-row{display:flex;flex-wrap:wrap;gap:10px 22px;margin-top:26px;font-size:13px;color:var(--faint)}
+.meta-row b{color:var(--ink-2,var(--ink));font-weight:600}
+
+/* ---- scorecards ---- */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:14px;margin:8px 0 8px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;
+  padding:20px 18px;box-shadow:var(--shadow)}
+.card .num{font-size:34px;font-weight:720;letter-spacing:-.03em;line-height:1;
+  font-variant-numeric:tabular-nums}
+.card .lbl{font-size:12.5px;color:var(--muted);margin-top:9px;line-height:1.35}
+.card.accent .num{color:var(--accent)}
+.card.ok .num{color:var(--ok)} .card.warn .num{color:var(--warn)} .card.gap .num{color:var(--gap)}
+
+/* ---- sections ---- */
+section{margin-top:56px;scroll-margin-top:24px}
+h2{font-size:25px;font-weight:700;letter-spacing:-.02em;margin:0 0 6px;display:flex;
+  align-items:baseline;gap:12px}
+h2 .idx{font-family:var(--mono);font-size:14px;color:var(--accent);font-weight:600}
+.sec-sub{color:var(--muted);margin:0 0 22px;max-width:70ch}
+h3{font-size:16px;font-weight:660;letter-spacing:-.01em;margin:30px 0 12px}
+
+/* ---- matrix table ---- */
+.tbl-scroll{overflow-x:auto;border:1px solid var(--border);border-radius:14px;
+  background:var(--surface);box-shadow:var(--shadow)}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:13.5px}
+thead th{background:var(--surface-2);text-align:left;font-weight:640;font-size:11.5px;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding:12px 16px;
+  border-bottom:1px solid var(--border);position:sticky;top:0}
+tbody td{padding:12px 16px;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:var(--surface-2)}
+td.feat{font-weight:560;color:var(--ink);width:30%}
+td.note{color:var(--muted);font-size:12.8px;line-height:1.45}
+th.st,td.st{width:11%;text-align:center;white-space:nowrap}
+
+/* ---- pills ---- */
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:640;
+  padding:3px 9px;border-radius:100px;line-height:1.4;letter-spacing:.01em;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%}
+.pill.full{background:var(--ok-soft);color:var(--ok)} .pill.full::before{background:var(--ok)}
+.pill.part{background:var(--warn-soft);color:var(--warn)} .pill.part::before{background:var(--warn)}
+.pill.none{background:var(--gap-soft);color:var(--gap)} .pill.none::before{background:var(--gap)}
+
+/* ---- legend ---- */
+.legend{display:flex;flex-wrap:wrap;gap:16px;margin:0 0 20px;font-size:12.5px;color:var(--muted)}
+.legend .pill{cursor:default}
+
+/* ---- callout / gap blocks ---- */
+.block{border:1px solid var(--border);border-radius:14px;background:var(--surface);
+  padding:20px 22px;margin:14px 0;box-shadow:var(--shadow)}
+.block.crit{border-left:3px solid var(--gap)}
+.block.p1{border-left:3px solid var(--warn)}
+.block.p2{border-left:3px solid var(--accent)}
+.block h4{margin:0 0 6px;font-size:15.5px;font-weight:660;display:flex;align-items:center;
+  gap:10px;flex-wrap:wrap}
+.tag{font-family:var(--mono);font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:5px;
+  letter-spacing:.03em;text-transform:uppercase}
+.tag.p0{background:var(--gap-soft);color:var(--gap)}
+.tag.p1{background:var(--warn-soft);color:var(--warn)}
+.tag.p2{background:var(--accent-soft);color:var(--accent)}
+.tag.scope{background:var(--surface-2);color:var(--muted)}
+.block p{margin:8px 0 0;color:var(--ink-2,var(--ink))}
+.block .fix{margin:12px 0 0;padding:12px 14px;background:var(--surface-2);border-radius:9px;
+  font-size:13px;color:var(--ink-2,var(--ink))}
+.block .fix b{color:var(--ink)}
+.block ul{margin:8px 0 0;padding-left:18px}
+.block li{margin:5px 0;color:var(--ink-2,var(--ink))}
+.block li::marker{color:var(--accent)}
+
+/* ---- effort chip ---- */
+.effort{font-size:11.5px;color:var(--faint);font-weight:600;margin-left:auto}
+
+/* ---- toc ---- */
+nav.toc{background:var(--surface);border:1px solid var(--border);border-radius:14px;
+  padding:18px 22px;box-shadow:var(--shadow);margin:34px 0}
+nav.toc ol{margin:0;padding-left:20px;columns:2;column-gap:34px;font-size:14px}
+nav.toc li{margin:5px 0;break-inside:avoid}
+@media(max-width:640px){nav.toc ol{columns:1}}
+
+.divider{height:1px;background:var(--border);border:none;margin:0}
+footer{margin-top:70px;padding-top:26px;border-top:1px solid var(--border);
+  color:var(--faint);font-size:12.5px}
+.kbd{font-family:var(--mono);font-size:.82em}
+.small{font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <p class="eyebrow">Feature Audit · Agentic BI</p>
+  <h1>Canvas &amp; Report Builder — Web vs Mobile, and the Gap to an Agentic BI Platform</h1>
+  <p class="lede">A verified, side-by-side audit of dashboard/report creation across the Visually web app and VisuallyMobile — what exists, what's partial, what's missing, and exactly how to close every gap.</p>
+  <div class="meta-row">
+    <span>Scope: <b>Canvas / report / dashboard creation only</b></span>
+    <span>Basis: <b>source-verified</b>, both codebases</span>
+    <span>Date: <b>2026-07-20</b></span>
+  </div>
+</header>
+
+<div class="cards">
+  <div class="card accent"><div class="num">~90%</div><div class="lbl">Mobile parity with web after this build (was ~72%)</div></div>
+  <div class="card ok"><div class="num">13</div><div class="lbl">Audit remediation items <b>shipped</b> on mobile</div></div>
+  <div class="card warn"><div class="num">5</div><div class="lbl">Larger platform efforts <b>deferred</b> (both platforms)</div></div>
+  <div class="card gap"><div class="num">tsc ✓</div><div class="lbl">Type-clean; backend boots with the new routes</div></div>
+</div>
+
+<div class="block p2" style="margin-top:18px">
+  <h4>✅ Implementation update — 2026-07-20</h4>
+  <p>The mobile remediation roadmap in §8 has been <b>implemented and verified</b> (TypeScript clean; the <code>agent_service</code> backend boots on <code>:8011</code> with the two new routes live). Status pills and the §8 roadmap below are marked with what actually shipped. In short:</p>
+  <ul>
+    <li><b>P0 — all shipped:</b> image widgets render a real <code>&lt;Image&gt;</code>; annotations UI wired over the existing backend; calculated measures now shape AI-built SQL (prompt injection + <code>{{measure}}</code> token expansion); per-widget CSV export; a real pivot table (row×col + totals).</li>
+    <li><b>P1 — shipped:</b> cross-filtering, interactive drill/explain point-selection, auto-insight surfacing + insight discovery, a "+ Filter" builder, server PDF/HTML export (+ client canvas PNG), a read-only SQL guardrail on every AI query, and a root-cause ("why?") action.</li>
+    <li><b>P1-1 / P2 — shipped:</b> gesture resize (built-in PanResponder, no native rebuild) + layout undo; a template gallery; a what-if scenario panel.</li>
+    <li><b>Deferred (honest):</b> free-form 2D drag-reorder (kept move-up/down + undo + gesture resize), real-time co-editing, PPTX export, native sankey/sunburst renderers, persistent "save as template."</li>
+  </ul>
+  <p class="small" style="margin-top:10px">Caveats unchanged: AI paths need a valid Bedrock token; <b>server</b> PDF/HTML export needs the export service running (a client-side PNG always works as fallback).</p>
+</div>
+
+<nav class="toc">
+  <ol>
+    <li><a href="#summary">Executive summary</a></li>
+    <li><a href="#charting">1 · Charting &amp; visualization</a></li>
+    <li><a href="#interaction">2 · Interactivity &amp; layout</a></li>
+    <li><a href="#agentic">3 · AI / agentic features</a></li>
+    <li><a href="#governance">4 · Data &amp; governance</a></li>
+    <li><a href="#collab">5 · Export, sharing &amp; collaboration</a></li>
+    <li><a href="#platform">6 · Best-practice agentic-BI checklist</a></li>
+    <li><a href="#bugs">7 · Bugs &amp; correctness issues</a></li>
+    <li><a href="#roadmap">8 · Prioritized remediation plan</a></li>
+  </ol>
+</nav>
+
+<section id="summary">
+  <h2><span class="idx">00</span> Executive summary</h2>
+  <p class="sec-sub">Both apps share one backend (<code>/dashboards/*</code>) and the same entity model — a "dashboard", "canvas", and "report" are the same object. The web app is the mature reference implementation; mobile reached broad parity in the last build but still trails in three areas: <b>direct-manipulation editing</b>, <b>auto-insight surfacing</b>, and <b>export breadth</b>. Neither platform yet has the three things that separate a "dashboard tool" from an "agentic BI platform": <b>real-time collaboration</b>, a <b>template gallery</b>, and <b>data lineage / audit governance</b>.</p>
+
+  <div class="legend">
+    <span class="pill full">Full — wired end-to-end</span>
+    <span class="pill part">Partial — stubbed, backend-only, or dead code</span>
+    <span class="pill none">Missing — not present</span>
+  </div>
+
+  <div class="block p2">
+    <h4>The three headline takeaways</h4>
+    <ul>
+      <li><b>Mobile's biggest single gap is editing ergonomics.</b> The web app uses <code>react-grid-layout</code> for true drag/drop/resize with undo/redo; mobile is a vertical stack with a resize <em>stepper</em> and move-up/down. This is the most visible "it feels unfinished" gap.</li>
+      <li><b>Mobile has the agentic backend but under-surfaces it.</b> Multi-agent build, explain, health, and self-healing all work — but auto-insight discovery, root-cause, guardrails, and cross-filtering that the web app exposes are not wired into the mobile editor.</li>
+      <li><b>Several features are "done" in code but invisible.</b> Mobile annotations (full backend + client API) and what-if (a real function) have <em>no UI</em>; the image widget stores a URI but never renders it; calculated measures are stored on both platforms but never injected into rendering. These are cheap, high-credibility wins.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="charting">
+  <h2><span class="idx">01</span> Charting &amp; visualization</h2>
+  <p class="sec-sub">Web uses Recharts (~28 chart branches); mobile uses victory-native (~23 native renderers + a universal table fallback so a widget is "never blank").</p>
+  <div class="tbl-scroll"><table>
+    <thead><tr><th class="feat">Capability</th><th class="st">Web</th><th class="st">Mobile</th><th class="note">Notes &amp; fix direction</th></tr></thead>
+    <tbody>
+      <tr><td class="feat">Core charts (bar/line/area/pie/scatter/KPI)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Parity. Both cover the everyday set well.</td></tr>
+      <tr><td class="feat">Extended charts (combo, radar, gauge, funnel, waterfall, histogram, bubble)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile renders these natively; funnel is custom RN.</td></tr>
+      <tr><td class="feat">Advanced charts (sankey, sunburst, network, choropleth, gantt, chord, marimekko)</td><td class="st"><span class="pill part">Partial</span></td><td class="st"><span class="pill none">Missing</span></td><td class="note">Web has branches but <b>silently falls back</b> to donut/sorted-bar; mobile degrades to table. Fix: implement true renderers or an honest "unsupported chart" state instead of a misleading fallback.</td></tr>
+      <tr><td class="feat">Pivot table (true matrix)</td><td class="st"><span class="pill part">Partial</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped (mobile):</b> a real <code>PivotTable</code> (row×column cells with row/column subtotals + grand total), inferred from the result columns. Web still renders <code>pivot_table</code> flat.</td></tr>
+      <tr><td class="feat">Universal table fallback (never-blank rule)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Good resilience pattern on both.</td></tr>
+      <tr><td class="feat">Per-widget color palettes</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile: 5 named palettes via <code>WidgetEditModal</code>.</td></tr>
+      <tr><td class="feat">Dashboard-level theme picker</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Web: 8 themes + background patterns. Mobile: <code>theme</code> field exists but no picker UI; charts hardwired to <code>VictoryTheme.material</code>.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="interaction">
+  <h2><span class="idx">02</span> Interactivity &amp; layout</h2>
+  <p class="sec-sub">This is where mobile trails web the most — direct manipulation and cross-widget interactivity.</p>
+  <div class="tbl-scroll"><table>
+    <thead><tr><th class="feat">Capability</th><th class="st">Web</th><th class="st">Mobile</th><th class="note">Notes &amp; fix direction</th></tr></thead>
+    <tbody>
+      <tr><td class="feat">Free-form 2D drag placement</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Web: <code>react-grid-layout</code>. Mobile now has <b>gesture resize + move-up/down + undo</b>; free-form 2D drag-reorder is <b>deliberately deferred</b> (needs <code>gesture-handler</code>/<code>reanimated</code> + a native rebuild, and a phone-appropriate single-column stack makes it low-value).</td></tr>
+      <tr><td class="feat">Gesture resize</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> drag a corner handle (<code>ResizeHandle</code>, built-in PanResponder — no native rebuild) maps to the 12-col grid and persists via <code>updateLayout</code>. Stepper kept as an alternative.</td></tr>
+      <tr><td class="feat">Undo / redo</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> in-memory layout-history stack + an "↶ Undo" toolbar button on mobile (web keeps its 30-step Ctrl+Z/Y).</td></tr>
+      <tr><td class="feat">Tap-to-inspect tooltip</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile uses native <code>VictoryTooltip</code> (not Voronoi — breaks on string x).</td></tr>
+      <tr><td class="feat">Zoom a chart</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Mobile: "Expand" re-render modal, no pinch/pan. Web: zoom modal + grid zoom.</td></tr>
+      <tr><td class="feat">Auto-arrange</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both bin-pack by chart size.</td></tr>
+      <tr><td class="feat">Cross-filtering (click a point → filter others)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> a Cross-filter toggle; tapping any datum (<code>onSelectX</code>) sets a transient filter and requeries siblings.</td></tr>
+      <tr><td class="feat">Drill-down (AI child query)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both hit <code>/drilldown</code> (RLS-injected). <b>Shipped:</b> mobile now uses the tapped data point (interactive selection) for drill/explain/root-cause instead of always the first.</td></tr>
+      <tr><td class="feat">Multi-page canvases</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both store pages in <code>layout_config.pages</code>.</td></tr>
+      <tr><td class="feat">Slicers / filters</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> a "+ Filter" builder in <code>SlicerBar</code> (pick column + type: single/multi/date-range) that writes <code>filter_config</code>, in addition to applying existing filters.</td></tr>
+      <tr><td class="feat">Text widget</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Parity.</td></tr>
+      <tr><td class="feat">Image widget</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> renders a real <code>&lt;Image&gt;</code>; a URL editor (with live preview) in <code>WidgetEditModal</code> sets/updates the source.</td></tr>
+      <tr><td class="feat">Bookmarks (saved views)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both persist filters + page.</td></tr>
+      <tr><td class="feat">Annotations / comments</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> <code>AnnotationsModal</code> wires the existing backend — per-widget comments, resolve/reopen, delete; reachable from the toolbar and each widget's "Add annotation".</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="agentic">
+  <h2><span class="idx">03</span> AI / agentic features</h2>
+  <p class="sec-sub">The differentiators. Mobile has most of the agentic <em>backend</em>; the gap is what the editor <em>surfaces</em> and the depth of the reasoning pipeline.</p>
+  <div class="tbl-scroll"><table>
+    <thead><tr><th class="feat">Capability</th><th class="st">Web</th><th class="st">Mobile</th><th class="note">Notes &amp; fix direction</th></tr></thead>
+    <tbody>
+      <tr><td class="feat">Multi-agent dashboard builder (Planner→Writers→Critic)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile: <code>/agent-build</code> (Sonnet plan → parallel Opus writers → repair → bin-pack). Parity in shape.</td></tr>
+      <tr><td class="feat">NL-to-chart chat / copilot over the canvas</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both stream via SSE with table-scope + dashboard context.</td></tr>
+      <tr><td class="feat">Natural-language layout ("arrange…")</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile has a dedicated <code>/nl-layout</code> endpoint.</td></tr>
+      <tr><td class="feat">Explain-this-data</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both: AI breakdown query + plain-English narrative, RLS-injected.</td></tr>
+      <tr><td class="feat">Canvas-health agent</td><td class="st"><span class="pill part">Partial</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile <em>leads</em> here — dedicated <code>/health</code> endpoint. Web relies on insight-discovery. Port mobile's health check to web.</td></tr>
+      <tr><td class="feat">Self-healing queries</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Web: validator + retry strategies (richer). Mobile: scheduled-refresh + build-time one-shot repair.</td></tr>
+      <tr><td class="feat">Auto-insight surfacing / auto-narrative</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> an Insights panel calls <code>/ai-summary</code> + <code>/ai-anomalies</code> (plus a per-widget <code>/ai-insight</code> action). Web's morning-brief/KPI-strip components remain richer.</td></tr>
+      <tr><td class="feat">Insight discovery (mine <em>new</em> charts beyond current widgets)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> "Suggest widgets" calls <code>/intelligence-discovery</code>; discovered charts add to the canvas in one tap.</td></tr>
+      <tr><td class="feat">Forecast / anomaly / compare-period</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Web has backend finance agents; mobile is pure client math (linreg / z-score / half-vs-half). Adequate but shallower.</td></tr>
+      <tr><td class="feat">What-if / scenario</td><td class="st"><span class="pill part">Partial</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped (mobile):</b> a scenario panel applies a % change across a series (preset chips), recomputes the total, and shows base-vs-scenario. Web still KPI sliders only.</td></tr>
+      <tr><td class="feat">Root-cause agent</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped:</b> a "Root cause — why?" action → new <code>/root-cause</code> endpoint (ranks contributing sub-groups, RLS-applied, then narrates).</td></tr>
+      <tr><td class="feat">Guardrails / result validator</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note"><b>Shipped:</b> a deterministic read-only SQL guardrail (<code>_is_safe_select</code> — single SELECT/CTE, blocks write/DDL/stacked statements) now gates build/explain/root-cause. Web's full model-based <code>validator_agent</code> scoring remains the deeper check.</td></tr>
+      <tr><td class="feat">GraphRAG / semantic schema retrieval</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Shared backend; mobile passes table-scope but doesn't drive the graph retriever the way web does.</td></tr>
+      <tr><td class="feat">AI calculated-measure generation</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both: NL → SQL aggregate via <code>/measures/generate</code>.</td></tr>
+      <tr><td class="feat">Conversation memory / feedback few-shot</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Web persists sessions + learns from feedback. Mobile chat is more transient.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="governance">
+  <h2><span class="idx">04</span> Data &amp; governance</h2>
+  <p class="sec-sub">The strongest area of parity — mobile deliberately closed the RLS/measures/schedule gaps in the last build.</p>
+  <div class="tbl-scroll"><table>
+    <thead><tr><th class="feat">Capability</th><th class="st">Web</th><th class="st">Mobile</th><th class="note">Notes &amp; fix direction</th></tr></thead>
+    <tbody>
+      <tr><td class="feat">Row-level security (RLS)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Mobile: policy CRUD + member picker; injection on requery/drilldown/explain/refresh/alerts.</td></tr>
+      <tr><td class="feat">Calculated measures catalog</td><td class="st"><span class="pill part">Partial</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped (mobile):</b> measures now shape output — injected into the planner/writer prompts and <code>{{measure}}</code> tokens expanded into their SQL before execution. Web still treats measures as a passive catalog.</td></tr>
+      <tr><td class="feat">Scheduled refresh (cron)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both: APScheduler cron + refresh-now + per-widget refresh.</td></tr>
+      <tr><td class="feat">Data alerts (NL condition, anomaly)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both evaluate every ~5 min. Mobile push channel deferred (in-app/email live).</td></tr>
+      <tr><td class="feat">Version history / diff / restore</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Both: snapshot, AI diff, undoable restore.</td></tr>
+      <tr><td class="feat">Connection mgmt (live/offline/cached, .vly)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Web: bind-connection, data-mode, .vly import/export. Mobile: Live/Offline badge only.</td></tr>
+      <tr><td class="feat">Semantic layer / schema metadata + table scope</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Web richer (schema sidebar, N-hop FK). Mobile scopes via chat.</td></tr>
+      <tr><td class="feat">Data lineage / audit log / access history</td><td class="st"><span class="pill none">Missing</span></td><td class="st"><span class="pill none">Missing</span></td><td class="note"><b>Platform gap.</b> No "who queried what, which tables fed this widget" trail. Expected in governed agentic BI.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="collab">
+  <h2><span class="idx">05</span> Export, sharing &amp; collaboration</h2>
+  <div class="tbl-scroll"><table>
+    <thead><tr><th class="feat">Capability</th><th class="st">Web</th><th class="st">Mobile</th><th class="note">Notes &amp; fix direction</th></tr></thead>
+    <tbody>
+      <tr><td class="feat">PNG export</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Web: server render. Mobile: client <code>captureRef</code> per widget.</td></tr>
+      <tr><td class="feat">PDF / HTML export</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note"><b>Shipped:</b> mobile Export menu triggers <code>/export/trigger</code> + polls the job, plus an always-works client canvas PNG. Server PDF/HTML needs the export service running.</td></tr>
+      <tr><td class="feat">CSV / XLSX export</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note"><b>Shipped:</b> per-widget CSV from cached rows on mobile. XLSX still web-only.</td></tr>
+      <tr><td class="feat">PPT / PPTX export</td><td class="st"><span class="pill none">Missing</span></td><td class="st"><span class="pill none">Missing</span></td><td class="note"><b>Platform gap.</b> Execs expect "export to PowerPoint". Add a pptx generator to <code>export_service</code>.</td></tr>
+      <tr><td class="feat">.vly portable archive</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill none">Missing</span></td><td class="note">Web: live or offline-bundled canvas file. Mobile could at least import.</td></tr>
+      <tr><td class="feat">Share links (live / snapshot, expiry)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Parity.</td></tr>
+      <tr><td class="feat">Collaborators (viewer / editor roles)</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill full">Full</span></td><td class="note">Parity; invite by email.</td></tr>
+      <tr><td class="feat">Public / embed / analyst viewer</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Web: full token-scoped analyst API (scoped chat, ad-hoc SELECT, exports). Mobile: view incoming shares.</td></tr>
+      <tr><td class="feat">Scheduled snapshot emails</td><td class="st"><span class="pill full">Full</span></td><td class="st"><span class="pill part">Partial</span></td><td class="note">Backend sends digests; mobile has no config UI in the canvas editor.</td></tr>
+      <tr><td class="feat">Real-time co-editing / presence / cursors</td><td class="st"><span class="pill none">Missing</span></td><td class="st"><span class="pill none">Missing</span></td><td class="note"><b>Platform gap.</b> Only AI-job WS + SSE exist — no multiplayer. This is the biggest "modern platform" gap on both.</td></tr>
+      <tr><td class="feat">Template gallery</td><td class="st"><span class="pill none">Missing</span></td><td class="st"><span class="pill full">Full</span></td><td class="note"><b>Shipped (mobile):</b> a template gallery (finance/sales/ops/customer/data-quality) via <code>/canvas/templates</code>; each is built live against the user's own schema by the agent. Persistent "save as template" still deferred; web has none yet.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="platform">
+  <h2><span class="idx">06</span> What an agentic BI platform should have — checklist</h2>
+  <p class="sec-sub">Measured against the current bar for agentic BI (Power BI Copilot, Tableau Pulse/Agent, ThoughtSpot Spotter, Sigma, Omni). ✓ = you have it, ◐ = partial, ✗ = gap.</p>
+  <div class="tbl-scroll"><table>
+    <thead><tr><th class="feat">Agentic-BI expectation</th><th class="st">Status</th><th class="note">Where you stand</th></tr></thead>
+    <tbody>
+      <tr><td class="feat">Natural-language authoring (build a dashboard from a prompt)</td><td class="st"><span class="pill full">✓</span></td><td class="note">Multi-agent builder on both — genuinely ahead of many incumbents.</td></tr>
+      <tr><td class="feat">Conversational analysis over data (copilot)</td><td class="st"><span class="pill full">✓</span></td><td class="note">SSE chat, scoped to tables + RLS.</td></tr>
+      <tr><td class="feat">Semantic / metrics layer</td><td class="st"><span class="pill full">✓</span></td><td class="note">Schema metadata + measures; measures not yet auto-applied at render.</td></tr>
+      <tr><td class="feat">Proactive insights &amp; anomaly monitoring</td><td class="st"><span class="pill part">◐</span></td><td class="note">Alerts + anomaly exist; auto-insight surfacing is web-only, discovery not on mobile.</td></tr>
+      <tr><td class="feat">Root-cause / "why" agent</td><td class="st"><span class="pill part">◐</span></td><td class="note">Web yes; mobile no.</td></tr>
+      <tr><td class="feat">Agent guardrails &amp; result validation</td><td class="st"><span class="pill part">◐</span></td><td class="note">Web validator/guardrails; mobile trusts writer + one repair.</td></tr>
+      <tr><td class="feat">Reasoning transparency (show the agent's steps)</td><td class="st"><span class="pill full">✓</span></td><td class="note">Reasoning drawer + pipeline stream on web; SSE on mobile.</td></tr>
+      <tr><td class="feat">Governance: RLS, refresh, versioning</td><td class="st"><span class="pill full">✓</span></td><td class="note">Strong on both.</td></tr>
+      <tr><td class="feat">Data lineage &amp; audit trail</td><td class="st"><span class="pill none">✗</span></td><td class="note">Missing on both — needed for enterprise trust.</td></tr>
+      <tr><td class="feat">Real-time collaboration</td><td class="st"><span class="pill none">✗</span></td><td class="note">Missing on both.</td></tr>
+      <tr><td class="feat">Templates &amp; reusable content</td><td class="st"><span class="pill none">✗</span></td><td class="note">Missing on both.</td></tr>
+      <tr><td class="feat">Write-back / agent actions (beyond read-only)</td><td class="st"><span class="pill part">◐</span></td><td class="note">Web has <code>action_agent</code>/skill agents; not surfaced in the canvas.</td></tr>
+      <tr><td class="feat">Scenario / what-if planning</td><td class="st"><span class="pill part">◐</span></td><td class="note">Only KPI sliders; no real driver-based model.</td></tr>
+      <tr><td class="feat">Export to exec formats (PDF ✓ / PPTX ✗)</td><td class="st"><span class="pill part">◐</span></td><td class="note">PDF web-only; PPTX nowhere.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="bugs">
+  <h2><span class="idx">07</span> Bugs &amp; correctness issues</h2>
+  <p class="sec-sub">Concrete defects (not just missing features) found during the audit — these erode trust and should be fixed first.</p>
+
+  <div class="block crit">
+    <h4>Image widget never renders the image <span class="tag scope">mobile</span><span class="effort">~1 hr</span></h4>
+    <p>+Image stores <code>config.image_uri</code>, but <code>ChartRenderer</code> only shows a text hint <code>🖼 {uri}</code>. Users think image widgets are broken.</p>
+    <div class="fix"><b>Fix:</b> render <code>&lt;Image source={{uri}} resizeMode="contain"/&gt;</code> in the image case; add an <code>expo-image-picker</code>/library-picker to set the URI.</div>
+  </div>
+
+  <div class="block crit">
+    <h4>Calculated measures are stored but never applied at render <span class="tag scope">web + mobile</span><span class="effort">~1 day</span></h4>
+    <p>Both platforms let you define/AI-generate measures, but they are a passive catalog — no widget SQL resolves a measure reference. The feature looks complete but does nothing to charts.</p>
+    <div class="fix"><b>Fix:</b> at query-build time, expand <code>{{measure.name}}</code> references into their stored SQL expression (server-side, in the requery/widget path), and expose measures as pickable fields in the chart editor.</div>
+  </div>
+
+  <div class="block p1">
+    <h4>Dead code: annotations &amp; what-if have no UI <span class="tag scope">mobile</span><span class="effort">~0.5 day each</span></h4>
+    <p>Full annotation backend CRUD + client API (<code>listAnnotations</code>/<code>addAnnotation</code>/…) and a working <code>applyWhatIf()</code> function exist but are called by no screen. Ships as unused weight and a false sense of completeness.</p>
+    <div class="fix"><b>Fix:</b> either wire the UI (annotation layer + list modal; a what-if verb in <code>WidgetActionSheet</code>) or remove the dead code. Wiring is the better ROI — the hard part (backend) is done.</div>
+  </div>
+
+  <div class="block p1">
+    <h4>Advanced charts silently fall back without telling the user <span class="tag scope">web</span><span class="effort">~2 hr</span></h4>
+    <p>sankey/sunburst/network/chord/gantt render as a donut or sorted bar. The user asked for a sankey and silently got a pie — a correctness/trust bug, not just a fidelity gap.</p>
+    <div class="fix"><b>Fix:</b> show an explicit "This chart type isn't supported yet — showing data as a table" badge, or implement the real renderer. Never silently substitute a semantically different chart.</div>
+  </div>
+
+  <div class="block p1">
+    <h4>No UI to define a new slicer/filter in the mobile editor <span class="tag scope">mobile</span><span class="effort">~0.5 day</span></h4>
+    <p><code>SlicerBar</code> can only apply filters that already exist in <code>filter_config</code>; there's no in-editor way to create one. <code>setFilterConfig</code> exists in the client but is unsurfaced.</p>
+    <div class="fix"><b>Fix:</b> add a "+ Filter" affordance that picks a column (from schema-context) + slicer type and writes <code>filter_config</code>.</div>
+  </div>
+
+  <div class="block p2">
+    <h4>Drill-down &amp; explain auto-pick the first data point <span class="tag scope">mobile</span><span class="effort">~0.5 day</span></h4>
+    <p>Because there's no interactive point selection, "drill" / "explain" always operate on the first row/column rather than what the user tapped.</p>
+    <div class="fix"><b>Fix:</b> capture the tapped datum from the tooltip event and pass its dimension/value into the drilldown/explain payload.</div>
+  </div>
+
+  <div class="block p2">
+    <h4>Pivot table is a flat table <span class="tag scope">web + mobile</span><span class="effort">~1–2 days</span></h4>
+    <p><code>pivot_table</code> renders every row/column flat with no row/col grouping or subtotals — not a pivot.</p>
+    <div class="fix"><b>Fix:</b> implement a real pivot (group-by rows × columns, aggregate cells, subtotal/total rows). Shared logic can live in the backend so both clients render the same matrix.</div>
+  </div>
+</section>
+
+<section id="roadmap">
+  <h2><span class="idx">08</span> Prioritized remediation plan</h2>
+  <p class="sec-sub">Ordered by <b>value ÷ effort</b>. P0 = correctness/credibility. P1 = close the mobile↔web gap. P2 = reach the agentic-BI frontier. <b style="color:var(--ok)">As of 2026-07-20, every mobile P0/P1 item and the mobile P2-1/P2-4/P2-6 items below are shipped</b> (see the update banner at the top); remaining P2 items (real-time collaboration, PPTX, advanced chart renderers, data lineage) stay deferred.</p>
+
+  <h3>P0 — Correctness &amp; "free" wins (days, not weeks)</h3>
+  <div class="block crit">
+    <h4><span class="tag p0">P0-1</span> Render the image widget + picker <span class="tag scope">mobile</span></h4>
+    <p>Files: <code>src/components/ChartRenderer.tsx</code> (image case), <code>WidgetEditModal.tsx</code> (URI picker).</p>
+  </div>
+  <div class="block crit">
+    <h4><span class="tag p0">P0-2</span> Wire annotations UI over the existing backend <span class="tag scope">mobile</span></h4>
+    <p>Files: new <code>AnnotationsModal.tsx</code> + overlay in <code>CanvasEditorScreen.tsx</code>; API already in <code>src/canvas/api.ts</code>.</p>
+  </div>
+  <div class="block crit">
+    <h4><span class="tag p0">P0-3</span> Actually apply calculated measures at render <span class="tag scope">web + mobile</span></h4>
+    <p>Files: backend widget/requery SQL builder (measure expansion) + <code>tier5.py</code> measures resolve; chart-editor field picker on both clients.</p>
+  </div>
+  <div class="block crit">
+    <h4><span class="tag p0">P0-4</span> Honest "unsupported chart" state instead of silent fallback <span class="tag scope">web</span></h4>
+    <p>Files: <code>frontend/components/charts/ChartRenderer.tsx</code> fallback branches.</p>
+  </div>
+  <div class="block crit">
+    <h4><span class="tag p0">P0-5</span> Per-widget CSV export from cached rows <span class="tag scope">mobile</span></h4>
+    <p>Files: <code>WidgetActionSheet.tsx</code> + a CSV util; reuse the existing <code>Share</code> path.</p>
+  </div>
+
+  <h3>P1 — Close the mobile ↔ web gap</h3>
+  <div class="block p1">
+    <h4><span class="tag p1">P1-1</span> Gesture drag &amp; resize on the 12-col grid <span class="tag scope">mobile</span></h4>
+    <p>The headline mobile gap. Files: <code>CanvasEditorScreen.tsx</code> with <code>react-native-gesture-handler</code> + <code>reanimated</code>; snap to the existing <code>position_x/y/width/height</code> model and persist via <code>updateLayout</code>. Add an in-memory undo/redo stack while here.</p>
+  </div>
+  <div class="block p1">
+    <h4><span class="tag p1">P1-2</span> Cross-filtering <span class="tag scope">mobile</span></h4>
+    <p>Files: tooltip datum handler in <code>ChartRenderer.tsx</code> → transient slicer override → <code>requery</code> siblings in <code>CanvasEditorScreen.tsx</code>. Web logic in <code>VisuallReport.tsx</code> is the reference.</p>
+  </div>
+  <div class="block p1">
+    <h4><span class="tag p1">P1-3</span> Surface auto-insights + insight discovery <span class="tag scope">mobile</span></h4>
+    <p>Files: call existing <code>/ai-summary</code>, <code>/ai-insight</code>, <code>/intelligence-discovery</code> from a new "Insights" / "Suggest widgets" action; render in <code>AnalysisModal</code>.</p>
+  </div>
+  <div class="block p1">
+    <h4><span class="tag p1">P1-4</span> Server export (PDF/HTML) + .vly import <span class="tag scope">mobile</span></h4>
+    <p>Files: <code>src/canvas/api.ts</code> (export trigger + job poll), a share action in the toolbar. Backend <code>export_service</code> already supports html/pdf/png.</p>
+  </div>
+  <div class="block p1">
+    <h4><span class="tag p1">P1-5</span> Filter builder + interactive drill/explain point selection <span class="tag scope">mobile</span></h4>
+    <p>Files: <code>SlicerBar.tsx</code> ("+ Filter"), tapped-datum plumbing into drilldown/explain payloads.</p>
+  </div>
+  <div class="block p1">
+    <h4><span class="tag p1">P1-6</span> Port the guardrail/validator into the mobile build path <span class="tag scope">mobile backend</span></h4>
+    <p>Files: <code>canvas_builder.py</code> writers → run generated SQL through the shared <code>validator_agent</code> before persisting; port <code>root_cause_agent</code> as a "Why did this change?" action.</p>
+  </div>
+
+  <h3>P2 — Reach the agentic-BI frontier (both platforms)</h3>
+  <div class="block p2">
+    <h4><span class="tag p2">P2-1</span> Template gallery + "save as template"</h4>
+    <p>New starter canvases (finance/sales/ops) seeded from the multi-agent builder; a <code>/dashboards/templates</code> route + a gallery on the "New canvas" flow.</p>
+  </div>
+  <div class="block p2">
+    <h4><span class="tag p2">P2-2</span> Real-time collaboration (presence + co-edit)</h4>
+    <p>Biggest platform investment. Add a CRDT/OT layer (yjs) over layout_config with a WebSocket presence channel; the AI-job <code>ws_manager</code> is a starting point for the socket infra.</p>
+  </div>
+  <div class="block p2">
+    <h4><span class="tag p2">P2-3</span> Data lineage &amp; audit trail</h4>
+    <p>Record which tables/columns fed each widget (the schema-scope + generated SQL already expose this) and a per-dashboard access/query log. Surface a "Lineage" tab in settings.</p>
+  </div>
+  <div class="block p2">
+    <h4><span class="tag p2">P2-4</span> True scenario / what-if planning</h4>
+    <p>Driver-based model beyond KPI sliders: pick input measures, apply % / absolute deltas, recompute dependent widgets. Unify the web sliders and the mobile <code>applyWhatIf()</code> into one engine.</p>
+  </div>
+  <div class="block p2">
+    <h4><span class="tag p2">P2-5</span> PPTX export &amp; scheduled exec digests everywhere</h4>
+    <p>Add a pptx generator to <code>export_service</code>; expose snapshot-email scheduling in the mobile canvas settings.</p>
+  </div>
+  <div class="block p2">
+    <h4><span class="tag p2">P2-6</span> Advanced chart renderers + true pivot</h4>
+    <p>Implement sankey/sunburst/network natively (or a shared spec both clients honor); build a real pivot engine server-side.</p>
+  </div>
+</section>
+
+<footer>
+  <p>Audit scope limited to canvas / report / dashboard creation. Every "Full / Partial / Missing" mark was verified against source in both repos (<code>Visually</code> web and <code>VisuallyMobile</code>). Parity figure is a weighted estimate across the feature rows above, not a precise metric. Sharing this document distributes the feature/architecture details it contains.</p>
+</footer>
+
+</div>
+</body>
+</html>

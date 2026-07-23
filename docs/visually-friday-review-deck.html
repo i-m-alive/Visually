@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visually — Friday Product Review</title>
+<style>
+  *,*::before,*::after{margin:0}
+  :root{
+    --bg:#F4F6FA; --panel:#FFFFFF; --panel-2:#FAFBFD;
+    --ink:#0F1620; --muted:#59647A; --faint:#8792A6;
+    --line:#E4E9F1; --line-strong:#D2DAE7;
+    --accent:#0C8F80; --accent-ink:#0A7568; --accent-soft:#DCF2EE;
+    --ai:#5145CD; --ai-soft:#E7E5FB;
+    --grid:rgba(16,86,140,0.045);
+    --shadow:0 1px 2px rgba(16,30,54,.06), 0 12px 34px -18px rgba(16,30,54,.28);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0A0F1A; --panel:#111A29; --panel-2:#0D1522;
+      --ink:#ECF1F8; --muted:#97A4B9; --faint:#697691;
+      --line:#1E2A3F; --line-strong:#293851;
+      --accent:#2FD9C4; --accent-ink:#5AE6D5; --accent-soft:rgba(47,217,196,.12);
+      --ai:#A79BFF; --ai-soft:rgba(129,111,255,.16);
+      --grid:rgba(120,170,220,.05);
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 18px 44px -22px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#F4F6FA; --panel:#FFFFFF; --panel-2:#FAFBFD;
+    --ink:#0F1620; --muted:#59647A; --faint:#8792A6;
+    --line:#E4E9F1; --line-strong:#D2DAE7;
+    --accent:#0C8F80; --accent-ink:#0A7568; --accent-soft:#DCF2EE;
+    --ai:#5145CD; --ai-soft:#E7E5FB; --grid:rgba(16,86,140,0.045);
+    --shadow:0 1px 2px rgba(16,30,54,.06), 0 12px 34px -18px rgba(16,30,54,.28);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0A0F1A; --panel:#111A29; --panel-2:#0D1522;
+    --ink:#ECF1F8; --muted:#97A4B9; --faint:#697691;
+    --line:#1E2A3F; --line-strong:#293851;
+    --accent:#2FD9C4; --accent-ink:#5AE6D5; --accent-soft:rgba(47,217,196,.12);
+    --ai:#A79BFF; --ai-soft:rgba(129,111,255,.16);
+    --grid:rgba(120,170,220,.05);
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 18px 44px -22px rgba(0,0,0,.7);
+  }
+
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(var(--grid) 1.2px, transparent 1.2px);
+    background-size:26px 26px;
+    overflow:hidden;
+  }
+  .mono{font-family:"SF Mono","JetBrains Mono",ui-monospace,"Roboto Mono",monospace}
+
+  /* ---- deck frame ---- */
+  .deck{position:fixed; inset:0; display:flex; flex-direction:column}
+  .stage{flex:1; position:relative; overflow:hidden}
+  .slide{
+    position:absolute; inset:0; padding:min(6.5vh,58px) min(7vw,88px);
+    display:flex; flex-direction:column;
+    opacity:0; transform:translateX(28px) scale(.995);
+    transition:opacity .5s ease, transform .5s cubic-bezier(.2,.7,.2,1);
+    pointer-events:none;
+  }
+  .slide.active{opacity:1; transform:none; pointer-events:auto}
+  .slide.prev{transform:translateX(-28px) scale(.995)}
+
+  /* ---- chrome ---- */
+  .chrome{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px min(7vw,88px); border-bottom:1px solid var(--line);
+    background:linear-gradient(var(--panel-2),transparent);
+  }
+  .brand{display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:-.01em}
+  .brand .dot{width:11px; height:11px; border-radius:3px;
+    background:conic-gradient(from 210deg,var(--accent),var(--ai),var(--accent));
+    box-shadow:0 0 0 3px var(--accent-soft)}
+  .chrome .meta{font-size:12px; color:var(--faint); letter-spacing:.14em; text-transform:uppercase}
+
+  /* ---- shared type ---- */
+  .eyebrow{
+    font-size:clamp(11px,1.15vw,13px); letter-spacing:.24em; text-transform:uppercase;
+    color:var(--accent-ink); font-weight:600; display:flex; align-items:center; gap:12px;
+  }
+  .eyebrow::before{content:""; width:26px; height:2px; background:var(--accent); border-radius:2px}
+  h1{font-size:clamp(40px,8.4vw,104px); line-height:.96; letter-spacing:-.035em;
+    font-weight:800; margin:0; text-wrap:balance}
+  h2{font-size:clamp(28px,4.4vw,52px); line-height:1; letter-spacing:-.03em;
+    font-weight:800; margin:0; text-wrap:balance}
+  .lede{color:var(--muted); font-size:clamp(15px,1.7vw,21px); line-height:1.5; max-width:30ch}
+
+  /* ---- slide 1 ---- */
+  .s1{justify-content:center; gap:26px}
+  .s1 h1 .g{background:linear-gradient(96deg,var(--accent),var(--ai));
+    -webkit-background-clip:text; background-clip:text; color:transparent}
+  .s1 .sub{font-size:clamp(17px,2.3vw,28px); color:var(--muted); max-width:24ch;
+    line-height:1.3; font-weight:500; letter-spacing:-.01em}
+  .chips{display:flex; flex-wrap:wrap; gap:10px; margin-top:6px}
+  .chip{display:flex; align-items:center; gap:9px; padding:9px 15px; border-radius:999px;
+    background:var(--panel); border:1px solid var(--line-strong); box-shadow:var(--shadow);
+    font-size:clamp(12px,1.35vw,15px); font-weight:600}
+  .chip i{width:8px; height:8px; border-radius:50%; background:var(--accent); font-style:normal}
+  .chip.ai i{background:var(--ai)}
+  .s1 .foot{margin-top:14px; color:var(--faint); font-size:13px}
+  .s1 .foot b{color:var(--muted); font-weight:600}
+
+  /* ---- content slides ---- */
+  .head{display:flex; flex-direction:column; gap:14px; margin-bottom:min(4vh,30px)}
+  .cols{display:grid; grid-template-columns:1fr 1fr; gap:min(3vw,34px); flex:1; min-height:0}
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:20px;
+    padding:min(3.3vh,30px) min(2.6vw,32px); box-shadow:var(--shadow);
+    display:flex; flex-direction:column; gap:16px; position:relative; overflow:hidden;
+  }
+  .card::before{content:""; position:absolute; left:0; top:0; bottom:0; width:4px;
+    background:var(--accent)}
+  .card.ai::before{background:var(--ai)}
+  .card .top{display:flex; align-items:baseline; justify-content:space-between; gap:12px}
+  .card .name{font-size:clamp(20px,2.5vw,30px); font-weight:800; letter-spacing:-.025em}
+  .role{font-size:11px; letter-spacing:.14em; text-transform:uppercase; font-weight:700;
+    color:var(--accent-ink); background:var(--accent-soft); padding:5px 10px; border-radius:7px; white-space:nowrap}
+  .card.ai .role{color:var(--ai); background:var(--ai-soft)}
+  .card .lead{font-size:clamp(14px,1.55vw,18px); color:var(--ink); font-weight:600; line-height:1.35; letter-spacing:-.01em; margin:-2px 0 2px}
+  ul{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:11px}
+  li{display:flex; gap:11px; font-size:clamp(13px,1.45vw,16px); color:var(--muted); line-height:1.4}
+  li::before{content:""; flex:none; width:7px; height:7px; margin-top:.5em; border-radius:2px;
+    background:var(--accent); transform:rotate(45deg)}
+  .card.ai li::before{background:var(--ai)}
+  li b{color:var(--ink); font-weight:650}
+  .stat{color:var(--accent-ink); font-weight:800; font-variant-numeric:tabular-nums}
+  .card.ai .stat{color:var(--ai)}
+  .note{margin-top:min(3vh,22px); text-align:center; font-size:13px; color:var(--faint)}
+  .note b{color:var(--muted); font-weight:600}
+
+  /* ---- footer nav ---- */
+  .nav{display:flex; align-items:center; justify-content:space-between;
+    padding:12px min(7vw,88px); border-top:1px solid var(--line); background:linear-gradient(transparent,var(--panel-2))}
+  .dots{display:flex; gap:9px; align-items:center}
+  .dots button{width:9px; height:9px; border-radius:50%; border:none; padding:0; cursor:pointer;
+    background:var(--line-strong); transition:.25s}
+  .dots button.on{width:26px; border-radius:5px; background:var(--accent)}
+  .count{font-size:12px; color:var(--faint); letter-spacing:.1em}
+  .count b{color:var(--ink)}
+  .arrows{display:flex; gap:8px}
+  .arrows button{width:34px; height:34px; border-radius:9px; border:1px solid var(--line-strong);
+    background:var(--panel); color:var(--ink); cursor:pointer; font-size:15px; display:grid; place-items:center; transition:.2s}
+  .arrows button:hover{border-color:var(--accent); color:var(--accent-ink)}
+  .arrows button:disabled{opacity:.35; cursor:default}
+  button:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+
+  @media (max-width:820px){
+    .cols{grid-template-columns:1fr; overflow-y:auto; gap:16px}
+    .slide{padding:26px 22px}
+    body{overflow:auto}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .slide{transition:opacity .01s}
+  }
+</style>
+
+<div class="deck">
+  <div class="chrome">
+    <div class="brand"><span class="dot"></span> Visually</div>
+    <div class="meta mono">Friday Product Review · 2026-07-21</div>
+  </div>
+
+  <div class="stage">
+
+    <!-- SLIDE 1 -->
+    <section class="slide s1" data-i="0">
+      <div class="eyebrow">The platform</div>
+      <h1>Visually<span class="g">.</span></h1>
+      <div class="sub">A BI platform where dashboards build themselves — and answer back.</div>
+      <div class="chips">
+        <span class="chip"><i></i> Canvas &amp; Dashboard</span>
+        <span class="chip"><i></i> Intelligence Page</span>
+        <span class="chip ai"><i></i> Canvas Assistant</span>
+        <span class="chip ai"><i></i> Report Copilot</span>
+      </div>
+      <div class="foot mono">Four components · AI on <b>AWS Bedrock Claude</b> — Sonnet 4.5, Opus 4.5 on demand</div>
+    </section>
+
+    <!-- SLIDE 2 -->
+    <section class="slide" data-i="1">
+      <div class="head">
+        <div class="eyebrow">The surfaces · what people build &amp; see</div>
+        <h2>Report it. Then understand it.</h2>
+      </div>
+      <div class="cols">
+        <div class="card">
+          <div class="top"><div class="name">Canvas &amp; Dashboard</div><div class="role">The builder</div></div>
+          <div class="lead">Power-BI-style drag-and-drop reporting — no code.</div>
+          <ul>
+            <li><span class="stat">14</span>&nbsp;chart &amp; widget types — bar, line, combo, waterfall, funnel, gauge, treemap, heatmap, KPI, table…</li>
+            <li><b>Multi-page reports</b> with slicers &amp; cross-filtering</li>
+            <li>Drill-down, calculated <b>measures</b>, row-level security</li>
+            <li>Live database connection + scheduled refresh</li>
+            <li>Share, publish &amp; embed · <b>.vly</b> / PDF / PNG export</li>
+          </ul>
+        </div>
+        <div class="card">
+          <div class="top"><div class="name">Intelligence Page</div><div class="role">The analyst</div></div>
+          <div class="lead">Executive AI analytics for any report.</div>
+          <ul>
+            <li><span class="stat">18</span>&nbsp;statistical skills run <b>before</b> the model writes — grounded, not hallucinated</li>
+            <li><b>Health score</b>, KPI cards with sparklines &amp; confidence</li>
+            <li>Anomaly detection, forecasts, Pareto &amp; correlations</li>
+            <li>AI narrative with <b>view-source SQL</b> — edit &amp; run</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLIDE 3 -->
+    <section class="slide" data-i="2">
+      <div class="head">
+        <div class="eyebrow">The AI layer · copilots that do the work</div>
+        <h2>Ask in plain English. Get a chart.</h2>
+      </div>
+      <div class="cols">
+        <div class="card ai">
+          <div class="top"><div class="name">Canvas Assistant</div><div class="role">In the builder</div></div>
+          <div class="lead">A conversational data analyst embedded in the canvas.</div>
+          <ul>
+            <li>Plain-English question → <b>SQL on your live database</b></li>
+            <li>Generates chart widgets and <b>drops them onto a page</b></li>
+            <li>Schema-RAG grounding + deterministic time filters</li>
+            <li>Self-healing retries · read-only, whitelisted tables only</li>
+          </ul>
+        </div>
+        <div class="card ai">
+          <div class="top"><div class="name">Report Copilot</div><div class="role">In the report</div></div>
+          <div class="lead">The intelligence page's embedded copilot.</div>
+          <ul>
+            <li>Same NL → SQL + instant charts, <b>scoped to the report's tables</b></li>
+            <li>Smart response modes: answer · explain · look-up · build</li>
+            <li><b>VizSwitcher</b> — flip any chart Bar / Line / Pie / Table</li>
+            <li>One-click export to Excel</li>
+          </ul>
+        </div>
+      </div>
+      <div class="note mono">Every copilot is <b>read-only</b> — whitelisted tables, no DDL/DML, no system catalogs.</div>
+    </section>
+
+  </div>
+
+  <div class="nav">
+    <div class="count mono"><b id="cur">01</b> / 03</div>
+    <div class="dots" id="dots"></div>
+    <div class="arrows">
+      <button id="prev" aria-label="Previous slide">‹</button>
+      <button id="next" aria-label="Next slide">›</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const dotsWrap=document.getElementById('dots');
+  const cur=document.getElementById('cur');
+  const prevB=document.getElementById('prev'), nextB=document.getElementById('next');
+  let i=0;
+  slides.forEach((_,n)=>{
+    const b=document.createElement('button');
+    b.setAttribute('aria-label','Go to slide '+(n+1));
+    b.onclick=()=>go(n); dotsWrap.appendChild(b);
+  });
+  const dots=[...dotsWrap.children];
+  function go(n){
+    i=Math.max(0,Math.min(slides.length-1,n));
+    slides.forEach((s,n2)=>{
+      s.classList.toggle('active',n2===i);
+      s.classList.toggle('prev',n2<i);
+    });
+    dots.forEach((d,n2)=>d.classList.toggle('on',n2===i));
+    cur.textContent=String(i+1).padStart(2,'0');
+    prevB.disabled=i===0; nextB.disabled=i===slides.length-1;
+  }
+  prevB.onclick=()=>go(i-1); nextB.onclick=()=>go(i+1);
+  addEventListener('keydown',e=>{
+    if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' '){e.preventDefault();go(i+1)}
+    if(e.key==='ArrowLeft'||e.key==='PageUp'){e.preventDefault();go(i-1)}
+    if(e.key==='Home')go(0); if(e.key==='End')go(slides.length-1);
+  });
+  go(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visually — System Architecture & Agent Flows</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box; margin:0}
+  :root{
+    --bg:#EAEEF5; --panel:#FFFFFF; --panel-2:#F5F8FC; --ink:#0E1420; --muted:#56617A; --faint:#8592A8;
+    --line:#DCE3EE; --line-2:#C7D2E2;
+    --teal:#0B8E7F; --teal-bg:#DBF1EE; --indigo:#4F46CF; --indigo-bg:#E7E5FB;
+    --amber:#B26A00; --amber-bg:#FBEBD2; --red:#C33B2B; --red-bg:#FBE3DE;
+    --green:#1C8A57; --green-bg:#DAF2E6; --slate:#4B5A73; --slate-bg:#E5EAF2;
+    --shadow:0 1px 2px rgba(16,30,54,.05),0 10px 30px -18px rgba(16,30,54,.30);
+    --mono:"SF Mono","JetBrains Mono",ui-monospace,"Roboto Mono",Menlo,monospace;
+    --sans:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#080D16; --panel:#101A29; --panel-2:#0C1521; --ink:#EAF0F8; --muted:#93A1B7; --faint:#61708A;
+      --line:#1D2A3E; --line-2:#2A3B54;
+      --teal:#33DBC6; --teal-bg:rgba(51,219,198,.12); --indigo:#A99CFF; --indigo-bg:rgba(120,105,255,.16);
+      --amber:#F2B25A; --amber-bg:rgba(242,178,90,.14); --red:#FF7C6C; --red-bg:rgba(255,90,74,.14);
+      --green:#4FDDA0; --green-bg:rgba(60,210,150,.14); --slate:#93A6C2; --slate-bg:rgba(120,150,190,.13);
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 16px 40px -22px rgba(0,0,0,.75);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#EAEEF5; --panel:#FFFFFF; --panel-2:#F5F8FC; --ink:#0E1420; --muted:#56617A; --faint:#8592A8;
+    --line:#DCE3EE; --line-2:#C7D2E2;
+    --teal:#0B8E7F; --teal-bg:#DBF1EE; --indigo:#4F46CF; --indigo-bg:#E7E5FB;
+    --amber:#B26A00; --amber-bg:#FBEBD2; --red:#C33B2B; --red-bg:#FBE3DE;
+    --green:#1C8A57; --green-bg:#DAF2E6; --slate:#4B5A73; --slate-bg:#E5EAF2;
+    --shadow:0 1px 2px rgba(16,30,54,.05),0 10px 30px -18px rgba(16,30,54,.30);
+  }
+  :root[data-theme="dark"]{
+    --bg:#080D16; --panel:#101A29; --panel-2:#0C1521; --ink:#EAF0F8; --muted:#93A1B7; --faint:#61708A;
+    --line:#1D2A3E; --line-2:#2A3B54;
+    --teal:#33DBC6; --teal-bg:rgba(51,219,198,.12); --indigo:#A99CFF; --indigo-bg:rgba(120,105,255,.16);
+    --amber:#F2B25A; --amber-bg:rgba(242,178,90,.14); --red:#FF7C6C; --red-bg:rgba(255,90,74,.14);
+    --green:#4FDDA0; --green-bg:rgba(60,210,150,.14); --slate:#93A6C2; --slate-bg:rgba(120,150,190,.13);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 16px 40px -22px rgba(0,0,0,.75);
+  }
+
+  body{background:var(--bg); color:var(--ink); font-family:var(--sans); line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(rgba(90,130,180,.06) 1px,transparent 1px); background-size:24px 24px;}
+  .mono{font-family:var(--mono)}
+
+  /* ---------- top nav ---------- */
+  nav{position:sticky; top:0; z-index:50; background:color-mix(in srgb,var(--panel) 88%,transparent);
+    backdrop-filter:blur(10px); border-bottom:1px solid var(--line)}
+  .nav-in{max-width:1180px; margin:0 auto; padding:11px 24px; display:flex; align-items:center; gap:18px; flex-wrap:wrap}
+  .logo{display:flex; align-items:center; gap:9px; font-weight:800; letter-spacing:-.02em; margin-right:6px}
+  .logo .dot{width:12px; height:12px; border-radius:3px;
+    background:conic-gradient(from 210deg,var(--teal),var(--indigo),var(--teal)); box-shadow:0 0 0 3px var(--teal-bg)}
+  nav a{color:var(--muted); text-decoration:none; font-size:13px; font-weight:600; padding:5px 2px; white-space:nowrap; border-bottom:2px solid transparent}
+  nav a:hover{color:var(--ink)} nav a.on{color:var(--ink); border-color:var(--teal)}
+  .spacer{flex:1}
+  .ttoggle{border:1px solid var(--line-2); background:var(--panel); color:var(--ink); border-radius:8px;
+    width:34px; height:30px; cursor:pointer; font-size:14px}
+  .ttoggle:hover{border-color:var(--teal)}
+
+  main{max-width:1180px; margin:0 auto; padding:0 24px 90px}
+
+  /* ---------- hero ---------- */
+  header.hero{padding:56px 0 30px}
+  .kicker{font-family:var(--mono); font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--teal); font-weight:700}
+  h1{font-size:clamp(30px,5vw,50px); line-height:1.02; letter-spacing:-.03em; font-weight:800; margin:12px 0 14px; text-wrap:balance}
+  .sub{color:var(--muted); font-size:clamp(15px,1.8vw,19px); max-width:70ch}
+  .scope{margin-top:18px; display:flex; flex-wrap:wrap; gap:8px}
+  .scope .in,.scope .out{font-family:var(--mono); font-size:11.5px; font-weight:600; padding:5px 11px; border-radius:999px; border:1px solid var(--line-2)}
+  .scope .in{color:var(--green); background:var(--green-bg); border-color:transparent}
+  .scope .out{color:var(--faint); background:transparent; text-decoration:line-through}
+
+  /* ---------- legend ---------- */
+  .legend{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:22px 0 8px}
+  @media(max-width:760px){.legend{grid-template-columns:1fr}}
+  .legend .box{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:15px 17px; box-shadow:var(--shadow)}
+  .legend h4{font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); margin-bottom:11px; font-weight:700}
+  .legend .row{display:flex; flex-wrap:wrap; gap:8px}
+  .tag{font-family:var(--mono); font-size:11.5px; font-weight:600; padding:4px 10px; border-radius:7px; display:inline-flex; align-items:center; gap:6px}
+  .tag::before{content:""; width:8px; height:8px; border-radius:2px; background:currentColor}
+  .t-ui{color:var(--teal); background:var(--teal-bg)} .t-agent{color:var(--indigo); background:var(--indigo-bg)}
+  .t-llm{color:var(--amber); background:var(--amber-bg)} .t-store{color:var(--slate); background:var(--slate-bg)}
+  .t-guard{color:var(--red); background:var(--red-bg)} .t-ok{color:var(--green); background:var(--green-bg)}
+
+  /* ---------- section ---------- */
+  section{padding:40px 0 8px; scroll-margin-top:70px}
+  .s-head{display:flex; align-items:baseline; gap:14px; margin-bottom:6px; border-top:1px solid var(--line); padding-top:32px}
+  .s-num{font-family:var(--mono); font-size:13px; color:var(--teal); font-weight:700}
+  h2{font-size:clamp(22px,3vw,32px); letter-spacing:-.02em; font-weight:800}
+  .s-lede{color:var(--muted); font-size:15.5px; max-width:78ch; margin:8px 0 26px}
+
+  /* ---------- generic node ---------- */
+  .node{background:var(--panel); border:1px solid var(--line); border-left-width:4px; border-radius:11px;
+    padding:11px 14px; box-shadow:var(--shadow); position:relative}
+  .node .nt{font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; opacity:.85}
+  .node .nn{font-weight:700; font-size:14px; letter-spacing:-.01em; margin-top:2px}
+  .node .nd{font-size:12.5px; color:var(--muted); margin-top:3px; line-height:1.45}
+  .node code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+  .n-ui{border-left-color:var(--teal)} .n-ui .nt{color:var(--teal)}
+  .n-agent{border-left-color:var(--indigo)} .n-agent .nt{color:var(--indigo)}
+  .n-llm{border-left-color:var(--amber)} .n-llm .nt{color:var(--amber)}
+  .n-store{border-left-color:var(--slate)} .n-store .nt{color:var(--slate)}
+  .n-guard{border-left-color:var(--red)} .n-guard .nt{color:var(--red)}
+  .n-ok{border-left-color:var(--green)} .n-ok .nt{color:var(--green)}
+
+  /* ---------- architecture bands ---------- */
+  .arch{display:flex; flex-direction:column; gap:0}
+  .band{display:grid; grid-template-columns:150px 1fr; gap:16px; align-items:center;
+    border:1px dashed var(--line-2); border-radius:16px; padding:16px; background:color-mix(in srgb,var(--panel) 45%,transparent)}
+  .band .blabel{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--faint); font-weight:700; line-height:1.4}
+  .band .bnodes{display:flex; flex-wrap:wrap; gap:11px}
+  .band .bnodes .node{flex:1 1 200px; min-width:180px}
+  .vconn{height:26px; width:2px; background:linear-gradient(var(--line-2),var(--line-2)); margin:0 auto; position:relative}
+  .vconn::after{content:"▼"; position:absolute; bottom:-4px; left:50%; transform:translateX(-50%); color:var(--line-2); font-size:11px}
+  @media(max-width:720px){.band{grid-template-columns:1fr; gap:12px}.band .bnodes .node{flex:1 1 100%}}
+
+  /* ---------- vertical flow ---------- */
+  .flow{display:flex; flex-direction:column; gap:0; counter-reset:step}
+  .fstep{display:grid; grid-template-columns:38px 1fr; gap:14px; align-items:start}
+  .fstep .marker{display:flex; flex-direction:column; align-items:center; align-self:stretch}
+  .fstep .num{width:30px; height:30px; flex:none; border-radius:50%; background:var(--indigo); color:#fff;
+    display:grid; place-items:center; font-family:var(--mono); font-size:13px; font-weight:700; box-shadow:0 0 0 4px var(--indigo-bg)}
+  .fstep .line{flex:1; width:2px; background:var(--line-2); margin:4px 0}
+  .fstep:last-child .line{display:none}
+  .fstep .body{padding-bottom:16px; min-width:0}
+  .fstep .body .node{width:100%}
+  .retry{border-left-color:var(--red)!important}
+  .badge{display:inline-block; font-family:var(--mono); font-size:10px; font-weight:700; padding:2px 8px; border-radius:6px; margin-left:8px;
+    color:var(--red); background:var(--red-bg); vertical-align:middle}
+  .badge.llm{color:var(--amber); background:var(--amber-bg)}
+  .badge.model{color:var(--slate); background:var(--slate-bg)}
+
+  /* ---------- pipeline (horizontal-ish stages) ---------- */
+  .stages{display:flex; flex-direction:column; gap:0}
+  .stage{border:1px solid var(--line); border-radius:14px; background:var(--panel); box-shadow:var(--shadow); overflow:hidden}
+  .stage .sbar{display:flex; align-items:center; gap:10px; padding:11px 15px; background:var(--panel-2); border-bottom:1px solid var(--line)}
+  .stage .sbar .sidx{font-family:var(--mono); font-weight:700; color:var(--teal); font-size:13px}
+  .stage .sbar .stt{font-weight:800; font-size:14.5px; letter-spacing:-.01em}
+  .stage .sbar .model{margin-left:auto}
+  .stage .sbody{padding:14px 15px; display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  @media(max-width:720px){.stage .sbody{grid-template-columns:1fr}}
+  .mini{font-size:13px; color:var(--muted)} .mini b{color:var(--ink); font-weight:650}
+  .mini code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+  .parrow{height:24px; width:2px; background:var(--line-2); margin:0 auto; position:relative}
+  .parrow::after{content:"▼"; position:absolute; bottom:-4px; left:50%; transform:translateX(-50%); color:var(--line-2); font-size:11px}
+
+  /* ---------- three store tiers ---------- */
+  .tiers{display:grid; grid-template-columns:repeat(3,1fr); gap:12px}
+  @media(max-width:720px){.tiers{grid-template-columns:1fr}}
+
+  /* ---------- skills grid ---------- */
+  .skills{display:grid; grid-template-columns:repeat(auto-fill,minmax(215px,1fr)); gap:10px}
+  .skill{background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:11px 13px; box-shadow:var(--shadow); position:relative}
+  .skill .sk-n{font-family:var(--mono); font-size:10px; font-weight:700; color:var(--teal); background:var(--teal-bg); border-radius:6px; padding:1px 6px; position:absolute; top:10px; right:10px}
+  .skill .sk-t{font-weight:700; font-size:13px; letter-spacing:-.01em; padding-right:28px}
+  .skill .sk-d{font-size:12px; color:var(--muted); margin-top:3px; line-height:1.4}
+  .skill .sk-d code{font-family:var(--mono); font-size:11px; color:var(--ink)}
+
+  /* ---------- compare grid ---------- */
+  .cmp{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  @media(max-width:760px){.cmp{grid-template-columns:1fr}}
+  .cmp .col{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:var(--shadow)}
+  .cmp .col h4{font-size:15px; font-weight:800; margin-bottom:4px; letter-spacing:-.01em}
+  .cmp .col .rolechip{font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; padding:3px 8px; border-radius:6px}
+  .diff{list-style:none; margin-top:12px; display:flex; flex-direction:column; gap:10px}
+  .diff li{display:flex; gap:9px; font-size:13px; color:var(--muted); line-height:1.45}
+  .diff li b{color:var(--ink); font-weight:650}
+  .diff li::before{content:"▸"; color:var(--indigo); font-weight:700; flex:none}
+  .diff li code{font-family:var(--mono); font-size:11px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+
+  .callout{border:1px solid var(--line); border-left:4px solid var(--amber); background:var(--amber-bg);
+    border-radius:11px; padding:13px 15px; margin:16px 0; font-size:13.5px; color:var(--ink)}
+  .callout b{font-weight:750}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:12px}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+
+  footer{border-top:1px solid var(--line); margin-top:50px; padding-top:22px; color:var(--faint); font-size:12.5px}
+  footer code{font-family:var(--mono)}
+  ::selection{background:var(--teal-bg)}
+  a.fnref{color:var(--teal); text-decoration:none}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-in">
+    <span class="logo"><span class="dot"></span>Visually</span>
+    <a href="#arch">Architecture</a>
+    <a href="#meta">Metadata Pipeline</a>
+    <a href="#assistant">Canvas Assistant</a>
+    <a href="#intel">Intelligence Agent</a>
+    <a href="#copilot">Report Copilot</a>
+    <a href="#recruiting">Recruiting Agents</a>
+    <span class="spacer"></span>
+    <button class="ttoggle" id="tt" aria-label="Toggle theme" title="Toggle light / dark">◐</button>
+  </div>
+</nav>
+
+<main>
+  <header class="hero">
+    <div class="kicker">System Architecture · Agent &amp; Data Flow</div>
+    <h1>How Visually turns a live database into a self-service BI report</h1>
+    <p class="sub">A technical walkthrough of the in-scope components — the <b>Canvas</b>, the <b>Intelligence Page</b>, the <b>Canvas Assistant</b>, the <b>Report Copilot</b>, and the <b>Recruiting agents</b> — plus the metadata pipeline that grounds every AI answer. All AI runs on AWS Bedrock Claude, grounded by a schema-metadata layer so answers reflect real data, not guesses.</p>
+    <div class="scope">
+      <span class="in">✓ Canvas &amp; Dashboard</span>
+      <span class="in">✓ Intelligence Page</span>
+      <span class="in">✓ Canvas Assistant</span>
+      <span class="in">✓ Report Copilot</span>
+      <span class="in">✓ Metadata / Schema pipeline</span>
+      <span class="in">✓ Recruiting agents</span>
+      <span class="out">finance agents</span>
+      <span class="out">rule-based / brainwave</span>
+    </div>
+
+    <div class="legend">
+      <div class="box">
+        <h4>Node types</h4>
+        <div class="row">
+          <span class="tag t-ui">UI / Surface</span>
+          <span class="tag t-agent">Agent / Service</span>
+          <span class="tag t-llm">LLM call</span>
+          <span class="tag t-store">Data store / cache</span>
+          <span class="tag t-guard">Guardrail / self-heal</span>
+        </div>
+      </div>
+      <div class="box">
+        <h4>Models (AWS Bedrock)</h4>
+        <div class="row">
+          <span class="tag t-llm">Claude Sonnet 4.5 · routing, SQL, critic</span>
+          <span class="tag t-llm">Claude Opus 4.5 · report writing</span>
+          <span class="tag t-llm">Claude Haiku 4.5 · light tasks</span>
+          <span class="tag t-store">Titan Embed v2 · 256-dim vectors</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===================== 1. ARCHITECTURE ===================== -->
+  <section id="arch">
+    <div class="s-head"><span class="s-num">01</span><h2>System architecture</h2></div>
+    <p class="s-lede">Six layers, top to bottom: the user opens a <b>surface</b>, which calls a <b>router</b>, which drives an <b>agent</b>. Every agent grounds itself against the <b>metadata &amp; retrieval</b> layer, calls <b>Bedrock</b>, and reads/writes the <b>data &amp; cache</b> layer. Everything in the finance / recruitment / query-agent / rule-based tracks is intentionally left out.</p>
+
+    <div class="arch">
+      <div class="band">
+        <div class="blabel">1 · Surfaces<br>(what the user sees)</div>
+        <div class="bnodes">
+          <div class="node n-ui"><div class="nt">UI</div><div class="nn">Canvas / Dashboard</div><div class="nd">Drag-and-drop report builder · 14 widget types, slicers, drill-down, RLS, measures. <code>canvas/[canvasId]/page.tsx</code></div></div>
+          <div class="node n-ui"><div class="nt">UI</div><div class="nn">Intelligence Page</div><div class="nd">Executive AI analytics view over one report. <code>intelligence/[canvasId]/page.tsx</code></div></div>
+          <div class="node n-ui"><div class="nt">UI · chat</div><div class="nn">Canvas Assistant panel</div><div class="nd"><code>CanvasChatPanel.tsx</code></div></div>
+          <div class="node n-ui"><div class="nt">UI · chat</div><div class="nn">Report Copilot panel</div><div class="nd">VizSwitcher + XLSX export. <code>IntelligenceCopilotPanel.tsx</code></div></div>
+        </div>
+      </div>
+      <div class="vconn"></div>
+
+      <div class="band">
+        <div class="blabel">2 · API routers<br>(SSE endpoints)</div>
+        <div class="bnodes">
+          <div class="node n-agent"><div class="nt">route</div><div class="nn">/agent/chat/stream</div><div class="nd"><code>routers/chat.py</code></div></div>
+          <div class="node n-agent"><div class="nt">route</div><div class="nn">/intelligence/chat/stream</div><div class="nd"><code>routers/intelligence_chat.py</code></div></div>
+          <div class="node n-agent"><div class="nt">route</div><div class="nn">/intelligence/orchestrate · /analyze</div><div class="nd"><code>routers/intelligence.py</code></div></div>
+          <div class="node n-agent"><div class="nt">route</div><div class="nn">/projects/{id}/schema/crawl</div><div class="nd"><code>routers/projects.py</code></div></div>
+        </div>
+      </div>
+      <div class="vconn"></div>
+
+      <div class="band">
+        <div class="blabel">3 · Agents<br>(the brains)</div>
+        <div class="bnodes">
+          <div class="node n-agent"><div class="nt">agent</div><div class="nn">ChatAgent</div><div class="nd">Canvas Assistant · NL→SQL + widget build. <code>agents/chat_agent.py</code></div></div>
+          <div class="node n-agent"><div class="nt">agent</div><div class="nn">IntelligenceChatAgent</div><div class="nd">Report Copilot · fork in REPORT MODE. <code>agents/intelligence_chat_agent.py</code></div></div>
+          <div class="node n-agent"><div class="nt">agent · multi</div><div class="nn">Intelligence orchestrator</div><div class="nd">Planner → Writers → Critic → Reducer. <code>routers/intelligence_orchestrator.py</code></div></div>
+          <div class="node n-agent"><div class="nt">agent · browser</div><div class="nn">Intelligence skills engine</div><div class="nd">18 statistical skills (pure TS). <code>lib/intelligenceAgent.ts</code></div></div>
+          <div class="node n-agent"><div class="nt">agent · skills</div><div class="nn">Recruiting skill agents</div><div class="nd">Domain-gated personas: Match · Briefing · Audit · Prospect (+ Action). Routed by the orchestrator's intent classifier. <code>agents/skill_agents/</code></div></div>
+        </div>
+      </div>
+      <div class="vconn"></div>
+
+      <div class="band">
+        <div class="blabel">4 · Metadata &amp;<br>retrieval (grounding)</div>
+        <div class="bnodes">
+          <div class="node n-agent"><div class="nt">build</div><div class="nn">Schema crawler</div><div class="nd">Reads tables/columns/FKs/stats + samples. <code>schema_crawler/</code></div></div>
+          <div class="node n-agent"><div class="nt">enrich · LLM</div><div class="nn">Metadata extractor</div><div class="nd">Business names, semantics, FK confirm. <code>metadata_extractor.py</code></div></div>
+          <div class="node n-agent"><div class="nt">retrieve</div><div class="nn">graph_rag_retriever</div><div class="nd">6-signal ensemble + FK hop expansion + RRF.</div></div>
+          <div class="node n-agent"><div class="nt">retrieve</div><div class="nn">nl_schema_router</div><div class="nd">FK-BFS minimal JOIN path for NL2SQL.</div></div>
+        </div>
+      </div>
+      <div class="vconn"></div>
+
+      <div class="band">
+        <div class="blabel">5 · Bedrock<br>(model transport)</div>
+        <div class="bnodes">
+          <div class="node n-llm"><div class="nt">LLM</div><div class="nn">bedrock_client.py</div><div class="nd">Streaming + non-streaming invoke, ephemeral prompt caching. Sonnet 4.5 · Opus 4.5 · Haiku 4.5 · Titan Embed v2.</div></div>
+          <div class="node n-agent"><div class="nt">service</div><div class="nn">query_executor :8002</div><div class="nd">Runs generated SQL against the live DB (read-only).</div></div>
+          <div class="node n-agent"><div class="nt">service</div><div class="nn">render service :3001</div><div class="nd">Renders chart images for narration.</div></div>
+        </div>
+      </div>
+      <div class="vconn"></div>
+
+      <div class="band">
+        <div class="blabel">6 · Data &amp; cache<br>(state)</div>
+        <div class="bnodes">
+          <div class="node n-store"><div class="nt">postgres</div><div class="nn">App DB</div><div class="nd"><code>schema_snapshots</code> · <code>schema_table_metadata</code> · <code>schema_column_metadata</code></div></div>
+          <div class="node n-store"><div class="nt">redis</div><div class="nn">Caches &amp; history</div><div class="nd"><code>schema_cache:*</code> (72h) · <code>chat:history:*</code> · <code>intel_chat:history:*</code> (4h)</div></div>
+          <div class="node n-store"><div class="nt">filesystem</div><div class="nn">Cold cache</div><div class="nd"><code>.schema_cache/*.json</code> fallback</div></div>
+          <div class="node n-store"><div class="nt">external</div><div class="nn">User's live database</div><div class="nd">Postgres · MySQL · Redshift · Snowflake (read-only)</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 2. METADATA PIPELINE ===================== -->
+  <section id="meta">
+    <div class="s-head"><span class="s-num">02</span><h2>Metadata pipeline — how the schema is created &amp; used</h2></div>
+    <p class="s-lede">This is the layer that makes the AI trustworthy. Before any question is answered, Visually crawls the database, uses Claude to describe every table and column in business terms, confirms relationships against real data, and caches a rich <b>EnrichedSchema</b>. At query time a zero-LLM retriever picks exactly the right tables to hand the SQL model.</p>
+
+    <div class="callout"><b>Why it matters:</b> the SQL model never sees the raw database blindly. It only receives the handful of tables the retriever proves are relevant — each already annotated with a business name, semantic column types, confirmed foreign keys, and example values. That is what turns "guessing SQL" into "grounded SQL."</div>
+
+    <div class="stages">
+
+      <div class="stage">
+        <div class="sbar"><span class="sidx">A</span><span class="stt">Crawl — read the raw schema</span><span class="tag t-agent model">schema_crawler · asyncpg</span></div>
+        <div class="sbody">
+          <div class="mini"><b>Trigger:</b> <code>POST /crawl</code> → <code>_run_crawl()</code>. Fired explicitly, on staleness at query time, or on <code>.vly</code> import. No auto-crawl on connect.</div>
+          <div class="mini"><b>Reads:</b> tables &amp; views, columns/types/nullability, primary keys, <b>foreign keys</b>, per-column stats (top-50 values, min/max/avg), and up to <b>25 sample rows</b> per table.</div>
+          <div class="mini"><b>Safety:</b> PII columns (email, phone, ssn, card…) masked to <code>[REDACTED]</code> before anything leaves the DB.</div>
+          <div class="mini"><b>Produces:</b> a versioned <code>schema_doc</code> with importance-ranked tables + placeholder <b>heuristic descriptions</b> (zero-cost, no LLM) → persisted as a <code>SchemaSnapshot</code> row (Postgres JSONB). Diffs vs prior version raise change alerts.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+
+      <div class="stage">
+        <div class="sbar"><span class="sidx">B</span><span class="stt">Enrich — describe it with Claude</span><span class="tag t-llm model">Claude Sonnet 4.5</span></div>
+        <div class="sbody">
+          <div class="mini"><b>Phase A — LLM analysis:</b> <code>metadata_extractor._call_llm_batch()</code> sends columns + sample rows (3 tables/call, 5 concurrent). Returns <b>business name, purpose, grain, fact-vs-dimension</b>, and per-column <b>semantic type</b> (pk / fk / metric / dimension / date / flag…). Static instructions use <b>ephemeral prompt caching</b> — billed once per window, not per batch.</div>
+          <div class="mini"><b>Phase B — FK confirmation:</b> reconnects to the DB and measures value overlap; a foreign key is confirmed only when ≥ <b>60%</b> of values match. Hallucinated FKs are downgraded. <code>_confirm_fk()</code></div>
+          <div class="mini"><b>Phase C — filter values:</b> for filter-eligible columns, pulls <code>SELECT DISTINCT … LIMIT 200</code> so slicers/filters know the real options.</div>
+          <div class="mini"><b>Heuristic vs LLM:</b> the crawler's heuristic text ("Table with columns: …") is a placeholder; these LLM descriptions <b>override</b> it. Output → <code>schema_table_metadata</code> + <code>schema_column_metadata</code> (Postgres), then the cache is invalidated.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+
+      <div class="stage">
+        <div class="sbar"><span class="sidx">C</span><span class="stt">Cache — build the EnrichedSchema</span><span class="tag t-store model">Titan Embed v2 · 256-dim</span></div>
+        <div class="sbody">
+          <div class="mini"><b>Cold build</b> <code>schema_cache._build()</code> merges snapshot + LLM metadata + <b>SQL-confirmed FKs</b> into one <code>EnrichedSchema</code>: a bidirectional <b>relationship graph</b>, a TF-IDF index, a concept index, entity-column maps, and <b>table-level embeddings</b> (Titan, 256-dim, one vector per table).</div>
+          <div class="mini"><b>Three cache tiers:</b> L1 in-process dict → L2 <b>Redis</b> <code>schema_cache:{conn}:{hash}</code> (72h TTL) → L3 <b>filesystem</b> JSON. A schema-hash of column names+types means any structural change <b>self-invalidates</b> the cache.</div>
+        </div>
+        <div class="sbody" style="padding-top:0">
+          <div class="tiers" style="grid-column:1/-1">
+            <div class="node n-store"><div class="nt">L1</div><div class="nn">In-process</div><div class="nd">dict, process lifetime — fastest</div></div>
+            <div class="node n-store"><div class="nt">L2 · Redis</div><div class="nn">72h TTL</div><div class="nd">shared across processes</div></div>
+            <div class="node n-store"><div class="nt">L3 · Filesystem</div><div class="nn">no TTL</div><div class="nd">cold-start fallback</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+
+      <div class="stage">
+        <div class="sbar"><span class="sidx">D</span><span class="stt">Retrieve — pick the right tables (zero LLM, &lt;5 ms)</span><span class="tag t-agent model">graph_rag_retriever · nl_schema_router</span></div>
+        <div class="sbody">
+          <div class="mini"><b>6-signal ensemble</b> scores every table for the question: ① TF-IDF cosine · ② concept-index term match · ③ table-name match · ④ entity→sample-value match · ⑤ <b>FK graph expansion</b> · ⑥ <b>embedding cosine</b> (Titan).</div>
+          <div class="mini"><b>FK hop expansion:</b> tables that don't match the words but are <b>join-reachable</b> from a matching fact table are pulled in — <b>1 hop = +0.30</b>, <b>2 hops = +0.20</b> — so the model always gets the dimension tables it needs to JOIN.</div>
+          <div class="mini"><b>Fusion:</b> signals are combined by <b>Reciprocal Rank Fusion</b> into a consensus table order + agreement score. <code>nl_schema_router</code> additionally runs FK-BFS for the minimal JOIN path.</div>
+          <div class="mini"><b>Tie-break (only on disagreement):</b> one small <b>Sonnet</b> "arbiter" call reorders the shortlist. <code>retrieval_arbiter.arbitrate()</code> — the sole LLM at retrieval time.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+
+      <div class="stage">
+        <div class="sbar"><span class="sidx">E</span><span class="stt">Use — hand grounded tables to SQL generation</span><span class="tag t-ok model">consumed by every agent</span></div>
+        <div class="sbody">
+          <div class="mini">The shortlisted tables — with business names, semantic column types, confirmed joins and example values — are injected into the prompt of the <b>Canvas Assistant</b>, the <b>Report Copilot</b>, and the <b>Intelligence agent</b>. From here the flows in §3–§5 take over.</div>
+          <div class="mini"><b>Cadence:</b> enriched schema is reused for <b>72h</b> and rebuilt only on structural change or after a fresh crawl. Embeddings / indexes are computed once per cold build.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 3. CANVAS ASSISTANT ===================== -->
+  <section id="assistant">
+    <div class="s-head"><span class="s-num">03</span><h2>Canvas Assistant — agent flow</h2></div>
+    <p class="s-lede">The conversational analyst embedded in the builder. A user asks in plain English; the agent grounds itself, writes SQL, runs it, and streams back a chart it can drop onto a page. Three <span style="color:var(--red);font-weight:700">self-heal loops</span> catch the common failure modes so the user rarely sees an error. Model: <b>Claude Sonnet 4.5</b> (Opus on override), streamed over SSE. The "tools" are a <code>sql_execute</code> / <code>dashboard_action</code> fenced-code protocol parsed server-side.</p>
+
+    <div class="flow">
+      <div class="fstep"><div class="marker"><div class="num">1</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">input</div><div class="nn">User message → <code>chat_stream()</code></div><div class="nd">Collect context: load Redis history (<code>chat:history:*</code>) + memory, resolve <code>EnrichedSchema</code>, read current canvas widgets &amp; pages, extract priority tables already on the canvas.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">2</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">ground</div><div class="nn">Retrieval + routing</div><div class="nd"><code>nl_schema_router.route_query()</code> and <code>graph_rag_retriever.retrieve()</code> select the relevant tables/joins for this question (see §2-D).</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">3</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">prompt</div><div class="nn">Build system blocks — <code>prepare()</code></div><div class="nd">Cached instructions + scoped schema + routing hints + live canvas state. Scope picks selected-tables (+FK hops), graph-RAG, or full schema. Ambiguous follow-ups force full schema.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">4</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">inject</div><div class="nn">Deterministic time filter</div><div class="nd"><code>_extract_time_filter_hint()</code> parses "last 3 months / YTD / last quarter", pre-computes ISO start/end dates, and prepends a <b>⚠️ MANDATORY TIME FILTER</b> block — so date ranges are never left to the model.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">5</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">LLM</div><div class="nn">Stream generation <span class="badge model">Sonnet 4.5 · temp 0.3</span></div><div class="nd"><code>bedrock_invoke_stream()</code> streams prose to the user up to the first code fence; the <code>sql_execute</code> block is withheld and run server-side. <code>parse_raw()</code> extracts SQL + dashboard action.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">6</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard retry"><div class="nt">self-heal ①</div><div class="nn">No SQL produced? <span class="badge">retry</span></div><div class="nd">If the request needed data but the model only narrated, <code>retry_for_sql()</code> re-prompts in strict "EXECUTE ONLY" mode (temp 0.0).</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">7</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">guardrails</div><div class="nn">Validate before running</div><div class="nd"><code>apply_fulldb_guardrails()</code> (read-only, scope, row-limit) + <code>verify_all_column_refs()</code> / <code>fuzzy_fix_column_names()</code> fix bad column names against the real schema.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">8</div><div class="line"></div></div><div class="body">
+        <div class="node n-store"><div class="nt">execute</div><div class="nn">Run SQL → <code>query_executor</code></div><div class="nd"><code>_execute_sql()</code> POSTs to the executor microservice (read-only, 130s budget) against the live DB.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">9</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard retry"><div class="nt">self-heal ② &amp; ③</div><div class="nn">Exec error / empty / wrong dimension? <span class="badge">retry</span></div><div class="nd"><code>_self_correct_sql()</code> looks up real columns and rewrites on an execution error or an empty/insane result. <code>check_dimension_match()</code> → <code>retry_with_feedback()</code> rewrites when the grouping dimension is wrong (temp 0.0).</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">10</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">build</div><div class="nn">Chart + grounded narration</div><div class="nd">Builds <code>inline_chart</code>, streams SSE <code>{type:chart}</code>, then <code>result_narrator.narrate()</code> + <code>verify_narrative_grounding()</code> streams a data-true explanation and an optional <code>dashboard_action</code> to add it to a page.</div></div>
+      </div></div>
+
+      <div class="fstep"><div class="marker"><div class="num">11</div><div class="line"></div></div><div class="body">
+        <div class="node n-store"><div class="nt">persist</div><div class="nn">Save history &amp; finish</div><div class="nd"><code>distill_memory()</code> + <code>save_history()</code> to Redis (4h TTL), then SSE <code>{type:done}</code>.</div></div>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ===================== 4. INTELLIGENCE AGENT ===================== -->
+  <section id="intel">
+    <div class="s-head"><span class="s-num">04</span><h2>Intelligence agent — 18 skills, then a writing team</h2></div>
+    <p class="s-lede">This is what makes the Intelligence Page trustworthy. <b>18 statistical skills run in the browser first</b> (pure TypeScript, no LLM) to compute hard facts from the report's data. Only then does a backend <b>multi-agent writing team</b> turn those facts into an executive narrative — so the prose is grounded in real numbers, not invented.</p>
+
+    <div class="grid2" style="margin-bottom:22px">
+      <div class="node n-ui" style="border-left-color:var(--teal)"><div class="nt">step 1 · browser</div><div class="nn">Pre-fetch live rows</div><div class="nd">Skill 18 (<code>fetchLiveSqlRows</code>) pulls full rows via the report's share token, 5 in parallel, before the per-widget loop.</div></div>
+      <div class="node n-agent"><div class="nt">step 2 · browser</div><div class="nn">Per-widget skill loop</div><div class="nd">Skills 1–17 run on each widget, assembling a <code>WidgetContext</code> of pre-computed facts. Then correlations across widgets + a 0–100 health score.</div></div>
+    </div>
+
+    <h4 style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:700;margin:6px 0 12px">The 18 statistical skills · <span style="color:var(--teal)">run in-browser, zero LLM</span></h4>
+    <div class="skills">
+      <div class="skill"><span class="sk-n">01</span><div class="sk-t">Data extraction</div><div class="sk-d">detects pattern: kpi / time-series / distribution / financial…</div></div>
+      <div class="skill"><span class="sk-n">02</span><div class="sk-t">Trend analysis</div><div class="sk-d">slope, CAGR, MoM, moving avg, acceleration</div></div>
+      <div class="skill"><span class="sk-n">03</span><div class="sk-t">Anomaly detection</div><div class="sk-d">Z-score ≥2.5, spikes, dips, reversals</div></div>
+      <div class="skill"><span class="sk-n">04</span><div class="sk-t">Period comparison</div><div class="sk-d">H1/H2, first/last third, recent-3 vs prior-3</div></div>
+      <div class="skill"><span class="sk-n">05</span><div class="sk-t">Pareto analysis</div><div class="sk-d">80/20, top-20% share, HHI concentration</div></div>
+      <div class="skill"><span class="sk-n">06</span><div class="sk-t">Cross-widget correlation</div><div class="sk-d">Pearson r between every time-series pair</div></div>
+      <div class="skill"><span class="sk-n">07</span><div class="sk-t">Forecast</div><div class="sk-d">linear regression + R² confidence, 3 periods</div></div>
+      <div class="skill"><span class="sk-n">08</span><div class="sk-t">Data quality</div><div class="sk-d">null / zero streaks, unit jumps</div></div>
+      <div class="skill"><span class="sk-n">09</span><div class="sk-t">Narrative context</div><div class="sk-d">turns stats into plain-English facts</div></div>
+      <div class="skill"><span class="sk-n">10</span><div class="sk-t">Segment intelligence</div><div class="sk-d">top / mid / laggard tiers, at-risk</div></div>
+      <div class="skill"><span class="sk-n">11</span><div class="sk-t">Alert engine</div><div class="sk-d">critical / warning / healthy per widget</div></div>
+      <div class="skill"><span class="sk-n">12</span><div class="sk-t">Schema detection</div><div class="sk-d">target vs actual, attainment, currency/percent</div></div>
+      <div class="skill"><span class="sk-n">13</span><div class="sk-t">Executive scoring</div><div class="sk-d">0–100 health score + color</div></div>
+      <div class="skill"><span class="sk-n">14</span><div class="sk-t">Column profiler</div><div class="sk-d">per-column statistics</div></div>
+      <div class="skill"><span class="sk-n">15</span><div class="sk-t">Dimension breakdown</div><div class="sk-d">categorical × numeric splits</div></div>
+      <div class="skill"><span class="sk-n">16</span><div class="sk-t">Row ranking</div><div class="sk-d">top-N / bottom-N rows</div></div>
+      <div class="skill"><span class="sk-n">17</span><div class="sk-t">Within-widget correlation</div><div class="sk-d">Pearson between columns</div></div>
+      <div class="skill"><span class="sk-n">18</span><div class="sk-t">Live SQL trends</div><div class="sk-d">pre-fetch full rows via share token</div></div>
+    </div>
+
+    <div class="parrow" style="margin-top:20px"></div>
+    <div class="callout" style="border-left-color:var(--indigo);background:var(--indigo-bg)"><b>Facts → prompt.</b> Each widget's computed facts become a <code>widget_block</code>. These blocks + schema context + correlations are sent to the backend orchestrator — the LLM only ever writes <i>about numbers already proven true in the browser</i>.</div>
+
+    <h4 style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:700;margin:20px 0 12px">Backend writing team · <code>intelligence_orchestrator.py</code></h4>
+    <div class="flow">
+      <div class="fstep"><div class="marker"><div class="num">1</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">plan</div><div class="nn">Planner <span class="badge model">Sonnet 4.5</span></div><div class="nd"><code>_plan()</code> reads the shared context (cached prompt prefix) and decides the report's sections.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">2</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">write + verify · parallel</div><div class="nn">Writers → Critic <span class="badge model">Opus 4.5</span> <span class="badge model">Sonnet 4.5</span></div><div class="nd"><code>_write_section()</code> (Opus, temp 0.2) drafts each section in parallel; <code>_critique()</code> (Sonnet) checks it against the facts. On fail → one bounded re-write with fix notes.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">3</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">reduce</div><div class="nn">Reducer <span class="badge model">Sonnet 4.5</span></div><div class="nd"><code>_reduce()</code> writes the global layer: title, subtitle, 3-sentence <b>morning brief</b>, and the 4–6 headline KPIs.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">4</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">render</div><div class="nn">Post-process in the browser</div><div class="nd">Parse → sanitize → inject forecast data, reference lines, source SQL, rebind charts to widgets → final <code>ExecutiveAnalysis</code>: header + N analyst sections (data story, key finding, KPIs, charts).</div></div>
+      </div></div>
+    </div>
+    <div class="callout"><b>Resilience:</b> if orchestration fails it falls back to a single monolithic <code>/analyze</code> call (Sonnet, Redis-cached); if that fails too, a deterministic <code>buildFallbackAnalysis()</code> renders with no LLM at all — the page always shows something real.</div>
+  </section>
+
+  <!-- ===================== 5. REPORT COPILOT ===================== -->
+  <section id="copilot">
+    <div class="s-head"><span class="s-num">05</span><h2>Report Copilot — a focused fork of the Canvas Assistant</h2></div>
+    <p class="s-lede">The Report Copilot (<code>IntelligenceChatAgent</code>) began as a byte-for-byte fork of the Canvas Assistant so it could diverge safely. It runs the <b>identical</b> flow from §3 — collect context → prepare → stream → parse → self-heal → execute → narrate → save — but reconfigured for the executive reading one specific report. Here is exactly what changed.</p>
+
+    <div class="cmp">
+      <div class="col">
+        <span class="rolechip t-ui">In the builder</span>
+        <h4 style="margin-top:8px">Canvas Assistant</h4>
+        <div class="mini" style="margin-top:4px"><code>chat_agent.py</code> · <code>ChatAgent</code></div>
+        <ul class="diff">
+          <li>Scope spans the <b>whole database</b> (guardrails <code>mode="database"</code>); out-of-scope tables only warn.</li>
+          <li>History window: last <b>20 turns</b>, namespace <code>chat:history:*</code>.</li>
+          <li>Free-form response — no forced format selector.</li>
+          <li>Builds charts and adds them to any canvas page.</li>
+        </ul>
+      </div>
+      <div class="col">
+        <span class="rolechip t-agent">In the report</span>
+        <h4 style="margin-top:8px">Report Copilot</h4>
+        <div class="mini" style="margin-top:4px"><code>intelligence_chat_agent.py</code> · <code>IntelligenceChatAgent</code></div>
+        <ul class="diff">
+          <li><b>REPORT MODE</b> — scoped to the report's <b>verified tables</b> only (the tables its widgets use, +FK hops); guardrails <code>mode="report"</code> enforce it as a hard security boundary.</li>
+          <li>Separate namespace <code>intel_chat:history:*</code>, shorter <b>8-turn</b> window — never collides with Canvas chats.</li>
+          <li><b>A/B/C/D response rule</b> — answer from snapshot · explain + chart · data look-up · build chart.</li>
+          <li>Reads embedded <code>[snapshot: …]</code> widget values to answer without re-querying.</li>
+          <li><b>VizSwitcher</b> (flip chart type) + <b>Excel .xlsx export</b> — front-end only, no Canvas equivalent.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout" style="margin-top:22px"><b>Shared spine.</b> Both agents reuse the same infrastructure — <code>bedrock_client</code>, <code>schema_cache</code>, <code>query_executor</code>, <code>intel_guardrails</code>, <code>sql_utils</code>, <code>result_narrator</code>, and SSE streaming — and the same three self-heal loops. Only the prompt, table scope, history namespace, and response contract differ. One engine, two safe front doors.</div>
+  </section>
+
+  <!-- ===================== 6. RECRUITING AGENTS ===================== -->
+  <section id="recruiting">
+    <div class="s-head"><span class="s-num">06</span><h2>Recruiting agents — domain-scoped skill personas</h2></div>
+    <p class="s-lede">Beyond dashboards, Visually ships a <b>domain-gated skill-agent framework</b>. Every project has a <code>domain</code> (<code>recruitment</code> by default, auto-detected from schema keywords like <i>candidate, applicant, placement, bullhorn</i>). When a recruiter asks a question, the platform classifies the <b>intent</b> and routes it to a specialised agent that reads their live ATS data (Bullhorn / BQP) and answers in plain markdown. These are thin <b>tool-use personas over the shared pipeline</b> — same Bedrock, schema cache, and read-only SQL as everything else.</p>
+
+    <div class="callout"><b>What they are — and aren't.</b> There is <b>no résumé upload and no vector search over résumés</b>. Candidate ML match-scores are produced upstream by a separate scoring pipeline; these agents <b>read and reason over</b> those scores and the pipeline data. They return prose / markdown, not charts, and every query is read-only.</div>
+
+    <h4 style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:700;margin:22px 0 12px">How a recruiter's question reaches an agent</h4>
+    <div class="flow">
+      <div class="fstep"><div class="marker"><div class="num">1</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">input</div><div class="nn">Question (domain = recruitment) → SSE</div><div class="nd">Asked from the chat surface with the recruitment domain selected. <code>QueryChatPanel.tsx</code> → <code>routers/chat.py</code> / <code>end_user.py</code>.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">2</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">classify</div><div class="nn">Intent classifier <span class="badge model">Sonnet 4.5</span></div><div class="nd"><code>orchestrator.py</code> calls <code>IntentClassifier.classify(text, domain)</code> → an intent such as <code>MATCH</code> / <code>BRIEFING</code> / <code>AUDIT</code> / <code>PROSPECT</code> / <code>ACTION</code>.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">3</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">gate</div><div class="nn">Route to skill agent?</div><div class="nd">Only if <code>intent ∈ _AGENT_INTENTS</code> <b>and</b> <code>domain ∈ SKILL_DOMAINS</code>. Otherwise the message falls through to the normal query path (out of scope here).</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">4</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">ground</div><div class="nn">Inject available tables</div><div class="nd"><code>schema_cache</code> + <code>graph_rag_retriever</code> prepend an "Available database tables" preamble so the agent doesn't blind-probe. <code>user_context_builder</code> adds the signed-in user's identity + an <b>ownership SQL filter</b>.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">5</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">run</div><div class="nn">ToolAgent loop <span class="badge model">Sonnet 4.5</span></div><div class="nd"><code>skill_agents.get_agent("recruitment", intent)</code> → a <code>ToolAgent</code> loops <code>bedrock_invoke_with_tools()</code> up to <code>max_turns</code>, calling its tools to fetch and shape data.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">6</div><div class="line"></div></div><div class="body">
+        <div class="node n-store"><div class="nt">execute</div><div class="nn">Read-only SQL → customer DB</div><div class="nd">All data access goes through <code>run_sql</code> (sandboxed, read-only) against the connected ATS tables (<code>staging.bullhorn_*</code>, <code>staging.bqp_*</code>, <code>target.job_profile_match_ml</code>).</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">7</div><div class="line"></div></div><div class="body">
+        <div class="node n-ok"><div class="nt">output</div><div class="nn">Markdown answer streamed back</div><div class="nd">The agent returns a shortlist / briefing / audit as markdown; the orchestrator emits <code>agent.started</code> then streams the result over SSE.</div></div>
+      </div></div>
+    </div>
+
+    <h4 style="font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:700;margin:24px 0 12px">The recruiting agents · <span style="color:var(--indigo)">all Claude Sonnet 4.5</span></h4>
+    <div class="skills">
+      <div class="skill"><span class="sk-n" style="color:var(--indigo);background:var(--indigo-bg)">MATCH</span><div class="sk-t">Match Agent</div><div class="sk-d">Finds, ranks &amp; shortlists candidates for a role using existing ML scores. Groups by recommendation tier. Tools: <code>get_candidate_scores</code>, <code>list_candidates</code>, <code>build_shortlist</code>.</div></div>
+      <div class="skill"><span class="sk-n" style="color:var(--indigo);background:var(--indigo-bg)">BRIEF</span><div class="sk-t">Briefing Agent</div><div class="sk-d">"My placements / my candidates," or a full daily pipeline briefing — health, what's new, jobs needing attention, priorities. Tools: <code>get_pipeline_summary</code>, <code>get_recent_activity</code>, <code>get_jobs_dashboard</code>.</div></div>
+      <div class="skill"><span class="sk-n" style="color:var(--indigo);background:var(--indigo-bg)">AUDIT</span><div class="sk-t">Audit Agent</div><div class="sk-d">Dual audit — front-office data quality (unscored / stale / churning applications) + back-office integrity (missing bill rate, inverted margin). 6 fixed checks → priority fix list.</div></div>
+      <div class="skill"><span class="sk-n" style="color:var(--indigo);background:var(--indigo-bg)">PROSPECT</span><div class="sk-t">Prospect Agent</div><div class="sk-d">Surfaces pipeline gaps &amp; at-risk jobs: applicants but 0 scored candidates, stale open jobs, roles the ML scorer never touched.</div></div>
+      <div class="skill"><span class="sk-n" style="color:var(--slate);background:var(--slate-bg)">ACTION</span><div class="sk-t">Action Agent <span style="font-weight:600;color:var(--muted)">· read-only</span></div><div class="sk-d">Handles write-style requests ("update / tag a candidate") by <b>drafting</b> grounded SQL and warning on destructive ops — it has no execute tool, so it never mutates data. Shared with the finance domain.</div></div>
+      <div class="skill" style="border-style:dashed"><span class="sk-n" style="color:var(--faint);background:var(--slate-bg)">SOON</span><div class="sk-t" style="color:var(--muted)">Screen · Enrich · Verify · Present</div><div class="sk-d">Advertised intents (incl. résumé-based screening &amp; interview-question generation) that currently fall through to a "coming soon" stub — not yet implemented for recruitment.</div></div>
+    </div>
+
+    <div class="callout" style="margin-top:20px;border-left-color:var(--indigo);background:var(--indigo-bg)"><b>Shared spine, mirrored by domain.</b> Recruiting agents reuse the same <code>bedrock_client</code>, <code>schema_cache</code>, <code>graph_rag_retriever</code>, <code>run_sql</code>, and Redis pipeline state as the rest of the platform — no private data store. The identical framework is mirrored for the <b>finance</b> domain (out of scope here); <code>ACTION</code> is the one agent registered for both.</div>
+  </section>
+
+  <footer>
+    <p><b>Scope:</b> This document covers the Canvas / Dashboard, Intelligence Page, Canvas Assistant, Report Copilot, the shared metadata pipeline, and the Recruiting agents. The standalone query/chat experience, finance agents, and rule-based / brainwave logic are excluded — the orchestrator's intent router appears only as the entry path to the recruiting agents.</p>
+    <p style="margin-top:8px">All AI on <b>AWS Bedrock Claude</b> — Sonnet 4.5 (routing / SQL / critic), Opus 4.5 (report writing), Haiku 4.5 (light tasks), Titan Embed v2 (256-dim schema vectors). Every generated query is <b>read-only</b> against whitelisted tables — no DDL/DML, no system catalogs.</p>
+  </footer>
+</main>
+
+<script>
+  // theme toggle
+  var tt=document.getElementById('tt');
+  tt.addEventListener('click',function(){
+    var cur=document.documentElement.getAttribute('data-theme');
+    var isDark = cur ? cur==='dark' : matchMedia('(prefers-color-scheme:dark)').matches;
+    document.documentElement.setAttribute('data-theme', isDark?'light':'dark');
+  });
+  // scrollspy
+  var links=[].slice.call(document.querySelectorAll('nav a'));
+  var secs=links.map(function(a){return document.querySelector(a.getAttribute('href'))}).filter(Boolean);
+  function spy(){
+    var y=window.scrollY+120, cur=secs[0];
+    secs.forEach(function(s){ if(s.offsetTop<=y) cur=s; });
+    links.forEach(function(a){ a.classList.toggle('on', a.getAttribute('href')==='#'+(cur&&cur.id)); });
+  }
+  addEventListener('scroll',spy,{passive:true}); spy();
+  links.forEach(function(a){ a.addEventListener('click',function(e){
+    var t=document.querySelector(a.getAttribute('href')); if(!t) return;
+    e.preventDefault(); t.scrollIntoView({behavior:'smooth'});
+  });});
+</script>
+</body>
+</html>

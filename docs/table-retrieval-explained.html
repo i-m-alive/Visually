@@ -98,6 +98,7 @@
       <li><a href="#joins">Finding related tables (joins)</a></li>
       <li><a href="#example">Worked example</a></li>
       <li><a href="#rag">Is this "RAG" / "GraphRAG"?</a></li>
+      <li><a href="#future">Future scope: true GraphRAG</a></li>
     </ol>
   </nav>
 
@@ -331,7 +332,57 @@
     </ul>
   </section>
 
-  <footer>Grounded in <code>graph_rag_retriever.py</code> and the enriched schema in <code>schema_cache.py</code>. Retrieval runs in-memory in ~5&nbsp;ms; the only AI calls are the optional query embedding and the gated arbiter.</footer>
+  <section id="future">
+    <h2><span class="num">11</span>Future scope: true GraphRAG for table/view matching</h2>
+    <p class="lede">Today the "graph" is the database's foreign-key graph used as one signal. A natural next step is a <strong>true GraphRAG layer</strong> — a richer, LLM-built knowledge graph of the schema that the retriever can traverse. The current architecture is deliberately ready for this.</p>
+
+    <h3>What "true GraphRAG" would add here</h3>
+    <p>Instead of only the FK edges the database happens to declare, we would build a <strong>schema knowledge graph</strong> once (offline), where:</p>
+    <ul>
+      <li><strong>Nodes</strong> are business concepts / entities discovered from the schema and data (customer, account, transaction, product, region…), not just raw tables.</li>
+      <li><strong>Edges</strong> are semantic relationships an LLM extracts — "a transaction <em>belongs to</em> an account", "a statement <em>summarizes</em> transactions" — including relationships that exist in the data but were never declared as foreign keys.</li>
+      <li><strong>Communities / summaries</strong> group related tables into subject areas (e.g. "trading activity", "risk &amp; compliance", "reference data") each with a short LLM-written summary.</li>
+    </ul>
+    <p>At query time the retriever could then <strong>traverse this graph</strong> — start from the concept the question names, walk to the tables that realize it, and pull in the connected tables a correct answer needs — and consult the <strong>community summaries</strong> to route a vague question to the right subject area before ranking individual tables.</p>
+
+    <div class="callout key">
+      <span class="tag">Why the current design makes this easy to add</span>
+      <p>The ensemble is already "a panel of experts fused by RRF." A GraphRAG retriever simply becomes <strong>one more expert</strong> — it emits its own ranked list of tables, and RRF fuses it with TF-IDF, embeddings, concept, entity and FK-graph exactly as today. No rewrite of the pipeline, no change to the arbiter, join resolution, or scoring. That's the payoff of the expert/fusion structure: new retrieval strategies plug in without disturbing the rest.</p>
+    </div>
+
+    <h3>Where it would help most</h3>
+    <ul>
+      <li><strong>Large, sprawling schemas</strong> (hundreds of tables across many subject areas) where routing to the right area first matters.</li>
+      <li><strong>Warehouses with no declared foreign keys</strong> — the LLM-extracted relationship graph fills in the joins the current heuristic can't infer from names alone.</li>
+      <li><strong>Vague, cross-domain questions</strong> ("how does risk relate to trading volume?") where community summaries give the retriever a map instead of a bag of tables.</li>
+    </ul>
+
+    <h3>What it would cost</h3>
+    <div class="table-wrap">
+    <table>
+      <tr><th>Aspect</th><th>Consideration</th></tr>
+      <tr><td class="k">Build cost</td><td>A one-time (per schema version) LLM pass to extract entities/relationships and summarize communities — offline, in the background crawl, not on the query path.</td></tr>
+      <tr><td class="k">Storage</td><td>A persisted graph (nodes + edges + summaries) alongside the existing enriched-schema cache.</td></tr>
+      <tr><td class="k">Freshness</td><td>The graph must be rebuilt when the schema changes — reuses the same diff-aware, content-hash invalidation already in place for metadata.</td></tr>
+      <tr><td class="k">Query latency</td><td>Graph traversal is in-memory and fast; the extra retrieval expert adds negligible time. No new per-query LLM call is required (the arbiter still only fires on disagreement).</td></tr>
+    </table>
+    </div>
+
+    <div class="callout info">
+      <span class="tag">Honest positioning</span>
+      <p>True GraphRAG is a <strong>build-cost-for-recall</strong> trade: it earns its keep on big, messy, FK-less, cross-domain schemas and is largely redundant on a small, clean, well-keyed database (where TF-IDF + embeddings + declared FKs already nail it). The recommended path is to <strong>add it as an optional expert</strong>, measure its lift against real query logs, and weight it up only where it demonstrably helps — rather than replacing the current hybrid retriever, which stays the fast default.</p>
+    </div>
+
+    <h3>Suggested rollout</h3>
+    <ol class="body">
+      <li>Extend the crawl to extract a lightweight concept/relationship graph + community summaries (offline).</li>
+      <li>Add a <code>graphrag</code> expert that traverses it and emits a ranked table list — plugged into the existing RRF fusion.</li>
+      <li>A/B against the current retriever on logged queries; tune its RRF weight by measured lift.</li>
+      <li>Optionally surface community summaries to the clarify step, so vague questions get a "did you mean trading activity or risk?" prompt.</li>
+    </ol>
+  </section>
+
+  <footer>Grounded in <code>graph_rag_retriever.py</code> and the enriched schema in <code>schema_cache.py</code>. Retrieval runs in-memory in ~5&nbsp;ms; the only AI calls are the optional query embedding and the gated arbiter. Section 11 describes planned scope, not current behavior.</footer>
 
 </div>
 </body>
