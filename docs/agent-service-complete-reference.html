@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Service — Complete Reference: Every Flow, Every Agent</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box; margin:0}
+  :root{
+    --bg:#EAEEF5; --panel:#FFFFFF; --panel-2:#F5F8FC; --ink:#0E1420; --muted:#56617A; --faint:#8592A8;
+    --line:#DCE3EE; --line-2:#C7D2E2;
+    --teal:#0B8E7F; --teal-bg:#DBF1EE; --indigo:#4F46CF; --indigo-bg:#E7E5FB;
+    --amber:#B26A00; --amber-bg:#FBEBD2; --red:#C33B2B; --red-bg:#FBE3DE;
+    --green:#1C8A57; --green-bg:#DAF2E6; --slate:#4B5A73; --slate-bg:#E5EAF2;
+    --purple:#7A3BC9; --purple-bg:#EEE3FB;
+    --shadow:0 1px 2px rgba(16,30,54,.05),0 10px 30px -18px rgba(16,30,54,.30);
+    --mono:"SF Mono","JetBrains Mono",ui-monospace,"Roboto Mono",Menlo,monospace;
+    --sans:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#080D16; --panel:#101A29; --panel-2:#0C1521; --ink:#EAF0F8; --muted:#93A1B7; --faint:#61708A;
+      --line:#1D2A3E; --line-2:#2A3B54;
+      --teal:#33DBC6; --teal-bg:rgba(51,219,198,.12); --indigo:#A99CFF; --indigo-bg:rgba(120,105,255,.16);
+      --amber:#F2B25A; --amber-bg:rgba(242,178,90,.14); --red:#FF7C6C; --red-bg:rgba(255,90,74,.14);
+      --green:#4FDDA0; --green-bg:rgba(60,210,150,.14); --slate:#93A6C2; --slate-bg:rgba(120,150,190,.13);
+      --purple:#C9AEFF; --purple-bg:rgba(160,110,240,.16);
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 16px 40px -22px rgba(0,0,0,.75);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#EAEEF5; --panel:#FFFFFF; --panel-2:#F5F8FC; --ink:#0E1420; --muted:#56617A; --faint:#8592A8;
+    --line:#DCE3EE; --line-2:#C7D2E2;
+    --teal:#0B8E7F; --teal-bg:#DBF1EE; --indigo:#4F46CF; --indigo-bg:#E7E5FB;
+    --amber:#B26A00; --amber-bg:#FBEBD2; --red:#C33B2B; --red-bg:#FBE3DE;
+    --green:#1C8A57; --green-bg:#DAF2E6; --slate:#4B5A73; --slate-bg:#E5EAF2;
+    --purple:#7A3BC9; --purple-bg:#EEE3FB;
+    --shadow:0 1px 2px rgba(16,30,54,.05),0 10px 30px -18px rgba(16,30,54,.30);
+  }
+  :root[data-theme="dark"]{
+    --bg:#080D16; --panel:#101A29; --panel-2:#0C1521; --ink:#EAF0F8; --muted:#93A1B7; --faint:#61708A;
+    --line:#1D2A3E; --line-2:#2A3B54;
+    --teal:#33DBC6; --teal-bg:rgba(51,219,198,.12); --indigo:#A99CFF; --indigo-bg:rgba(120,105,255,.16);
+    --amber:#F2B25A; --amber-bg:rgba(242,178,90,.14); --red:#FF7C6C; --red-bg:rgba(255,90,74,.14);
+    --green:#4FDDA0; --green-bg:rgba(60,210,150,.14); --slate:#93A6C2; --slate-bg:rgba(120,150,190,.13);
+    --purple:#C9AEFF; --purple-bg:rgba(160,110,240,.16);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 16px 40px -22px rgba(0,0,0,.75);
+  }
+
+  body{background:var(--bg); color:var(--ink); font-family:var(--sans); line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(rgba(90,130,180,.06) 1px,transparent 1px); background-size:24px 24px;}
+  .mono{font-family:var(--mono)}
+
+  nav{position:sticky; top:0; z-index:50; background:color-mix(in srgb,var(--panel) 88%,transparent);
+    backdrop-filter:blur(10px); border-bottom:1px solid var(--line)}
+  .nav-in{max-width:1220px; margin:0 auto; padding:11px 24px; display:flex; align-items:center; gap:16px; flex-wrap:wrap}
+  .logo{display:flex; align-items:center; gap:9px; font-weight:800; letter-spacing:-.02em; margin-right:4px}
+  .logo .dot{width:12px; height:12px; border-radius:3px;
+    background:conic-gradient(from 210deg,var(--teal),var(--indigo),var(--purple),var(--teal)); box-shadow:0 0 0 3px var(--teal-bg)}
+  nav a{color:var(--muted); text-decoration:none; font-size:12.5px; font-weight:600; padding:5px 2px; white-space:nowrap; border-bottom:2px solid transparent}
+  nav a:hover{color:var(--ink)} nav a.on{color:var(--ink); border-color:var(--teal)}
+  .spacer{flex:1}
+  .ttoggle{border:1px solid var(--line-2); background:var(--panel); color:var(--ink); border-radius:8px;
+    width:34px; height:30px; cursor:pointer; font-size:14px; flex-shrink:0}
+  .ttoggle:hover{border-color:var(--teal)}
+
+  main{max-width:1220px; margin:0 auto; padding:0 24px 90px}
+
+  header.hero{padding:56px 0 30px}
+  .kicker{font-family:var(--mono); font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--teal); font-weight:700}
+  h1{font-size:clamp(28px,4.6vw,46px); line-height:1.05; letter-spacing:-.03em; font-weight:800; margin:12px 0 14px; text-wrap:balance}
+  .sub{color:var(--muted); font-size:clamp(15px,1.8vw,18px); max-width:76ch}
+  .scope{margin-top:18px; display:flex; flex-wrap:wrap; gap:8px}
+  .scope .in,.scope .out{font-family:var(--mono); font-size:11.5px; font-weight:600; padding:5px 11px; border-radius:999px; border:1px solid var(--line-2)}
+  .scope .in{color:var(--green); background:var(--green-bg); border-color:transparent}
+  .scope .out{color:var(--faint); background:transparent; text-decoration:line-through}
+
+  .legend{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:22px 0 8px}
+  @media(max-width:760px){.legend{grid-template-columns:1fr}}
+  .legend .box{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:15px 17px; box-shadow:var(--shadow)}
+  .legend h4{font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); margin-bottom:11px; font-weight:700}
+  .legend .row{display:flex; flex-wrap:wrap; gap:8px}
+  .tag{font-family:var(--mono); font-size:11.5px; font-weight:600; padding:4px 10px; border-radius:7px; display:inline-flex; align-items:center; gap:6px}
+  .tag::before{content:""; width:8px; height:8px; border-radius:2px; background:currentColor}
+  .t-ui{color:var(--teal); background:var(--teal-bg)} .t-agent{color:var(--indigo); background:var(--indigo-bg)}
+  .t-llm{color:var(--amber); background:var(--amber-bg)} .t-store{color:var(--slate); background:var(--slate-bg)}
+  .t-guard{color:var(--red); background:var(--red-bg)} .t-ok{color:var(--green); background:var(--green-bg)}
+  .t-gap{color:var(--purple); background:var(--purple-bg)}
+
+  section{padding:40px 0 8px; scroll-margin-top:70px}
+  .s-head{display:flex; align-items:baseline; gap:14px; margin-bottom:6px; border-top:1px solid var(--line); padding-top:32px}
+  .s-num{font-family:var(--mono); font-size:13px; color:var(--teal); font-weight:700}
+  h2{font-size:clamp(21px,2.8vw,30px); letter-spacing:-.02em; font-weight:800}
+  h3{font-size:16px; font-weight:800; letter-spacing:-.01em; margin:26px 0 12px}
+  .s-lede{color:var(--muted); font-size:15px; max-width:82ch; margin:8px 0 26px}
+  .kicker2{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:700;margin:24px 0 12px}
+
+  .node{background:var(--panel); border:1px solid var(--line); border-left-width:4px; border-radius:11px;
+    padding:11px 14px; box-shadow:var(--shadow); position:relative}
+  .node .nt{font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; opacity:.85}
+  .node .nn{font-weight:700; font-size:14px; letter-spacing:-.01em; margin-top:2px}
+  .node .nd{font-size:12.5px; color:var(--muted); margin-top:3px; line-height:1.45}
+  .node code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+  .n-ui{border-left-color:var(--teal)} .n-ui .nt{color:var(--teal)}
+  .n-agent{border-left-color:var(--indigo)} .n-agent .nt{color:var(--indigo)}
+  .n-llm{border-left-color:var(--amber)} .n-llm .nt{color:var(--amber)}
+  .n-store{border-left-color:var(--slate)} .n-store .nt{color:var(--slate)}
+  .n-guard{border-left-color:var(--red)} .n-guard .nt{color:var(--red)}
+  .n-ok{border-left-color:var(--green)} .n-ok .nt{color:var(--green)}
+  .n-gap{border-left-color:var(--purple)} .n-gap .nt{color:var(--purple)}
+
+  .arch{display:flex; flex-direction:column; gap:0}
+  .band{display:grid; grid-template-columns:150px 1fr; gap:16px; align-items:center;
+    border:1px dashed var(--line-2); border-radius:16px; padding:16px; background:color-mix(in srgb,var(--panel) 45%,transparent)}
+  .band .blabel{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--faint); font-weight:700; line-height:1.4}
+  .band .bnodes{display:flex; flex-wrap:wrap; gap:11px}
+  .band .bnodes .node{flex:1 1 200px; min-width:180px}
+  .vconn{height:26px; width:2px; background:linear-gradient(var(--line-2),var(--line-2)); margin:0 auto; position:relative}
+  .vconn::after{content:"▼"; position:absolute; bottom:-4px; left:50%; transform:translateX(-50%); color:var(--line-2); font-size:11px}
+  @media(max-width:720px){.band{grid-template-columns:1fr; gap:12px}.band .bnodes .node{flex:1 1 100%}}
+
+  .flow{display:flex; flex-direction:column; gap:0; counter-reset:step}
+  .fstep{display:grid; grid-template-columns:38px 1fr; gap:14px; align-items:start}
+  .fstep .marker{display:flex; flex-direction:column; align-items:center; align-self:stretch}
+  .fstep .num{width:30px; height:30px; flex:none; border-radius:50%; background:var(--indigo); color:#fff;
+    display:grid; place-items:center; font-family:var(--mono); font-size:13px; font-weight:700; box-shadow:0 0 0 4px var(--indigo-bg)}
+  .fstep .line{flex:1; width:2px; background:var(--line-2); margin:4px 0}
+  .fstep:last-child .line{display:none}
+  .fstep .body{padding-bottom:16px; min-width:0}
+  .fstep .body .node{width:100%}
+  .retry{border-left-color:var(--red)!important}
+  .badge{display:inline-block; font-family:var(--mono); font-size:10px; font-weight:700; padding:2px 8px; border-radius:6px; margin-left:8px;
+    color:var(--red); background:var(--red-bg); vertical-align:middle}
+  .badge.llm{color:var(--amber); background:var(--amber-bg)}
+  .badge.model{color:var(--slate); background:var(--slate-bg)}
+  .badge.gap{color:var(--purple); background:var(--purple-bg)}
+
+  .stages{display:flex; flex-direction:column; gap:0}
+  .stage{border:1px solid var(--line); border-radius:14px; background:var(--panel); box-shadow:var(--shadow); overflow:hidden}
+  .stage .sbar{display:flex; align-items:center; gap:10px; padding:11px 15px; background:var(--panel-2); border-bottom:1px solid var(--line); flex-wrap:wrap}
+  .stage .sbar .sidx{font-family:var(--mono); font-weight:700; color:var(--teal); font-size:13px}
+  .stage .sbar .stt{font-weight:800; font-size:14.5px; letter-spacing:-.01em}
+  .stage .sbar .model{margin-left:auto}
+  .stage .sbody{padding:14px 15px; display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  @media(max-width:720px){.stage .sbody{grid-template-columns:1fr}}
+  .mini{font-size:13px; color:var(--muted)} .mini b{color:var(--ink); font-weight:650}
+  .mini code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+  .parrow{height:24px; width:2px; background:var(--line-2); margin:0 auto; position:relative}
+  .parrow::after{content:"▼"; position:absolute; bottom:-4px; left:50%; transform:translateX(-50%); color:var(--line-2); font-size:11px}
+
+  .tiers{display:grid; grid-template-columns:repeat(3,1fr); gap:12px}
+  @media(max-width:720px){.tiers{grid-template-columns:1fr}}
+
+  .skills{display:grid; grid-template-columns:repeat(auto-fill,minmax(225px,1fr)); gap:10px}
+  .skill{background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:11px 13px; box-shadow:var(--shadow); position:relative}
+  .skill .sk-n{font-family:var(--mono); font-size:10px; font-weight:700; color:var(--teal); background:var(--teal-bg); border-radius:6px; padding:1px 6px; position:absolute; top:10px; right:10px}
+  .skill .sk-t{font-weight:700; font-size:13px; letter-spacing:-.01em; padding-right:44px}
+  .skill .sk-d{font-size:12px; color:var(--muted); margin-top:3px; line-height:1.4}
+  .skill .sk-d code{font-family:var(--mono); font-size:11px; color:var(--ink)}
+
+  .cmp{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  @media(max-width:760px){.cmp{grid-template-columns:1fr}}
+  .cmp .col{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:var(--shadow)}
+  .cmp .col h4{font-size:15px; font-weight:800; margin-bottom:4px; letter-spacing:-.01em}
+  .cmp .col .rolechip{font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; padding:3px 8px; border-radius:6px}
+  .diff{list-style:none; margin-top:12px; display:flex; flex-direction:column; gap:10px}
+  .diff li{display:flex; gap:9px; font-size:13px; color:var(--muted); line-height:1.45}
+  .diff li b{color:var(--ink); font-weight:650}
+  .diff li::before{content:"▸"; color:var(--indigo); font-weight:700; flex:none}
+  .diff li code{font-family:var(--mono); font-size:11px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+
+  .callout{border:1px solid var(--line); border-left:4px solid var(--amber); background:var(--amber-bg);
+    border-radius:11px; padding:13px 15px; margin:16px 0; font-size:13.5px; color:var(--ink)}
+  .callout b{font-weight:750}
+  .callout.gap{border-left-color:var(--purple); background:var(--purple-bg)}
+  .callout.ok{border-left-color:var(--green); background:var(--green-bg)}
+  .callout.guard{border-left-color:var(--red); background:var(--red-bg)}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:12px}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+
+  table.tbl{width:100%; border-collapse:collapse; font-size:12.8px; margin:14px 0; background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:var(--shadow)}
+  table.tbl th{background:var(--panel-2); text-align:left; padding:9px 12px; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--faint); font-weight:700; border-bottom:1px solid var(--line)}
+  table.tbl td{padding:9px 12px; border-bottom:1px solid var(--line); color:var(--muted); vertical-align:top}
+  table.tbl tr:last-child td{border-bottom:none}
+  table.tbl td b, table.tbl td.ink{color:var(--ink)}
+  table.tbl code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); padding:1px 5px; border-radius:5px; color:var(--ink)}
+  .tblwrap{overflow-x:auto}
+
+  .toc{display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:20px 0}
+  @media(max-width:820px){.toc{grid-template-columns:1fr 1fr}}
+  @media(max-width:560px){.toc{grid-template-columns:1fr}}
+  .toc a{display:block; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; text-decoration:none; box-shadow:var(--shadow)}
+  .toc a .tn{font-family:var(--mono); font-size:10px; color:var(--teal); font-weight:700}
+  .toc a .tt{font-weight:750; font-size:13.5px; color:var(--ink); margin-top:2px}
+  .toc a .td{font-size:11.5px; color:var(--muted); margin-top:2px}
+
+  footer{border-top:1px solid var(--line); margin-top:50px; padding-top:22px; color:var(--faint); font-size:12.5px}
+  footer code{font-family:var(--mono)}
+  ::selection{background:var(--teal-bg)}
+  a.fnref{color:var(--teal); text-decoration:none}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-in">
+    <span class="logo"><span class="dot"></span>Visually</span>
+    <a href="#overview">Overview</a>
+    <a href="#sysmap">System Map</a>
+    <a href="#assistant">Canvas Assistant</a>
+    <a href="#copilot">Report Copilot</a>
+    <a href="#reportgen">Report Generation</a>
+    <a href="#querychat">Query Chat</a>
+    <a href="#orchestrator">Orchestrator &amp; Skills</a>
+    <a href="#guardrails">Guardrails</a>
+    <a href="#gaps">Known Gaps</a>
+    <span class="spacer"></span>
+    <button class="ttoggle" id="tt" aria-label="Toggle theme" title="Toggle light / dark">◐</button>
+  </div>
+</nav>
+
+<main>
+  <header class="hero" id="overview">
+    <div class="kicker">Complete Technical Reference · Every Agent, Every Flow</div>
+    <h1>Every agent in agent_service, end to end</h1>
+    <p class="sub">This is the full picture: <b>five live chat/generation surfaces</b> (Canvas Assistant, Report Copilot, Intelligence Report Generation, Query Chat, and the Orchestrator's skill-agent personas), the <b>19 core agent modules</b> and <b>14 domain skill agents</b> underneath them, the <b>guardrail/validation layer</b> that keeps generated SQL safe, and the <b>router/database map</b> that ties everything to the frontend. It complements <code>visually-architecture.html</code> (which covers Canvas Assistant / Report Copilot / Report Generation / recruiting agents at a lighter level) by going one layer deeper everywhere, and by adding the three flows that doc explicitly scoped out: <b>Query Chat</b>, the <b>finance skill-agent suite</b>, and the <b>full guardrails/validator picture</b>.</p>
+    <div class="scope">
+      <span class="in">✓ Canvas Assistant</span>
+      <span class="in">✓ Report Copilot</span>
+      <span class="in">✓ Report Generation</span>
+      <span class="in">✓ Query Chat / Query Agent</span>
+      <span class="in">✓ Orchestrator + 14 skill agents</span>
+      <span class="in">✓ Validator + Guardrails</span>
+      <span class="in">✓ Router / DB / auth map</span>
+      <span class="in">✓ Known gaps &amp; dead code</span>
+    </div>
+
+    <div class="legend">
+      <div class="box">
+        <h4>Node types</h4>
+        <div class="row">
+          <span class="tag t-ui">UI / Surface</span>
+          <span class="tag t-agent">Agent / Service</span>
+          <span class="tag t-llm">LLM call</span>
+          <span class="tag t-store">Data store / cache</span>
+          <span class="tag t-guard">Guardrail / self-heal</span>
+          <span class="tag t-gap">Gap / dead code</span>
+        </div>
+      </div>
+      <div class="box">
+        <h4>Models (AWS Bedrock)</h4>
+        <div class="row">
+          <span class="tag t-llm">Claude Sonnet 4.5 · routing, SQL, critic, writer-support</span>
+          <span class="tag t-llm">Claude Opus 4.5 · report writing</span>
+          <span class="tag t-llm">Claude Haiku 4.5 · intent, cheap SQL, grounding checks</span>
+          <span class="tag t-store">Titan Embed v2 · 256-dim vectors</span>
+        </div>
+      </div>
+    </div>
+
+    <h3>Five surfaces, one spine</h3>
+    <div class="toc">
+      <a href="#assistant"><div class="tn">01</div><div class="tt">Canvas Assistant</div><div class="td">Build/edit widgets by chat. <code>chat.py</code> + <code>chat_agent.py</code></div></a>
+      <a href="#copilot"><div class="tn">02</div><div class="tt">Report Copilot</div><div class="td">Chat over one Intelligence report. <code>intelligence_chat.py</code></div></a>
+      <a href="#reportgen"><div class="tn">03</div><div class="tt">Report Generation</div><div class="td">Planner→Writer→Critic→Reducer. <code>intelligence_orchestrator.py</code></div></a>
+      <a href="#querychat"><div class="tn">04</div><div class="tt">Query Chat</div><div class="td">Standalone NL→chart engine. <code>/agent/intent</code></div></a>
+      <a href="#orchestrator"><div class="tn">05</div><div class="tt">Orchestrator &amp; Skill Agents</div><div class="td">14 domain personas. <code>orchestrator.py</code></div></a>
+      <a href="#guardrails"><div class="tn">06</div><div class="tt">Guardrails &amp; Validation</div><div class="td">3 independent SQL-safety layers</div></a>
+    </div>
+  </header>
+
+  <!-- ===================== SYSTEM MAP ===================== -->
+  <section id="sysmap">
+    <div class="s-head"><span class="s-num">00</span><h2>System map — routers, database, frontend, auth</h2></div>
+    <p class="s-lede">The connective tissue before the deep dives. <code>backend/agent_service/main.py</code> wires 17 routers; five carry the agent flows detailed later in this document, the rest are feature-specific CRUD/utility surfaces.</p>
+
+    <h3>Router inventory (excluding the 5 flow routers covered in their own sections)</h3>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Router</th><th>Role</th><th>Key routes</th></tr>
+      <tr><td class="ink"><b>ai_insights.py</b></td><td>End-user AI features on a saved dashboard: NL summary, single-widget insight, KPI anomaly scan.</td><td><code>POST /dashboards/{id}/ai-summary·ai-insight·ai-anomalies</code></td></tr>
+      <tr><td class="ink"><b>alerts.py</b></td><td>Plain-language alert rules on widget data, evaluated on a schedule.</td><td><code>/dashboards/{id}/alerts</code>, <code>/alerts/{id}</code></td></tr>
+      <tr><td class="ink"><b>analyst.py</b></td><td>Public/share-token surface proxying all DB access through the server's stored connection — powers the shared-link <code>ExecutiveCopilot</code> chat (see §Report Copilot gap).</td><td><code>/analyst/canvas/{token}/*</code> (chat, query, drilldown, export, bookmarks)</td></tr>
+      <tr><td class="ink"><b>brainwave_profiles.py</b></td><td>Platform-level employee-identity profile management, admin-gated.</td><td><code>/brainwave-profiles/me·users</code></td></tr>
+      <tr><td class="ink"><b>end_user.py</b></td><td>Actions for analyst/end-user role accounts: create+test a connection, import <code>.vly</code>, delete a report.</td><td><code>/end-user/connections·import-vly</code></td></tr>
+      <tr><td class="ink"><b>explain.py</b></td><td>"Explain this point" right-click feature — NL explanation + evidence + SQL used.</td><td><code>POST /dashboards/{id}/explain-point</code></td></tr>
+      <tr><td class="ink"><b>exports.py</b></td><td>Triggers/tracks HTML·PDF·PNG dashboard exports; also owns its own <code>Orchestrator()</code> instance for export-triggered refresh.</td><td><code>/export/trigger·jobs/{id}</code></td></tr>
+      <tr><td class="ink"><b>projects.py</b></td><td><span class="badge gap">DEAD CODE</span> Full project CRUD + connections/schema-crawl — but <b>never mounted</b>. Live <code>/projects*</code> routes are defined inline on <code>app</code> in <code>main.py</code> instead.</td><td>— not reachable —</td></tr>
+      <tr><td class="ink"><b>public_canvas.py</b></td><td>Fully anonymous canvas viewing, no Bearer token.</td><td><code>GET /public/canvas/{token}</code>, <code>POST .../refresh</code></td></tr>
+      <tr><td class="ink"><b>query_sessions.py</b></td><td>Persisted chat-history tree (session→messages) for Query Chat.</td><td><code>/query/sessions*</code> (prefixed)</td></tr>
+      <tr><td class="ink"><b>share.py</b></td><td>Dashboard sharing: share tokens + collaborators.</td><td><code>/dashboards/{id}/shares·collaborators</code></td></tr>
+      <tr><td class="ink"><b>tier5.py</b></td><td>"Power BI parity": RLS policies, refresh schedules, DAX-like measures (incl. AI-generate), drilldown, RLS-aware requery.</td><td><code>/dashboards/{id}/rls-policies·measures·drilldown</code></td></tr>
+      <tr><td class="ink"><b>versions.py</b></td><td>Dashboard version history: snapshot, list, prose diff, restore.</td><td><code>/dashboards/{id}/versions*</code></td></tr>
+      <tr><td class="ink"><b>vly.py</b></td><td>Largest router (1600+ lines) — <code>.vly</code> ZIP-based export/import format: full analyst bundle (canvas + queries + schema + AI context), offline data-mode.</td><td><code>/dashboards/{id}/export-vly</code>, <code>/dashboards/import-vly</code></td></tr>
+    </table></div>
+
+    <h3><code>main.py</code> — router mount order</h3>
+    <p class="mini">In file order: <code>chat</code> → <code>exports</code> → <code>query_sessions</code> (prefix <code>/query/sessions</code>) → <code>vly</code> → <code>share</code> → <code>public_canvas</code> → <code>tier5</code> → <code>ai_insights</code> → <code>analyst</code> → <code>end_user</code> → <code>intelligence</code> → <code>intelligence_orchestrator</code> → <code>intelligence_chat</code> → <code>brainwave_profiles</code> (prefix <code>/brainwave-profiles</code>) → <code>alerts</code> → <code>versions</code> → <code>explain</code>. Almost all routers hardcode full paths per-route rather than using a shared <code>prefix=</code>. CORS is wide open: <code>allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"]</code>.</p>
+
+    <h3>Core database models</h3>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Table</th><th>Key columns</th><th>Owner</th></tr>
+      <tr><td class="ink"><b>projects</b></td><td><code>id, name, description, domain</code> (default "recruitment")<code>, domain_is_manual, owner_id</code></td><td>the tenant/workspace entity</td></tr>
+      <tr><td class="ink"><b>dashboards</b></td><td><code>id, project_id, name, description, theme, layout_config</code> (JSONB pages)<code>, is_archived, filter_config</code></td><td>the "canvas" — one row per report/canvas</td></tr>
+      <tr><td class="ink"><b>widgets</b></td><td><code>id, dashboard_id, title, widget_type, chart_type, sql_query, connection_id, position_x/y, width, height, config, chart_data</code> (cache)<code>, validation_score</code></td><td>one row per chart on a canvas</td></tr>
+      <tr><td class="ink"><b>database_connections</b></td><td><code>id, project_id, name, db_type, host, port, database_name, username, encrypted_password, ssl_enabled, is_active</code></td><td>the user's live DB credentials</td></tr>
+      <tr><td class="ink"><b>schema_snapshots</b></td><td><code>id, connection_id, version, schema_document</code> (JSONB)<code>, table_count, crawl_duration_seconds</code></td><td>raw crawled schema, versioned</td></tr>
+      <tr><td class="ink"><b>intelligence_reports</b></td><td><code>dashboard_id (PK/FK), analysis</code> (JSONB — the whole ExecutiveAnalysis)<code>, data_version, generated_at, updated_at</code></td><td>Report Generation output</td></tr>
+      <tr><td class="ink"><b>query_sessions / query_messages</b></td><td><code>sessions: id, project_id, user_id, title, active_leaf_id</code> · <code>messages: id, session_id, parent_id</code> (tree)<code>, role, content, result</code> (JSONB)<code>, job_id</code></td><td>Query Chat history</td></tr>
+    </table></div>
+
+    <h3>Frontend → backend map</h3>
+    <p class="mini">One shared axios client (<code>frontend/lib/api.ts</code>) plus a token-only <code>publicApi</code>. Namespaces: <code>agentApi→/agent/intent</code> (Query Chat) · <code>chatApi→/agent/chat*</code> (Canvas Assistant) · <code>intelligenceChatApi→/intelligence/chat*</code> (Report Copilot) · <code>intelligenceApi→/intelligence/*</code> (report gen) · <code>dashboardApi/canvasApi→/dashboards*</code> · <code>analystApi→/analyst/canvas/{token}/*</code> (shared-link, no auth) · <code>publicCanvasApi→/public/canvas/{token}*</code> · plus <code>rlsApi, scheduleApi, measuresApi, drilldownApi, versionsApi, alertsApi, explainApi, vlyApi, shareApi, brainwaveApi, endUserApi, aiInsightsApi</code>. Frontend page groups under <code>app/(app)/</code>: <code>settings, intelligence, projects, canvas, team, end-user</code> (plus <code>embed/canvas</code>, <code>report/canvas</code>, <code>share/canvas</code> outside the auth’d group).</p>
+
+    <div class="callout gap"><b>Auth is not DRY.</b> There is one canonical <code>get_current_user</code> defined in <code>main.py</code> — but roughly 8 routers (<code>ai_insights, alerts, end_user, explain, share, tier5, versions, vly</code>, plus <code>brainwave_profiles, query_sessions</code>) each independently define their own private <code>HTTPBearer</code> + <code>_get_user()</code>/<code>_current_user()</code> helper that re-decodes the token, rather than importing a shared dependency. <code>analyst.py</code> and <code>public_canvas.py</code> skip user auth entirely and authenticate via an opaque share/analyst token instead.</div>
+  </section>
+
+  <!-- ===================== CANVAS ASSISTANT ===================== -->
+  <section id="assistant">
+    <div class="s-head"><span class="s-num">01</span><h2>Canvas Assistant — build &amp; edit widgets by chat</h2></div>
+    <p class="s-lede">The chat panel embedded in the canvas builder. Streaming NL→SQL→chart, with a data-grounded conversation-memory + root-cause-followup layer added on 2026-07-10 (commit <code>257198a</code>). <code>CanvasChatPanel.tsx</code> → <code>POST /agent/chat/stream</code> → <code>routers/chat.py</code> → <code>ChatAgent</code> (<code>agents/chat_agent.py</code>).</p>
+
+    <div class="flow">
+      <div class="fstep"><div class="marker"><div class="num">1</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">request</div><div class="nn">SSE POST — no widget list sent</div><div class="nd"><code>{session_id, message, project_id, dashboard_id, connection_id, active_page_id, scope, selected_tables?}</code>. <code>session_id</code> persists in <code>localStorage["canvas-chat-session-{canvasId}"]</code>. The backend independently loads the canvas's own widgets — the client never sends them.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">2</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">context</div><div class="nn"><code>_collect_chat_context()</code> <span class="mono" style="font-size:11px">chat.py:73-202</span></div><div class="nd">Loads history+memory (Redis), schema snapshot, enriched schema (<code>schema_cache.get_or_build</code>), all dashboard widgets/pages, regex-extracted "priority tables" from existing widget SQL, runs <code>parse_intent()</code>+<code>route_query()</code>, and — <code>scope="database"</code> only — full graph-RAG retrieval.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">3</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">gate</div><div class="nn">Root-cause follow-up short-circuit</div><div class="nd">If the immediately-prior assistant turn carried <code>error</code>/<code>low_confidence</code> AND the message matches <code>ROOT_CAUSE_FOLLOWUP_PATTERN</code> ("why is this wrong", "what happened", "debug this"…) — skip straight to a corrective pass instead of a fresh LLM turn.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">4</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">generate</div><div class="nn"><code>ChatAgent.prepare()</code> <span class="badge model">Sonnet 4.5, Opus 4.5 &gt;8000 chars</span></div><div class="nd">Zoned, cache-friendly system prompt: <b>Zone 1</b> static instructions (cached) → <b>Zone 2</b> full/scoped schema detail keyed to <code>scope</code> (cached) → <b>Zone 2.5</b> routing hints (uncached, after the cache breakpoint) → <b>Zone 3</b> live canvas widget list (uncached). <code>CONVERSATION MEMORY</code> block appended when a distilled gist list exists. No native tool-use — the model emits fenced <code>```sql_execute{...}```</code> / <code>```dashboard_action{...}```</code> JSON blocks, parsed by regex.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">5</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">execute</div><div class="nn"><code>_execute_and_build_chart()</code> <span class="mono" style="font-size:11px">chat.py:234-368</span></div><div class="nd">guardrails (<code>mode="database"</code>, scope violations WARN not BLOCK) → column verification/fuzzy-fix → execute via query-executor service → self-correct-on-error (1 retry) → post-exec sanity check → render chart image → dimension-mismatch check (deterministic) with one more retry if the GROUP BY looks wrong for the asked dimension.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">6</div><div class="line"></div></div><div class="body">
+        <div class="node n-ok"><div class="nt">stream</div><div class="nn">Chart streamed BEFORE narration</div><div class="nd">SSE <code>chart</code> event fires immediately; <code>result_narrator.narrate()</code> + grounding check stream as an additional <code>text</code> delta after, so the user never waits on narration to see the chart.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">7</div><div class="line"></div></div><div class="body">
+        <div class="node n-store"><div class="nt">persist</div><div class="nn">History + distilled memory saved</div><div class="nd">Assistant turn stores <code>content = prose + narrative</code>, plus <code>sql/error/low_confidence</code> bookkeeping — exactly what step 3's root-cause gate reads back next turn. <code>distill_memory()</code> is a cheap truncate+dedupe, <b>no LLM call</b>. Redis key <code>chat:history:{session_id}</code>, TTL 4h.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">8</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">manual</div><div class="nn">"Add to Canvas" — the only DB mutation</div><div class="nd">The chart above is only a chat-message preview. Clicking <b>Add to Canvas</b> is what actually calls <code>POST /dashboards/{id}/widgets</code> to insert a row. <b>The LLM itself never triggers a DB write</b> — <code>sql_execute</code> is always read-only, enforced by the guardrail stack (§Guardrails).</div></div>
+      </div></div>
+    </div>
+
+    <div class="callout gap"><b>Dead wiring:</b> <code>dashboard_action</code> fences (<code>add_widget, rename_widget, filter_widget, navigate</code>) are fully parsed server-side and emitted as an SSE <code>action</code> event — but <code>CanvasChatPanel.tsx</code> never registers an <code>onAction</code> handler. These are effectively no-ops in the live UI today.</div>
+    <div class="callout gap"><b><code>chat_agent/skills/</code> is documentation, not code.</b> <code>skill.md</code> + 3 standalone CLI scripts (<code>build_system_prompt.py, manage_conversation_history.py, respond_with_history.py</code>) exist on disk but are never imported anywhere (<code>grep -rn "chat_agent.skills"</code> → zero hits). The <i>real</i>, running system prompt/history logic is 100% inline in <code>chat_agent.py</code>. This same pattern repeats for every agent that has a <code>*/skills/</code> subdirectory — see §Known Gaps.</div>
+  </section>
+
+  <!-- ===================== REPORT COPILOT ===================== -->
+  <section id="copilot">
+    <div class="s-head"><span class="s-num">02</span><h2>Report Copilot — chat over one Intelligence report</h2></div>
+    <p class="s-lede">A focused fork of the Canvas Assistant, scoped to a single Executive Intelligence report. <code>IntelligenceCopilotPanel.tsx</code> → <code>POST /intelligence/chat/stream</code> → <code>routers/intelligence_chat.py</code> → <code>IntelligenceChatAgent</code>. Two user-facing modes share one session: <b>report</b> scope (schema limited to this report's own tables + 2-hop FK neighbours) and <b>database</b> scope (full enriched schema via graph-RAG).</p>
+
+    <div class="stages">
+      <div class="stage">
+        <div class="sbar"><span class="sidx">1</span><span class="stt">Context collection</span><span class="tag t-agent model">_collect_chat_context()</span></div>
+        <div class="sbody">
+          <div class="mini"><b>3-layer VERIFIED TABLES doc:</b> ① widget-SQL regex parse → ② enriched-schema column attach (or live <code>information_schema</code> fetch, capped at 8 tables, if no enriched cache) → ③ override from <code>IntelligenceReport.analysis["_tables_metadata"]</code> persisted at report-gen time — "most trusted."</div>
+          <div class="mini"><b>Graph-RAG retrieval</b> only runs for <code>scope="database"</code> — report scope relies on widget-derived <code>priority_tables</code> + FK-hop expansion instead.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">2</span><span class="stt">Root-cause short-circuit</span><span class="tag t-guard">before any main LLM call</span></div>
+        <div class="sbody">
+          <div class="mini">Same pattern as Canvas Assistant: gated on the prior turn's <code>error</code>/<code>low_confidence</code> + a "why…" phrasing match. Runs <code>RootCauseAgent.diagnose()</code> — <b>one</b> Sonnet call against the <i>actual recorded SQL + error</i>, not a fresh generation. Explicitly told: <i>"if you cannot confidently fix it, leave fixed_sql null — a wrong fix is worse than admitting you can't produce one."</i> Any <code>fixed_sql</code> is threaded back through the same guardrail/execute pipeline, never run directly.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">3</span><span class="stt">Schema scoping — 2-tier render</span><span class="tag t-agent">schema_scope.py (shared) + private copy</span></div>
+        <div class="sbody">
+          <div class="mini"><b>report scope:</b> seed = widget tables mapped onto the enriched schema; BFS 2 hops out for "RELATED TABLES" (name + 1-line purpose only). Falls back to GraphRAG-scoped or full schema if zero widget tables match.</div>
+          <div class="mini"><b>database scope:</b> priority order — (1) true GraphRAG candidates → (2) nl_schema_router <code>resolved_context</code> → (3) full cached schema. An <b>"ambiguous follow-up" guard</b> skips GraphRAG scoping entirely when history exists and the top routing score &lt; 0.15 (elliptical follow-ups like "what about last month?" would otherwise wrongly narrow the schema).</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">4</span><span class="stt">Generate → execute → narrate → persist</span><span class="tag t-llm model">Sonnet 4.5 / Opus 4.5</span></div>
+        <div class="sbody">
+          <div class="mini">Same guardrail→column-check→execute→self-correct→sanity-check→render pipeline as Canvas Assistant, via <code>apply_fulldb_guardrails(mode="report" if priority_tables else "database")</code> — <b>report-scoped conversations hard-block out-of-scope tables; unscoped ones only warn.</b></div>
+          <div class="mini">Chart SSE event fires <i>before</i> narration is computed (comment: "narration adds a Sonnet+Haiku round-trip and must never delay the chart"). History+memory persisted with <code>sql/error/low_confidence</code> bookkeeping, Redis TTL 4h.</div>
+        </div>
+      </div>
+    </div>
+
+    <h3>Two chat surfaces on the same page — a real parity gap</h3>
+    <div class="cmp">
+      <div class="col">
+        <h4>IntelligenceCopilotPanel <span class="rolechip" style="color:var(--green);background:var(--green-bg)">LOGGED-IN VIEW</span></h4>
+        <p class="mini">Used whenever <code>shareToken</code> is absent — the normal authenticated view.</p>
+        <ul class="diff">
+          <li><b>Full data-grounded memory</b> — <code>conversation_memory</code> + <code>sql/error/low_confidence</code> bookkeeping on every turn.</li>
+          <li><b>Root-cause follow-ups</b> — <code>RootCauseAgent</code> diagnoses against the actual failed SQL/error.</li>
+          <li>Backend: <code>intelligence_chat_agent.py</code> + <code>routers/intelligence_chat.py</code> (received both 2026-07-10 upgrade commits).</li>
+        </ul>
+      </div>
+      <div class="col">
+        <h4>ExecutiveCopilot <span class="rolechip" style="color:var(--purple);background:var(--purple-bg)">SHARED-LINK VIEW</span></h4>
+        <p class="mini">Used only when a report is opened via a public share <code>token</code> — same chat button, same panel position, different component swapped in by <code>page.tsx</code>.</p>
+        <ul class="diff">
+          <li><b>Basic history only</b> — prior turns load from Redis and correctly reach the Bedrock prompt (not broken), but as <b>plain prose</b>, no <code>sql/error/low_confidence</code> keys.</li>
+          <li><b>No root-cause mechanism</b> — <code>routers/analyst.py</code> was never touched by either 2026-07-10 commit; zero references to <code>_wants_root_cause_followup</code>/<code>ChartExecResult</code>/<code>conversation_memory</code>.</li>
+          <li>Legacy code path, predates the current copilot; kept for the share-link surface only.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout gap"><b>Status: known, accepted.</b> Confirmed with the team 2026-07-23 — left as-is for now. If a shared-link viewer asks a grounded "why is that wrong" follow-up, <code>ExecutiveCopilot</code> won't have the SQL/error context to answer it well; <code>IntelligenceCopilotPanel</code> handles it correctly.</div>
+  </section>
+
+  <!-- ===================== REPORT GENERATION ===================== -->
+  <section id="reportgen">
+    <div class="s-head"><span class="s-num">03</span><h2>Report Generation — the Intelligence dashboard pipeline</h2></div>
+    <p class="s-lede">What actually happens when a user clicks <b>Regenerate</b> / <b>Sync Now</b> on the Intelligence page. Two full implementations exist side by side: a new multi-agent orchestrator (planner→writer→critic→reducer) tried first, and an older single-shot prompt kept only as a network/HTTP-failure fallback — with a fully deterministic, LLM-free analysis as the final safety net. The page is never left blank.</p>
+
+    <h3>Stage-ordered, click → charts on screen</h3>
+    <div class="flow">
+      <div class="fstep"><div class="marker"><div class="num">1</div><div class="line"></div></div><div class="body">
+        <div class="node n-ui"><div class="nt">trigger</div><div class="nn">Regenerate / Sync Now / apply date range</div><div class="nd"><b>Sync Now</b> re-fetches live widget data first (force-bypasses cache); <b>Regenerate</b> rebuilds from whatever's already cached. A cross-tab localStorage lock stops two open tabs double-running the pipeline.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">2</div><div class="line"></div></div><div class="body">
+        <div class="node n-store"><div class="nt">fetch</div><div class="nn"><code>POST /dashboards/{id}/intelligence-data</code></div><div class="nd">Executes every widget's SQL in parallel (semaphore-bounded, default 6 concurrent), 500-row cap each. Any widget erroring or returning 0 rows silently falls back to its last-known <code>chart_data</code> cache. Result cached in Redis 15 min.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">3</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">browser</div><div class="nn">18 statistical skills run client-side <b>first</b></div><div class="nd"><code>frontend/lib/intelligenceAgent.ts</code> — trend/anomaly/pareto/forecast/segment/correlation/etc. computed in the browser, per widget, <i>before</i> any LLM call. Serialized into per-widget fact blocks and sent to the backend as plain text. <b>The backend never computes its own stats</b> — it only writes prose/charts from these pre-computed facts.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">4</div><div class="line"></div></div><div class="body">
+        <div class="node n-llm"><div class="nt">primary</div><div class="nn"><code>POST /intelligence/orchestrate</code> — 4-stage pipeline</div><div class="nd">See stage table below. Content-addressed Redis cache (sha256 of canvas+schema+widget facts+correlations) plus a <b>coalescing lock</b> (<code>SET NX EX=180s</code>, poll every 2s up to 300s) so simultaneous Regenerate clicks from multiple tabs share one run instead of N duplicate multi-agent pipelines.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">5</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">fallback 1</div><div class="nn"><code>POST /intelligence/analyze</code> — older single-shot</div><div class="nd">Only tried if the orchestrator call throws (network/HTTP error) — <b>not</b> a feature flag, purely an error fallback. One giant Sonnet prompt, 16,384 max tokens, same Redis lock/cache pattern (with a 30s heartbeat refresh).</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">6</div><div class="line"></div></div><div class="body">
+        <div class="node n-ok"><div class="nt">fallback 2</div><div class="nn"><code>buildFallbackAnalysis()</code> — zero LLM</div><div class="nd">Fully deterministic grouping of widgets into sections with template narrative. The final safety net if <i>both</i> backend calls fail — the page is <b>never</b> blank.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">7</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">post-process</div><div class="nn">6 deterministic passes, same for either backend path</div><div class="nd"><code>parseResponse → sanitizeAnalysis → injectForecastData → injectReferenceLines/injectSourceSql → rebindChartDataToWidgets → injectTableCharts/injectUncoveredWidgets</code>. Guarantees: no widget silently dropped, forecasts come from the real client-computed regression not the LLM, and "ghost" all-zero charts get rebound to ground-truth widget data.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">8</div><div class="line"></div></div><div class="body">
+        <div class="node n-store"><div class="nt">persist</div><div class="nn"><code>PUT /dashboards/{id}/intelligence-report</code></div><div class="nd">One JSONB row (<code>intelligence_reports</code>) per dashboard — the whole <code>ExecutiveAnalysis</code> as a single document, no per-chart IDs. Also stamps <code>last_regenerated_at</code>/<code>last_synced_at</code>, which seeds the discovery-cache invalidation key.</div></div>
+      </div></div>
+    </div>
+
+    <h3>Stage 4 detail — the multi-agent orchestrator</h3>
+    <div class="stages">
+      <div class="stage">
+        <div class="sbar"><span class="sidx">A</span><span class="stt">Planner</span><span class="tag t-llm model">Sonnet 4.5 · 1 call</span></div>
+        <div class="sbody"><div class="mini">Given 1-line-per-widget summaries only (not full facts), groups widgets into 4-6 sections, each with a distinct business "angle" so no two overlap. Deterministic fallback grouping if the call/parse fails.</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">B</span><span class="stt">Writer + Critic, per section — fanned out concurrently</span><span class="tag t-llm model">Opus 4.5 writer · Sonnet 4.5 critic</span></div>
+        <div class="sbody">
+          <div class="mini"><code>asyncio.gather</code> under a shared <code>Semaphore(6)</code>. Writer gets the FULL cached shared-context (schema + every widget's facts) via an ephemeral prompt-cache breakpoint, so N parallel writers don't N× the input token cost.</div>
+          <div class="mini">Critic checks vague wording, repeated headline numbers across prose fields, data-hygiene talk, fabricated numbers, missing fields — <b>plus a deterministic (non-LLM) chart-shape check</b> added in this session: does every chart's <code>data[]</code> actually carry the field its own type reads (<code>value</code>, or matching <code>series[].key</code> for combo)? One bounded re-write on failure; if still broken, the offending chart is dropped rather than shipped blank.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">C</span><span class="stt">Reducer</span><span class="tag t-llm model">Sonnet 4.5 · 1 call</span></div>
+        <div class="sbody"><div class="mini">Given only each section's <code>label/data_story/key_finding/kpis</code> (a digest, not full content) — produces the global <code>title/subtitle/morning_brief/kpis</code>.</div></div>
+      </div>
+    </div>
+
+    <div class="callout ok"><b>Fixed this session — the "chart renders empty but Data modal shows it" bug.</b> Root cause was two-part: (1) <code>sanitizeChart()</code> forced every row into <code>{name:'', value:0}</code> whenever the AI used real column names instead (e.g. <code>{customer, revenue}</code>) — wiping the fields while keeping the real data inert under its original key; (2) <code>AgentChartView</code> hard-codes <code>dataKey="name"/"value"</code> with zero fallback, so it silently drew nothing. The <b>Data modal</b> (<code>TableView</code>) never hard-codes a key — it discovers real columns dynamically — which is exactly why the modal showed correct data while the chart above it was blank. <b>Fix, three layers:</b> <code>sanitizeChart()</code> now borrows a real string/number field instead of forcing blanks; the backend critic gained the deterministic chart-shape check above; and the frontend now auto-heals in place — a chart failing the same field-check stays in its exact grid slot as a "Fixing…" placeholder, gets repaired first via an <b>instant, zero-LLM rebuild</b> straight from the widget's already-loaded real data (<code>regenerateChartFromWidgets</code>), falling back to a scoped single-chart LLM call (<code>runChartAgent</code>) only if no source widget can be matched — never a whole-section or whole-report regenerate for a one-chart problem.</div>
+  </section>
+
+  <!-- ===================== QUERY CHAT ===================== -->
+  <section id="querychat">
+    <div class="s-head"><span class="s-num">04</span><h2>Query Chat — the standalone "ask a question about your data" engine</h2></div>
+    <p class="s-lede">Architecturally <b>separate</b> from Canvas Assistant and Report Copilot — its own retrieval engine, its own SQL generator, its own validation/retry loop. Frontend: <code>QueryChatPanel.tsx</code> on <code>/projects/[id]/query</code> and <code>/end-user/query</code>. Backend entry: <code>POST /agent/intent</code> in <code>main.py</code> (not any file under <code>routers/</code>) → background task → <code>Orchestrator.run_single_viz_pipeline()</code> in <code>agents/orchestrator.py</code>. Results stream over a WebSocket, <code>/agent/stream/{job_id}</code>.</p>
+
+    <div class="callout"><b>What "redesign the query agent semantic matching" actually changed.</b> The branch name implies a rewrite, but most of this system predates the branch. What the redesign commit (<code>fb795c4</code>) actually did: converted table retrieval from one weighted-sum score into a <b>multi-expert ensemble fused by Reciprocal Rank Fusion, with a conditional LLM arbiter</b> — implementing a design that had been written up but not yet coded. Everything else here (SQL generation, templated SQL, cross-session memory, the metric registry, the 4-attempt validation/retry loop, result narration) is a mature, already-shipped system.</div>
+
+    <h3>Full pipeline, request to rendered chart</h3>
+    <div class="stages">
+      <div class="stage">
+        <div class="sbar"><span class="sidx">1</span><span class="stt">Intent classification</span><span class="tag t-llm model">Haiku 4.5</span></div>
+        <div class="sbody"><div class="mini">Pre-classified once upstream by a <code>QuickClassifier</code> in <code>main.py</code>'s background task, handed to the orchestrator so it isn't reclassified. Domain-aware: adds an "AGENT SKILL INTENTS" vocabulary for recruitment/finance projects. A regex backstop guarantees time-granularity phrasing ("month wise") is never lost even if the LLM misses it.</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">1.5</span><span class="stt">Skill-agent routing bypass</span><span class="tag t-guard">conditional</span></div>
+        <div class="sbody"><div class="mini">If the intent is one of MATCH/BRIEFING/AUDIT/PROSPECT/ACTION/… and the project's domain has skill agents, the request <b>never touches the SQL pipeline</b> — routes straight to a <code>ToolAgent</code> persona instead. See §Orchestrator &amp; Skill Agents.</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">2-3</span><span class="stt">Schema fetch + Graph-RAG retrieval</span><span class="tag t-agent">zero LLM, &lt;5ms</span></div>
+        <div class="sbody">
+          <div class="mini"><b>Six independent "expert" signals</b>, each producing its own ranked table list: TF-IDF cosine, Titan-embedding cosine, table-name token match, concept-index business-vocabulary match, entity/sample-value fuzzy match, FK-graph 1/2-hop reachability.</div>
+          <div class="mini"><b>Fusion:</b> Reciprocal Rank Fusion combines the six rankings by rank position (not raw score) into a consensus order + an <code>agreement</code> score, then a composite weighted score applies LLM-authored semantic-metadata adjustments (fact-table boost, KPI-metric boost, view-first boost, junk-table penalty, conversation-history fallback for elliptical follow-ups).</div>
+          <div class="mini"><b>Conditional arbiter</b> <span class="badge llm">Sonnet 4.5, 1 call</span> — only fires when confidence ≥0.12 but expert agreement &lt;0.6 or the top-2 margin &lt;0.08; re-orders the shortlist using only compact metadata, never the full schema. Non-fatal, falls back to the RRF order on failure.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">3c-3e</span><span class="stt">Root-cause / schema-explore / clarification guards</span><span class="tag t-guard">conditional shortcuts</span></div>
+        <div class="sbody">
+          <div class="mini">Same root-cause-follow-up shortcut pattern as the other two chat flows. A <code>SCHEMA_EXPLORE</code> intent returns a plain-English schema overview with no SQL. If RAG confidence &lt;0.12 or the question is compound ("X and Y"), the pipeline asks the user to clarify rather than guessing.</div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">4</span><span class="stt">Accuracy-context assembly</span><span class="tag t-agent">zero/low LLM</span></div>
+        <div class="sbody">
+          <div class="mini"><code>metric_registry.match_metrics()</code> — canonical, <b>user-editable</b> metric definitions (per-connection JSON, full CRUD REST API) pin a business term to an exact <code>{table, expression, date_column, filter}</code>.</div>
+          <div class="mini"><code>query_memory.find_similar()</code> — up to 3 similar past validated (question→SQL) pairs as few-shot examples, Jaccard token-overlap match, persisted per-connection as JSONL (300-entry cap).</div>
+          <div class="mini"><code>sql_template_builder</code> — if exactly one metric matched and the shape is simple, builds SQL <b>deterministically in Python with zero LLM call.</b></div>
+        </div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">4b</span><span class="stt">Multi-candidate ambiguity fan-out</span><span class="tag t-guard">conditional</span></div>
+        <div class="sbody"><div class="mini">When the top-2 RAG candidates are close, runs the single-candidate pipeline for up to 3 tables in parallel; auto-selects the best if the score gap &gt;0.22, else surfaces all options to the user.</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">5</span><span class="stt">SQL generation — up to 4 attempts</span><span class="tag t-llm model">Haiku (simple) / Sonnet (retry, complex)</span></div>
+        <div class="sbody"><div class="mini"><code>QueryAgent.generate()</code> prompt injects: top table schemas, GraphRAG hints, exact-column schema for the #1 candidate, a user-role SQL filter, metric-registry definitions (authoritative), query-memory few-shots, and a Python-computed concrete date range for relative time filters (never left to the LLM to compute).</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">5.5</span><span class="stt">Pre-execution guardrails, 7 checks</span><span class="tag t-guard">sql_utils.py + sandbox.py</span></div>
+        <div class="sbody"><div class="mini">Sandbox read-only check → intent-contract check (does the SQL honor requested granularity/shape?) → basic lint (SELECT/WITH-only, balanced parens, no UNION+ORDER BY) → qualified/unqualified column verification with fuzzy auto-fix → WHERE-literal case-mismatch fix. Each failure retries Stage 5 with feedback, no DB round-trip wasted.</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">6-6.5</span><span class="stt">Execute + result-shape guards</span><span class="tag t-agent">query_executor service</span></div>
+        <div class="sbody"><div class="mini">Zero-row retry, bad-JOIN null-ratio detection, date-spine completeness check for granularity requests, KPI-must-be-1-row check, cartesian-JOIN guard (&gt;200k rows), numeric-column-presence check, null/all-zero sanity check — all zero-LLM Python, before the expensive validator runs.</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">8</span><span class="stt">Validation</span><span class="tag t-llm model">ValidatorAgent — Haiku label-check, Sonnet feedback</span></div>
+        <div class="sbody"><div class="mini">Scores chart-type / axis-labels / data-shape / completeness. Pass threshold is <b>0.65 here</b> (the orchestrator overrides the class's own internal 0.80). Below threshold with attempts left → retry with structured feedback naming a retry strategy (<code>adjust_aggregation, alternate_table, expand_join, broaden_query</code>).</div></div>
+      </div>
+      <div class="parrow"></div>
+      <div class="stage">
+        <div class="sbar"><span class="sidx">9-10</span><span class="stt">Memory write + streamed narration</span><span class="tag t-llm model">Sonnet narrate · Haiku verify</span></div>
+        <div class="sbody"><div class="mini">On success, writes to <code>query_memory</code> for future few-shot reuse. <code>result_narrator.narrate_stream()</code> streams tokens live over the WebSocket; <code>verify_narrative_grounding()</code> checks every number in the narrative actually appears in the returned rows, correcting it live if not.</div></div>
+      </div>
+    </div>
+
+    <h3>Relationship to Canvas Assistant &amp; Report Copilot — parallel, not unified</h3>
+    <p class="mini">Confirmed by import graph: <code>chat.py</code>/<code>intelligence_chat.py</code> still run on the <b>older</b> <code>intent_parser.py</code> + <code>nl_schema_router.py</code> stack and never import <code>intent_classifier.py</code>, <code>query_agent.py</code>, <code>query_memory.py</code>, <code>metric_registry.py</code>, <code>sql_template_builder.py</code>, <code>retrieval_arbiter.py</code>, or <code>table_role_classifier.py</code>. Two retrieval systems exist in parallel by design — <code>graph_rag_retriever.py</code>'s own code comments explicitly cross-reference mirroring (not replacing) logic that <code>nl_schema_router.py</code> already has for the other stack. <code>candidate_ranker.py</code> is the one utility genuinely shared by both.</p>
+
+    <div class="callout gap"><b>Stale doc flagged:</b> <code>docs/query-agent-architecture.html</code> still describes retrieval as "six blended signals → one score" with zero mention of "arbiter"/"RRF"/"ensemble," despite its own header claiming to reflect current code. <code>query-agent-dataflow.html</code>, <code>query-agent-security-guardrails.html</code>, and <code>table-retrieval-explained.html</code> were updated in the redesign commit and are accurate.</div>
+  </section>
+
+  <!-- ===================== ORCHESTRATOR & SKILL AGENTS ===================== -->
+  <section id="orchestrator">
+    <div class="s-head"><span class="s-num">05</span><h2>Orchestrator &amp; the 14 skill-agent personas</h2></div>
+    <p class="s-lede"><code>agents/orchestrator.py</code>'s <code>Orchestrator</code> class is the dispatcher underneath Query Chat — it either runs the SQL/chart pipeline (§Query Chat) or, for certain intents, hands off entirely to a domain-specific persona built on a shared tool-use engine. Not to be confused with <code>routers/intelligence_orchestrator.py</code> (Report Generation, a different file).</p>
+
+    <div class="flow">
+      <div class="fstep"><div class="marker"><div class="num">1</div><div class="line"></div></div><div class="body">
+        <div class="node n-guard"><div class="nt">gate</div><div class="nn">Route to skill agent?</div><div class="nd"><code>intent.intent_type ∈ _AGENT_INTENTS</code> (MATCH/BRIEFING/SCREEN/ENRICH/VERIFY/PRESENT/AUDIT/PROSPECT/ACTION, plus finance-only RECONCILE/ANOMALY/FORECAST/NETWORK) <b>and</b> <code>domain ∈ SKILL_DOMAINS = {"recruitment","finance"}</code>.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">2</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">registry</div><div class="nn"><code>skill_agents.get_agent(domain, intent_type)</code></div><div class="nd">A plugin registry — <code>register(domain, intent_type, fn)</code> stores an async <code>run(user_text, ctx) -&gt; str</code> per <code>(domain, intent)</code> key, loaded at startup by importing a hardcoded module list. Unregistered combos fall to a "coming soon" stub.</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">3</div><div class="line"></div></div><div class="body">
+        <div class="node n-agent"><div class="nt">engine</div><div class="nn"><code>ToolAgent</code> <span class="mono" style="font-size:11px">tool_agent.py</span></div><div class="nd">The shared, domain-agnostic engine underneath 13 of the 14 personas: a multi-turn Bedrock tool-use loop (<code>bedrock_invoke_with_tools</code>, Sonnet) dispatching tool calls via <code>tools/dispatcher.py</code> until <code>end_turn</code> or <code>max_turns</code>. Every skill agent just supplies a different <code>system_prompt</code> + <code>tool_names</code> list — "swap the prompt, keep everything else identical."</div></div>
+      </div></div>
+      <div class="fstep"><div class="marker"><div class="num">4</div><div class="line"></div></div><div class="body">
+        <div class="node n-ok"><div class="nt">output</div><div class="nn">Prose/markdown answer, same wire shape as a chart</div><div class="nd">Wrapped into the identical <code>chart_data</code>/<code>chart.confirmed</code> result shape as the SQL pipeline (<code>output_mode: "text"</code>) so the frontend doesn't need a special case.</div></div>
+      </div></div>
+    </div>
+
+    <h3>Recruitment personas <span style="color:var(--indigo);font-weight:600">· fixed, hard-coded schema</span></h3>
+    <div class="skills">
+      <div class="skill"><span class="sk-n">MATCH</span><div class="sk-t">match_agent.py</div><div class="sk-d">Ranks/shortlists candidates using pre-existing ML scores from an external Lambda — read-only, never scores itself.</div></div>
+      <div class="skill"><span class="sk-n">BRIEF</span><div class="sk-t">briefing_agent.py</div><div class="sk-d">"My placements" personal queries, or a full daily pipeline briefing via 3 sequential tool calls.</div></div>
+      <div class="skill"><span class="sk-n">AUDIT</span><div class="sk-t">audit_agent.py</div><div class="sk-d">6 fixed SQL checks: front-office data quality + back-office financial integrity against <code>staging.bullhorn_*</code>/<code>bqp_*</code>.</div></div>
+      <div class="skill"><span class="sk-n">PROSPECT</span><div class="sk-t">prospect_agent.py</div><div class="sk-d">Finds pipeline gaps: applicants with zero scored candidates, stale open jobs, ML-scoring blind spots.</div></div>
+      <div class="skill" style="border-style:dashed"><span class="sk-n" style="color:var(--purple);background:var(--purple-bg)">GAP</span><div class="sk-t" style="color:var(--muted)">SCREEN · ENRICH · VERIFY · PRESENT</div><div class="sk-d">Listed in the module-load list but <b>the files don't exist on disk</b> — <code>ImportError</code> is silently swallowed, so these intents always hit the "coming soon" stub.</div></div>
+    </div>
+
+    <h3>Finance personas <span style="color:var(--indigo);font-weight:600">· schema-discovered, <code>run_sql</code> only, fully independent (no chaining)</span></h3>
+    <div class="skills">
+      <div class="skill"><span class="sk-n">RECON</span><div class="sk-t">finance_reconcile_agent.py</div><div class="sk-d">Matches totals between two related sources (ledger vs. statement) and pinpoints exactly which records don't tie out.</div></div>
+      <div class="skill"><span class="sk-n">ANOM</span><div class="sk-t">finance_anomaly_agent.py</div><div class="sk-d">Live outlier detection via SQL — stddev outliers, velocity, structuring, round-number clustering.</div></div>
+      <div class="skill"><span class="sk-n">CAST</span><div class="sk-t">finance_forecast_agent.py</div><div class="sk-d">Projects trend/balance/cash-flow via plain SQL (moving average / period-over-period) — deliberately not an ML model, for explainability.</div></div>
+      <div class="skill"><span class="sk-n">NET</span><div class="sk-t">finance_network_agent.py</div><div class="sk-d">Finds relationships <i>between</i> entities — shared attributes, circular fund flows, related-party chains.</div></div>
+      <div class="skill"><span class="sk-n">AUDIT</span><div class="sk-t">finance_audit_agent.py</div><div class="sk-d">Generic, schema-discovered data-quality/integrity checks — nulls, duplicate IDs, orphaned FKs, invalid amounts.</div></div>
+      <div class="skill"><span class="sk-n">BRIEF</span><div class="sk-t">finance_briefing_agent.py</div><div class="sk-d">Daily operational overview — exceptions, flagged transactions, pending reconciliations.</div></div>
+      <div class="skill"><span class="sk-n">ENRICH</span><div class="sk-t">finance_enrich_agent.py</div><div class="sk-d">Given one identifier, cross-references every referencing table into one consolidated profile.</div></div>
+      <div class="skill"><span class="sk-n">MATCH</span><div class="sk-t">finance_match_agent.py</div><div class="sk-d">Ranks/flags accounts/transactions by risk/fraud/priority — schema-discovered counterpart to recruitment's fixed-schema match agent.</div></div>
+      <div class="skill"><span class="sk-n">PROS</span><div class="sk-t">finance_prospect_agent.py</div><div class="sk-d">Finds operational gaps: stale open items, missing ownership, high-value backlog.</div></div>
+      <div class="skill"><span class="sk-n" style="color:var(--slate);background:var(--slate-bg)">ACT</span><div class="sk-t">action_agent.py <span style="font-weight:600;color:var(--muted)">· shared, read-only</span></div><div class="sk-d">Registered for <b>both</b> domains. Deliberately tool-less: drafts the SQL a write request would need, never executes it, adds an irreversibility warning for DELETE/DROP/TRUNCATE.</div></div>
+    </div>
+
+    <div class="callout"><b>Confirmed independent, not a pipeline.</b> No finance skill agent imports/calls another — a user asking "reconcile my ledger" gets exactly <code>finance_reconcile_agent.run()</code> and nothing else. The only shared coupling is an optional, best-effort "table role hints" block (<code>table_role_classifier.py</code>) injected once for the finance domain, non-fatal on failure.</div>
+
+    <div class="callout gap"><b>Only one live call site.</b> All 14 personas are reachable through exactly one path: chat → <code>POST /agent/intent</code> → background task → <code>Orchestrator.run_single_viz_pipeline</code> → the routing gate above. No router imports <code>skill_agents</code> or <code>tool_agent</code> directly, no dedicated REST endpoint, no scheduled job.</div>
+  </section>
+
+  <!-- ===================== GUARDRAILS & VALIDATION ===================== -->
+  <section id="guardrails">
+    <div class="s-head"><span class="s-num">06</span><h2>Guardrails &amp; Validation — the safety layer, and where it's inconsistent</h2></div>
+    <p class="s-lede">Two genuinely distinct concerns exist here: <b>SQL-safety gating</b> (can this query even run?) and <b>post-execution quality scoring</b> (is the resulting chart actually good?). The second is cleanly scoped to Query Chat only. The first is where the real finding is — the same concern is <b>reimplemented three separate times</b>, with meaningfully different completeness, across the three chat/query surfaces.</p>
+
+    <h3>ValidatorAgent — post-execution chart-quality critic <span style="font-weight:600;color:var(--muted)">· Query Chat only</span></h3>
+    <div class="grid2">
+      <div class="node n-llm"><div class="nt">scores</div><div class="nn">4 weighted dimensions</div><div class="nd"><code>chart_type</code> (0.25, exact match) · <code>axis_labels</code> (0.20, Haiku semantic check) · <code>data_shape</code> (0.25, row-count plausibility) · <code>completeness</code> (0.30, coverage ratio). Composite ≥0.65 (orchestrator's override; the class's own internal default is 0.80) → pass.</div></div>
+      <div class="node n-guard"><div class="nt">on failure</div><div class="nn"><code>generate_structured_feedback()</code></div><div class="nd">One more Sonnet call producing a single-sentence, actionable retry instruction, tagged with a named strategy from <code>RETRY_STRATEGIES</code>. Sole caller: <code>Orchestrator</code> (§Query Chat, stage 8) — <code>chat_agent.py</code> and <code>intelligence_chat_agent.py</code> never call it.</div></div>
+    </div>
+    <div class="callout gap"><b><code>validator_agent/skills/</code> is a richer, unused spec.</b> The 5 standalone skill scripts implement noticeably <i>more thorough</i> checks than the production class methods they document (e.g. full <code>CHART_REQUIREMENTS</code> shape validation vs. production's 1-line string-equality <code>validate_chart_type()</code>) — but are never imported at runtime. <code>skill.md</code> also documents a 6th skill, <code>score_screenshot_mode</code>, whose script file doesn't exist anywhere in the repo.</div>
+
+    <h3>The three independent SQL-safety implementations</h3>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Implementation</th><th>Used by</th><th>Comment-strip</th><th>Statement-chain block</th><th>System-catalog block</th><th>Row-limit cap</th><th>Table-scope enforce</th></tr>
+      <tr><td class="ink"><b>query_executor/sandbox.py</b><br><code>validate_sql()</code></td><td>Query Chat (<code>orchestrator.py</code>) — belt-and-suspenders before the executor's own check</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+      <tr><td class="ink"><b>sql_utils.py</b><br><code>basic_sql_lint()</code></td><td>Query Chat (<code>orchestrator.py</code>)</td><td>—</td><td>balanced-parens + no ORDER BY inside UNION (unique to this one)</td><td>—</td><td>—</td><td>—</td></tr>
+      <tr><td class="ink"><b>intel_guardrails.py</b><br><code>apply_fulldb_guardrails()</code></td><td>Canvas Assistant + Report Copilot ONLY (both via their router, never orchestrator.py)</td><td>✓</td><td>✓</td><td>✓ (25-entry pattern list incl. Redshift/Snowflake/Db2)</td><td>✓ (auto-cap at 10,000)</td><td>✓ (BLOCK in <code>mode="report"</code>, WARN in <code>mode="database"</code>)</td></tr>
+    </table></div>
+    <div class="callout guard"><b>The most protected pipeline is arguably the wrong one.</b> <code>intel_guardrails.py</code> — the most complete implementation, with comment-stripping, chaining detection, catalog blocking, row-limit enforcement, and table-scope enforcement — is used only by the two conversational copilots. The Query Chat / Orchestrator pipeline, which auto-retries and can chain up to 4 LLM-generated SQL attempts per request, relies on the two thinner, independently-written keyword blockers instead — neither of which checks for comment-hidden injections, statement chaining, or system-catalog access, and neither enforces a table scope or row cap. None of the three share code or constants.</div>
+
+    <h3><code>intel_guardrails.py</code> — the 6-layer stack that Canvas Assistant &amp; Report Copilot use</h3>
+    <div class="stages">
+      <div class="stage"><div class="sbar"><span class="sidx">L0</span><span class="stt">Strip comments</span></div><div class="sbody"><div class="mini">Removes <code>/* */</code> and <code>--</code> before any analysis, so a dangerous keyword can't hide behind a comment.</div></div></div>
+      <div class="parrow"></div>
+      <div class="stage"><div class="sbar"><span class="sidx">L1</span><span class="stt">Block statement chaining</span><span class="tag t-guard" style="margin-left:auto">reject</span></div><div class="sbody"><div class="mini">A quote-aware scanner flags a mid-string <code>;</code> followed by non-whitespace. Trailing <code>;</code> alone is fine.</div></div></div>
+      <div class="parrow"></div>
+      <div class="stage"><div class="sbar"><span class="sidx">L2</span><span class="stt">Statement-type allowlist</span><span class="tag t-guard" style="margin-left:auto">reject</span></div><div class="sbody"><div class="mini">Only <code>SELECT</code>/<code>WITH</code> pass. Everything else is bucketed &amp; named: write ops (INSERT/UPDATE/DELETE/MERGE/UPSERT), DDL (CREATE/DROP/ALTER/TRUNCATE…), admin (COPY/GRANT/EXECUTE/VACUUM…), introspection (EXPLAIN/SET/SHOW/BEGIN…).</div></div></div>
+      <div class="parrow"></div>
+      <div class="stage"><div class="sbar"><span class="sidx">L3</span><span class="stt">System-catalog block</span><span class="tag t-guard" style="margin-left:auto">reject</span></div><div class="sbody"><div class="mini">25-pattern list: Postgres <code>information_schema./pg_catalog./pg_class</code>, SQL Server <code>sys.tables</code>, Db2 <code>syscat.</code>, Redshift <code>stl_/stv_/svl_/svv_</code>, Snowflake <code>account_usage.</code>.</div></div></div>
+      <div class="parrow"></div>
+      <div class="stage"><div class="sbar"><span class="sidx">L4</span><span class="stt">Row-limit enforcement</span><span class="tag llm badge model" style="margin-left:auto">warn only</span></div><div class="sbody"><div class="mini">Injects <code>LIMIT 10000</code> if absent, or caps an existing higher LIMIT down. Never blocks — only appends a warning when it changes something.</div></div></div>
+      <div class="parrow"></div>
+      <div class="stage"><div class="sbar"><span class="sidx">L5</span><span class="stt">Table-scope check</span><span class="tag t-guard" style="margin-left:auto">mode-dependent</span></div><div class="sbody"><div class="mini">CTE aliases exempted. <code>mode="report"</code> → hard BLOCK on any out-of-scope table. <code>mode="database"</code> → WARN only, execution proceeds. This warning's exact substring <code>"outside the allowed scope"</code> is what downstream callers pattern-match to set <code>low_confidence=True</code> for later root-cause follow-ups.</div></div></div>
+    </div>
+  </section>
+
+  <!-- ===================== KNOWN GAPS ===================== -->
+  <section id="gaps">
+    <div class="s-head"><span class="s-num">07</span><h2>Known gaps, dead code &amp; documentation drift</h2></div>
+    <p class="s-lede">Consolidated from every flow above — useful as a punch list, not a criticism. None of these are blocking; several are intentional (e.g. ExecutiveCopilot's simpler scope was confirmed acceptable).</p>
+
+    <div class="grid2">
+      <div class="node n-gap"><div class="nt">dead code</div><div class="nn"><code>routers/projects.py</code> never mounted</div><div class="nd">Full project CRUD + connections/schema-crawl router exists but <code>main.py</code> never calls <code>include_router</code> on it — the live <code>/projects*</code> routes are defined inline in <code>main.py</code> instead, duplicating the file's own private <code>get_current_user</code>.</div></div>
+      <div class="node n-gap"><div class="nt">dead wiring</div><div class="nn">Canvas Assistant <code>dashboard_action</code> events</div><div class="nd"><code>add_widget/rename_widget/filter_widget/navigate</code> fences are fully parsed server-side and emitted over SSE, but <code>CanvasChatPanel.tsx</code> never registers an <code>onAction</code> handler — effectively inert in the live UI.</div></div>
+      <div class="node n-gap"><div class="nt">scaffolding only</div><div class="nn">Five <code>*/skills/</code> subdirectories are docs+CLI tools, not runtime code</div><div class="nd"><code>chat_agent/skills/</code>, <code>validator_agent/skills/</code>, <code>orchestrator/skills/</code>, <code>intent_classifier/skills/</code>, <code>query_agent/skills/</code> — each a <code>skill.md</code> + standalone Python scripts, never imported by the live service. Some (validator's) are actually <i>more thorough</i> than the shipped code; worth mining for improvements rather than treating as dead weight.</div></div>
+      <div class="node n-gap"><div class="nt">missing files</div><div class="nn">4 recruitment personas advertised, not built</div><div class="nd"><code>SCREEN/ENRICH/VERIFY/PRESENT</code> are in the skill-agent module-load list and the intent classifier's vocabulary, but the files don't exist — <code>ImportError</code> is silently swallowed at startup, so these intents always hit the "coming soon" stub. Same gap exists for finance <code>SCREEN/VERIFY/PRESENT</code>.</div></div>
+      <div class="node n-gap"><div class="nt">stale doc</div><div class="nn"><code>docs/query-agent-architecture.html</code></div><div class="nd">Still describes single-score retrieval with no mention of the ensemble/RRF/arbiter mechanism actually shipped in <code>fb795c4</code>, despite its header claiming to reflect current code. Three sibling docs were updated in the same commit and are accurate.</div></div>
+      <div class="node n-gap"><div class="nt">3× duplication</div><div class="nn">SQL-safety logic reimplemented independently</div><div class="nd"><code>sandbox.py</code>, <code>sql_utils.basic_sql_lint()</code>, and <code>intel_guardrails.apply_fulldb_guardrails()</code> share no code or constants — see §Guardrails for the completeness comparison.</div></div>
+      <div class="node n-gap"><div class="nt">non-DRY auth</div><div class="nn">~8 routers reimplement Bearer decoding</div><div class="nd">One canonical <code>get_current_user</code> exists in <code>main.py</code>, but <code>ai_insights, alerts, end_user, explain, share, tier5, versions, vly, brainwave_profiles, query_sessions</code> each define their own private <code>HTTPBearer</code> + user-resolution helper.</div></div>
+      <div class="node n-gap"><div class="nt">confirmed acceptable</div><div class="nn">ExecutiveCopilot vs. IntelligenceCopilotPanel parity gap</div><div class="nd">The shared-link chat surface lacks the data-grounded memory + root-cause follow-up upgrade the logged-in copilot has. Raised and explicitly left as-is 2026-07-23 — documented here so it isn't rediscovered as a surprise.</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <p><b>Scope:</b> This document is the complete reference — every live agent flow in <code>backend/agent_service</code>, the guardrail/validation layer, and the router/database/frontend map. It complements <code>visually-architecture.html</code>, which covers Canvas Assistant / Report Copilot / Report Generation / the metadata pipeline / recruiting agents at a lighter level and explicitly excludes Query Chat, finance agents, and the full guardrails picture — all three are covered in full here.</p>
+    <p style="margin-top:8px">All AI on <b>AWS Bedrock Claude</b> — Sonnet 4.5 (routing / SQL / critic / writer-support), Opus 4.5 (report writing), Haiku 4.5 (intent, cheap SQL, grounding checks), Titan Embed v2 (256-dim schema vectors). Every generated query across every flow is read-only against whitelisted tables at the point it reaches a database — no DDL/DML is ever executed by an LLM-generated statement.</p>
+  </footer>
+</main>
+
+<script>
+  var tt=document.getElementById('tt');
+  tt.addEventListener('click',function(){
+    var cur=document.documentElement.getAttribute('data-theme');
+    var isDark = cur ? cur==='dark' : matchMedia('(prefers-color-scheme:dark)').matches;
+    document.documentElement.setAttribute('data-theme', isDark?'light':'dark');
+  });
+  var links=[].slice.call(document.querySelectorAll('nav a'));
+  var secs=links.map(function(a){return document.querySelector(a.getAttribute('href'))}).filter(Boolean);
+  function spy(){
+    var y=window.scrollY+120, cur=secs[0];
+    secs.forEach(function(s){ if(s.offsetTop<=y) cur=s; });
+    links.forEach(function(a){ a.classList.toggle('on', a.getAttribute('href')==='#'+(cur&&cur.id)); });
+  }
+  addEventListener('scroll',spy,{passive:true}); spy();
+  links.forEach(function(a){ a.addEventListener('click',function(e){
+    var t=document.querySelector(a.getAttribute('href')); if(!t) return;
+    e.preventDefault(); t.scrollIntoView({behavior:'smooth'});
+  });});
+</script>
+</body>
+</html>

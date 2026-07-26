@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visually — AWS ECR Deployment &amp; Database Architecture</title>
+<style>
+  /* ============ TOKENS ============ */
+  :root{
+    --bg:#f6f7f9;
+    --surface:#ffffff;
+    --surface-2:#eef1f5;
+    --ink:#161c26;
+    --ink-2:#4a5568;
+    --ink-3:#78859a;
+    --line:#dfe4ea;
+    --line-2:#c9d1db;
+    --accent:#c9691f;          /* AWS-adjacent amber, desaturated for ground */
+    --accent-soft:#f6e6d6;
+    --steel:#356094;           /* data layer */
+    --steel-soft:#dde7f1;
+    --good:#2f7d55;
+    --good-soft:#dcefe2;
+    --warn:#9a6a12;
+    --warn-soft:#f5ebd4;
+    --bad:#a83232;
+    --bad-soft:#f4dede;
+    --code-bg:#f2efe9;
+    --code-ink:#2a2320;
+    --shadow:0 1px 2px rgba(20,28,38,.05),0 4px 16px rgba(20,28,38,.05);
+    --radius:12px;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,"Cascadia Code",Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0e1218;--surface:#161c25;--surface-2:#1d2531;--ink:#e7ecf3;--ink-2:#aeb9c8;
+      --ink-3:#7c8798;--line:#2a333f;--line-2:#3a4552;--accent:#e2924e;--accent-soft:#33261a;
+      --steel:#6ea3d8;--steel-soft:#1a2634;--good:#5cc088;--good-soft:#16281e;--warn:#d6a94e;
+      --warn-soft:#2a2416;--bad:#e07070;--bad-soft:#2a1818;--code-bg:#12171f;--code-ink:#d8dee7;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f6f7f9;--surface:#ffffff;--surface-2:#eef1f5;--ink:#161c26;--ink-2:#4a5568;--ink-3:#78859a;
+    --line:#dfe4ea;--line-2:#c9d1db;--accent:#c9691f;--accent-soft:#f6e6d6;--steel:#356094;
+    --steel-soft:#dde7f1;--good:#2f7d55;--good-soft:#dcefe2;--warn:#9a6a12;--warn-soft:#f5ebd4;
+    --bad:#a83232;--bad-soft:#f4dede;--code-bg:#f2efe9;--code-ink:#2a2320;
+    --shadow:0 1px 2px rgba(20,28,38,.05),0 4px 16px rgba(20,28,38,.05);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0e1218;--surface:#161c25;--surface-2:#1d2531;--ink:#e7ecf3;--ink-2:#aeb9c8;--ink-3:#7c8798;
+    --line:#2a333f;--line-2:#3a4552;--accent:#e2924e;--accent-soft:#33261a;--steel:#6ea3d8;
+    --steel-soft:#1a2634;--good:#5cc088;--good-soft:#16281e;--warn:#d6a94e;--warn-soft:#2a2416;
+    --bad:#e07070;--bad-soft:#2a1818;--code-bg:#12171f;--code-ink:#d8dee7;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    line-height:1.65;font-size:16px;-webkit-font-smoothing:antialiased;
+  }
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px;display:grid;grid-template-columns:1fr;gap:0}
+  @media(min-width:1000px){
+    .layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:48px;align-items:start}
+  }
+
+  /* ---- header ---- */
+  header.hero{
+    border-bottom:1px solid var(--line);
+    background:
+      radial-gradient(120% 140% at 100% 0%, var(--accent-soft) 0%, transparent 55%),
+      var(--surface);
+  }
+  .hero-inner{max-width:1180px;margin:0 auto;padding:44px 24px 38px}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600;margin:0 0 14px}
+  h1{font-size:clamp(28px,4.2vw,44px);line-height:1.08;margin:0 0 14px;letter-spacing:-.02em;text-wrap:balance;font-weight:750}
+  .lede{font-size:clamp(16px,2vw,19px);color:var(--ink-2);max-width:64ch;margin:0}
+  .meta-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+  .chip{font-family:var(--mono);font-size:12px;padding:5px 11px;border-radius:100px;border:1px solid var(--line-2);color:var(--ink-2);background:var(--surface)}
+  .chip b{color:var(--ink);font-weight:600}
+
+  /* ---- TOC ---- */
+  nav.toc{display:none}
+  @media(min-width:1000px){
+    nav.toc{display:block;position:sticky;top:24px;padding-top:40px;font-size:13.5px}
+    nav.toc .toc-title{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);margin:0 0 12px}
+    nav.toc a{display:block;color:var(--ink-2);text-decoration:none;padding:5px 10px;border-left:2px solid transparent;border-radius:0 6px 6px 0;line-height:1.35}
+    nav.toc a:hover{color:var(--ink);background:var(--surface-2);border-left-color:var(--accent)}
+    nav.toc a.sub{padding-left:22px;font-size:12.5px;color:var(--ink-3)}
+  }
+
+  main{padding:40px 0 90px;min-width:0}
+  section{margin:0 0 56px;scroll-margin-top:24px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:600;display:flex;align-items:center;gap:10px;margin:0 0 8px}
+  .eyebrow .num{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:6px;background:var(--accent);color:#fff;font-size:12px}
+  h2{font-size:clamp(22px,3vw,29px);letter-spacing:-.015em;margin:0 0 16px;line-height:1.15;font-weight:720;text-wrap:balance}
+  h3{font-size:19px;margin:34px 0 10px;letter-spacing:-.01em;font-weight:680}
+  h4{font-size:15px;margin:22px 0 8px;font-weight:650;color:var(--ink)}
+  p{margin:0 0 14px;max-width:70ch}
+  a{color:var(--accent);text-underline-offset:3px}
+  strong{font-weight:650}
+  ul,ol{margin:0 0 16px;padding-left:22px;max-width:70ch}
+  li{margin:6px 0}
+  li::marker{color:var(--ink-3)}
+
+  /* ---- callouts ---- */
+  .note{border-radius:var(--radius);padding:16px 18px;margin:20px 0;border:1px solid var(--line);background:var(--surface);display:flex;gap:13px;box-shadow:var(--shadow)}
+  .note .ic{flex:0 0 auto;width:26px;height:26px;border-radius:7px;display:grid;place-items:center;font-size:14px;font-weight:700;color:#fff}
+  .note p{margin:0}
+  .note .body{min-width:0}
+  .note.key{background:var(--accent-soft);border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
+  .note.key .ic{background:var(--accent)}
+  .note.good{background:var(--good-soft);border-color:color-mix(in srgb,var(--good) 35%,transparent)}
+  .note.good .ic{background:var(--good)}
+  .note.warn{background:var(--warn-soft);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+  .note.warn .ic{background:var(--warn)}
+  .note.bad{background:var(--bad-soft);border-color:color-mix(in srgb,var(--bad) 35%,transparent)}
+  .note.bad .ic{background:var(--bad)}
+
+  /* ---- code ---- */
+  .code{margin:18px 0;border-radius:var(--radius);border:1px solid var(--line);overflow:hidden;box-shadow:var(--shadow)}
+  .code .bar{display:flex;align-items:center;gap:8px;padding:9px 14px;background:var(--surface-2);border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+  .code .bar .dot{width:9px;height:9px;border-radius:50%;background:var(--line-2)}
+  .code .bar .name{margin-left:4px;color:var(--ink-2)}
+  .code .bar .tag{margin-left:auto;font-size:11px;padding:2px 8px;border-radius:5px;background:var(--surface);border:1px solid var(--line);color:var(--ink-3)}
+  pre{margin:0;padding:16px 18px;background:var(--code-bg);color:var(--code-ink);overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.7}
+  pre .c{color:var(--ink-3)}
+  pre .k{color:var(--accent);font-weight:600}
+  pre .s{color:var(--steel)}
+  code:not(pre code){font-family:var(--mono);font-size:.88em;background:var(--surface-2);padding:1.5px 6px;border-radius:5px;border:1px solid var(--line);color:var(--ink)}
+
+  /* ---- tables ---- */
+  .tablewrap{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;background:var(--surface);min-width:520px}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--surface-2);font-weight:640;font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:var(--ink-2);white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  td code{white-space:nowrap}
+  .num-col{font-variant-numeric:tabular-nums}
+
+  .pill{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;padding:2px 8px;border-radius:5px;white-space:nowrap}
+  .pill.py{background:var(--steel-soft);color:var(--steel)}
+  .pill.node{background:var(--good-soft);color:var(--good)}
+  .pill.req{background:var(--good-soft);color:var(--good)}
+  .pill.opt{background:var(--surface-2);color:var(--ink-3)}
+  .pill.no{background:var(--bad-soft);color:var(--bad)}
+
+  /* ---- diagram primitives ---- */
+  .diagram{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:26px 22px;margin:22px 0;box-shadow:var(--shadow);overflow-x:auto}
+  .diagram .cap{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin:0 0 18px;text-align:center}
+  .tier{margin:0 0 14px}
+  .tier-label{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:0 0 8px;padding-left:2px}
+  .row{display:flex;flex-wrap:wrap;gap:12px;justify-content:center}
+  .node{flex:1 1 150px;min-width:140px;max-width:210px;border-radius:10px;padding:12px 14px;border:1.5px solid var(--line-2);background:var(--surface-2);text-align:left}
+  .node .t{font-weight:640;font-size:14px;margin:0 0 3px;display:flex;align-items:center;gap:7px}
+  .node .d{font-size:12px;color:var(--ink-2);margin:0;line-height:1.4}
+  .node .port{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+  .node.svc{border-color:color-mix(in srgb,var(--accent) 55%,var(--line-2));background:color-mix(in srgb,var(--accent-soft) 60%,var(--surface))}
+  .node.data{border-color:color-mix(in srgb,var(--steel) 55%,var(--line-2));background:color-mix(in srgb,var(--steel-soft) 60%,var(--surface))}
+  .node.ext{border-style:dashed;border-color:var(--line-2);background:var(--surface)}
+  .node.fe{border-color:color-mix(in srgb,var(--good) 45%,var(--line-2));background:color-mix(in srgb,var(--good-soft) 55%,var(--surface))}
+  .arrow{text-align:center;color:var(--ink-3);font-size:20px;line-height:1;margin:2px 0}
+  .flowline{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:6px 4px}
+  .flowline .step{background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600}
+  .flowline .step small{display:block;font-weight:400;color:var(--ink-3);font-family:var(--mono);font-size:10.5px;letter-spacing:.03em}
+  .flowline .to{color:var(--accent);font-weight:700}
+
+  /* two-col compare */
+  .compare{display:grid;grid-template-columns:1fr;gap:16px;margin:22px 0}
+  @media(min-width:680px){.compare{grid-template-columns:1fr 1fr}}
+  .card{border-radius:var(--radius);border:1px solid var(--line);background:var(--surface);padding:20px;box-shadow:var(--shadow)}
+  .card.pg{border-top:4px solid var(--steel)}
+  .card.rs{border-top:4px solid var(--accent)}
+  .card h4{margin:0 0 4px;font-size:17px}
+  .card .role{font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin:0 0 14px}
+  .card.pg .role{color:var(--steel)}
+  .card.rs .role{color:var(--accent)}
+  .card ul{padding-left:18px;margin:0;font-size:14px}
+  .card li{margin:8px 0}
+
+  .grid-2{display:grid;grid-template-columns:1fr;gap:16px;margin:20px 0}
+  @media(min-width:680px){.grid-2{grid-template-columns:1fr 1fr}}
+  .mini{border:1px solid var(--line);border-radius:10px;padding:16px 18px;background:var(--surface)}
+  .mini h4{margin:0 0 6px}
+  .mini p{font-size:13.5px;color:var(--ink-2);margin:0}
+
+  .steps{counter-reset:step;list-style:none;padding:0;margin:22px 0}
+  .steps>li{position:relative;padding:0 0 4px 46px;margin:0 0 26px}
+  .steps>li::before{counter-increment:step;content:counter(step);position:absolute;left:0;top:0;width:30px;height:30px;border-radius:8px;background:var(--accent);color:#fff;font-weight:700;font-size:14px;display:grid;place-items:center;font-family:var(--mono)}
+  .steps>li h4{margin:2px 0 8px}
+
+  hr{border:none;border-top:1px solid var(--line);margin:44px 0}
+  footer{border-top:1px solid var(--line);padding:26px 0 60px;color:var(--ink-3);font-size:13px}
+  .tag-legend{display:flex;flex-wrap:wrap;gap:14px;margin:14px 0 0;font-size:12.5px;color:var(--ink-2)}
+  .tag-legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:13px;height:13px;border-radius:4px;display:inline-block;border:1px solid var(--line-2)}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="hero-inner">
+    <p class="kicker">Deployment &amp; Architecture Reference · v1 · 2026-07-24</p>
+    <h1>Deploying Visually to AWS — ECR, and the Database It Needs</h1>
+    <p class="lede">A complete, manager-ready walkthrough of how the six Visually services are packaged and pushed to Amazon ECR (CLI <em>and</em> Console), plus a plain-English answer to the question that keeps coming up: <strong>do we need PostgreSQL, Redshift, or both — and why?</strong></p>
+    <div class="meta-row">
+      <span class="chip"><b>6</b> container images</span>
+      <span class="chip"><b>1</b> platform DB · PostgreSQL</span>
+      <span class="chip"><b>4</b> source-warehouse drivers</span>
+      <span class="chip">Registry: <b>Amazon ECR</b></span>
+      <span class="chip">Runtime: <b>ECS Fargate</b></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+<div class="layout">
+
+  <nav class="toc">
+    <p class="toc-title">On this page</p>
+    <a href="#tldr">Executive summary</a>
+    <a href="#arch">1 · System architecture</a>
+    <a href="#components" class="sub">The 6 services</a>
+    <a href="#db">2 · Database architecture</a>
+    <a href="#db-two-roles" class="sub">Two database roles</a>
+    <a href="#db-why-pg" class="sub">Why PostgreSQL</a>
+    <a href="#db-why-not-rs" class="sub">Why not Redshift for the platform</a>
+    <a href="#db-provision" class="sub">What to provision</a>
+    <a href="#ecr">3 · Push to ECR — CLI</a>
+    <a href="#ecr-console">4 · Push to ECR — Console</a>
+    <a href="#run">5 · Running the images</a>
+    <a href="#cicd">6 · CI/CD automation</a>
+    <a href="#env">7 · Env &amp; secrets checklist</a>
+    <a href="#pitch">Talking points for your manager</a>
+  </nav>
+
+  <main>
+
+  <!-- ============ EXEC SUMMARY ============ -->
+  <section id="tldr">
+    <p class="eyebrow"><span class="num">§</span> Executive summary</p>
+    <h2>What we are deploying, in one page</h2>
+    <p>Visually is a set of <strong>six independent containers</strong> that already run together locally via <code>docker-compose.yml</code>. Deploying to AWS means two separate things that people often conflate:</p>
+    <div class="grid-2">
+      <div class="mini">
+        <h4>① A place to store the images</h4>
+        <p><strong>Amazon ECR</strong> (Elastic Container Registry) is a private Docker image registry. We build each service into an image and <em>push</em> it here. ECR only <em>stores</em> images — it does not run them. This is the direct analog of the Azure Container Registry (ACR) we already use today.</p>
+      </div>
+      <div class="mini">
+        <h4>② A place to run the images</h4>
+        <p><strong>ECS Fargate</strong> (or App Runner) pulls images from ECR and runs them as live containers with CPU, memory, networking and secrets. This is where the app actually serves traffic — the analog of Azure Container Apps.</p>
+      </div>
+    </div>
+    <p>Alongside the containers, the platform needs three managed AWS data services. This is the part your manager will ask about:</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>AWS service</th><th>Role in Visually</th><th>Needed?</th></tr></thead>
+        <tbody>
+          <tr><td><strong>RDS for PostgreSQL</strong></td><td>The platform's own operational database — users, projects, saved connections, canvases, dashboards, query history.</td><td><span class="pill req">Required</span></td></tr>
+          <tr><td><strong>ElastiCache for Redis</strong></td><td>Cache + pub/sub for the live pipeline and schema crawls.</td><td><span class="pill req">Required</span></td></tr>
+          <tr><td><strong>S3 bucket</strong></td><td>File storage for uploads and generated exports (PDF/PPTX/PNG).</td><td><span class="pill req">Required</span></td></tr>
+          <tr><td><strong>Amazon Bedrock</strong></td><td>All LLM calls (Claude Sonnet / Haiku / Vision) — no separate API key.</td><td><span class="pill req">Required</span></td></tr>
+          <tr><td><strong>Amazon Redshift</strong></td><td>Only if <em>the customer's analytics data</em> lives there. Visually reads from it as a source — it is <u>not</u> where Visually stores anything.</td><td><span class="pill opt">Only if a customer uses it</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note key">
+      <div class="ic">!</div>
+      <div class="body"><p><strong>The one-sentence answer to “Postgres or Redshift?”:</strong> We need <strong>PostgreSQL</strong> for the platform itself (it is a transactional application database). <strong>Redshift is never required by us</strong> — it only appears when a customer happens to keep their data warehouse in Redshift, in which case we connect to it read-only, exactly like we connect to MySQL, Snowflake or another Postgres.</p></div>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- ============ ARCHITECTURE ============ -->
+  <section id="arch">
+    <p class="eyebrow"><span class="num">1</span> System architecture</p>
+    <h2>How the pieces fit together</h2>
+    <p>Every box below is a container we build and push to ECR, except the dashed boxes, which are managed AWS services (or the customer's own database). The frontend talks only to the Agent Service; the Agent Service orchestrates the rest.</p>
+
+    <div class="diagram">
+      <p class="cap">Visually — runtime topology on AWS</p>
+
+      <div class="tier">
+        <p class="tier-label">Browser</p>
+        <div class="row">
+          <div class="node fe" style="max-width:260px">
+            <p class="t">Frontend</p>
+            <p class="d">Next.js app the user sees <span class="port">· :3000</span></p>
+          </div>
+        </div>
+      </div>
+      <div class="arrow">↓ &nbsp; HTTPS + WebSocket</div>
+
+      <div class="tier">
+        <p class="tier-label">Application services (images in ECR → running on ECS Fargate)</p>
+        <div class="row">
+          <div class="node svc">
+            <p class="t">Agent Service</p>
+            <p class="d">Auth, projects, AI pipeline, WebSocket hub <span class="port">· :8001</span></p>
+          </div>
+          <div class="node svc">
+            <p class="t">Query Executor</p>
+            <p class="d">Runs SQL against customer DBs <span class="port">· :8002</span></p>
+          </div>
+          <div class="node svc">
+            <p class="t">Schema Crawler</p>
+            <p class="d">Reads &amp; profiles customer schemas <span class="port">· :8003</span></p>
+          </div>
+          <div class="node svc">
+            <p class="t">Render Service</p>
+            <p class="d">Chart → PNG (Node/Canvas) <span class="port">· :3001</span></p>
+          </div>
+          <div class="node svc">
+            <p class="t">Export Service</p>
+            <p class="d">PDF / PPTX / DOCX via Chromium <span class="port">· :3002</span></p>
+          </div>
+        </div>
+      </div>
+      <div class="arrow">↓</div>
+
+      <div class="tier">
+        <p class="tier-label">Managed data &amp; AI (AWS) — not container images</p>
+        <div class="row">
+          <div class="node data">
+            <p class="t">RDS PostgreSQL</p>
+            <p class="d">Platform DB — all app state</p>
+          </div>
+          <div class="node data">
+            <p class="t">ElastiCache Redis</p>
+            <p class="d">Cache + pub/sub</p>
+          </div>
+          <div class="node data">
+            <p class="t">S3</p>
+            <p class="d">Uploads &amp; exports</p>
+          </div>
+          <div class="node ext">
+            <p class="t">Bedrock</p>
+            <p class="d">Claude Sonnet / Haiku / Vision</p>
+          </div>
+        </div>
+      </div>
+      <div class="arrow">↓ &nbsp; Query Executor + Schema Crawler connect out (read-only)</div>
+
+      <div class="tier">
+        <p class="tier-label">Customer data sources (the customer owns these — we only read)</p>
+        <div class="row">
+          <div class="node ext"><p class="t">PostgreSQL</p></div>
+          <div class="node ext"><p class="t">MySQL</p></div>
+          <div class="node ext"><p class="t">Redshift</p></div>
+          <div class="node ext"><p class="t">Snowflake</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tag-legend">
+      <span><span class="sw" style="background:var(--accent-soft);border-color:var(--accent)"></span> Our services (build → ECR)</span>
+      <span><span class="sw" style="background:var(--steel-soft);border-color:var(--steel)"></span> Managed AWS data</span>
+      <span><span class="sw" style="background:var(--good-soft);border-color:var(--good)"></span> Frontend</span>
+      <span><span class="sw" style="background:var(--surface);border-style:dashed"></span> External / customer-owned</span>
+    </div>
+
+    <h3 id="components">The six services in detail</h3>
+    <p>These map one-to-one to the <code>build</code> targets already in <code>.github/workflows/deploy.yml</code> — so the ECR migration reuses the exact same build set.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Service</th><th>Stack</th><th class="num-col">Port</th><th>Build context / Dockerfile</th><th>Depends on</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>agent-service</strong><br><span style="color:var(--ink-3);font-size:12px">bundles auth_service</span></td>
+            <td><span class="pill py">Python 3.11 · FastAPI</span></td>
+            <td class="num-col">8001</td>
+            <td><code>backend</code> / <code>agent_service/Dockerfile</code></td>
+            <td>Postgres, Redis, Bedrock, S3, all other services</td>
+          </tr>
+          <tr>
+            <td><strong>query-executor</strong></td>
+            <td><span class="pill py">Python 3.11 · FastAPI</span></td>
+            <td class="num-col">8002</td>
+            <td><code>backend</code> / <code>query_executor/Dockerfile</code></td>
+            <td>Postgres, customer DBs (pg/mysql/redshift/snowflake)</td>
+          </tr>
+          <tr>
+            <td><strong>schema-crawler</strong></td>
+            <td><span class="pill py">Python 3.11 · FastAPI</span></td>
+            <td class="num-col">8003</td>
+            <td><code>backend</code> / <code>schema_crawler/Dockerfile</code></td>
+            <td>Postgres, Redis, Bedrock, customer DBs</td>
+          </tr>
+          <tr>
+            <td><strong>render-service</strong></td>
+            <td><span class="pill node">Node 20 · Canvas</span></td>
+            <td class="num-col">3001</td>
+            <td><code>backend/render_service</code> / <code>Dockerfile</code></td>
+            <td>— (stateless)</td>
+          </tr>
+          <tr>
+            <td><strong>export-service</strong></td>
+            <td><span class="pill py">Python</span> <span class="pill node">+ Node/Chromium</span></td>
+            <td class="num-col">3002</td>
+            <td><code>backend</code> / <code>export_service/Dockerfile</code></td>
+            <td>Agent Service, S3</td>
+          </tr>
+          <tr>
+            <td><strong>frontend</strong></td>
+            <td><span class="pill node">Next.js · Node 20</span></td>
+            <td class="num-col">3000</td>
+            <td><code>frontend</code> / <code>Dockerfile</code></td>
+            <td>Agent Service (URL baked at build time)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">
+      <div class="ic">▲</div>
+      <div class="body"><p>The <strong>frontend</strong> image is special: <code>NEXT_PUBLIC_API_URL</code> and <code>NEXT_PUBLIC_WS_URL</code> are compiled <em>into</em> the JavaScript bundle at build time. You must pass your production API domain as a <code>--build-arg</code> when you build it — changing it later means rebuilding the image, not just restarting the container.</p></div>
+    </div>
+
+    <h3>The request pipeline (what happens on one question)</h3>
+    <div class="diagram">
+      <p class="cap">Natural language → chart, streamed live over WebSocket</p>
+      <div class="flowline">
+        <span class="step">User text<small>frontend</small></span><span class="to">→</span>
+        <span class="step">Intent classifier<small>Bedrock · Haiku</small></span><span class="to">→</span>
+        <span class="step">Schema fetch<small>schema-crawler</small></span><span class="to">→</span>
+        <span class="step">Query agent<small>Bedrock · Sonnet</small></span><span class="to">→</span>
+        <span class="step">SQL execute<small>query-executor</small></span><span class="to">→</span>
+        <span class="step">Chart render<small>render-service</small></span><span class="to">→</span>
+        <span class="step">Validate<small>Bedrock · Sonnet</small></span><span class="to">→</span>
+        <span class="step">Broadcast<small>WebSocket</small></span>
+      </div>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- ============ DATABASE ============ -->
+  <section id="db">
+    <p class="eyebrow"><span class="num">2</span> Database architecture</p>
+    <h2>The database: what it needs, and why Postgres — not Redshift</h2>
+    <p>This is the section to bring into the conversation with your manager. The confusion is almost always because <strong>the word “database” is doing two completely different jobs</strong> in this system.</p>
+
+    <h3 id="db-two-roles">There are two database roles — keep them separate</h3>
+    <div class="compare">
+      <div class="card pg">
+        <p class="role">Role A · The platform's own brain</p>
+        <h4>PostgreSQL (our database)</h4>
+        <ul>
+          <li>Owned and written by <strong>us</strong>. Every user action changes it.</li>
+          <li>Stores accounts, projects, saved DB connections (encrypted), canvases, dashboards, widgets, query history, sharing tokens, alerts, snapshots.</li>
+          <li>Workload is <strong>OLTP</strong> — thousands of tiny reads and writes: “log this user in”, “save this widget”, “insert this query row”.</li>
+          <li>Provisioned as <strong>Amazon RDS for PostgreSQL</strong>. One instance for the whole platform.</li>
+        </ul>
+      </div>
+      <div class="card rs">
+        <p class="role">Role B · The customer's data warehouse</p>
+        <h4>Redshift / Snowflake / MySQL / Postgres (their database)</h4>
+        <ul>
+          <li>Owned by <strong>the customer</strong>. We only ever <strong>read</strong> from it, never write.</li>
+          <li>Holds the business data the customer wants to analyze — sales, events, transactions.</li>
+          <li>Workload is <strong>OLAP</strong> — occasional large analytical <code>SELECT</code>s generated by the AI.</li>
+          <li>We reach it through the <strong>Query Executor</strong>, which has a driver for each engine. Redshift is just one of four.</li>
+        </ul>
+      </div>
+    </div>
+    <p>Evidence this split is real, straight from the code:</p>
+    <ul>
+      <li><code>backend/shared/models/*.py</code> — ~25 SQLAlchemy tables (<code>users</code>, <code>projects</code>, <code>database_connections</code>, <code>dashboards</code>, <code>query_history</code>…). These live in <strong>our Postgres</strong>.</li>
+      <li><code>backend/query_executor/drivers/</code> — <code>postgres.py</code>, <code>mysql.py</code>, <code>redshift.py</code>, <code>snowflake.py</code>. These connect to the <strong>customer's</strong> database.</li>
+      <li><code>.env.example</code> — <code>DATABASE_URL=postgresql+asyncpg://…/visually_platform</code>. The platform URL is hard-committed to Postgres.</li>
+    </ul>
+
+    <h3 id="db-why-pg">Why the platform database is PostgreSQL</h3>
+    <div class="grid-2">
+      <div class="mini"><h4>It is a transactional app, not a warehouse</h4><p>Logins, saves, and edits are single-row reads/writes that must be instant and consistent. That is precisely what a row-store OLTP engine like Postgres is built for.</p></div>
+      <div class="mini"><h4>Relational integrity matters</h4><p>Projects own connections, dashboards own widgets, users own everything. Foreign keys, constraints and transactions keep this correct — first-class in Postgres.</p></div>
+      <div class="mini"><h4>The code is already committed to it</h4><p>Async driver <code>asyncpg</code>, migrations via <strong>Alembic</strong>, and Postgres-specific column types are already in the repo. It is a drop-in move to RDS with zero code change.</p></div>
+      <div class="mini"><h4>It is cheap and boring — in a good way</h4><p>A single small/medium RDS Postgres instance comfortably runs the whole control plane. No cluster, no tuning, well-understood backups and failover.</p></div>
+    </div>
+
+    <h3 id="db-why-not-rs">Why Redshift would be the wrong choice for the platform DB</h3>
+    <div class="note bad">
+      <div class="ic">✕</div>
+      <div class="body"><p>Redshift is a <strong>columnar, cluster-based OLAP data warehouse</strong>. It is designed to scan billions of rows for analytics — and is deliberately <em>bad</em> at the many-tiny-writes workload the platform generates.</p></div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Dimension</th><th>PostgreSQL (right for platform)</th><th>Redshift (wrong for platform)</th></tr></thead>
+        <tbody>
+          <tr><td>Built for</td><td>OLTP — transactional app state</td><td>OLAP — analytical scans over huge tables</td></tr>
+          <tr><td>Storage</td><td>Row-oriented</td><td>Column-oriented</td></tr>
+          <tr><td>Single-row insert/update</td><td>Milliseconds, made for it</td><td>Slow &amp; discouraged; hurts the cluster</td></tr>
+          <tr><td>Foreign keys / constraints</td><td>Enforced</td><td>Not enforced (informational only)</td></tr>
+          <tr><td>Cost floor</td><td>One small instance</td><td>A cluster — far higher baseline cost</td></tr>
+          <tr><td>Fit for our tables</td><td><span class="pill req">Ideal</span></td><td><span class="pill no">Misuse of the tool</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>Bottom line for the manager:</strong> using Redshift as the platform database would cost more, run slower for our actual workload, and throw away the data-integrity guarantees the app relies on. Postgres is not a compromise here — it is the correct engineering choice, and Redshift is a different tool for a different job.</p>
+
+    <div class="note good">
+      <div class="ic">✓</div>
+      <div class="body"><p><strong>When Redshift <em>does</em> enter the picture:</strong> if a customer keeps their analytics data in Redshift, they add it as a connection in the app, and our Query Executor reads from it using the existing <code>redshift.py</code> driver — no different from them using Snowflake or MySQL. We provision <em>nothing</em> for this; it is their warehouse. You would only stand up a Redshift cluster yourself if you want an internal demo/sample dataset.</p></div>
+    </div>
+
+    <h3 id="db-provision">What you actually provision on AWS</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Component</th><th>AWS service</th><th>Starting size</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Platform DB</td><td>RDS for PostgreSQL 15</td><td><code>db.t4g.medium</code>, 50 GB gp3, Multi-AZ later</td><td>All application state; run Alembic migrations against it</td></tr>
+          <tr><td>Cache / pub-sub</td><td>ElastiCache for Redis 7</td><td><code>cache.t4g.small</code></td><td>Pipeline events, schema-crawl coordination, WebSocket fan-out</td></tr>
+          <tr><td>Object storage</td><td>S3 (one private bucket)</td><td>Standard</td><td>Uploads + generated exports; replaces the local <code>uploads_data</code> volume</td></tr>
+          <tr><td>LLM</td><td>Bedrock (model access enabled)</td><td>On-demand</td><td>Sonnet / Haiku / Vision model IDs from env</td></tr>
+          <tr><td>Redshift</td><td>—</td><td>Do not provision</td><td>Only a customer source; not part of our footprint</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- ============ ECR CLI ============ -->
+  <section id="ecr">
+    <p class="eyebrow"><span class="num">3</span> Approach A — CLI</p>
+    <h2>Build &amp; push all six images to ECR from the command line</h2>
+    <p>This is the fast, repeatable path and the one you will eventually automate in CI. It mirrors the <code>build()</code> helper already in your Azure workflow, retargeted at ECR.</p>
+
+    <h4>Prerequisites (once per machine)</h4>
+    <ul>
+      <li>An AWS account and an IAM user/role with ECR permissions (<code>AmazonEC2ContainerRegistryPowerUser</code> is enough to create repos + push).</li>
+      <li><code>aws</code> CLI v2 installed and configured: <code>aws configure</code> (or SSO).</li>
+      <li>Docker Desktop running.</li>
+    </ul>
+
+    <div class="note warn">
+      <div class="ic">▲</div>
+      <div class="body"><p><strong>You are on an Apple-silicon Mac.</strong> Docker builds ARM images by default, but Fargate runs x86 by default. Build for the target platform explicitly with <code>--platform linux/amd64</code> (shown below) or every container will fail to start with an “exec format error”.</p></div>
+    </div>
+
+    <ol class="steps">
+      <li>
+        <h4>Set your variables</h4>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="name">terminal — from repo root</span><span class="tag">bash</span></div>
+<pre><span class="k">export</span> AWS_REGION=us-east-1
+<span class="k">export</span> AWS_ACCOUNT_ID=<span class="s">$(aws sts get-caller-identity --query Account --output text)</span>
+<span class="k">export</span> ECR=<span class="s">$AWS_ACCOUNT_ID</span>.dkr.ecr.<span class="s">$AWS_REGION</span>.amazonaws.com
+<span class="k">export</span> TAG=<span class="s">$(git rev-parse --short HEAD)</span>   <span class="c"># tag every image with the commit SHA</span></pre>
+        </div>
+      </li>
+      <li>
+        <h4>Create one private repository per service (run once)</h4>
+        <p>ECR needs a repository to exist before you can push to it. We namespace them under <code>visually/</code>.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="name">create-repos.sh</span><span class="tag">bash</span></div>
+<pre><span class="k">for</span> repo <span class="k">in</span> agent-service query-executor schema-crawler export-service render-service frontend; <span class="k">do</span>
+  aws ecr create-repository \
+    --repository-name <span class="s">"visually/$repo"</span> \
+    --region <span class="s">"$AWS_REGION"</span> \
+    --image-scanning-configuration scanOnPush=true \
+    --image-tag-mutability IMMUTABLE 2&gt;/dev/null || <span class="k">echo</span> <span class="s">"visually/$repo already exists"</span>
+<span class="k">done</span></pre>
+        </div>
+      </li>
+      <li>
+        <h4>Authenticate Docker to ECR</h4>
+        <p>The login token is valid for 12 hours. Re-run this whenever a push says “no basic auth credentials”.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="name">terminal</span><span class="tag">bash</span></div>
+<pre>aws ecr get-login-password --region <span class="s">"$AWS_REGION"</span> \
+  | docker login --username AWS --password-stdin <span class="s">"$ECR"</span></pre>
+        </div>
+      </li>
+      <li>
+        <h4>Build &amp; push the five backend images</h4>
+        <p>Note the <strong>build context is <code>backend</code></strong> for four of them (they share <code>shared/</code> and <code>requirements.txt</code>), and <code>backend/render_service</code> for the render service — exactly as in <code>docker-compose.yml</code>.</p>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="name">push-backend.sh</span><span class="tag">bash</span></div>
+<pre><span class="c"># helper: build(name, dockerfile, context)</span>
+build() {
+  docker buildx build --platform linux/amd64 \
+    -t <span class="s">"$ECR/visually/$1:$TAG"</span> \
+    -t <span class="s">"$ECR/visually/$1:latest"</span> \
+    -f <span class="s">"$2"</span> <span class="s">"$3"</span> --push
+}
+
+build agent-service  backend/agent_service/Dockerfile  backend
+build query-executor backend/query_executor/Dockerfile backend
+build schema-crawler backend/schema_crawler/Dockerfile backend
+build export-service backend/export_service/Dockerfile backend
+build render-service backend/render_service/Dockerfile backend/render_service</pre>
+        </div>
+        <div class="note key"><div class="ic">i</div><div class="body"><p><code>buildx … --push</code> builds and uploads in one step. If you prefer the classic flow, use <code>docker build -t … </code> then <code>docker push …</code> — but keep <code>--platform linux/amd64</code>.</p></div></div>
+      </li>
+      <li>
+        <h4>Build &amp; push the frontend (bakes the production API URL)</h4>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="name">push-frontend.sh</span><span class="tag">bash</span></div>
+<pre>docker buildx build --platform linux/amd64 \
+  --build-arg NEXT_PUBLIC_API_URL=<span class="s">"https://api.yourdomain.com"</span> \
+  --build-arg NEXT_PUBLIC_WS_URL=<span class="s">"wss://api.yourdomain.com"</span> \
+  -t <span class="s">"$ECR/visually/frontend:$TAG"</span> \
+  -t <span class="s">"$ECR/visually/frontend:latest"</span> \
+  -f frontend/Dockerfile frontend --push</pre>
+        </div>
+      </li>
+      <li>
+        <h4>Verify the images landed</h4>
+        <div class="code">
+          <div class="bar"><span class="dot"></span><span class="name">terminal</span><span class="tag">bash</span></div>
+<pre>aws ecr describe-images --repository-name visually/agent-service \
+  --region <span class="s">"$AWS_REGION"</span> --query <span class="s">'imageDetails[].imageTags'</span> --output table</pre>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <hr>
+
+  <!-- ============ ECR CONSOLE ============ -->
+  <section id="ecr-console">
+    <p class="eyebrow"><span class="num">4</span> Approach B — Console</p>
+    <h2>The same thing through the AWS web console</h2>
+    <p>Useful when you want a visual confirmation, or when someone without CLI access needs to see the registry. The console still hands you CLI commands for the actual push — there is no way to upload an image purely by clicking.</p>
+
+    <ol class="steps">
+      <li>
+        <h4>Open ECR</h4>
+        <p>AWS Console → search <strong>“ECR”</strong> → <strong>Elastic Container Registry</strong>. Make sure the region selector (top-right) is <code>us-east-1</code> (or your chosen region) — repos are region-scoped.</p>
+      </li>
+      <li>
+        <h4>Create a private repository — repeat for each service</h4>
+        <p>Left nav → <strong>Repositories</strong> → <strong>Create repository</strong>. Then:</p>
+        <ul>
+          <li>Visibility: <strong>Private</strong>.</li>
+          <li>Repository name: <code>visually/agent-service</code> (then <code>visually/query-executor</code>, <code>visually/schema-crawler</code>, <code>visually/export-service</code>, <code>visually/render-service</code>, <code>visually/frontend</code>).</li>
+          <li>Toggle <strong>Scan on push</strong> = on (free vulnerability scan).</li>
+          <li>Tag immutability = on (recommended, so a tag can't be silently overwritten).</li>
+          <li><strong>Create repository</strong>. Do this six times.</li>
+        </ul>
+      </li>
+      <li>
+        <h4>Grab the push commands</h4>
+        <p>Open a repository → top-right <strong>“View push commands”</strong>. AWS shows the exact four commands for that repo (login, build, tag, push). They are the CLI commands from Approach A, pre-filled with your account ID.</p>
+        <div class="note warn"><div class="ic">▲</div><div class="body"><p>The console's generated <code>docker build</code> command does <strong>not</strong> include <code>--platform linux/amd64</code> or the frontend <code>--build-arg</code>s. On your Mac, add <code>--platform linux/amd64</code>, and for the frontend add the two <code>NEXT_PUBLIC_*</code> build args, or the containers won't run correctly.</p></div></div>
+      </li>
+      <li>
+        <h4>Run those commands locally &amp; refresh</h4>
+        <p>Paste them into your terminal (Docker must be running). When each push finishes, refresh the repository page — you'll see the image tag, size, pushed-at time, and the scan result.</p>
+      </li>
+    </ol>
+    <div class="note key"><div class="ic">i</div><div class="body"><p><strong>Recommendation:</strong> use the <strong>Console once</strong> to create the six repositories and confirm permissions, then use the <strong>CLI script</strong> for every build after that. Clicking through six “View push commands” dialogs each release does not scale — the CLI loop does.</p></div></div>
+  </section>
+
+  <hr>
+
+  <!-- ============ RUNNING ============ -->
+  <section id="run">
+    <p class="eyebrow"><span class="num">5</span> After ECR</p>
+    <h2>Running the images — ECR is only half the story</h2>
+    <p>ECR stores images; it never runs them. To actually serve the app you point a compute service at those images. Two realistic options on AWS:</p>
+
+    <div class="compare">
+      <div class="card">
+        <p class="role" style="color:var(--accent)">Recommended</p>
+        <h4>Amazon ECS on Fargate</h4>
+        <ul>
+          <li>Serverless containers — no EC2 to manage. One <strong>task definition</strong> per service, pointing at its ECR image URI.</li>
+          <li>Direct analog of the Azure Container Apps setup you run today, so the mental model carries over.</li>
+          <li>Front the <strong>frontend</strong> and <strong>agent-service</strong> with an <strong>Application Load Balancer</strong> (agent-service needs sticky/WebSocket support). The other four are internal-only via <strong>Service Connect</strong> / private DNS.</li>
+          <li>Inject secrets from <strong>AWS Secrets Manager</strong>; never bake them into images.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="role" style="color:var(--steel)">Simplest to start</p>
+        <h4>AWS App Runner</h4>
+        <ul>
+          <li>Point it at an ECR image and it gives you an HTTPS URL, autoscaling and TLS with almost no config.</li>
+          <li>Great for the frontend and agent-service individually; weaker for a 6-service private mesh.</li>
+          <li>Good for a quick demo; most teams graduate to ECS for the full topology.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h4>Minimum viable ECS rollout</h4>
+    <ol>
+      <li>Provision <strong>RDS Postgres</strong>, <strong>ElastiCache Redis</strong>, and an <strong>S3 bucket</strong> in the same VPC.</li>
+      <li>Put every connection string / key in <strong>Secrets Manager</strong> (see the checklist in §7).</li>
+      <li>Run the DB migration once, as a one-off Fargate task using the agent-service image: <code>alembic upgrade head</code>.</li>
+      <li>Create an ECS cluster + one service per image. Map the container ports from the table in §1.</li>
+      <li>Set each service's internal URLs to the private DNS names (<code>QUERY_EXECUTOR_URL</code>, <code>SCHEMA_CRAWLER_URL</code>, <code>RENDER_SERVICE_URL</code>, <code>EXPORT_SERVICE_URL</code>).</li>
+      <li>Give the ECS task role permission to call <strong>Bedrock</strong> and read/write the <strong>S3</strong> bucket — this replaces long-lived AWS keys.</li>
+    </ol>
+    <div class="note good"><div class="ic">✓</div><div class="body"><p><strong>Prefer IAM task roles over access keys.</strong> Today the services take <code>AWS_ACCESS_KEY_ID</code> / <code>SECRET</code> / <code>SESSION_TOKEN</code> from env. On ECS, attach an IAM role to the task instead — Bedrock and S3 calls then use rotating credentials automatically, and you can drop the static keys from the environment.</p></div></div>
+  </section>
+
+  <hr>
+
+  <!-- ============ CICD ============ -->
+  <section id="cicd">
+    <p class="eyebrow"><span class="num">6</span> Automation</p>
+    <h2>CI/CD — the ECR version of your existing workflow</h2>
+    <p>You already auto-build all images on push to <code>main</code> for Azure. Here is the equivalent GitHub Actions job for ECR. It uses OIDC (no long-lived AWS keys in GitHub) via <code>configure-aws-credentials</code>.</p>
+    <div class="code">
+      <div class="bar"><span class="dot"></span><span class="name">.github/workflows/deploy-aws.yml</span><span class="tag">yaml</span></div>
+<pre><span class="k">name:</span> Deploy to AWS ECR
+<span class="k">on:</span>
+  <span class="k">push:</span> { <span class="k">branches:</span> [main] }
+  <span class="k">workflow_dispatch:</span> {}
+
+<span class="k">permissions:</span> { id-token: write, contents: read }   <span class="c"># id-token = OIDC</span>
+
+<span class="k">env:</span>
+  AWS_REGION: us-east-1
+  ECR: <span class="s">${{ secrets.AWS_ACCOUNT_ID }}</span>.dkr.ecr.us-east-1.amazonaws.com
+  TAG: <span class="s">${{ github.sha }}</span>
+  API_URL: https://api.yourdomain.com
+  WS_URL: wss://api.yourdomain.com
+
+<span class="k">jobs:</span>
+  <span class="k">build-and-push:</span>
+    <span class="k">runs-on:</span> ubuntu-latest
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> actions/checkout@v4
+      - <span class="k">uses:</span> aws-actions/configure-aws-credentials@v4
+        <span class="k">with:</span>
+          role-to-assume: <span class="s">${{ secrets.AWS_DEPLOY_ROLE_ARN }}</span>
+          aws-region: <span class="s">${{ env.AWS_REGION }}</span>
+      - <span class="k">uses:</span> aws-actions/amazon-ecr-login@v2
+
+      - <span class="k">name:</span> Build &amp; push backend
+        <span class="k">run:</span> |
+          build() { docker build --platform linux/amd64 \
+            -t "$ECR/visually/$1:$TAG" -t "$ECR/visually/$1:latest" \
+            -f "$2" "$3" && docker push "$ECR/visually/$1:$TAG" \
+            && docker push "$ECR/visually/$1:latest"; }
+          build agent-service  backend/agent_service/Dockerfile  backend
+          build query-executor backend/query_executor/Dockerfile backend
+          build schema-crawler backend/schema_crawler/Dockerfile backend
+          build export-service backend/export_service/Dockerfile backend
+          build render-service backend/render_service/Dockerfile backend/render_service
+
+      - <span class="k">name:</span> Build &amp; push frontend
+        <span class="k">run:</span> |
+          docker build --platform linux/amd64 \
+            --build-arg NEXT_PUBLIC_API_URL="$API_URL" \
+            --build-arg NEXT_PUBLIC_WS_URL="$WS_URL" \
+            -t "$ECR/visually/frontend:$TAG" -f frontend/Dockerfile frontend
+          docker push "$ECR/visually/frontend:$TAG"
+
+      <span class="c"># optional: force ECS to pull the new images</span>
+      - <span class="k">name:</span> Roll ECS services
+        <span class="k">run:</span> |
+          for s in agent-service query-executor schema-crawler export-service render-service frontend; do
+            aws ecs update-service --cluster visually --service "$s" --force-new-deployment
+          done</pre>
+    </div>
+    <p>Repo secrets to add: <code>AWS_ACCOUNT_ID</code> and <code>AWS_DEPLOY_ROLE_ARN</code> (an IAM role trusting GitHub's OIDC provider, with ECR push + <code>ecs:UpdateService</code> permissions).</p>
+  </section>
+
+  <hr>
+
+  <!-- ============ ENV ============ -->
+  <section id="env">
+    <p class="eyebrow"><span class="num">7</span> Configuration</p>
+    <h2>Environment &amp; secrets checklist</h2>
+    <p>Everything the containers read at runtime. In production these come from <strong>Secrets Manager</strong> (secrets) and the ECS task definition (plain config), not a <code>.env</code> file.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Variable</th><th>Used by</th><th>Production value</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td><code>DATABASE_URL</code></td><td>agent, query-exec, crawler</td><td>RDS Postgres async URL</td><td><span class="pill no">Secret</span></td></tr>
+          <tr><td><code>DATABASE_SYNC_URL</code></td><td>Alembic migration</td><td>RDS Postgres sync URL</td><td><span class="pill no">Secret</span></td></tr>
+          <tr><td><code>REDIS_URL</code></td><td>agent, crawler</td><td>ElastiCache endpoint</td><td>Config</td></tr>
+          <tr><td><code>ENCRYPTION_KEY</code></td><td>all backend</td><td>Fernet key — encrypts saved customer DB passwords</td><td><span class="pill no">Secret</span></td></tr>
+          <tr><td><code>JWT_SECRET</code></td><td>agent</td><td>32+ char random</td><td><span class="pill no">Secret</span></td></tr>
+          <tr><td><code>AWS_REGION</code></td><td>agent, crawler, query-exec</td><td><code>us-east-1</code></td><td>Config</td></tr>
+          <tr><td>AWS creds</td><td>agent, crawler, query-exec</td><td><em>Prefer IAM task role</em> over static keys</td><td>Role</td></tr>
+          <tr><td><code>BEDROCK_*_MODEL_ID</code></td><td>agent, crawler</td><td>Sonnet / Haiku / Vision model IDs</td><td>Config</td></tr>
+          <tr><td><code>S3_BUCKET_NAME</code></td><td>agent, export</td><td>your private bucket</td><td>Config</td></tr>
+          <tr><td><code>S3_ENDPOINT_URL</code></td><td>agent, export</td><td><strong>empty</strong> (uses real AWS S3, not MinIO)</td><td>Config</td></tr>
+          <tr><td><code>QUERY_EXECUTOR_URL</code> etc.</td><td>agent</td><td>internal ECS DNS names</td><td>Config</td></tr>
+          <tr><td><code>NEXT_PUBLIC_API_URL</code> / <code>_WS_URL</code></td><td>frontend</td><td>public API domain — <strong>build-time arg</strong></td><td>Build</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn"><div class="ic">▲</div><div class="body"><p>Set <code>S3_ENDPOINT_URL</code> to <strong>empty</strong> in production. A non-empty value points the app at local MinIO — in AWS it must fall through to the real S3 SDK default.</p></div></div>
+  </section>
+
+  <hr>
+
+  <!-- ============ PITCH ============ -->
+  <section id="pitch">
+    <p class="eyebrow"><span class="num">★</span> For the conversation</p>
+    <h2>Talking points for your manager</h2>
+    <div class="grid-2">
+      <div class="mini"><h4>“Why Postgres and not Redshift?”</h4><p>Because our platform database is a <strong>transactional application store</strong> (users, projects, dashboards), not an analytics warehouse. Postgres is the right tool; Redshift would be slower for our workload and cost far more. Redshift only appears if a <em>customer's</em> data lives there — and then we just read from it, we don't run it.</p></div>
+      <div class="mini"><h4>“What do we have to run in AWS?”</h4><p>Six container images in <strong>ECR</strong>, run on <strong>ECS Fargate</strong>, backed by <strong>one RDS Postgres</strong>, <strong>one Redis</strong>, <strong>one S3 bucket</strong>, and <strong>Bedrock</strong> for AI. That is the entire footprint.</p></div>
+      <div class="mini"><h4>“How risky is the move?”</h4><p>Low. The app already runs as containers, and we already push to a registry (Azure ACR) on every merge. ECR + ECS is the one-to-one AWS equivalent — same images, same Dockerfiles, different registry and runtime.</p></div>
+      <div class="mini"><h4>“How does a release work?”</h4><p>Push to <code>main</code> → GitHub Actions builds all six images, pushes to ECR tagged with the commit, and rolls the ECS services. Rollback is redeploying an earlier image tag.</p></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Generated for the Visually platform · deployment reference · 2026-07-24. Sources: <code>docker-compose.yml</code>, the six service <code>Dockerfile</code>s, <code>backend/requirements.txt</code>, <code>backend/shared/models/</code>, <code>backend/query_executor/drivers/</code>, and the existing <code>.github/workflows/deploy.yml</code>.</p>
+  </footer>
+
+  </main>
+</div>
+</div>
+</body>
+</html>

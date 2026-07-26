@@ -1796,15 +1796,32 @@ async def list_shared_with_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return dashboards explicitly shared with the current user via CanvasCollaborator."""
+    """Return every dashboard the current user can access in analyst mode.
+
+    This includes dashboards explicitly shared with them via CanvasCollaborator
+    AND dashboards living in projects they own or are a member of. The latter is
+    what makes reports created/imported in builder mode also show up here when the
+    same user switches to analyst mode (previously they were hidden because they
+    had no CanvasCollaborator row).
+    """
     from shared.models.sharing import CanvasCollaborator
     from shared.models.projects import Project
+    from sqlalchemy import or_
 
     result = await db.execute(
         select(Dashboard, Project.name.label("project_name"))
-        .join(CanvasCollaborator, CanvasCollaborator.dashboard_id == Dashboard.id)
         .join(Project, Dashboard.project_id == Project.id)
-        .where(CanvasCollaborator.user_id == current_user.id)
+        .outerjoin(CanvasCollaborator,
+                   (CanvasCollaborator.dashboard_id == Dashboard.id) &
+                   (CanvasCollaborator.user_id == current_user.id))
+        .outerjoin(ProjectMember,
+                   (ProjectMember.project_id == Project.id) &
+                   (ProjectMember.user_id == current_user.id))
+        .where(or_(
+            CanvasCollaborator.user_id == current_user.id,
+            Project.owner_id == current_user.id,
+            ProjectMember.user_id == current_user.id,
+        ))
         .where(Dashboard.is_archived == False)
         .distinct()
         .order_by(Dashboard.updated_at.desc())

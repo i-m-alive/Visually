@@ -416,6 +416,43 @@ async def _critique(section: dict, shared_context: str) -> dict:
         return {"ok": True, "issues": []}
 
 
+def _validate_chart_shapes(section: dict) -> list[str]:
+    """Deterministic check the LLM critic doesn't do: does every chart's data
+    actually carry the field(s) its own renderer will read? A chart can pass
+    the critic's "non-empty data array" rule while still rendering fully blank
+    if the AI used real column names (e.g. {"customer":..,"revenue":..}) instead
+    of the literal "value" the simple chart types read, or if a combo chart's
+    declared series[].key doesn't match any key actually present on its rows."""
+    issues: list[str] = []
+    for ch in section.get("charts") or []:
+        if not isinstance(ch, dict):
+            continue
+        ctype = ch.get("type")
+        data = ch.get("data")
+        if not isinstance(data, list) or not data or ctype in ("table", "forecast"):
+            continue
+        row_keys: set[str] = set()
+        for row in data[:5]:
+            if isinstance(row, dict):
+                row_keys |= set(row.keys())
+        title = ch.get("title", "chart")
+        if ctype == "combo":
+            for s in ch.get("series") or []:
+                key = s.get("key") if isinstance(s, dict) else None
+                if key and key not in row_keys:
+                    issues.append(
+                        f'Chart "{title}" (combo): series key "{key}" does not appear in any data row '
+                        f'(row keys found: {sorted(row_keys)}). Rename the series key to match a real '
+                        f'field in "data", or add that field to every data row.'
+                    )
+        elif "value" not in row_keys:
+            issues.append(
+                f'Chart "{title}" ({ctype}): data rows are missing the literal "value" field '
+                f'(row keys found: {sorted(row_keys)}). Every data row must be {{"name": "...", "value": <number>}}.'
+            )
+    return issues
+
+
 async def _write_and_verify(canvas_name: str, shared_context: str, sec: dict, sem: asyncio.Semaphore) -> Optional[dict]:
     """Write a section, critique it, and do ONE bounded re-write if it fails."""
     async with sem:
@@ -427,12 +464,26 @@ async def _write_and_verify(canvas_name: str, shared_context: str, sec: dict, se
     print(f'[intel-orch] section {sec["id"]} ({sec["label"]}) written  charts={nch} → critic', flush=True)
     async with sem:
         verdict = await _critique(section, shared_context)
+    shape_issues = _validate_chart_shapes(section)
+    if shape_issues:
+        verdict = {"ok": False, "issues": (verdict.get("issues") or []) + shape_issues}
+        print(f'[intel-orch] section {sec["id"]} chart-shape check failed: {shape_issues}', flush=True)
     if verdict["ok"]:
         print(f'[intel-orch] section {sec["id"]} ACCEPTED (no re-write)', flush=True)
         return section
     print(f'[intel-orch] section {sec["id"]} failed review → 1 bounded re-write', flush=True)
     async with sem:
         revised = await _write_section(canvas_name, shared_context, sec, "\n".join(f"- {i}" for i in verdict["issues"]))
+    if revised is not None and _validate_chart_shapes(revised):
+        # Re-write still didn't fix the field names — drop the offending charts
+        # rather than shipping a section that will render blank panels.
+        bad_titles = set()
+        for issue in _validate_chart_shapes(revised):
+            for ch in revised.get("charts") or []:
+                if isinstance(ch, dict) and ch.get("title", "chart") in issue:
+                    bad_titles.add(ch.get("title"))
+        revised["charts"] = [ch for ch in (revised.get("charts") or []) if ch.get("title") not in bad_titles]
+        print(f'[intel-orch] section {sec["id"]} re-write still broken → dropped charts {bad_titles}', flush=True)
     print(f'[intel-orch] section {sec["id"]} {"RE-WRITTEN" if revised else "re-write failed, kept original"}', flush=True)
     return revised or section
 

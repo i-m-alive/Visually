@@ -10,6 +10,7 @@ import { ConnectLiveDbModal } from '@/components/canvas/ConnectLiveDbModal'
 import type { CanvasWidgetData } from '@/components/canvas/CanvasWidget'
 import {
   runIntelligenceAgent, buildFallbackAnalysis, runSectionAgent,
+  regenerateChartFromWidgets, runChartAgent,
   type ExecutiveAnalysis, type AgentKPI, type AgentChart, type AgentSection,
   type InsightCard, type PerformerRow, type WidgetInput,
 } from '@/lib/intelligenceAgent'
@@ -1505,6 +1506,45 @@ function boldFigures(text: string): React.ReactNode[] {
       : <React.Fragment key={i}>{p}</React.Fragment>)
 }
 
+// Does this chart's data actually carry the field(s) its own renderer reads?
+// Combo charts check their DECLARED series[].key specifically rather than "any
+// nonzero field anywhere" — the looser check let a combo chart through as
+// "renderable" even when its real numbers live under a key that doesn't match
+// any series[].key, so the panel mounted with a full toolbar but drew nothing.
+function chartFieldsRenderable(ch: AgentChart): boolean {
+  if (ch.type === 'table') return true
+  const toN = (v: unknown) => (typeof v === 'number' ? v : Number(v))
+  const nonZero = (v: unknown) => { const n = toN(v); return isFinite(n) && n !== 0 }
+  if (ch.type === 'scatter') {
+    const xk = ch.x_key || 'x'
+    const yk = ch.y_key || 'y'
+    return ch.data.some(r => isFinite(toN(r[xk] ?? r.x ?? r.value)) && isFinite(toN(r[yk] ?? r.y)))
+  }
+  if (ch.type === 'combo') {
+    const keys = ch.series?.length ? ch.series.map(s => s.key) : ['value']
+    return ch.data.some(r => keys.some(k => nonZero((r as Record<string, unknown>)[k])))
+  }
+  return ch.data.some(r => nonZero((r as { value?: unknown }).value))
+}
+
+// Placeholder shown in a broken chart's normal grid slot instead of the panel
+// silently vanishing — it stays visible while an automatic repair runs.
+function BrokenChartPlaceholder({ title, healing }: { title: string; healing: boolean }) {
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+      gap: 8, minHeight: 220, borderRadius: 14, border: '1px dashed #dbe4f0', background: '#f8fafc',
+      padding: 20, textAlign: 'center',
+    }}>
+      <RefreshCw size={16} style={{ color: '#94a3b8', animation: healing ? 'ispin 1s linear infinite' : undefined }} />
+      <p style={{ fontSize: 12, fontWeight: 600, color: '#64748b', margin: 0 }}>{title}</p>
+      <p style={{ fontSize: 11, color: '#94a3b8', margin: 0 }}>
+        {healing ? 'Fixing this chart…' : 'Queued for repair…'}
+      </p>
+    </div>
+  )
+}
+
 // ── Section content ────────────────────────────────────────────────────────────
 function SectionContent({
   section, sectionIdx,
@@ -1512,6 +1552,7 @@ function SectionContent({
   onRegenSection, regenning,
   onDrill, onFullscreen,
   annotations, onAnnotate,
+  onChartBroken, healingChartKeys,
 }: {
   section: AgentSection; sectionIdx: number
   globalKpis?: AgentKPI[]
@@ -1521,6 +1562,8 @@ function SectionContent({
   onFullscreen?: (chart: AgentChart) => void
   annotations?: Record<string, string>
   onAnnotate?: (chartTitle: string, pointName: string) => void
+  onChartBroken?: (sectionId: string, chart: AgentChart) => void
+  healingChartKeys?: Set<string>
 }) {
   const hasPerformers = (section.top_performers?.length ?? 0) > 0 || (section.bottom_performers?.length ?? 0) > 0
   const [showFullNarrative, setShowFullNarrative] = useState(false)
@@ -1537,6 +1580,46 @@ function SectionContent({
     ...(section.bottom_performers ?? []).map(p => p.label.trim().toLowerCase()),
   ])
   const accentColor = PALETTE[sectionIdx % PALETTE.length]
+
+  // Charts with real data that isn't shaped the way their own renderer reads
+  // are never silently dropped — they stay in their normal grid slot as a
+  // "Fixing…" placeholder (see chartFieldsRenderable / BrokenChartPlaceholder)
+  // and are reported upward so the page can repair just that one chart in place.
+  const chartsPrelim = section.charts.filter(ch => {
+    if ((ch.data?.length ?? 0) === 0) return false
+    // Skip charts where every single cell is null/empty (AI-generated ghosts) —
+    // there's nothing to repair here, unlike a wrong-field-name chart.
+    const hasAnyRealValue = ch.data.some(row =>
+      Object.values(row).some(v => v !== null && v !== undefined && v !== '' && String(v).trim() !== '')
+    )
+    if (!hasAnyRealValue) return false
+
+    // Fix B — suppress table charts whose first-column entities are already
+    // shown by the PerformerPanel (≥50% overlap → duplicate visual)
+    if (ch.type === 'table' && performerLabels.size > 0) {
+      const firstKey = Object.keys(ch.data[0]).find(
+        k => !['value','base','total','projected','anomaly'].includes(k.toLowerCase())
+      ) ?? Object.keys(ch.data[0])[0]
+      const tableEntities = ch.data
+        .map(r => String(r[firstKey] ?? '').trim().toLowerCase())
+        .filter(Boolean)
+      if (tableEntities.length > 0) {
+        const matched = tableEntities.filter(e => performerLabels.has(e)).length
+        if (matched / Math.min(tableEntities.length, performerLabels.size) >= 0.5) return false
+      }
+    }
+    return true
+  })
+  const brokenCharts = chartsPrelim.filter(ch => !chartFieldsRenderable(ch))
+  const brokenTitleKey = brokenCharts.map(c => c.title).join('|')
+
+  useEffect(() => {
+    if (!onChartBroken) return
+    for (const ch of brokenCharts) onChartBroken(section.id, ch)
+    // brokenTitleKey is the intentional dep — re-fires only when the SET of
+    // broken chart titles in this section actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brokenTitleKey, onChartBroken])
 
   const chartProps = (ch: AgentChart, i: number) => ({
     chart: ch, colorIdx: sectionIdx * 4 + i,
@@ -1640,54 +1723,7 @@ function SectionContent({
 
       {/* ── Performers + Charts ── */}
       {(hasPerformers || section.charts.length > 0) && (() => {
-        const charts = section.charts.filter(ch => {
-          if ((ch.data?.length ?? 0) === 0) return false
-          // Skip charts where every single cell is null/empty (AI-generated ghosts)
-          const hasAnyRealValue = ch.data.some(row =>
-            Object.values(row).some(v => v !== null && v !== undefined && v !== '' && String(v).trim() !== '')
-          )
-          if (!hasAnyRealValue) return false
-
-          // Hide charts that would render blank. Key on the SAME field the renderer
-          // reads, not just "any numeric column": almost every chart type draws from
-          // `value` (bar/line/area/pie/donut/funnel/treemap/radar/waterfall/forecast),
-          // scatter draws from x/y. A chart with numbers only under some other key
-          // (e.g. `jobs`) but no real `value` renders empty — so drop it. `combo` may
-          // use multiple series keys, so it keeps the broad any-numeric check.
-          if (ch.type !== 'table') {
-            const toN = (v: unknown) => (typeof v === 'number' ? v : Number(v))
-            const nonZero = (v: unknown) => { const n = toN(v); return isFinite(n) && n !== 0 }
-            let renderable: boolean
-            if (ch.type === 'scatter') {
-              const xk = (ch as { x_key?: string }).x_key || 'x'
-              const yk = (ch as { y_key?: string }).y_key || 'y'
-              renderable = ch.data.some(r => isFinite(toN(r[xk] ?? r.x ?? r.value)) && isFinite(toN(r[yk] ?? r.y)))
-            } else if (ch.type === 'combo') {
-              const catKeys = new Set(['name', 'x', String((ch as { x_key?: string }).x_key ?? '')].filter(Boolean).map(s => s.toLowerCase()))
-              renderable = ch.data.some(r => Object.entries(r).some(([k, v]) => !catKeys.has(k.toLowerCase()) && typeof v !== 'boolean' && nonZero(v)))
-            } else {
-              renderable = ch.data.some(r => nonZero((r as { value?: unknown }).value))
-            }
-            if (!renderable) return false
-          }
-
-          // Fix B — suppress table charts whose first-column entities are already
-          // shown by the PerformerPanel (≥50% overlap → duplicate visual)
-          if (ch.type === 'table' && performerLabels.size > 0) {
-            const firstKey = Object.keys(ch.data[0]).find(
-              k => !['value','base','total','projected','anomaly'].includes(k.toLowerCase())
-            ) ?? Object.keys(ch.data[0])[0]
-            const tableEntities = ch.data
-              .map(r => String(r[firstKey] ?? '').trim().toLowerCase())
-              .filter(Boolean)
-            if (tableEntities.length > 0) {
-              const matched = tableEntities.filter(e => performerLabels.has(e)).length
-              if (matched / Math.min(tableEntities.length, performerLabels.size) >= 0.5) return false
-            }
-          }
-
-          return true
-        })
+        const charts = chartsPrelim
 
         // A chart "needs the full row" if it's a table type OR its data rows carry
         // more than 3 column keys beyond the standard name/value pair (e.g. multi-year
@@ -1721,7 +1757,9 @@ function SectionContent({
                 )}
                 {firstCompact && (
                   <div style={{ animation: 'fadeInUp 0.32s 0.08s ease both', minWidth: 0 }}>
-                    <AgentChartView {...chartProps(firstCompact, 0)} />
+                    {chartFieldsRenderable(firstCompact)
+                      ? <AgentChartView {...chartProps(firstCompact, 0)} />
+                      : <BrokenChartPlaceholder title={firstCompact.title} healing={healingChartKeys?.has(`${section.id}|${firstCompact.title}`) ?? false} />}
                   </div>
                 )}
               </div>
@@ -1742,7 +1780,9 @@ function SectionContent({
                   const isLoneTrailing = i === restCompact.length - 1 && restCompact.length % 2 === 1
                   return (
                     <div key={`compact-${i}`} style={{ animation: `fadeInUp 0.32s ${0.1 + i * 0.06}s ease both`, minWidth: 0, gridColumn: isLoneTrailing ? '1 / -1' : undefined }}>
-                      <AgentChartView {...chartProps(ch, i + 1)} />
+                      {chartFieldsRenderable(ch)
+                        ? <AgentChartView {...chartProps(ch, i + 1)} />
+                        : <BrokenChartPlaceholder title={ch.title} healing={healingChartKeys?.has(`${section.id}|${ch.title}`) ?? false} />}
                     </div>
                   )
                 })}
@@ -1752,7 +1792,9 @@ function SectionContent({
             {/* Wide charts (tables + multi-column) — always occupy the full row */}
             {wideCharts.map((ch, i) => (
               <div key={`wide-${i}`} style={{ animation: `fadeInUp 0.3s ${0.08 + i * 0.05}s ease both`, width: '100%', minWidth: 0 }}>
-                <AgentChartView {...chartProps(ch, compactCharts.length + i)} />
+                {chartFieldsRenderable(ch)
+                  ? <AgentChartView {...chartProps(ch, compactCharts.length + i)} />
+                  : <BrokenChartPlaceholder title={ch.title} healing={healingChartKeys?.has(`${section.id}|${ch.title}`) ?? false} />}
               </div>
             ))}
 
@@ -2467,6 +2509,12 @@ export default function IntelligenceCanvasPage() {
   // Feature 3: Per-section regeneration
   const [regenSection, setRegenSection] = useState<string | null>(null)
 
+  // Chart self-heal: charts whose data is present but not shaped the way their
+  // own renderer reads (see chartFieldsRenderable in SectionContent) get fixed
+  // automatically instead of sitting blank forever. Keyed by `${sectionId}|${chartTitle}`.
+  const [healingCharts, setHealingCharts] = useState<Set<string>>(new Set())
+  const chartRepairAttempts = useRef<Set<string>>(new Set())
+
   // Feature 5: Fullscreen chart
   const [fsChart, setFsChart] = useState<{ chart: AgentChart; colorIdx: number } | null>(null)
 
@@ -2727,6 +2775,50 @@ export default function IntelligenceCanvasPage() {
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
   }, [analysis, persistReport])
+
+  // Chart self-heal: SectionContent reports a chart once when its data is
+  // present but doesn't match the fields its own renderer reads. Try the
+  // deterministic ground-truth rebuild first (instant, no LLM call — reads
+  // straight from the widget data already loaded client-side); fall back to a
+  // single-chart LLM regen only when no source widget can be matched. Each
+  // (section, chart title) pair is attempted at most once per page load.
+  const handleChartBroken = useCallback(async (sectionId: string, chart: AgentChart) => {
+    const key = `${sectionId}|${chart.title}`
+    if (chartRepairAttempts.current.has(key)) return
+    chartRepairAttempts.current.add(key)
+    setHealingCharts(prev => new Set(prev).add(key))
+
+    try {
+      let fixed = regenerateChartFromWidgets(chart, rawWidgets as WidgetInput[])
+      if (!fixed) {
+        const sec = analysis?.sections.find(s => s.id === sectionId)
+        if (sec) {
+          fixed = await runChartAgent(
+            { canvasName: String(canvas?.name ?? 'Report') },
+            sec.label, chart, rawWidgets as WidgetInput[],
+          )
+        }
+      }
+      if (fixed) {
+        const fixedChart = fixed
+        let nextAnalysis: ExecutiveAnalysis | null = null
+        setAnalysis(prev => {
+          if (!prev) return prev
+          nextAnalysis = {
+            ...prev,
+            sections: prev.sections.map(s => s.id === sectionId
+              ? { ...s, charts: s.charts.map(c => c.title === chart.title ? fixedChart : c) }
+              : s),
+          }
+          return nextAnalysis
+        })
+        if (nextAnalysis) void persistReport(nextAnalysis)
+      }
+    } catch { /* leave the placeholder — user can still hit section Refresh */ }
+    finally {
+      setHealingCharts(prev => { const next = new Set(prev); next.delete(key); return next })
+    }
+  }, [rawWidgets, analysis, canvas, persistReport])
 
   useEffect(() => {
     let cancelled = false
@@ -3371,6 +3463,8 @@ export default function IntelligenceCanvasPage() {
               onFullscreen={(chart) => setFsChart({ chart, colorIdx: sectionIdx * 4 })}
               annotations={annotations}
               onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${currentSection.id}|${chartTitle}|${pt}`)}
+              onChartBroken={handleChartBroken}
+              healingChartKeys={healingCharts}
             />
             </div>
           )}
@@ -3392,6 +3486,8 @@ export default function IntelligenceCanvasPage() {
                     onFullscreen={(chart) => setFsChart({ chart, colorIdx: sectionIdx * 4 })}
                     annotations={annotations}
                     onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${currentSection.id}|${chartTitle}|${pt}`)}
+                    onChartBroken={handleChartBroken}
+                    healingChartKeys={healingCharts}
                   />
                 </div>
               )}
@@ -3408,6 +3504,8 @@ export default function IntelligenceCanvasPage() {
                       onFullscreen={(chart) => setFsChart({ chart, colorIdx: compIdx * 4 })}
                       annotations={annotations}
                       onAnnotate={(chartTitle, pt) => setAnnotatingKey(`${compSec.id}|${chartTitle}|${pt}`)}
+                      onChartBroken={handleChartBroken}
+                      healingChartKeys={healingCharts}
                     />
                   </div>
                 )

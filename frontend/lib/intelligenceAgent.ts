@@ -1125,6 +1125,41 @@ function sanitizePerformer(p: PerformerRow): PerformerRow {
   }
 }
 
+const CHART_ROW_RESERVED_KEYS = ['name', 'value', 'base', 'total', 'projected', 'anomaly']
+
+/** Coerce one AI-emitted chart row into the shape the renderer reads (literal
+ * "name"/"value"), WITHOUT discarding real column names the model used instead
+ * (e.g. table-style rows like {customer, revenue}). Forcing name:''/value:0
+ * whenever those literal keys are absent is what produces a panel that renders
+ * fully blank while the "Data" modal — which reads columns dynamically — still
+ * shows the real numbers. Only fall back to name:''/value:0 when there's truly
+ * no usable field to borrow from. */
+function coerceChartRow(d: AgentChartRow): AgentChartRow {
+  const extraKeys = Object.keys(d).filter(k => !CHART_ROW_RESERVED_KEYS.includes(k))
+
+  let name = d.name
+  if (name == null || name === '') {
+    const k = extraKeys.find(k => typeof d[k] === 'string' && d[k] !== '')
+    if (k != null) name = d[k] as string
+  }
+
+  let value: number | string = d.value
+  if (value == null) {
+    const k = extraKeys.find(k => {
+      const v = d[k]
+      return typeof v === 'number' || (typeof v === 'string' && v !== '' && isFinite(Number(v)))
+    })
+    if (k != null) value = d[k] as number | string
+  }
+
+  const row: AgentChartRow = { name: String(name ?? ''), value: Number(value ?? 0) }
+  if (d.base != null) row.base = Number(d.base)
+  if (d.total) row.total = true
+  if (d.projected) row.projected = true
+  for (const k of extraKeys) row[k] = d[k]
+  return row
+}
+
 function sanitizeChart(ch: AgentChart): AgentChart {
   const type = VALID_CHART_TYPES.includes(ch.type as never) ? ch.type : 'bar'
   return {
@@ -1140,16 +1175,7 @@ function sanitizeChart(ch: AgentChart): AgentChart {
     x_key: ch.x_key ? String(ch.x_key) : undefined,
     y_key: ch.y_key ? String(ch.y_key) : undefined,
     insight: ch.insight ? String(ch.insight) : undefined,
-    data: (ch.data ?? []).slice(0, 60).map((d: AgentChartRow) => {
-      const row: AgentChartRow = { name: String(d.name ?? ''), value: Number(d.value ?? 0) }
-      if (d.base != null) row.base = Number(d.base)
-      if (d.total) row.total = true
-      if (d.projected) row.projected = true
-      for (const k of Object.keys(d)) {
-        if (!['name', 'value', 'base', 'total', 'projected', 'anomaly'].includes(k)) row[k] = d[k]
-      }
-      return row
-    }),
+    data: (ch.data ?? []).slice(0, 60).map(coerceChartRow),
   }
 }
 
@@ -1310,6 +1336,22 @@ function hasNonZeroValue(rows: AgentChartRow[] | undefined): boolean {
   return rows.some(r => { const n = toNum((r as { value?: unknown }).value); return isFinite(n) && n !== 0 })
 }
 
+/** Build ground-truth {name, value, ...row} data points straight from a widget's
+ * real chart_data — no AI involved. Shared by the bulk ghost-chart rebind below
+ * and the on-demand single-chart repair (regenerateChartFromWidgets). */
+function widgetGroundTruthRows(cd: WidgetInput['chart_data'] | undefined): AgentChartRow[] {
+  if (!cd) return []
+  if ((cd.labels?.length ?? 0) > 0 && (cd.values?.length ?? 0) > 0) {
+    return cd.labels.map((l, i) => ({ name: String(l ?? ''), value: toNum(cd.values[i]) || 0 }))
+  }
+  if ((cd.rows?.length ?? 0) > 0 && (cd.columns?.length ?? 0) > 0) {
+    const nameCol = cd.columns[0]
+    const valCol = cd.columns.find(c => cd.rows.slice(0, 5).some(r => isFinite(toNum(r[c])))) ?? cd.columns[1] ?? 'value'
+    return cd.rows.map(r => ({ name: String(r[nameCol] ?? ''), value: toNum(r[valCol]) || 0, ...r }))
+  }
+  return []
+}
+
 function rebindChartDataToWidgets(sections: AgentSection[], widgets: WidgetInput[]): void {
   const bySql = new Map<string, WidgetInput>()
   for (const w of widgets) if (w.sql_query) bySql.set(w.sql_query.trim(), w)
@@ -1324,15 +1366,7 @@ function rebindChartDataToWidgets(sections: AgentSection[], widgets: WidgetInput
       const cd = bySql.get(sql)?.chart_data
       if (!cd) continue
 
-      // Build ground-truth {name, value} rows from the widget's real data.
-      let rebuilt: AgentChartRow[] = []
-      if ((cd.labels?.length ?? 0) > 0 && (cd.values?.length ?? 0) > 0) {
-        rebuilt = cd.labels.map((l, i) => ({ name: String(l ?? ''), value: toNum(cd.values[i]) || 0 }))
-      } else if ((cd.rows?.length ?? 0) > 0 && (cd.columns?.length ?? 0) > 0) {
-        const nameCol = cd.columns[0]
-        const valCol = cd.columns.find(c => cd.rows.slice(0, 5).some(r => isFinite(toNum(r[c])))) ?? cd.columns[1] ?? 'value'
-        rebuilt = cd.rows.map(r => ({ name: String(r[nameCol] ?? ''), value: toNum(r[valCol]) || 0, ...r }))
-      }
+      const rebuilt = widgetGroundTruthRows(cd)
       if (rebuilt.length === 0) continue
 
       // Swap in ground truth only when the widget has real numbers and the AI's
@@ -1342,6 +1376,120 @@ function rebindChartDataToWidgets(sections: AgentSection[], widgets: WidgetInput
       }
     }
   }
+}
+
+/** Find the widget backing a chart — exact source_sql match first, falling back
+ * to the same fuzzy title match used by injectSourceSql. */
+function findSourceWidget(chart: AgentChart, widgets: WidgetInput[]): WidgetInput | undefined {
+  const sql = chart.source_sql?.trim()
+  if (sql) {
+    const bySql = widgets.find(w => w.sql_query?.trim() === sql)
+    if (bySql) return bySql
+  }
+  const chartNorm = chart.title.toLowerCase().replace(/[^a-z0-9]/g, '')
+  return widgets.find(w => {
+    const wNorm = (w.title || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+    return wNorm !== '' && (chartNorm.includes(wNorm.slice(0, 10)) || wNorm.includes(chartNorm.slice(0, 10)))
+  })
+}
+
+/** Deterministically repair ONE chart straight from its source widget's real
+ * rows — no LLM round-trip. This is the primary fix for a chart whose panel
+ * renders empty because the AI's field names (or a stale series[].key) don't
+ * match its own data rows: the widget's ground truth is already loaded
+ * client-side, so the fix is instant and guaranteed correct. Returns null when
+ * no source widget can be matched or it has no usable data (caller should then
+ * fall back to runChartAgent). */
+export function regenerateChartFromWidgets(chart: AgentChart, widgets: WidgetInput[]): AgentChart | null {
+  if (chart.type === 'table' || chart.type === 'forecast') return null
+  const widget = findSourceWidget(chart, widgets)
+  if (!widget) return null
+  const rows = widgetGroundTruthRows(widget.chart_data)
+  if (!rows.length || !hasNonZeroValue(rows)) return null
+
+  const fixed: AgentChart = { ...chart, data: rows.slice(0, 60), source_sql: widget.sql_query ?? chart.source_sql }
+
+  if (chart.type === 'combo' && chart.series?.length) {
+    const sampleKeys = new Set(rows.flatMap(r => Object.keys(r)))
+    fixed.series = chart.series.map(s => {
+      if (sampleKeys.has(s.key)) return s
+      // The declared series key doesn't exist on the real rows — remap it to
+      // the first numeric column that isn't the name/value pair.
+      const numericKey = Object.keys(rows[0] ?? {}).find(k =>
+        k !== 'name' && k !== 'value' && rows.some(r => isFinite(toNum(r[k])) && toNum(r[k]) !== 0)
+      )
+      return numericKey ? { ...s, key: numericKey } : s
+    })
+  }
+
+  return sanitizeChart(fixed)
+}
+
+/** LLM fallback for repairing one chart when no source widget can be matched
+ * deterministically (regenerateChartFromWidgets returned null). Scoped to a
+ * single chart's data only — cheap, and never touches the rest of the report. */
+export async function runChartAgent(
+  opts: Pick<AgentOptions, 'canvasName'>,
+  sectionLabel: string,
+  chart: AgentChart,
+  widgets: WidgetInput[],
+  onProgress?: (step: string) => void,
+): Promise<AgentChart | null> {
+  const { canvasName } = opts
+  onProgress?.(`Regenerating chart "${chart.title}"…`)
+
+  const widget = findSourceWidget(chart, widgets)
+  const factsBlock = widget
+    ? buildWidgetBlock({
+        title: widget.title || chart.title,
+        type: widget.chart_type,
+        pattern: detectPattern(widget),
+        quality_score: 100,
+        quality_issues: [],
+        narrative: '',
+        schema: { targetColumn: null, actualColumn: null, attainmentRate: null, currencyLikely: false, percentageLikely: false },
+        sample_labels: (widget.chart_data?.labels ?? []).slice(0, 20).map(v => String(v ?? '')),
+        sample_values: (widget.chart_data?.values ?? []).map(toNum).slice(0, 20),
+        anomaly_count: 0,
+        sql_query: widget.sql_query,
+        table_columns: (widget.chart_data?.columns?.length ?? 0) ? widget.chart_data.columns : undefined,
+      })
+    : `No widget facts matched "${chart.title}" — use only what is already known about this chart.`
+
+  const prompt = `You are fixing ONE broken chart in the "${sectionLabel}" section of the report "${canvasName}". The chart titled "${chart.title}" (type: ${chart.type}) rendered with no visible data because its "data" array didn't use the field names the chart needs. Rebuild ONLY this chart's data from the widget facts below — do not invent numbers not present in the facts.
+
+${factsBlock}
+
+Return ONLY raw JSON for this one chart. Every data point MUST use the literal keys "name" and "value" (never a different field name):
+{"title":"${chart.title}","type":"${chart.type}","data":[{"name":"...","value":0}]${chart.type === 'combo' ? ',"series":[{"key":"...","type":"bar|line"}]' : ''}}`
+
+  let responseText = ''
+  try {
+    const resp = await intelligenceApi.analyze({ prompt, canvas_name: canvasName })
+    responseText = resp.data?.text ?? ''
+  } catch {
+    return null
+  }
+
+  const parsed = parseChartJson(responseText)
+  if (!parsed) return null
+  const fixed = sanitizeChart({ ...chart, ...parsed })
+  if (!fixed.data.length || !hasNonZeroValue(fixed.data)) return null
+  return fixed
+}
+
+function parseChartJson(text: string): Partial<AgentChart> | null {
+  const clean = text.trim()
+  const stripped = clean.replace(/^```(?:json)?\n?|```$/gm, '').trim()
+  const sanitized = stripped.replace(/,(\s*[}\]])/g, '$1')
+  const candidates = [..._extractJsonObjects(sanitized), ..._extractJsonObjects(stripped)]
+  for (const candidate of candidates) {
+    try {
+      const p = JSON.parse(candidate)
+      if (p && typeof p === 'object' && Array.isArray((p as { data?: unknown }).data)) return p as Partial<AgentChart>
+    } catch { /* try next candidate */ }
+  }
+  return null
 }
 
 function injectTableCharts(analysis: ExecutiveAnalysis, widgets: WidgetInput[]): void {
